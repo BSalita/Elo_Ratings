@@ -55,8 +55,7 @@ def run_with_progress(label: str, seconds_hint: int, work_fn):
 # -------------------------------
 # Config / Paths
 # -------------------------------
-DATA_ROOT = pathlib.Path('e:/bridge/data')
-ACBL_PATH = DATA_ROOT.joinpath('acbl')
+DATA_ROOT = pathlib.Path('data')
 
 
 # -------------------------------
@@ -65,7 +64,7 @@ ACBL_PATH = DATA_ROOT.joinpath('acbl')
 @st.cache_data(show_spinner=True)
 def load_elo_ratings_schema(club_or_tournament: str) -> list[str]:
     filename = f'acbl_{club_or_tournament}_elo_ratings.parquet'
-    file_path = ACBL_PATH.joinpath(filename)
+    file_path = DATA_ROOT.joinpath(filename)
     if not file_path.exists():
         raise FileNotFoundError(f"Missing file: {file_path}")
     df0 = pl.read_parquet(file_path, n_rows=0)
@@ -75,7 +74,7 @@ def load_elo_ratings_schema(club_or_tournament: str) -> list[str]:
 @st.cache_data(show_spinner=True)
 def load_elo_ratings_schema_map(club_or_tournament: str) -> dict:
     filename = f'acbl_{club_or_tournament}_elo_ratings.parquet'
-    file_path = ACBL_PATH.joinpath(filename)
+    file_path = DATA_ROOT.joinpath(filename)
     if not file_path.exists():
         raise FileNotFoundError(f"Missing file: {file_path}")
     df0 = pl.read_parquet(file_path, n_rows=0)
@@ -89,7 +88,7 @@ def load_elo_ratings(
     date_from: datetime | None = None,
 ) -> pl.DataFrame:
     filename = f'acbl_{club_or_tournament}_elo_ratings.parquet'
-    file_path = ACBL_PATH.joinpath(filename)
+    file_path = DATA_ROOT.joinpath(filename)
     if not file_path.exists():
         raise FileNotFoundError(f"Missing file: {file_path}")
 

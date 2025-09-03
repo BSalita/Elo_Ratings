@@ -1,0 +1,30 @@
+# Requirements for ACBL Elo Ratings Project
+# ==========================================
+
+# Core Streamlit web interface
+streamlit>=1.28.0
+streamlit-aggrid>=0.3.0
+
+# Data processing and analysis
+pandas>=2.0.0
+polars>=1.30.0
+
+# Data visualization
+matplotlib>=3.7.0
+
+# PDF generation for reports
+reportlab>=4.0.0
+markdown>=3.5.0
+
+# Standard library extensions (if needed)
+typing-extensions>=4.8.0
+
+# Development and debugging
+IPython>=8.15.0
+
+# Optional ML dependencies (uncomment if using mlBridgeAiLib.py)
+# torch>=2.0.0
+# tqdm>=4.65.0
+
+# Note: The DDS library (dds.py) requires external DLL files
+# Make sure dds.dll is available in the specified path
