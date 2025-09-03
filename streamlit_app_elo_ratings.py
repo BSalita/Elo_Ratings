@@ -61,7 +61,6 @@ DATA_ROOT = pathlib.Path('data')
 # -------------------------------
 # Data Loading
 # -------------------------------
-@st.cache_data(show_spinner=True)
 def load_elo_ratings_schema(club_or_tournament: str) -> list[str]:
     filename = f'acbl_{club_or_tournament}_elo_ratings.parquet'
     file_path = DATA_ROOT.joinpath(filename)
@@ -71,7 +70,6 @@ def load_elo_ratings_schema(club_or_tournament: str) -> list[str]:
     return df0.columns
 
 
-@st.cache_data(show_spinner=True)
 def load_elo_ratings_schema_map(club_or_tournament: str) -> dict:
     filename = f'acbl_{club_or_tournament}_elo_ratings.parquet'
     file_path = DATA_ROOT.joinpath(filename)
@@ -81,7 +79,6 @@ def load_elo_ratings_schema_map(club_or_tournament: str) -> dict:
     return df0.schema  # dict[str, pl.DataType]
 
 
-@st.cache_data(show_spinner=True)
 def load_elo_ratings(
     club_or_tournament: str,
     columns: list[str] | None = None,
@@ -258,7 +255,7 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
             pl.col('Pair_Names').last().alias('Pair_Names'),
             pl.col('Avg_MPs').mean().alias('Avg_MPs'),
             pl.col('Geo_MPs').mean().alias('Geo_MPs'),
-            pl.col('session_id').n_unique().alias('Sessions_Played'),
+            pl.col('session_id').n_unique().alias('Sessions'),
             pl.col('Player_ID_A').first().alias('Player_ID_A'),
             pl.col('Player_ID_B').first().alias('Player_ID_B'),
             pl.col('Avg_Player_Elo_Row').mean().alias('Avg_Player_Elo'),
@@ -268,12 +265,12 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
             pl.col('Avg_MPs').rank(method='ordinal', descending=True).alias('Avg_MPs_Rank'),
             pl.col('Geo_MPs').rank(method='ordinal', descending=True).alias('Geo_MPs_Rank'),
         ])
-        .filter(pl.col('Sessions_Played') >= min_elo_count)
+        .filter(pl.col('Sessions') >= min_elo_count)
         .sort('Elo_Score', descending=True, nulls_last=True)
-        .select(['Elo_Score', 'Avg_Elo_Rank', 'Pair_IDs', 'Pair_Names', 'Avg_MPs', 'Avg_MPs_Rank', 'Geo_MPs_Rank', 'Sessions_Played'])
+        .select(['Elo_Score', 'Avg_Elo_Rank', 'Pair_IDs', 'Pair_Names', 'Avg_MPs', 'Avg_MPs_Rank', 'Geo_MPs_Rank', 'Sessions'])
         .head(top_n)
         .with_row_index(name='Pair_Elo_Rank', offset=1)
-        .select(['Pair_Elo_Rank', 'Elo_Score', 'Avg_Elo_Rank', 'Pair_IDs', 'Pair_Names', 'Avg_MPs', 'Avg_MPs_Rank', 'Geo_MPs_Rank', 'Sessions_Played'])
+        .select(['Pair_Elo_Rank', 'Elo_Score', 'Avg_Elo_Rank', 'Pair_IDs', 'Pair_Names', 'Avg_MPs', 'Avg_MPs_Rank', 'Geo_MPs_Rank', 'Sessions'])
     )
 
     top_partnerships = top_partnerships.with_columns([
@@ -392,12 +389,8 @@ else:
         "date_from": None if date_from is None else date_from.isoformat(),
     }
 
-    use_cache = (
-        st.session_state.get("report_opts") == opts
-        and "report_table_df" in st.session_state
-        and "report_title" in st.session_state
-        and "report_date_range" in st.session_state
-    )
+    # Disable caching for now to avoid memory issues
+    use_cache = False
 
     if not use_cache:
         # Intersect needed columns with available to avoid errors
@@ -527,7 +520,7 @@ else:
         def build_pdf():
             # Enable shrink_to_fit for Pair reports to better fit the wider tables
             shrink_pairs = (rating_type == "Pairs")
-            return create_pdf([pdf_title, table_df], pdf_title, max_rows=int(top_n), rows_per_page=(20, 25), shrink_to_fit=shrink_pairs)
+            return create_pdf([pdf_title, table_df], pdf_title, max_rows=int(top_n), rows_per_page=(20, 24), shrink_to_fit=shrink_pairs)
         try:
             pdf_bytes = build_pdf()
         except TypeError:
@@ -541,7 +534,7 @@ else:
                             assets.append(table_df.slice(0, first))
                         idx = first
                         while idx < total:
-                            take = min(25, total - idx)
+                            take = min(24, total - idx)
                             assets.append(table_df.slice(idx, take))
                             idx += take
                     else:
@@ -552,7 +545,7 @@ else:
                             assets.append(table_df.iloc[0:first, :])
                         idx = first
                         while idx < total:
-                            take = min(25, total - idx)
+                            take = min(24, total - idx)
                             assets.append(table_df.iloc[idx:idx+take, :])
                             idx += take
                 except Exception:
