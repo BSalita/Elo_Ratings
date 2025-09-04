@@ -131,23 +131,40 @@ def load_elo_ratings(
 # Computation Helpers
 # -------------------------------
 def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating_method: str = 'Avg') -> pl.DataFrame:
+    import gc
+    
     if 'MasterPoints_N' not in df.columns:
         df = df.with_columns([pl.lit(None).alias(f"MasterPoints_{d}") for d in "NESW"])
 
+    # Memory optimization: Pre-filter data to reduce processing load
+    # Only keep rows with valid player data to reduce memory usage
+    df_filtered = df.filter(
+        (pl.col("Player_ID_N").is_not_null()) | 
+        (pl.col("Player_ID_S").is_not_null()) | 
+        (pl.col("Player_ID_E").is_not_null()) | 
+        (pl.col("Player_ID_W").is_not_null())
+    )
+
     position_frames: list[pl.DataFrame] = []
     for d in "NESW":
-        position_frames.append(
-            df.select(
-                pl.col("Date"),
-                pl.col("session_id"),
-                pl.col(f"Player_ID_{d}").alias("Player_ID"),
-                pl.col(f"Player_Name_{d}").alias("Player_Name"),
-                pl.col(f"MasterPoints_{d}").alias("MasterPoints"),
-                pl.when(pl.col(f"Elo_R_{d}").is_nan()).then(None).otherwise(pl.col(f"Elo_R_{d}")).alias("Elo_R_Player"),
-                pl.lit(d).alias("Position"),
-            )
-        )
-    players_stacked = pl.concat(position_frames, how="vertical").drop_nulls(subset=["Player_ID", "Elo_R_Player"])  # drop rows with missing ID or rating
+        # Only process positions that have valid data
+        position_frame = df_filtered.select(
+            pl.col("Date"),
+            pl.col("session_id"),
+            pl.col(f"Player_ID_{d}").alias("Player_ID"),
+            pl.col(f"Player_Name_{d}").alias("Player_Name"),
+            pl.col(f"MasterPoints_{d}").alias("MasterPoints"),
+            pl.when(pl.col(f"Elo_R_{d}").is_nan()).then(None).otherwise(pl.col(f"Elo_R_{d}")).alias("Elo_R_Player"),
+            pl.lit(d).alias("Position"),
+        ).filter(pl.col("Player_ID").is_not_null() & pl.col("Elo_R_Player").is_not_null())
+        
+        position_frames.append(position_frame)
+
+    players_stacked = pl.concat(position_frames, how="vertical")
+    
+    # Free memory immediately
+    del df_filtered, position_frames
+    gc.collect()
 
     if rating_method == 'Avg':
         rating_agg = pl.col('Elo_R_Player').mean().alias('Elo_R_Player')
@@ -158,7 +175,9 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
     else:
         raise ValueError(f"Invalid rating method: {rating_method}")
 
-    top_players = (
+    # Memory optimization: Process aggregation in stages to reduce peak memory
+    # Stage 1: Group and aggregate core metrics
+    player_aggregates = (
         players_stacked
         .group_by('Player_ID')
         .agg([
@@ -168,16 +187,29 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
             pl.col('session_id').n_unique().alias('Elo_Count'),
             pl.col('Position').n_unique().alias('Positions_Played'),
         ])
+        .filter(pl.col('Elo_Count') >= min_elo_count)  # Filter early to reduce data
+    )
+    
+    # Free the large stacked DataFrame
+    del players_stacked
+    gc.collect()
+    
+    # Stage 2: Add rankings and final processing on smaller dataset
+    top_players = (
+        player_aggregates
         .with_columns([
             pl.col('MasterPoints').rank(method='ordinal', descending=True).alias('MasterPoint_Rank')
         ])
-        .filter(pl.col('Elo_Count') >= min_elo_count)
         .sort('Elo_R_Player', descending=True, nulls_last=True)
         .select(['Elo_R_Player', 'Player_ID', 'Player_Name', 'MasterPoints', 'MasterPoint_Rank', 'Elo_Count'])
-        .head(top_n)
+        .head(top_n)  # Limit early to reduce final processing
         .with_row_index(name='Rank', offset=1)
         .select(['Rank', 'Elo_R_Player', 'Player_ID', 'Player_Name', 'MasterPoints', 'MasterPoint_Rank', 'Elo_Count'])
     )
+    
+    # Final cleanup
+    del player_aggregates
+    gc.collect()
 
     top_players = top_players.with_columns([
         pl.col('Elo_R_Player').cast(pl.Int32, strict=False),
@@ -190,6 +222,8 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
 
 
 def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating_method: str = 'Avg') -> pl.DataFrame:
+    import gc
+    
     if 'MasterPoints_N' not in df.columns:
         df = df.with_columns(
             pl.lit(None).alias('MasterPoints_N'),
@@ -197,8 +231,14 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
             pl.lit(None).alias('MasterPoints_E'),
             pl.lit(None).alias('MasterPoints_W')
         )
+    
+    # Memory optimization: Pre-filter to only rows with valid pair data
+    df_filtered = df.filter(
+        (pl.col("Elo_R_NS").is_not_null()) | (pl.col("Elo_R_EW").is_not_null())
+    )
 
-    ns_partnerships = df.select(
+    # Process NS partnerships from filtered data
+    ns_partnerships = df_filtered.select(
         pl.col("Date"),
         pl.col("session_id"),
         pl.concat_str([
@@ -217,7 +257,8 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
          .alias("Avg_Player_Elo_Row"),
     )
 
-    ew_partnerships = df.select(
+    # Process EW partnerships from filtered data  
+    ew_partnerships = df_filtered.select(
         pl.col("Date"),
         pl.col("session_id"),
         pl.concat_str([
@@ -236,11 +277,15 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
          .alias("Avg_Player_Elo_Row"),
     )
 
-    partnerships_stacked = pl.concat([ns_partnerships, ew_partnerships], how="vertical").drop_nulls(subset=["Pair_IDs", "Elo_R_Pair"])
+    # Apply filtering to each partnership DataFrame before concatenation
+    ns_partnerships = ns_partnerships.drop_nulls(subset=["Pair_IDs", "Elo_R_Pair"])
+    ew_partnerships = ew_partnerships.drop_nulls(subset=["Pair_IDs", "Elo_R_Pair"])
     
-    # Debug: Check if we have data after concat and drop_nulls
-    if partnerships_stacked.height == 0:
-        raise ValueError("No valid partnership data found after processing")
+    partnerships_stacked = pl.concat([ns_partnerships, ew_partnerships], how="vertical")
+    
+    # Free memory immediately after concatenation
+    del df_filtered, ns_partnerships, ew_partnerships
+    gc.collect()
 
     if rating_method == 'Avg':
         rating_agg = pl.col('Elo_R_Pair').mean().alias('Elo_Score')
@@ -251,7 +296,9 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
     else:
         raise ValueError(f"Invalid rating method: {rating_method}")
 
-    top_partnerships = (
+    # Memory optimization: Process pairs aggregation in stages
+    # Stage 1: Group and aggregate core metrics
+    pair_aggregates = (
         partnerships_stacked
         .group_by('Pair_IDs')
         .agg([
@@ -264,18 +311,31 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
             pl.col('Player_ID_B').first().alias('Player_ID_B'),
             pl.col('Avg_Player_Elo_Row').mean().alias('Avg_Player_Elo'),
         ])
+        .filter(pl.col('Sessions') >= min_elo_count)  # Filter early to reduce data
+    )
+    
+    # Free the large stacked DataFrame
+    del partnerships_stacked
+    gc.collect()
+    
+    # Stage 2: Add rankings and final processing on smaller dataset
+    top_partnerships = (
+        pair_aggregates
         .with_columns([
             pl.col('Avg_Player_Elo').rank(method='ordinal', descending=True).alias('Avg_Elo_Rank'),
             pl.col('Avg_MPs').rank(method='ordinal', descending=True).alias('Avg_MPs_Rank'),
             pl.col('Geo_MPs').rank(method='ordinal', descending=True).alias('Geo_MPs_Rank'),
         ])
-        .filter(pl.col('Sessions') >= min_elo_count)
         .sort('Elo_Score', descending=True, nulls_last=True)
         .select(['Elo_Score', 'Avg_Elo_Rank', 'Pair_IDs', 'Pair_Names', 'Avg_MPs', 'Avg_MPs_Rank', 'Geo_MPs_Rank', 'Sessions'])
-        .head(top_n)
+        .head(top_n)  # Limit early to reduce final processing
         .with_row_index(name='Pair_Elo_Rank', offset=1)
         .select(['Pair_Elo_Rank', 'Elo_Score', 'Avg_Elo_Rank', 'Pair_IDs', 'Pair_Names', 'Avg_MPs', 'Avg_MPs_Rank', 'Geo_MPs_Rank', 'Sessions'])
     )
+    
+    # Final cleanup
+    del pair_aggregates
+    gc.collect()
 
     top_partnerships = top_partnerships.with_columns([
         pl.col('Elo_Score').cast(pl.Int32, strict=False),
@@ -469,25 +529,12 @@ else:
                 raise ValueError(f"Invalid rating type: {rating_type}")
             return tbl, ttl
 
-        # Estimate processing time based on data type and size
-        estimated_rows = df.height if df is not None else 100000
-        if rating_type == "Pairs":
-            # Pairs processing is more complex (2x the data + complex aggregations)
-            seconds_hint = max(10, min(120, int(estimated_rows / 10000) * 15))
-        else:
-            # Players processing is simpler
-            seconds_hint = max(5, min(60, int(estimated_rows / 20000) * 10))
-        
-        try:
-            table_df, title = run_with_progress(
-                f"Creating {rating_type} Report Table. Processing {estimated_rows:,} rows...",
-                seconds_hint,
-                build_table,
-            )
-        except Exception as e:
-            st.error(f"Error creating report table: {str(e)}")
-            st.error("This might be due to memory constraints or data processing issues.")
-            st.stop()
+        seconds_hint = 60 if club_or_tournament == 'Club' else 10
+        table_df, title = run_with_progress(
+            f"Creating Report Table. Takes up to {seconds_hint} seconds.",
+            seconds_hint,
+            build_table,
+        )
 
         # Cache results
         st.session_state["report_opts"] = opts
