@@ -237,6 +237,10 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
     )
 
     partnerships_stacked = pl.concat([ns_partnerships, ew_partnerships], how="vertical").drop_nulls(subset=["Pair_IDs", "Elo_R_Pair"])
+    
+    # Debug: Check if we have data after concat and drop_nulls
+    if partnerships_stacked.height == 0:
+        raise ValueError("No valid partnership data found after processing")
 
     if rating_method == 'Avg':
         rating_agg = pl.col('Elo_R_Pair').mean().alias('Elo_Score')
@@ -465,12 +469,25 @@ else:
                 raise ValueError(f"Invalid rating type: {rating_type}")
             return tbl, ttl
 
-        seconds_hint = 60 if club_or_tournament == 'Club' else 10
-        table_df, title = run_with_progress(
-            f"Creating Report Table. Takes up to {seconds_hint} seconds.",
-            seconds_hint,
-            build_table,
-        )
+        # Estimate processing time based on data type and size
+        estimated_rows = df.height if df is not None else 100000
+        if rating_type == "Pairs":
+            # Pairs processing is more complex (2x the data + complex aggregations)
+            seconds_hint = max(10, min(120, int(estimated_rows / 10000) * 15))
+        else:
+            # Players processing is simpler
+            seconds_hint = max(5, min(60, int(estimated_rows / 20000) * 10))
+        
+        try:
+            table_df, title = run_with_progress(
+                f"Creating {rating_type} Report Table. Processing {estimated_rows:,} rows...",
+                seconds_hint,
+                build_table,
+            )
+        except Exception as e:
+            st.error(f"Error creating report table: {str(e)}")
+            st.error("This might be due to memory constraints or data processing issues.")
+            st.stop()
 
         # Cache results
         st.session_state["report_opts"] = opts
