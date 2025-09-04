@@ -46,8 +46,14 @@ def run_with_progress(label: str, seconds_hint: int, work_fn):
     bar.progress(100)
     time.sleep(0.2)  # Brief pause to show 100%
     
-    # Clear message when finished
-    container.empty()
+    # Clear progress bar and message when finished
+    try:
+        msg.empty()  # Clear the info message
+        bar.empty()  # Clear the progress bar
+    except:
+        pass
+    container.empty()  # Clear the entire container
+    
     if 'error' in holder:
         raise holder['error']
     return holder.get('result')
@@ -128,27 +134,77 @@ def load_elo_ratings(
 
 
 # -------------------------------
+# Data Enrichment
+# -------------------------------
+def enrich_tournament_with_club_masterpoints_direct(tournament_df: pl.DataFrame, club_df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Enrich tournament data with MasterPoints from club data by joining on Player_IDs.
+    Takes both DataFrames directly (used during startup enrichment).
+    """
+    try:
+        # Extract unique player MasterPoints from club data
+        # Get the most recent MasterPoints for each player
+        club_players = []
+        for pos in "NESW":
+            if f"Player_ID_{pos}" in club_df.columns and f"MasterPoints_{pos}" in club_df.columns:
+                club_players.append(
+                    club_df.select([
+                        pl.col(f"Player_ID_{pos}").alias("Player_ID"),
+                        pl.col(f"MasterPoints_{pos}").alias("MasterPoints"),
+                        pl.col("Date")
+                    ]).filter(pl.col("Player_ID").is_not_null())
+                )
+        
+        if not club_players:
+            return tournament_df
+            
+        # Combine all club player data and get latest MasterPoints per player
+        club_players_combined = pl.concat(club_players, how="vertical")
+        latest_masterpoints = (
+            club_players_combined
+            .sort("Date", descending=True)
+            .group_by("Player_ID")
+            .agg([
+                pl.col("MasterPoints").first().alias("MasterPoints")
+            ])
+        )
+        
+        # Join MasterPoints to tournament data for each position
+        enriched_df = tournament_df
+        for pos in "NESW":
+            if f"Player_ID_{pos}" in tournament_df.columns:
+                # Join MasterPoints for this position
+                enriched_df = enriched_df.join(
+                    latest_masterpoints.select([
+                        pl.col("Player_ID"),
+                        pl.col("MasterPoints").alias(f"MasterPoints_{pos}")
+                    ]),
+                    left_on=f"Player_ID_{pos}",
+                    right_on="Player_ID",
+                    how="left"
+                )
+        
+        return enriched_df
+        
+    except Exception as e:
+        st.warning(f"⚠️ Could not enrich tournament data with club MasterPoints: {e}")
+        return tournament_df
+
+
+# -------------------------------
 # Computation Helpers
 # -------------------------------
 def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating_method: str = 'Avg') -> pl.DataFrame:
-    import gc
     
     if 'MasterPoints_N' not in df.columns:
         df = df.with_columns([pl.lit(None).alias(f"MasterPoints_{d}") for d in "NESW"])
 
-    # Memory optimization: Pre-filter data to reduce processing load
-    # Only keep rows with valid player data to reduce memory usage
-    df_filtered = df.filter(
-        (pl.col("Player_ID_N").is_not_null()) | 
-        (pl.col("Player_ID_S").is_not_null()) | 
-        (pl.col("Player_ID_E").is_not_null()) | 
-        (pl.col("Player_ID_W").is_not_null())
-    )
+    # Don't filter out null Player_IDs - process all rows
 
     position_frames: list[pl.DataFrame] = []
     for d in "NESW":
         # Only process positions that have valid data
-        position_frame = df_filtered.select(
+        position_frame = df.select(
             pl.col("Date"),
             pl.col("session_id"),
             pl.col(f"Player_ID_{d}").alias("Player_ID"),
@@ -156,15 +212,14 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
             pl.col(f"MasterPoints_{d}").alias("MasterPoints"),
             pl.when(pl.col(f"Elo_R_{d}").is_nan()).then(None).otherwise(pl.col(f"Elo_R_{d}")).alias("Elo_R_Player"),
             pl.lit(d).alias("Position"),
-        ).filter(pl.col("Player_ID").is_not_null() & pl.col("Elo_R_Player").is_not_null())
+        )
         
         position_frames.append(position_frame)
 
-    players_stacked = pl.concat(position_frames, how="vertical")
+    players_stacked = pl.concat(position_frames, how="vertical").drop_nulls(subset=["Player_ID", "Elo_R_Player"])
     
-    # Free memory immediately
-    del df_filtered, position_frames
-    gc.collect()
+    # Keep data in memory - don't delete or garbage collect
+    del position_frames  # Only delete local references
 
     if rating_method == 'Avg':
         rating_agg = pl.col('Elo_R_Player').mean().alias('Elo_R_Player')
@@ -190,9 +245,8 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
         .filter(pl.col('Elo_Count') >= min_elo_count)  # Filter early to reduce data
     )
     
-    # Free the large stacked DataFrame
+    # Keep data in memory - only delete local reference
     del players_stacked
-    gc.collect()
     
     # Stage 2: Add rankings and final processing on smaller dataset
     top_players = (
@@ -207,9 +261,8 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
         .select(['Rank', 'Elo_R_Player', 'Player_ID', 'Player_Name', 'MasterPoints', 'MasterPoint_Rank', 'Elo_Count'])
     )
     
-    # Final cleanup
+    # Keep data in memory - only delete local reference
     del player_aggregates
-    gc.collect()
 
     top_players = top_players.with_columns([
         pl.col('Elo_R_Player').cast(pl.Int32, strict=False),
@@ -222,7 +275,6 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
 
 
 def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating_method: str = 'Avg') -> pl.DataFrame:
-    import gc
     
     if 'MasterPoints_N' not in df.columns:
         df = df.with_columns(
@@ -249,8 +301,8 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
         pl.max_horizontal(pl.col('Player_ID_N'), pl.col('Player_ID_S')).alias("Player_ID_B"),
         pl.when(pl.col("Elo_R_NS").is_nan()).then(None).otherwise(pl.col("Elo_R_NS")).alias("Elo_R_Pair"),
         (pl.col("Player_Name_N") + " - " + pl.col("Player_Name_S")).str.replace_all("(swap names)", "", literal=True).alias("Pair_Names"),
-        ((pl.col("MasterPoints_N").fill_null(0) + pl.col("MasterPoints_S").fill_null(0)) / 2).alias("Avg_MPs"),
-        (pl.col("MasterPoints_N").fill_null(0) * pl.col("MasterPoints_S").fill_null(0)).sqrt().alias("Geo_MPs"),
+        ((pl.col("MasterPoints_N") + pl.col("MasterPoints_S")) / 2).alias("Avg_MPs"),
+        (pl.col("MasterPoints_N") * pl.col("MasterPoints_S")).sqrt().alias("Geo_MPs"),
         pl.when(pl.mean_horizontal([pl.col("Elo_R_N"), pl.col("Elo_R_S")]).is_nan())
          .then(None)
          .otherwise(pl.mean_horizontal([pl.col("Elo_R_N"), pl.col("Elo_R_S")]))
@@ -269,8 +321,8 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
         pl.max_horizontal(pl.col('Player_ID_E'), pl.col('Player_ID_W')).alias("Player_ID_B"),
         pl.when(pl.col("Elo_R_EW").is_nan()).then(None).otherwise(pl.col("Elo_R_EW")).alias("Elo_R_Pair"),
         (pl.col("Player_Name_E") + " - " + pl.col("Player_Name_W")).str.replace_all("(swap names)", "", literal=True).alias("Pair_Names"),
-        ((pl.col("MasterPoints_E").fill_null(0) + pl.col("MasterPoints_W").fill_null(0)) / 2).alias("Avg_MPs"),
-        (pl.col("MasterPoints_E").fill_null(0) * pl.col("MasterPoints_W").fill_null(0)).sqrt().alias("Geo_MPs"),
+        ((pl.col("MasterPoints_E") + pl.col("MasterPoints_W")) / 2).alias("Avg_MPs"),
+        (pl.col("MasterPoints_E") * pl.col("MasterPoints_W")).sqrt().alias("Geo_MPs"),
         pl.when(pl.mean_horizontal([pl.col("Elo_R_E"), pl.col("Elo_R_W")]).is_nan())
          .then(None)
          .otherwise(pl.mean_horizontal([pl.col("Elo_R_E"), pl.col("Elo_R_W")]))
@@ -283,9 +335,8 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
     
     partnerships_stacked = pl.concat([ns_partnerships, ew_partnerships], how="vertical")
     
-    # Free memory immediately after concatenation
+    # Keep data in memory - only delete local references
     del df_filtered, ns_partnerships, ew_partnerships
-    gc.collect()
 
     if rating_method == 'Avg':
         rating_agg = pl.col('Elo_R_Pair').mean().alias('Elo_Score')
@@ -314,9 +365,8 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
         .filter(pl.col('Sessions') >= min_elo_count)  # Filter early to reduce data
     )
     
-    # Free the large stacked DataFrame
+    # Keep data in memory - only delete local reference
     del partnerships_stacked
-    gc.collect()
     
     # Stage 2: Add rankings and final processing on smaller dataset
     top_partnerships = (
@@ -333,9 +383,8 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
         .select(['Pair_Elo_Rank', 'Elo_Score', 'Avg_Elo_Rank', 'Pair_IDs', 'Pair_Names', 'Avg_MPs', 'Avg_MPs_Rank', 'Geo_MPs_Rank', 'Sessions'])
     )
     
-    # Final cleanup
+    # Keep data in memory - only delete local reference
     del pair_aggregates
-    gc.collect()
 
     top_partnerships = top_partnerships.with_columns([
         pl.col('Elo_Score').cast(pl.Int32, strict=False),
@@ -383,6 +432,78 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Sidebar will be created after data loading is complete
+# Set default values for data loading
+date_from = None  # Default to all time for initial loading
+
+# Load all columns initially (sidebar controls will be available after loading)
+needed_cols = None  # Load all columns
+
+# -------------------------------
+# Preload Data Files on App Start
+# -------------------------------
+
+# Determine date_from for preloading (use the selected date range)
+preload_date_from = date_from
+
+# Check which datasets need loading
+datasets_to_load = []
+for dataset in ["club", "tournament"]:
+    dataset_cache_key = f"cached_df_{dataset}"
+    dataset_date_key = f"cached_date_{dataset}"
+    
+    if not (dataset_cache_key in st.session_state 
+            and st.session_state[dataset_cache_key] is not None
+            and st.session_state.get(dataset_date_key) == str(preload_date_from)):
+        datasets_to_load.append(dataset)
+
+# Load datasets with single progress indicator
+if datasets_to_load:
+    seconds_hint = 90
+    
+    def load_all_datasets():
+        results = {}
+        for dataset in datasets_to_load:
+            results[dataset] = load_elo_ratings(dataset, columns=None, date_from=preload_date_from)
+        return results
+    
+    try:
+        all_data = run_with_progress(
+            f"Loading datasets. One time only. Takes up to {seconds_hint} seconds.",
+            seconds_hint,
+            load_all_datasets
+        )
+        
+        # Cache all loaded datasets
+        for dataset, df in all_data.items():
+            dataset_cache_key = f"cached_df_{dataset}"
+            dataset_date_key = f"cached_date_{dataset}"
+            st.session_state[dataset_cache_key] = df
+            st.session_state[dataset_date_key] = str(preload_date_from)
+        
+        # Enrich tournament data with club MasterPoints if both datasets were loaded
+        if 'tournament' in all_data and 'club' in all_data:
+            def enrich_tournament_data():
+                tournament_df = all_data['tournament']
+                club_df = all_data['club']
+                return enrich_tournament_with_club_masterpoints_direct(tournament_df, club_df)
+            
+            enriched_tournament_df = run_with_progress(
+                "Augmenting tournament data with club masterPoints. Takes about 30 seconds.",
+                30,
+                enrich_tournament_data
+            )
+            
+            # Update the cached tournament data with enriched version
+            st.session_state["cached_df_tournament"] = enriched_tournament_df
+            
+    except Exception as e:
+        st.error(f"❌ Failed to load datasets: {e}")
+
+# -------------------------------
+# Create Sidebar Controls (After Data Loading)
+# -------------------------------
+
 with st.sidebar:
     st.header("Controls")
     club_or_tournament = st.selectbox("Dataset", options=["Club", "Tournament"], index=0)
@@ -397,36 +518,8 @@ with st.sidebar:
         index=0,
     )
     
-    st.divider()
-    st.subheader("Actions")
     display_table = st.button("Display Table", type="primary")
     generate_pdf = st.button("Generate PDF", type="primary")
-    
-    st.divider()
-    st.subheader("Cache Management")
-    
-    # Show cache status
-    if "cached_df" in st.session_state and st.session_state["cached_df"] is not None:
-        cached_key = st.session_state.get("cached_data_key", "Unknown")
-        st.success(f"📊 Data cached: {cached_key}")
-        if st.button("🗑️ Clear Data Cache"):
-            if "cached_df" in st.session_state:
-                del st.session_state["cached_df"]
-            if "cached_data_key" in st.session_state:
-                del st.session_state["cached_data_key"]
-            st.rerun()
-    else:
-        st.info("No data currently cached")
-    
-    if "report_table_df" in st.session_state:
-        st.success("📋 Report cached")
-        if st.button("🗑️ Clear Report Cache"):
-            for key in ["report_opts", "report_table_df", "report_title", "report_date_range"]:
-                if key in st.session_state:
-                    del st.session_state[key]
-            st.rerun()
-    else:
-        st.info("No report currently cached")
 
 # Determine date_from based on selection
 now = datetime.now()
@@ -449,27 +542,9 @@ elif date_range_choice == "Last 5 years":
 else:
     date_from = None # Default to all time
 
-# Determine needed columns to accelerate load
-common_cols = ["Date", "session_id"]
-if rating_type == "Players":
-    needed = []
-    for d in "NESW":
-        needed += [
-            f"Player_ID_{d}", f"Player_Name_{d}", f"MasterPoints_{d}", f"Elo_R_{d}",
-        ]
-    needed_cols = common_cols + needed
-else:
-    needed_cols = common_cols + [
-        # IDs and Names
-        "Player_ID_N", "Player_ID_S", "Player_ID_E", "Player_ID_W",
-        "Player_Name_N", "Player_Name_S", "Player_Name_E", "Player_Name_W",
-        # MasterPoints and Elo components
-        "MasterPoints_N", "MasterPoints_S", "MasterPoints_E", "MasterPoints_W",
-        "Elo_R_N", "Elo_R_S", "Elo_R_E", "Elo_R_W",
-        # Pair Elo
-        "Elo_R_NS", "Elo_R_EW",
-    ]
-
+# -------------------------------
+# Report Generation
+# -------------------------------
 if not (display_table or generate_pdf):
     st.info("Select options and hit the 'Display Table' or 'Generate PDF' button.")
 else:
@@ -485,120 +560,48 @@ else:
         "date_from": None if date_from is None else date_from.isoformat(),
     }
 
-    # Check if we can reuse cached data (load data once, reuse for multiple reports)
-    data_cache_key = f"data_{club_or_tournament.lower()}_{date_from}"
-    use_data_cache = (
-        st.session_state.get("cached_data_key") == data_cache_key
-        and "cached_df" in st.session_state
-        and st.session_state["cached_df"] is not None
-    )
+    # Get preloaded data
+    dataset_type = club_or_tournament.lower()
+    dataset_cache_key = f"cached_df_{dataset_type}"
     
-    # Check if we can reuse cached report results
-    use_report_cache = (
-        st.session_state.get("report_opts") == opts
-        and "report_table_df" in st.session_state
-        and "report_title" in st.session_state
-        and "report_date_range" in st.session_state
-    )
-
-    if not use_report_cache:
-        # Intersect needed columns with available to avoid errors
-        try:
-            available_cols = set(load_elo_ratings_schema(club_or_tournament.lower()))
-            columns_to_read = [c for c in needed_cols if c in available_cols]
-            if "Date" not in columns_to_read and "Date" in available_cols:
-                columns_to_read.insert(0, "Date")
-        except Exception as e:
-            st.error(f"Failed to read schema: {e}")
-            st.stop()
-
-        # Helper: run work with a seconds-based progress bar
-        def run_with_progress(label: str, seconds_hint: int, work_fn):
-            container = st.container()
-            msg = container.info(label)
-            bar = container.progress(0)
-            done = threading.Event()
-            holder = {}
-
-            def worker():
-                try:
-                    holder['result'] = work_fn()
-                except Exception as ex:
-                    holder['error'] = ex
-                finally:
-                    done.set()
-
-            t = threading.Thread(target=worker, daemon=True)
-            t.start()
-
-            start_t = time.time()
-            while not done.is_set():
-                elapsed = time.time() - start_t
-                pct = 100 if seconds_hint <= 0 else min(100, int((elapsed / seconds_hint) * 100))
-                bar.progress(pct)
-                time.sleep(1)
-
-            # Clear message when finished (even if earlier than hint)
-            container.empty()
-            if 'error' in holder:
-                raise holder['error']
-            return holder.get('result')
-
-        # Load data with caching (load once, reuse for multiple reports)
-        if use_data_cache:
-            st.info("♻️ Reusing cached dataset - no need to reload!")
-            df = st.session_state["cached_df"]
-        else:
-            # Load data with progress
-            seconds_hint = 15 if club_or_tournament == 'Club' else 2
-            df = run_with_progress(
-                f"Loading dataset. Takes up to {seconds_hint} seconds.",
-                seconds_hint,
-                lambda: load_elo_ratings(club_or_tournament.lower(), columns=columns_to_read, date_from=date_from),
-            )
-            
-            # Cache the loaded data for reuse
-            st.session_state["cached_df"] = df
-            st.session_state["cached_data_key"] = data_cache_key
-            st.success("✅ Dataset loaded and cached for future use!")
-
-        # Compute date range for captions
-        try:
-            date_min, date_max = df.select([pl.col("Date").min().alias("min"), pl.col("Date").max().alias("max")]).row(0)
-            date_range = f"{str(date_min)[:10]} to {str(date_max)[:10]}"
-        except Exception:
-            date_range = ""
-
-        # Compute table and title with progress (60s hint)
-        def build_table():
-            if rating_type == "Players":
-                tbl = show_top_players(df, int(top_n), int(min_sessions), rating_method)
-                ttl = f"Top {top_n} ACBL {club_or_tournament} Players by Elo Rating ({rating_method} method)"
-            elif rating_type == "Pairs":
-                tbl = show_top_pairs(df, int(top_n), int(min_sessions), rating_method)
-                ttl = f"Top {top_n} ACBL {club_or_tournament} Pairs by Elo Rating ({rating_method} method)"
-            else:
-                raise ValueError(f"Invalid rating type: {rating_type}")
-            return tbl, ttl
-
-        seconds_hint = 60 if club_or_tournament == 'Club' else 10
-        table_df, title = run_with_progress(
-            f"Creating Report Table. Takes up to {seconds_hint} seconds.",
-            seconds_hint,
-            build_table,
-        )
-
-        # Cache results
-        st.session_state["report_opts"] = opts
-        st.session_state["report_table_df"] = table_df
-        st.session_state["report_title"] = title
-        st.session_state["report_date_range"] = date_range
+    # Generate report (no caching needed since data is pre-loaded)
+    # Use preloaded data
+    if dataset_cache_key in st.session_state:
+        df = st.session_state[dataset_cache_key]
+        st.info(f"✅ Using preloaded {dataset_type} dataset with {df.height:,} rows")
     else:
-        # Reusing cached report results
-        st.info("⚡ Reusing cached report - no need to regenerate!")
-        table_df = st.session_state["report_table_df"]
-        title = st.session_state["report_title"]
-        date_range = st.session_state["report_date_range"]
+        st.error(f"❌ {dataset_type.title()} dataset not preloaded. Please refresh the page.")
+        st.stop()
+
+    # Tournament data is already enriched during startup if both datasets were loaded
+
+    # Compute date range for captions
+    try:
+        date_min, date_max = df.select([pl.col("Date").min().alias("min"), pl.col("Date").max().alias("max")]).row(0)
+        date_range = f"{str(date_min)[:10]} to {str(date_max)[:10]}"
+    except Exception:
+        date_range = ""
+
+    # Compute table and title with progress (60s hint)
+    def build_table():
+        st.info(f"🔄 Building {rating_type} report for {dataset_type} data...")
+        if rating_type == "Players":
+            tbl = show_top_players(df, int(top_n), int(min_sessions), rating_method)
+            ttl = f"Top {top_n} ACBL {club_or_tournament} Players by Elo Rating ({rating_method} method)"
+        elif rating_type == "Pairs":
+            tbl = show_top_pairs(df, int(top_n), int(min_sessions), rating_method)
+            ttl = f"Top {top_n} ACBL {club_or_tournament} Pairs by Elo Rating ({rating_method} method)"
+        else:
+            raise ValueError(f"Invalid rating type: {rating_type}")
+        st.info(f"✅ Report built with {tbl.height:,} rows")
+        return tbl, ttl
+
+    seconds_hint = 60 if club_or_tournament == 'Club' else 10
+    table_df, title = run_with_progress(
+        f"Creating Report Table. Takes up to {seconds_hint} seconds.",
+        seconds_hint,
+        build_table,
+    )
 
     # Show table only when requested
     if display_table:
