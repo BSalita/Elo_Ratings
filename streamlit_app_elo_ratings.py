@@ -396,8 +396,37 @@ with st.sidebar:
         options=["All time", "Last 3 months", "Last 6 months", "Last 1 year", "Last 2 years", "Last 3 years", "Last 4 years", "Last 5 years"],
         index=0,
     )
+    
+    st.divider()
+    st.subheader("Actions")
     display_table = st.button("Display Table", type="primary")
     generate_pdf = st.button("Generate PDF", type="primary")
+    
+    st.divider()
+    st.subheader("Cache Management")
+    
+    # Show cache status
+    if "cached_df" in st.session_state and st.session_state["cached_df"] is not None:
+        cached_key = st.session_state.get("cached_data_key", "Unknown")
+        st.success(f"📊 Data cached: {cached_key}")
+        if st.button("🗑️ Clear Data Cache"):
+            if "cached_df" in st.session_state:
+                del st.session_state["cached_df"]
+            if "cached_data_key" in st.session_state:
+                del st.session_state["cached_data_key"]
+            st.rerun()
+    else:
+        st.info("No data currently cached")
+    
+    if "report_table_df" in st.session_state:
+        st.success("📋 Report cached")
+        if st.button("🗑️ Clear Report Cache"):
+            for key in ["report_opts", "report_table_df", "report_title", "report_date_range"]:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
+    else:
+        st.info("No report currently cached")
 
 # Determine date_from based on selection
 now = datetime.now()
@@ -456,13 +485,26 @@ else:
         "date_from": None if date_from is None else date_from.isoformat(),
     }
 
-    # Disable caching for now to avoid memory issues
-    use_cache = False
+    # Check if we can reuse cached data (load data once, reuse for multiple reports)
+    data_cache_key = f"data_{club_or_tournament.lower()}_{date_from}"
+    use_data_cache = (
+        st.session_state.get("cached_data_key") == data_cache_key
+        and "cached_df" in st.session_state
+        and st.session_state["cached_df"] is not None
+    )
+    
+    # Check if we can reuse cached report results
+    use_report_cache = (
+        st.session_state.get("report_opts") == opts
+        and "report_table_df" in st.session_state
+        and "report_title" in st.session_state
+        and "report_date_range" in st.session_state
+    )
 
-    if not use_cache:
+    if not use_report_cache:
         # Intersect needed columns with available to avoid errors
         try:
-            available_cols = set(load_elo_ratings_schema(club_or_tournament))
+            available_cols = set(load_elo_ratings_schema(club_or_tournament.lower()))
             columns_to_read = [c for c in needed_cols if c in available_cols]
             if "Date" not in columns_to_read and "Date" in available_cols:
                 columns_to_read.insert(0, "Date")
@@ -502,13 +544,23 @@ else:
                 raise holder['error']
             return holder.get('result')
 
-        # Load data with progress (15s hint)
-        seconds_hint = 15 if club_or_tournament == 'Club' else 2
-        df = run_with_progress(
-            f"Loading dataset. Takes up to {seconds_hint} seconds.",
-            seconds_hint,
-            lambda: load_elo_ratings(club_or_tournament, columns=columns_to_read, date_from=date_from),
-        )
+        # Load data with caching (load once, reuse for multiple reports)
+        if use_data_cache:
+            st.info("♻️ Reusing cached dataset - no need to reload!")
+            df = st.session_state["cached_df"]
+        else:
+            # Load data with progress
+            seconds_hint = 15 if club_or_tournament == 'Club' else 2
+            df = run_with_progress(
+                f"Loading dataset. Takes up to {seconds_hint} seconds.",
+                seconds_hint,
+                lambda: load_elo_ratings(club_or_tournament.lower(), columns=columns_to_read, date_from=date_from),
+            )
+            
+            # Cache the loaded data for reuse
+            st.session_state["cached_df"] = df
+            st.session_state["cached_data_key"] = data_cache_key
+            st.success("✅ Dataset loaded and cached for future use!")
 
         # Compute date range for captions
         try:
@@ -542,6 +594,8 @@ else:
         st.session_state["report_title"] = title
         st.session_state["report_date_range"] = date_range
     else:
+        # Reusing cached report results
+        st.info("⚡ Reusing cached report - no need to regenerate!")
         table_df = st.session_state["report_table_df"]
         title = st.session_state["report_title"]
         date_range = st.session_state["report_date_range"]
