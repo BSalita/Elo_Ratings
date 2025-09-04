@@ -62,7 +62,7 @@ DATA_ROOT = pathlib.Path('data')
 # Data Loading
 # -------------------------------
 def load_elo_ratings_schema(club_or_tournament: str) -> list[str]:
-    filename = f'acbl_{club_or_tournament}_elo_ratings.parquet'
+    filename = f'acbl_{club_or_tournament.lower()}_elo_ratings.parquet'
     file_path = DATA_ROOT.joinpath(filename)
     if not file_path.exists():
         raise FileNotFoundError(f"Missing file: {file_path}")
@@ -71,7 +71,7 @@ def load_elo_ratings_schema(club_or_tournament: str) -> list[str]:
 
 
 def load_elo_ratings_schema_map(club_or_tournament: str) -> dict:
-    filename = f'acbl_{club_or_tournament}_elo_ratings.parquet'
+    filename = f'acbl_{club_or_tournament.lower()}_elo_ratings.parquet'
     file_path = DATA_ROOT.joinpath(filename)
     if not file_path.exists():
         raise FileNotFoundError(f"Missing file: {file_path}")
@@ -84,7 +84,7 @@ def load_elo_ratings(
     columns: list[str] | None = None,
     date_from: datetime | None = None,
 ) -> pl.DataFrame:
-    filename = f'acbl_{club_or_tournament}_elo_ratings.parquet'
+    filename = f'acbl_{club_or_tournament.lower()}_elo_ratings.parquet'
     file_path = DATA_ROOT.joinpath(filename)
     if not file_path.exists():
         raise FileNotFoundError(f"Missing file: {file_path}")
@@ -130,7 +130,7 @@ def load_elo_ratings(
 # -------------------------------
 # Computation Helpers
 # -------------------------------
-def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating_method: str = 'mean') -> pl.DataFrame:
+def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating_method: str = 'Avg') -> pl.DataFrame:
     if 'MasterPoints_N' not in df.columns:
         df = df.with_columns([pl.lit(None).alias(f"MasterPoints_{d}") for d in "NESW"])
 
@@ -149,11 +149,11 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
         )
     players_stacked = pl.concat(position_frames, how="vertical").drop_nulls(subset=["Player_ID", "Elo_R_Player"])  # drop rows with missing ID or rating
 
-    if rating_method == 'max':
-        rating_agg = pl.col('Elo_R_Player').max().alias('Elo_R_Player')
-    elif rating_method == 'mean':
+    if rating_method == 'Avg':
         rating_agg = pl.col('Elo_R_Player').mean().alias('Elo_R_Player')
-    elif rating_method == 'last':
+    elif rating_method == 'Max':
+        rating_agg = pl.col('Elo_R_Player').max().alias('Elo_R_Player')
+    elif rating_method == 'Latest':
         rating_agg = pl.col('Elo_R_Player').last().alias('Elo_R_Player')
     else:
         raise ValueError(f"Invalid rating method: {rating_method}")
@@ -189,7 +189,7 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
     return top_players
 
 
-def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating_method: str = 'mean') -> pl.DataFrame:
+def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating_method: str = 'Avg') -> pl.DataFrame:
     if 'MasterPoints_N' not in df.columns:
         df = df.with_columns(
             pl.lit(None).alias('MasterPoints_N'),
@@ -238,11 +238,11 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
 
     partnerships_stacked = pl.concat([ns_partnerships, ew_partnerships], how="vertical").drop_nulls(subset=["Pair_IDs", "Elo_R_Pair"])
 
-    if rating_method == 'max':
-        rating_agg = pl.col('Elo_R_Pair').max().alias('Elo_Score')
-    elif rating_method == 'mean':
+    if rating_method == 'Avg':
         rating_agg = pl.col('Elo_R_Pair').mean().alias('Elo_Score')
-    elif rating_method == 'last':
+    elif rating_method == 'Max':
+        rating_agg = pl.col('Elo_R_Pair').max().alias('Elo_Score')
+    elif rating_method == 'Latest':
         rating_agg = pl.col('Elo_R_Pair').last().alias('Elo_Score')
     else:
         raise ValueError(f"Invalid rating method: {rating_method}")
@@ -321,15 +321,15 @@ st.markdown(
 
 with st.sidebar:
     st.header("Controls")
-    club_or_tournament = st.selectbox("Dataset", options=["club", "tournament"], index=0)
+    club_or_tournament = st.selectbox("Dataset", options=["Club", "Tournament"], index=0)
     rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=False)
     top_n = st.number_input("Top N", min_value=50, max_value=5000, value=1000, step=50)
     min_sessions = st.number_input("Minimum sessions", min_value=1, max_value=200, value=30, step=1)
-    rating_method = st.selectbox("Rating method", options=["mean", "max", "last"], index=0)
+    rating_method = st.selectbox("Rating method", options=["Avg", "Max", "Latest"], index=0)
     # Date range quick filter (default All time)
     date_range_choice = st.selectbox(
         "Date range",
-        options=["All time", "Last 3 months", "Last 6 months", "Last 12 months"],
+        options=["All time", "Last 3 months", "Last 6 months", "Last 1 year", "Last 2 years", "Last 3 years", "Last 4 years", "Last 5 years"],
         index=0,
     )
     display_table = st.button("Display Table", type="primary")
@@ -343,8 +343,18 @@ elif date_range_choice == "Last 3 months":
     date_from = now - timedelta(days=90)
 elif date_range_choice == "Last 6 months":
     date_from = now - timedelta(days=182)
-else:  # Last 12 months
+elif date_range_choice == "Last 1 year":
     date_from = now - timedelta(days=365)
+elif date_range_choice == "Last 2 years":
+    date_from = now - timedelta(days=365*2)
+elif date_range_choice == "Last 3 years":
+    date_from = now - timedelta(days=365*3)
+elif date_range_choice == "Last 4 years":
+    date_from = now - timedelta(days=365*4)
+elif date_range_choice == "Last 5 years":
+    date_from = now - timedelta(days=365*5)
+else:
+    date_from = None # Default to all time
 
 # Determine needed columns to accelerate load
 common_cols = ["Date", "session_id"]
@@ -370,14 +380,7 @@ else:
 if not (display_table or generate_pdf):
     st.info("Select options and hit the 'Display Table' or 'Generate PDF' button.")
 else:
-    # Show immediate progress indicator when PDF generation is requested
-    if generate_pdf:
-        progress_container = st.container()
-        with progress_container:
-            progress_status = st.status("🔄 Preparing PDF generation...", expanded=True)
-            with progress_status:
-                st.write("Initializing PDF report generation process. Takes 60 seconds.")
-                progress_bar = st.progress(0, text="Starting...")
+    # PDF generation will show progress through run_with_progress function
     
     # Build options signature for reuse
     opts = {
@@ -435,23 +438,14 @@ else:
                 raise holder['error']
             return holder.get('result')
 
-        # Update progress for PDF generation
-        if generate_pdf:
-            progress_bar.progress(10, text="Loading dataset...")
-            progress_status.update(label="📊 Loading dataset. Takes 30 seconds.", state="running")
-        
-        # Load data with progress (60s hint)
+        # Load data with progress (15s hint)
+        seconds_hint = 15 if club_or_tournament == 'Club' else 2
         df = run_with_progress(
-            "Loading dataset. Takes 30 seconds.",
-            60,
+            f"Loading dataset. Takes up to {seconds_hint} seconds.",
+            seconds_hint,
             lambda: load_elo_ratings(club_or_tournament, columns=columns_to_read, date_from=date_from),
         )
 
-        # Update progress after data loading
-        if generate_pdf:
-            progress_bar.progress(50, text="Dataset loaded. Creating report table...")
-            progress_status.update(label="📋 Creating report table...", state="running")
-        
         # Compute date range for captions
         try:
             date_min, date_max = df.select([pl.col("Date").min().alias("min"), pl.col("Date").max().alias("max")]).row(0)
@@ -463,22 +457,20 @@ else:
         def build_table():
             if rating_type == "Players":
                 tbl = show_top_players(df, int(top_n), int(min_sessions), rating_method)
-                ttl = f"Top {top_n} ACBL {club_or_tournament} Players by Elo ({rating_method})"
-            else:
+                ttl = f"Top {top_n} ACBL {club_or_tournament} Players by Elo Rating ({rating_method} method)"
+            elif rating_type == "Pairs":
                 tbl = show_top_pairs(df, int(top_n), int(min_sessions), rating_method)
-                ttl = f"Top {top_n} ACBL {club_or_tournament} Pairs by Elo ({rating_method})"
+                ttl = f"Top {top_n} ACBL {club_or_tournament} Pairs by Elo Rating ({rating_method} method)"
+            else:
+                raise ValueError(f"Invalid rating type: {rating_type}")
             return tbl, ttl
 
+        seconds_hint = 60 if club_or_tournament == 'Club' else 10
         table_df, title = run_with_progress(
-            "Creating Report Table. Takes 30 seconds.",
-            60,
+            f"Creating Report Table. Takes up to {seconds_hint} seconds.",
+            seconds_hint,
             build_table,
         )
-
-        # Update progress after table creation
-        if generate_pdf:
-            progress_bar.progress(75, text="Report table created. Caching results...")
-            progress_status.update(label="💾 Caching results...", state="running")
 
         # Cache results
         st.session_state["report_opts"] = opts
@@ -486,11 +478,6 @@ else:
         st.session_state["report_title"] = title
         st.session_state["report_date_range"] = date_range
     else:
-        # Using cached data
-        if generate_pdf:
-            progress_bar.progress(80, text="Using cached data...")
-            progress_status.update(label="⚡ Using cached data...", state="running")
-        
         table_df = st.session_state["report_table_df"]
         title = st.session_state["report_title"]
         date_range = st.session_state["report_date_range"]
@@ -498,7 +485,7 @@ else:
     # Show table only when requested
     if display_table:
         if date_range:
-            st.subheader(f"{title} ({date_range})")
+            st.subheader(f"{title} From {date_range}")
         else:
             st.subheader(title)
         # Prefer large grid height equal to top_n; fallback if not supported
@@ -509,23 +496,20 @@ else:
 
     # PDF generation regardless of whether table is shown
     if generate_pdf:
-        # Update progress before PDF generation
-        progress_bar.progress(85, text="Preparing PDF generation...")
-        progress_status.update(label="📄 Generating PDF...", state="running")
         
         created_on = time.strftime("%Y-%m-%d")
-        pdf_title = f"{title} ({date_range})"
+        pdf_title = f"{title} From {date_range}"
         pdf_filename = f"Unofficial Elo Scores for ACBL {club_or_tournament} MatchPoint Games - Top {top_n} {rating_type} {created_on}.pdf"
         # Try new API with max_rows; fallback to chunking when older API is loaded
         def build_pdf():
             # Enable shrink_to_fit for Pair reports to better fit the wider tables
             shrink_pairs = (rating_type == "Pairs")
-            return create_pdf([pdf_title, table_df], pdf_title, max_rows=int(top_n), rows_per_page=(20, 24), shrink_to_fit=shrink_pairs)
+            return create_pdf([f"## {pdf_title}", "### Created by https://elo.7nt.info", table_df], pdf_title, max_rows=int(top_n), rows_per_page=(20, 24), shrink_to_fit=shrink_pairs)
         try:
             pdf_bytes = build_pdf()
         except TypeError:
             def build_pdf_fallback():
-                assets = [pdf_title]
+                assets = [f"## {pdf_title}", "### Created by https://elo.7nt.info"]
                 try:
                     if isinstance(table_df, pl.DataFrame):
                         total = min(int(top_n), table_df.height)
@@ -558,14 +542,6 @@ else:
                     return create_pdf(assets, pdf_title)
 
             pdf_bytes = build_pdf_fallback()
-
-        # Complete the progress indicator
-        progress_bar.progress(100, text="PDF generation complete!")
-        progress_status.update(label="✅ PDF generation complete!", state="complete")
-        
-        # Clear progress indicators after a brief moment
-        time.sleep(0.5)
-        progress_container.empty()
 
         st.download_button(
             label="Download PDF",

@@ -332,6 +332,9 @@ class HorizontalLine(Flowable):
 
 
 def markdown_to_paragraphs(md_string, styles):
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER
+    
     # Convert Markdown to HTML
     html_content = markdown.markdown(md_string)
     
@@ -345,14 +348,23 @@ def markdown_to_paragraphs(md_string, styles):
             # Extract header level and text
             level = int(line[2])
             text = line[4:-5]
-            style = styles[f"Heading{level}"]
+            # Create centered style for headings
+            base_style = styles[f"Heading{level}"]
+            centered_style = ParagraphStyle(
+                f"CenteredHeading{level}",
+                parent=base_style,
+                alignment=TA_CENTER
+            )
+            style = centered_style
         else:
             text = line[3:-4]  # Remove <p> and </p> tags
             style = styles["Normal"]
         
         if text:
             paragraphs.append(Paragraph(text, style))
-            paragraphs.append(Spacer(1, 12))
+            # Don't add spacing after H2 headings (main title) to keep subheader close
+            if not (line.startswith("<h") and int(line[2]) == 2):
+                paragraphs.append(Spacer(1, 12))
     
     return paragraphs
 
@@ -388,8 +400,30 @@ def dataframe_to_table(df, max_rows: int | None = None, max_cols: int | None = N
         # Estimate column widths based on content
         col_count = len(table_data[0])
         if col_count > 0:
-            # Set specific column widths for better fit
-            col_widths = [available_width / col_count] * col_count
+            # Check if this is a pairs report by looking for 'Pair_Names' column
+            headers = table_data[0] if len(table_data) > 0 else []
+            pair_names_idx = None
+            for i, header in enumerate(headers):
+                if 'Pair_Names' in str(header):
+                    pair_names_idx = i
+                    break
+            
+            if pair_names_idx is not None:
+                # Special column widths for pairs report - make Pair_Names column 2x wider
+                base_width = available_width / (col_count + 1)  # Extra space for 2x column
+                col_widths = [base_width] * col_count
+                col_widths[pair_names_idx] = base_width * 2  # Make Pair_Names 2x wider
+                
+                # Adjust other columns to fit the remaining space
+                remaining_width = available_width - col_widths[pair_names_idx]
+                other_width = remaining_width / (col_count - 1)
+                for i in range(col_count):
+                    if i != pair_names_idx:
+                        col_widths[i] = other_width
+            else:
+                # Default equal column widths
+                col_widths = [available_width / col_count] * col_count
+            
             table = Table(table_data, repeatRows=1, colWidths=col_widths)
         else:
             table = Table(table_data, repeatRows=1)
