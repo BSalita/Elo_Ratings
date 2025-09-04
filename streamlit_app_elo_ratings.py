@@ -123,8 +123,8 @@ def load_elo_ratings(
     if date_from is not None and 'Date' in schema_map:
         lf = lf.filter(pl.col('Date') >= pl.lit(date_from))
 
-    # Collect with streaming enabled
-    return lf.collect(streaming=True)
+    # Collect with streaming engine for memory efficiency
+    return lf.collect(engine="streaming")
 
 
 # -------------------------------
