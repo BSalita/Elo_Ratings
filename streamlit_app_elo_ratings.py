@@ -1,5 +1,7 @@
 import pathlib
 import time
+import uuid
+import json
 from datetime import datetime, timedelta
 
 import polars as pl
@@ -12,6 +14,140 @@ from streamlitlib.streamlitlib import (
     stick_it_good,
     widen_scrollbars,
 )
+
+# -------------------------------
+# Singleton Queue Management
+# -------------------------------
+
+QUEUE_FILE = pathlib.Path('.queue_state.json')
+SESSION_TIMEOUT = 600  # 10 minutes in seconds
+
+def get_user_id():
+    """Get or create a unique user ID for this session."""
+    if 'user_id' not in st.session_state:
+        st.session_state.user_id = str(uuid.uuid4())
+    return st.session_state.user_id
+
+def load_queue_state():
+    """Load the current queue state from file."""
+    if not QUEUE_FILE.exists():
+        return {
+            'active_user': None,
+            'active_since': None,
+            'queue': []
+        }
+    
+    try:
+        with open(QUEUE_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {
+            'active_user': None,
+            'active_since': None,
+            'queue': []
+        }
+
+def save_queue_state(state):
+    """Save the queue state to file."""
+    try:
+        with open(QUEUE_FILE, 'w') as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+def cleanup_expired_session(state):
+    """Remove active user if their session has expired."""
+    if state['active_user'] and state['active_since']:
+        try:
+            active_since = datetime.fromisoformat(state['active_since'])
+            if (datetime.now() - active_since).total_seconds() > SESSION_TIMEOUT:
+                # Session expired, kick out the user
+                state['active_user'] = None
+                state['active_since'] = None
+                return True
+        except Exception:
+            # Invalid timestamp, clear it
+            state['active_user'] = None
+            state['active_since'] = None
+            return True
+    return False
+
+def get_queue_position(user_id, state):
+    """Get the position of user in queue (0-based, -1 if not in queue)."""
+    try:
+        return state['queue'].index(user_id)
+    except ValueError:
+        return -1
+
+def manage_user_access():
+    """Manage user access to the singleton app."""
+    user_id = get_user_id()
+    
+    # Load current state
+    state = load_queue_state()
+    
+    # Clean up expired sessions
+    session_expired = cleanup_expired_session(state)
+    
+    # Check if this user is the active user
+    if state['active_user'] == user_id:
+        # Update last activity time
+        state['active_since'] = datetime.now().isoformat()
+        save_queue_state(state)
+        return True, 0, state
+    
+    # Check if no one is active or session expired
+    if not state['active_user'] or session_expired:
+        # Make this user active
+        state['active_user'] = user_id
+        state['active_since'] = datetime.now().isoformat()
+        # Remove from queue if they were waiting
+        if user_id in state['queue']:
+            state['queue'].remove(user_id)
+        save_queue_state(state)
+        return True, 0, state
+    
+    # User needs to wait in queue
+    if user_id not in state['queue']:
+        state['queue'].append(user_id)
+        save_queue_state(state)
+    
+    position = get_queue_position(user_id, state)
+    return False, position + 1, state
+
+def promote_next_user():
+    """Promote the next user in queue to active status."""
+    state = load_queue_state()
+    
+    if state['queue']:
+        # Promote first user in queue
+        next_user = state['queue'].pop(0)
+        state['active_user'] = next_user
+        state['active_since'] = datetime.now().isoformat()
+        save_queue_state(state)
+
+def leave_queue():
+    """Remove current user from queue and promote next user if they were active."""
+    user_id = get_user_id()
+    state = load_queue_state()
+    
+    was_active = state['active_user'] == user_id
+    
+    # Remove from active or queue
+    if state['active_user'] == user_id:
+        state['active_user'] = None
+        state['active_since'] = None
+    
+    if user_id in state['queue']:
+        state['queue'].remove(user_id)
+    
+    # If the active user left, promote next in queue
+    if was_active and state['queue']:
+        next_user = state['queue'].pop(0)
+        state['active_user'] = next_user
+        state['active_since'] = datetime.now().isoformat()
+    
+    save_queue_state(state)
 
 
 # -------------------------------
@@ -400,9 +536,80 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
 # UI
 # -------------------------------
 st.set_page_config(page_title="UnofficialACBL Elo Ratings", layout="wide")
+
+# -------------------------------
+# Queue Management Check
+# -------------------------------
+is_active, queue_position, queue_state = manage_user_access()
+
+if not is_active:
+    # User is in queue, show waiting screen
+    st.title("🕐 Please Wait - App in Use")
+    st.warning(f"**You are #{queue_position} in the queue**")
+    
+    # Calculate estimated wait time
+    estimated_wait_minutes = (queue_position - 1) * 10  # 10 minutes per person ahead
+    
+    if queue_position == 1:
+        st.info("You're next! The app will be available when the current user finishes or after their 10-minute session expires.")
+        
+        # Show remaining time for current user if available
+        if queue_state['active_since']:
+            try:
+                active_since = datetime.fromisoformat(queue_state['active_since'])
+                current_user_remaining = SESSION_TIMEOUT - (datetime.now() - active_since).total_seconds()
+                current_user_remaining_minutes = max(0, current_user_remaining / 60)
+                st.markdown(f"⏱️ **Current user has approximately {current_user_remaining_minutes:.1f} minutes remaining**")
+            except:
+                pass
+    else:
+        st.info(f"There are {queue_position - 1} people ahead of you. Each user gets up to 10 minutes.")
+        st.markdown(f"⏰ **Estimated wait time: {estimated_wait_minutes} minutes** (assuming each person uses their full 10 minutes)")
+    
+    # Show current queue status
+    total_in_queue = len(queue_state['queue'])
+    if total_in_queue > 0:
+        st.markdown(f"**Total users waiting:** {total_in_queue}")
+    
+    # Auto-refresh every 5 seconds to check queue status
+    time.sleep(5)
+    st.rerun()
+
+# User is active, show the app
 widen_scrollbars()
 st.title("Unofficial ACBL Elo Ratings Playground")
 st.caption("An interactive playground for fiddling with ACBL Elo ratings")
+
+# Welcome message for new sessions
+if 'welcomed' not in st.session_state:
+    st.balloons()
+    st.info("🎯 **Welcome to your 10-minute playground session!** Explore player rankings, pair statistics, generate PDFs, and discover insights in the ACBL Elo ratings data. Make the most of your time!")
+    st.session_state.welcomed = True
+
+# Check if session has expired
+remaining_time = SESSION_TIMEOUT - (datetime.now() - datetime.fromisoformat(queue_state['active_since'])).total_seconds()
+remaining_minutes = max(0, remaining_time / 60)
+
+if remaining_time <= 0:
+    # Session expired, kick out user
+    leave_queue()
+    st.error("⏰ Your 10-minute session has expired. Redirecting to queue...")
+    time.sleep(3)
+    st.rerun()
+
+# Show session info
+if remaining_minutes <= 1:
+    st.warning(f"⚠️ **Session ending soon!** Time remaining: {remaining_minutes:.1f} minutes to explore the playground")
+else:
+    st.success(f"🎉 **Welcome to the playground!** You have {remaining_minutes:.1f} minutes to explore all the Elo ratings features")
+
+# Add leave button
+if st.button("🚪 Leave App (Let Next Person In)", type="secondary"):
+    leave_queue()
+    st.success("👋 Thanks for using the app! Redirecting next user...")
+    time.sleep(2)
+    st.rerun()
+
 stick_it_good()
 st.markdown(
     """
