@@ -558,8 +558,17 @@ if not is_active:
             try:
                 active_since = datetime.fromisoformat(queue_state['active_since'])
                 current_user_remaining = SESSION_TIMEOUT - (datetime.now() - active_since).total_seconds()
-                current_user_remaining_minutes = max(0, current_user_remaining / 60)
-                st.markdown(f"⏱️ **Current user has approximately {current_user_remaining_minutes:.1f} minutes remaining**")
+                current_user_remaining_seconds = max(0, current_user_remaining)
+                current_user_remaining_minutes = current_user_remaining_seconds / 60
+                
+                # Progress bar for current user's remaining time
+                progress_value = max(0, min(1.0, current_user_remaining_seconds / SESSION_TIMEOUT))
+                st.progress(progress_value)
+                
+                if current_user_remaining_seconds > 60:
+                    st.markdown(f"⏱️ **Current user: {current_user_remaining_minutes:.1f} minutes ({int(current_user_remaining_seconds)} seconds) remaining**")
+                else:
+                    st.markdown(f"⏱️ **Current user: {int(current_user_remaining_seconds)} seconds remaining**")
             except:
                 pass
     else:
@@ -588,26 +597,39 @@ if 'welcomed' not in st.session_state:
 
 # Check if session has expired
 remaining_time = SESSION_TIMEOUT - (datetime.now() - datetime.fromisoformat(queue_state['active_since'])).total_seconds()
-remaining_minutes = max(0, remaining_time / 60)
+remaining_seconds = max(0, remaining_time)
+remaining_minutes = remaining_seconds / 60
 
 if remaining_time <= 0:
     # Session expired, kick out user
     leave_queue()
+    # Clear session state to ensure clean exit
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
     st.error("⏰ Your 10-minute session has expired. Redirecting to queue...")
     time.sleep(3)
     st.rerun()
 
-# Show session info
+# Progress bar for remaining session time
+progress_value = max(0, min(1.0, remaining_seconds / SESSION_TIMEOUT))
+st.progress(progress_value)
+
+# Show session info with seconds
 if remaining_minutes <= 1:
-    st.warning(f"⚠️ **Session ending soon!** Time remaining: {remaining_minutes:.1f} minutes to explore the playground")
+    st.warning(f"⚠️ **Session ending soon!** {int(remaining_seconds)} seconds remaining to explore the playground")
+elif remaining_seconds > 60:
+    st.success(f"🎉 **Welcome to the playground!** You have {remaining_minutes:.1f} minutes ({int(remaining_seconds)} seconds) to explore all the Elo ratings features")
 else:
-    st.success(f"🎉 **Welcome to the playground!** You have {remaining_minutes:.1f} minutes to explore all the Elo ratings features")
+    st.success(f"🎉 **Welcome to the playground!** You have {int(remaining_seconds)} seconds to explore all the Elo ratings features")
 
 # Add leave button
 if st.button("🚪 Leave App (Let Next Person In)", type="secondary"):
     leave_queue()
-    st.success("👋 Thanks for using the app! Redirecting next user...")
-    time.sleep(2)
+    # Clear session state to ensure clean exit
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.success("👋 Thanks for using the app! Next user should be promoted automatically!")
+    time.sleep(3)
     st.rerun()
 
 stick_it_good()
@@ -723,10 +745,10 @@ with st.sidebar:
     generate_pdf = st.button("Generate PDF", type="primary")
     
     # Automated Postmortem Apps
-    with st.expander("Automated Postmortem Apps"):
-        st.markdown("🔗 [ACBL Postmortem](https://acbl.postmortem.chat)")
-        st.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
-        st.markdown("🔗 [BridgeWebs Postmortem](https://bridgewebs.postmortem.chat)")
+    st.markdown("**Automated Postmortem Apps**")
+    st.markdown("🔗 [ACBL Postmortem](https://acbl.postmortem.chat)")
+    st.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
+    #st.markdown("🔗 [BridgeWebs Postmortem](https://bridgewebs.postmortem.chat)")
 
 # Determine date_from based on selection
 now = datetime.now()
