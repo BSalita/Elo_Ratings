@@ -23,10 +23,23 @@ QUEUE_FILE = pathlib.Path('.queue_state.json')
 SESSION_TIMEOUT = 600  # 10 minutes in seconds
 
 def get_user_id():
-    """Get or create a unique user ID for this session."""
-    if 'user_id' not in st.session_state:
-        st.session_state.user_id = str(uuid.uuid4())
-    return st.session_state.user_id
+    """Get or create a unique user ID for this browser session."""
+    # Try to get from session state first
+    if 'user_id' in st.session_state:
+        return st.session_state.user_id
+    
+    # Try to get from query params (survives refresh)
+    query_params = st.query_params
+    if 'user_id' in query_params:
+        user_id = query_params['user_id']
+        st.session_state.user_id = user_id
+        return user_id
+    
+    # Create new user ID and add to URL
+    user_id = str(uuid.uuid4())
+    st.session_state.user_id = user_id
+    st.query_params['user_id'] = user_id
+    return user_id
 
 def load_queue_state():
     """Load the current queue state from file."""
@@ -72,6 +85,22 @@ def cleanup_expired_session(state):
             return True
     return False
 
+def cleanup_stale_queue_entries(state):
+    """Remove duplicate entries from queue (same user_id multiple times)."""
+    if 'queue' in state and state['queue']:
+        # Remove duplicates while preserving order (keep first occurrence)
+        seen = set()
+        cleaned_queue = []
+        for user_id in state['queue']:
+            if user_id not in seen:
+                seen.add(user_id)
+                cleaned_queue.append(user_id)
+        
+        if len(cleaned_queue) != len(state['queue']):
+            state['queue'] = cleaned_queue
+            return True
+    return False
+
 def get_queue_position(user_id, state):
     """Get the position of user in queue (0-based, -1 if not in queue)."""
     try:
@@ -86,8 +115,13 @@ def manage_user_access():
     # Load current state
     state = load_queue_state()
     
-    # Clean up expired sessions
+    # Clean up expired sessions and stale queue entries
     session_expired = cleanup_expired_session(state)
+    queue_cleaned = cleanup_stale_queue_entries(state)
+    
+    # Save state if any cleanup occurred
+    if session_expired or queue_cleaned:
+        save_queue_state(state)
     
     # Check if this user is the active user
     if state['active_user'] == user_id:
