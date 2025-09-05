@@ -443,7 +443,7 @@ needed_cols = None  # Load all columns
 # Preload Data Files on App Start (Multi-User Safe)
 # -------------------------------
 
-@st.cache_data(ttl=3600, show_spinner="Loading datasets and augmenting tournament data... This may take up to 2 minutes.")
+@st.cache_data(ttl=3600, show_spinner=False)  # Disable built-in spinner, we'll use our progress bar
 def load_and_enrich_datasets(date_from_str: str):
     """Load and enrich datasets with multi-user safe caching."""
     date_from = None if date_from_str == "None" else datetime.fromisoformat(date_from_str)
@@ -468,11 +468,16 @@ cache_key = f"datasets_{date_from_str}"
 
 # Try to load data first (this handles concurrency properly)
 try:
-    # This will either return cached data instantly or load it (with Streamlit's built-in concurrency handling)
-    all_data = load_and_enrich_datasets(date_from_str)
-    
-    # Store in session state for this user (if not already there)
+    # Check if we need to show progress (data not in cache)
     if cache_key not in st.session_state:
+        # Show progress bar for loading
+        all_data = run_with_progress(
+            "Loading datasets and augmenting tournament data... This may take up to 2 minutes.",
+            120,  # 2 minutes
+            lambda: load_and_enrich_datasets(date_from_str)
+        )
+        
+        # Store in session state for this user
         st.session_state[cache_key] = all_data
         st.session_state["cached_df_club"] = all_data["club"]
         st.session_state["cached_df_tournament"] = all_data["tournament"]
@@ -481,6 +486,9 @@ try:
         
         # Show completion message only for users who just loaded
         st.success("✅ Datasets loading and augmentation completed.")
+    else:
+        # Data already loaded, just get it from session state
+        all_data = st.session_state[cache_key]
     
 except Exception as e:
     st.error(f"❌ Failed to load datasets: {e}")
