@@ -443,7 +443,7 @@ needed_cols = None  # Load all columns
 # Preload Data Files on App Start (Multi-User Safe)
 # -------------------------------
 
-@st.cache_data(ttl=3600, show_spinner=False)  # Cache for 1 hour, handle spinner manually
+@st.cache_data(ttl=3600, show_spinner="Loading datasets and enriching tournament data... This may take up to 2 minutes.")
 def load_and_enrich_datasets(date_from_str: str):
     """Load and enrich datasets with multi-user safe caching."""
     date_from = None if date_from_str == "None" else datetime.fromisoformat(date_from_str)
@@ -465,35 +465,26 @@ date_from_str = "None" if date_from is None else date_from.isoformat()
 
 # Check if data needs loading (use cache key to avoid multi-user conflicts)
 cache_key = f"datasets_{date_from_str}"
-if cache_key not in st.session_state:
-    # Show loading progress
-    with st.container():
-        st.info("🔄 Loading datasets. One time only. Takes up to 2 minutes...")
-        progress_bar = st.progress(0)
+
+# Try to load data first (this handles concurrency properly)
+try:
+    # This will either return cached data instantly or load it (with Streamlit's built-in concurrency handling)
+    all_data = load_and_enrich_datasets(date_from_str)
+    
+    # Store in session state for this user (if not already there)
+    if cache_key not in st.session_state:
+        st.session_state[cache_key] = all_data
+        st.session_state["cached_df_club"] = all_data["club"]
+        st.session_state["cached_df_tournament"] = all_data["tournament"]
+        st.session_state["cached_date_club"] = date_from_str
+        st.session_state["cached_date_tournament"] = date_from_str
         
-        try:
-            # Load data using cached function (handles multi-user concurrency)
-            all_data = load_and_enrich_datasets(date_from_str)
-            
-            # Complete progress bar
-            progress_bar.progress(100)
-            
-            # Store in session state for this user
-            st.session_state[cache_key] = all_data
-            st.session_state["cached_df_club"] = all_data["club"]
-            st.session_state["cached_df_tournament"] = all_data["tournament"]
-            st.session_state["cached_date_club"] = date_from_str
-            st.session_state["cached_date_tournament"] = date_from_str
-            
-            st.success("✅ Datasets loaded and tournament data enriched!")
-            progress_bar.empty()
-            
-        except Exception as e:
-            st.error(f"❌ Failed to load datasets: {e}")
-            progress_bar.empty()
-else:
-    # Data already loaded for this user
-    all_data = st.session_state[cache_key]
+        # Show completion message only for users who just loaded
+        st.success("✅ Datasets loaded and tournament data enriched!")
+    
+except Exception as e:
+    st.error(f"❌ Failed to load datasets: {e}")
+    st.stop()
 
 # -------------------------------
 # Create Sidebar Controls (After Data Loading)
