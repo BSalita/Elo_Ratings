@@ -603,9 +603,11 @@ remaining_minutes = remaining_seconds / 60
 if remaining_time <= 0:
     # Session expired, kick out user
     leave_queue()
-    # Clear session state to ensure clean exit
+    # Clear session state but preserve user_id
+    user_id = st.session_state.get('user_id')
     for key in list(st.session_state.keys()):
-        del st.session_state[key]
+        if key != 'user_id':  # Keep user_id to maintain identity
+            del st.session_state[key]
     st.error("⏰ Your 10-minute session has expired. Redirecting to queue...")
     time.sleep(3)
     st.rerun()
@@ -625,9 +627,11 @@ else:
 # Add leave button
 if st.button("🚪 Leave App (Let Next Person In)", type="secondary"):
     leave_queue()
-    # Clear session state to ensure clean exit
+    # Clear session state but preserve user_id
+    user_id = st.session_state.get('user_id')
     for key in list(st.session_state.keys()):
-        del st.session_state[key]
+        if key != 'user_id':  # Keep user_id to maintain identity
+            del st.session_state[key]
     st.success("👋 Thanks for using the app! Next user should be promoted automatically!")
     time.sleep(3)
     st.rerun()
