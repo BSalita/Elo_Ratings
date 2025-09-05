@@ -614,8 +614,8 @@ if not is_active:
     if total_in_queue > 0:
         st.markdown(f"**Total users waiting:** {total_in_queue}")
     
-    # Auto-refresh every 5 seconds to check queue status
-    time.sleep(5)
+    # Auto-refresh every 2 seconds to update countdown and check queue status
+    time.sleep(2)
     st.rerun()
 
 # User is active, show the app
@@ -671,6 +671,11 @@ if st.button("🚪 Leave App (Let Next Person In)", type="secondary"):
     st.rerun()
 
 stick_it_good()
+
+# Auto-refresh every 2 seconds to keep countdown timer updated
+time.sleep(2)
+st.rerun()
+
 st.markdown(
     """
     <style>
