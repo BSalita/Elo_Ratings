@@ -401,8 +401,8 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
 # -------------------------------
 st.set_page_config(page_title="UnofficialACBL Elo Ratings", layout="wide")
 widen_scrollbars()
-st.title("Unofficial ACBL Elo Ratings")
-st.caption("Interactive viewer for unofficial ACBL Elo ratings")
+st.title("Unofficial ACBL Elo Ratings Playground")
+st.caption("An interactive playground for fiddling with ACBL Elo ratings")
 stick_it_good()
 st.markdown(
     """
@@ -503,7 +503,7 @@ with st.sidebar:
     club_or_tournament = st.selectbox("Dataset", options=["Club", "Tournament"], index=0)
     rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=False)
     top_n = st.number_input("Top N", min_value=50, max_value=5000, value=1000, step=50)
-    min_sessions = st.number_input("Minimum sessions", min_value=1, max_value=200, value=30, step=1)
+    min_sessions = st.number_input("Minimum sessions played", min_value=1, max_value=200, value=30, step=1)
     rating_method = st.selectbox("Rating method", options=["Avg", "Max", "Latest"], index=0)
     # Date range quick filter (default All time)
     date_range_choice = st.selectbox(
