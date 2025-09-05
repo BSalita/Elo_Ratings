@@ -506,6 +506,12 @@ with st.sidebar:
     
     display_table = st.button("Display Table", type="primary")
     generate_pdf = st.button("Generate PDF", type="primary")
+    
+    # Automated Postmortem Apps
+    with st.expander("Automated Postmortem Apps"):
+        st.markdown("🔗 [ACBL Postmortem](https://acbl.postmortem.chat)")
+        st.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
+        st.markdown("🔗 [BridgeWebs Postmortem](https://bridgewebs.postmortem.chat)")
 
 # Determine date_from based on selection
 now = datetime.now()
