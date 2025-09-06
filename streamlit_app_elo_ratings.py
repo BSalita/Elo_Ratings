@@ -1,12 +1,11 @@
 import pathlib
 import time
-import uuid
-import json
 from datetime import datetime, timedelta
 
 import polars as pl
 import streamlit as st
-import threading
+import duckdb
+from streamlit_extras.bottom_container import bottom
 
 from streamlitlib.streamlitlib import (
     ShowDataFrameTable,
@@ -16,217 +15,69 @@ from streamlitlib.streamlitlib import (
 )
 
 # -------------------------------
-# Singleton Queue Management
+# SQL Query Support
 # -------------------------------
 
-QUEUE_FILE = pathlib.Path('.queue_state.json')
-SESSION_TIMEOUT = 600  # 10 minutes in seconds
+def get_db_connection():
+    """Get or create a session-specific database connection.
+    
+    This ensures each Streamlit session has its own database connection,
+    preventing concurrency issues when multiple users access the app.
+    
+    Returns:
+        duckdb.DuckDBPyConnection: Session-specific database connection
+    """
+    if 'db_connection' not in st.session_state:
+        # Create a new connection for this session
+        st.session_state.db_connection = duckdb.connect()
+    return st.session_state.db_connection
 
-def get_user_id():
-    """Get or create a unique user ID for this browser session."""
-    # Try to get from session state first
-    if 'user_id' in st.session_state:
-        return st.session_state.user_id
-    
-    # Try to get from query params (survives refresh)
-    query_params = st.query_params
-    if 'user_id' in query_params:
-        user_id = query_params['user_id']
-        st.session_state.user_id = user_id
-        return user_id
-    
-    # Create new user ID and add to URL
-    user_id = str(uuid.uuid4())
-    st.session_state.user_id = user_id
-    st.query_params['user_id'] = user_id
-    return user_id
-
-def load_queue_state():
-    """Load the current queue state from file."""
-    if not QUEUE_FILE.exists():
-        return {
-            'active_user': None,
-            'active_since': None,
-            'queue': []
-        }
-    
+def execute_sql_query(df, query, key):
+    """Execute SQL query on dataframe using DuckDB."""
     try:
-        with open(QUEUE_FILE, 'r') as f:
-            return json.load(f)
-    except Exception:
-        return {
-            'active_user': None,
-            'active_since': None,
-            'queue': []
-        }
+        # Show SQL query if enabled
+        if st.session_state.get('show_sql_query', False):
+            st.text(f"SQL Query: {query}")
 
-def save_queue_state(state):
-    """Save the queue state to file."""
-    try:
-        with open(QUEUE_FILE, 'w') as f:
-            json.dump(state, f)
-    except Exception:
-        pass
+        # If query doesn't contain 'FROM', add 'FROM self' to the beginning
+        if 'from ' not in query.lower():
+            query = 'FROM self ' + query
 
-def cleanup_expired_session(state):
-    """Remove active user if their session has expired."""
-    if state['active_user'] and state['active_since']:
-        try:
-            active_since = datetime.fromisoformat(state['active_since'])
-            if (datetime.now() - active_since).total_seconds() > SESSION_TIMEOUT:
-                # Session expired, kick out the user
-                state['active_user'] = None
-                state['active_since'] = None
-                return True
-        except Exception:
-            # Invalid timestamp, clear it
-            state['active_user'] = None
-            state['active_since'] = None
-            return True
-    return False
-
-def cleanup_stale_queue_entries(state):
-    """Remove duplicate entries from queue (same user_id multiple times)."""
-    if 'queue' in state and state['queue']:
-        # Remove duplicates while preserving order (keep first occurrence)
-        seen = set()
-        cleaned_queue = []
-        for user_id in state['queue']:
-            if user_id not in seen:
-                seen.add(user_id)
-                cleaned_queue.append(user_id)
+        con = get_db_connection()
+        result_df = con.execute(query).pl()
         
-        if len(cleaned_queue) != len(state['queue']):
-            state['queue'] = cleaned_queue
-            return True
-    return False
+        if st.session_state.get('show_sql_query', False):
+            st.text(f"Result is a dataframe of {len(result_df)} rows.")
+        
+        # Use the existing ShowDataFrameTable function
+        ShowDataFrameTable(result_df, key)
+        return result_df
+        
+    except Exception as e:
+        st.error(f"SQL error: {e}")
+        st.text(f"Query: {query}")
+        return None
 
-def get_queue_position(user_id, state):
-    """Get the position of user in queue (0-based, -1 if not in queue)."""
-    try:
-        return state['queue'].index(user_id)
-    except ValueError:
-        return -1
-
-def manage_user_access():
-    """Manage user access to the singleton app."""
-    user_id = get_user_id()
-    
-    # Load current state
-    state = load_queue_state()
-    
-    # Clean up expired sessions and stale queue entries
-    session_expired = cleanup_expired_session(state)
-    queue_cleaned = cleanup_stale_queue_entries(state)
-    
-    # Save state if any cleanup occurred
-    if session_expired or queue_cleaned:
-        save_queue_state(state)
-    
-    # Check if this user is the active user
-    if state['active_user'] == user_id:
-        # Update last activity time
-        state['active_since'] = datetime.now().isoformat()
-        save_queue_state(state)
-        return True, 0, state
-    
-    # Check if no one is active or session expired
-    if not state['active_user'] or session_expired:
-        # Make this user active
-        state['active_user'] = user_id
-        state['active_since'] = datetime.now().isoformat()
-        # Remove from queue if they were waiting
-        if user_id in state['queue']:
-            state['queue'].remove(user_id)
-        save_queue_state(state)
-        return True, 0, state
-    
-    # User needs to wait in queue
-    if user_id not in state['queue']:
-        state['queue'].append(user_id)
-        save_queue_state(state)
-    
-    position = get_queue_position(user_id, state)
-    return False, position + 1, state
-
-def promote_next_user():
-    """Promote the next user in queue to active status."""
-    state = load_queue_state()
-    
-    if state['queue']:
-        # Promote first user in queue
-        next_user = state['queue'].pop(0)
-        state['active_user'] = next_user
-        state['active_since'] = datetime.now().isoformat()
-        save_queue_state(state)
-
-def leave_queue():
-    """Remove current user from queue and promote next user if they were active."""
-    user_id = get_user_id()
-    state = load_queue_state()
-    
-    was_active = state['active_user'] == user_id
-    
-    # Remove from active or queue
-    if state['active_user'] == user_id:
-        state['active_user'] = None
-        state['active_since'] = None
-    
-    if user_id in state['queue']:
-        state['queue'].remove(user_id)
-    
-    # If the active user left, promote next in queue
-    if was_active and state['queue']:
-        next_user = state['queue'].pop(0)
-        state['active_user'] = next_user
-        state['active_since'] = datetime.now().isoformat()
-    
-    save_queue_state(state)
+def sql_input_callback():
+    """Handle SQL query input submission."""
+    query = st.session_state.get('sql_query_input', '').strip()
+    if query:
+        # Get the current dataset
+        dataset_type = st.session_state.get('current_dataset_type', 'club')
+        if dataset_type in st.session_state.get('all_data', {}):
+            df = st.session_state.all_data[dataset_type]
+            # Register the dataframe with DuckDB
+            con = get_db_connection()
+            con.register('self', df)
+            # Execute the query
+            execute_sql_query(df, query, f'sql_query_result_{len(st.session_state.get("sql_queries", []))}')
+            # Store query in history
+            if 'sql_queries' not in st.session_state:
+                st.session_state.sql_queries = []
+            st.session_state.sql_queries.append(query)
 
 
-# -------------------------------
-# Progress helper
-# -------------------------------
-def run_with_progress(label: str, seconds_hint: int, work_fn):
-    container = st.container()
-    msg = container.info(label)
-    bar = container.progress(0)
-    done = threading.Event()
-    holder = {}
 
-    def worker():
-        try:
-            holder['result'] = work_fn()
-        except Exception as ex:
-            holder['error'] = ex
-        finally:
-            done.set()
-
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-
-    start_t = time.time()
-    while not done.is_set():
-        elapsed = time.time() - start_t
-        pct = 100 if seconds_hint <= 0 else min(100, int((elapsed / seconds_hint) * 100))
-        bar.progress(pct)
-        time.sleep(1)
-
-    # Update to 100% when finished (even if earlier than hint)
-    bar.progress(100)
-    time.sleep(0.2)  # Brief pause to show 100%
-    
-    # Clear progress bar and message when finished
-    try:
-        msg.empty()  # Clear the info message
-        bar.empty()  # Clear the progress bar
-    except:
-        pass
-    container.empty()  # Clear the entire container
-    
-    if 'error' in holder:
-        raise holder['error']
-    return holder.get('result')
 
 # -------------------------------
 # Config / Paths
@@ -569,112 +420,16 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
 # -------------------------------
 # UI
 # -------------------------------
-st.set_page_config(page_title="UnofficialACBL Elo Ratings", layout="wide")
+st.set_page_config(page_title="Unofficial ACBL Elo Ratings", layout="wide")
 
 # -------------------------------
-# Queue Management Check
+# Main App
 # -------------------------------
-is_active, queue_position, queue_state = manage_user_access()
-
-if not is_active:
-    # User is in queue, show waiting screen
-    st.title("🕐 Please Wait - App in Use")
-    st.warning(f"**You are #{queue_position} in the queue**")
-    
-    # Calculate estimated wait time
-    estimated_wait_minutes = (queue_position - 1) * 10  # 10 minutes per person ahead
-    
-    if queue_position == 1:
-        st.info("You're next! The app will be available when the current user finishes or after their 10-minute session expires.")
-        
-        # Show remaining time for current user if available
-        if queue_state['active_since']:
-            try:
-                active_since = datetime.fromisoformat(queue_state['active_since'])
-                current_user_remaining = SESSION_TIMEOUT - (datetime.now() - active_since).total_seconds()
-                current_user_remaining_seconds = max(0, current_user_remaining)
-                current_user_remaining_minutes = current_user_remaining_seconds / 60
-                
-                # Progress bar for current user's remaining time
-                progress_value = max(0, min(1.0, current_user_remaining_seconds / SESSION_TIMEOUT))
-                st.progress(progress_value)
-                
-                if current_user_remaining_seconds > 60:
-                    st.markdown(f"⏱️ **Current user: {current_user_remaining_minutes:.1f} minutes ({int(current_user_remaining_seconds)} seconds) remaining**")
-                else:
-                    st.markdown(f"⏱️ **Current user: {int(current_user_remaining_seconds)} seconds remaining**")
-            except:
-                pass
-    else:
-        st.info(f"There are {queue_position - 1} people ahead of you. Each user gets up to 10 minutes.")
-        st.markdown(f"⏰ **Estimated wait time: {estimated_wait_minutes} minutes** (assuming each person uses their full 10 minutes)")
-    
-    # Show current queue status
-    total_in_queue = len(queue_state['queue'])
-    if total_in_queue > 0:
-        st.markdown(f"**Total users waiting:** {total_in_queue}")
-    
-    # Auto-refresh every 2 seconds to update countdown and check queue status
-    time.sleep(2)
-    st.rerun()
-
-# User is active, show the app
 widen_scrollbars()
 st.title("Unofficial ACBL Elo Ratings Playground")
 st.caption("An interactive playground for fiddling with ACBL Elo ratings")
 
-# Welcome message for new sessions
-if 'welcomed' not in st.session_state:
-    st.balloons()
-    st.info("🎯 **Welcome to your 10-minute playground session!** Explore player rankings, pair statistics, generate PDFs, and discover insights in the ACBL Elo ratings data. Make the most of your time!")
-    st.session_state.welcomed = True
-
-# Check if session has expired
-remaining_time = SESSION_TIMEOUT - (datetime.now() - datetime.fromisoformat(queue_state['active_since'])).total_seconds()
-remaining_seconds = max(0, remaining_time)
-remaining_minutes = remaining_seconds / 60
-
-if remaining_time <= 0:
-    # Session expired, kick out user
-    leave_queue()
-    # Clear session state but preserve user_id
-    user_id = st.session_state.get('user_id')
-    for key in list(st.session_state.keys()):
-        if key != 'user_id':  # Keep user_id to maintain identity
-            del st.session_state[key]
-    st.error("⏰ Your 10-minute session has expired. Redirecting to queue...")
-    time.sleep(3)
-    st.rerun()
-
-# Progress bar for remaining session time
-progress_value = max(0, min(1.0, remaining_seconds / SESSION_TIMEOUT))
-st.progress(progress_value)
-
-# Show session info with seconds
-if remaining_minutes <= 1:
-    st.warning(f"⚠️ **Session ending soon!** {int(remaining_seconds)} seconds remaining to explore the playground")
-elif remaining_seconds > 60:
-    st.success(f"🎉 **Welcome to the playground!** You have {remaining_minutes:.1f} minutes ({int(remaining_seconds)} seconds) to explore all the Elo ratings features")
-else:
-    st.success(f"🎉 **Welcome to the playground!** You have {int(remaining_seconds)} seconds to explore all the Elo ratings features")
-
-# Add leave button
-if st.button("🚪 Leave App (Let Next Person In)", type="secondary"):
-    leave_queue()
-    # Clear session state but preserve user_id
-    user_id = st.session_state.get('user_id')
-    for key in list(st.session_state.keys()):
-        if key != 'user_id':  # Keep user_id to maintain identity
-            del st.session_state[key]
-    st.success("👋 Thanks for using the app! Next user should be promoted automatically!")
-    time.sleep(3)
-    st.rerun()
-
 stick_it_good()
-
-# Auto-refresh every 2 seconds to keep countdown timer updated
-time.sleep(2)
-st.rerun()
 
 st.markdown(
     """
@@ -712,12 +467,12 @@ date_from = None  # Default to all time for initial loading
 needed_cols = None  # Load all columns
 
 # -------------------------------
-# Preload Data Files on App Start (Multi-User Safe)
+# Data Loading
 # -------------------------------
 
-@st.cache_data(ttl=3600, show_spinner=False)  # Disable built-in spinner, we'll use our progress bar
+#@st.cache_data(ttl=3600)
 def load_and_enrich_datasets(date_from_str: str):
-    """Load and enrich datasets with multi-user safe caching."""
+    """Load and enrich datasets."""
     date_from = None if date_from_str == "None" else datetime.fromisoformat(date_from_str)
     
     # Load both datasets
@@ -735,33 +490,21 @@ def load_and_enrich_datasets(date_from_str: str):
 # Convert date_from to string for caching key
 date_from_str = "None" if date_from is None else date_from.isoformat()
 
-# Check if data needs loading (use cache key to avoid multi-user conflicts)
-cache_key = f"datasets_{date_from_str}"
-
-# Try to load data first (this handles concurrency properly)
+# Load data
 try:
-    # Check if we need to show progress (data not in cache)
-    if cache_key not in st.session_state:
-        # Show progress bar for loading
-        all_data = run_with_progress(
-            "Loading datasets and augmenting tournament data... This may take up to 2 minutes.",
-            120,  # 2 minutes
-            lambda: load_and_enrich_datasets(date_from_str)
-        )
-        
-        # Store in session state for this user
-        st.session_state[cache_key] = all_data
-        st.session_state["cached_df_club"] = all_data["club"]
-        st.session_state["cached_df_tournament"] = all_data["tournament"]
-        st.session_state["cached_date_club"] = date_from_str
-        st.session_state["cached_date_tournament"] = date_from_str
-        
-        # Show completion message only for users who just loaded
-        st.success("✅ Datasets loading and augmentation completed.")
-    else:
-        # Data already loaded, just get it from session state
-        all_data = st.session_state[cache_key]
+    with st.spinner("Loading datasets and augmenting tournament data..."):
+        all_data = load_and_enrich_datasets(date_from_str)
+    st.success("✅ Datasets loaded successfully.")
     
+    # Store data in session state for SQL queries
+    st.session_state.all_data = all_data
+    
+    # Initialize SQL query settings
+    if 'show_sql_query' not in st.session_state:
+        st.session_state.show_sql_query = False
+    if 'sql_queries' not in st.session_state:
+        st.session_state.sql_queries = []
+        
 except Exception as e:
     st.error(f"❌ Failed to load datasets: {e}")
     st.stop()
@@ -787,7 +530,14 @@ with st.sidebar:
     display_table = st.button("Display Table", type="primary")
     generate_pdf = st.button("Generate PDF", type="primary")
     
+    # SQL Query Controls
+    st.markdown("---")
+    st.markdown("**SQL Query Options**")
+    show_sql = st.checkbox('Show SQL Query', value=st.session_state.show_sql_query, help='Show SQL used to query dataframes.')
+    st.session_state.show_sql_query = show_sql
+    
     # Automated Postmortem Apps
+    st.markdown("---")
     st.markdown("**Automated Postmortem Apps**")
     st.markdown("🔗 [ACBL Postmortem](https://acbl.postmortem.chat)")
     st.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
@@ -818,9 +568,8 @@ else:
 # Report Generation
 # -------------------------------
 if not (display_table or generate_pdf):
-    st.info("Select options and hit the 'Display Table' or 'Generate PDF' button.")
+    st.info("Select left sidebar options then click 'Display Table' or 'Generate PDF' button.")
 else:
-    # PDF generation will show progress through run_with_progress function
     
     # Build options signature for reuse
     opts = {
@@ -832,18 +581,15 @@ else:
         "date_from": None if date_from is None else date_from.isoformat(),
     }
 
-    # Get preloaded data
+    # Get data
     dataset_type = club_or_tournament.lower()
-    dataset_cache_key = f"cached_df_{dataset_type}"
+    df = all_data[dataset_type]
+    st.info(f"✅ Using {dataset_type} dataset with {df.height:,} rows")
     
-    # Generate report (no caching needed since data is pre-loaded)
-    # Use preloaded data
-    if dataset_cache_key in st.session_state:
-        df = st.session_state[dataset_cache_key]
-        st.info(f"✅ Using preloaded {dataset_type} dataset with {df.height:,} rows")
-    else:
-        st.error(f"❌ {dataset_type.title()} dataset not preloaded. Please refresh the page.")
-        st.stop()
+    # Store current dataset type and register with DuckDB for SQL queries
+    st.session_state.current_dataset_type = dataset_type
+    con = get_db_connection()
+    con.register('self', df)
 
     # Tournament data is already enriched during startup if both datasets were loaded
 
@@ -854,26 +600,17 @@ else:
     except Exception:
         date_range = ""
 
-    # Compute table and title with progress (60s hint)
-    def build_table():
-        st.info(f"🔄 Building {rating_type} report for {dataset_type} data...")
+    # Compute table and title
+    with st.spinner(f"Building {rating_type} report for {dataset_type} data..."):
         if rating_type == "Players":
-            tbl = show_top_players(df, int(top_n), int(min_sessions), rating_method)
-            ttl = f"Top {top_n} ACBL {club_or_tournament} Players by Elo Rating ({rating_method} method)"
+            table_df = show_top_players(df, int(top_n), int(min_sessions), rating_method)
+            title = f"Top {top_n} ACBL {club_or_tournament} Players by Elo Rating ({rating_method} method)"
         elif rating_type == "Pairs":
-            tbl = show_top_pairs(df, int(top_n), int(min_sessions), rating_method)
-            ttl = f"Top {top_n} ACBL {club_or_tournament} Pairs by Elo Rating ({rating_method} method)"
+            table_df = show_top_pairs(df, int(top_n), int(min_sessions), rating_method)
+            title = f"Top {top_n} ACBL {club_or_tournament} Pairs by Elo Rating ({rating_method} method)"
         else:
             raise ValueError(f"Invalid rating type: {rating_type}")
-        st.info(f"✅ Report built with {tbl.height:,} rows")
-        return tbl, ttl
-
-    seconds_hint = 60 if club_or_tournament == 'Club' else 10
-    table_df, title = run_with_progress(
-        f"Creating Report Table. Takes up to {seconds_hint} seconds.",
-        seconds_hint,
-        build_table,
-    )
+    st.success(f"✅ Report built with {table_df.height:,} rows")
 
     # Show table only when requested
     if display_table:
@@ -942,3 +679,13 @@ else:
             file_name=pdf_filename,
             mime="application/pdf",
         )
+
+# -------------------------------
+# SQL Query Input (Bottom of Page)
+# -------------------------------
+with bottom():
+    st.chat_input(
+        'Enter a SQL query (e.g., SELECT * FROM self ORDER BY Elo_R_Player DESC LIMIT 100)',
+        key='sql_query_input',
+        on_submit=sql_input_callback
+    )
