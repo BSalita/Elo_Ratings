@@ -47,6 +47,17 @@ from mlBridgeLib.mlBridgeLib import (
     show_estimated_memory_usage,
     CATEGORICAL_SCHEMAS,
 )
+
+from mlBridgeLib.mlBridgeAcblLib import (
+    get_club_results_from_acbl_number,
+    get_tournament_sessions_from_acbl_number,
+    get_tournament_session_results,
+    get_club_results_details_data,
+    create_club_dfs,
+    merge_clean_augment_club_dfs,
+    merge_clean_augment_tournament_dfs,
+)
+
 from mlBridgeLib.logging_config import (
     setup_logger,
     get_logger,

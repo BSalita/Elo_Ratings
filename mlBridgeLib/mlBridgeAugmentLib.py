@@ -846,7 +846,7 @@ def update_hand_records_cache(hrs_cache_df: pl.DataFrame, new_df: pl.DataFrame) 
     # The update operation replaces existing rows with matching PBNs
     # Then we add all rows from new_df that don't exist in hrs_cache_df
     expected_final_rows = hrs_cache_df.height - len(pbns_to_update) + new_df.height
-    logger.info(f"Expected final rows: {expected_final_rows} (existing: {hrs_cache_df.height} - updated: {len(pbns_to_update)} + new: {new_df.height})")
+    logger.info(f"Expected final rows: {expected_final_rows} (existing: {hrs_cache_df.height} - updated: {len(pbns_to_update)} + new: {len(pbns_to_add)})")
 
     # check for differing dtypes
     common_cols = set(hrs_cache_df.columns) & set(new_df.columns)
