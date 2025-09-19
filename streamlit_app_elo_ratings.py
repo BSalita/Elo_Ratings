@@ -665,7 +665,7 @@ def main():
     # -------------------------------
     widen_scrollbars()
     st.title("Unofficial ACBL Elo Ratings Playground")
-    st.caption("An interactive playground for fiddling with ACBL Elo ratings")
+    st.caption("An interactive playground for fiddling with Unofficial ACBL Elo ratings")
     app_info()
     
     stick_it_good()
@@ -1143,13 +1143,14 @@ def main():
                             return
             
             created_on = time.strftime("%Y-%m-%d")
-            pdf_title = f"{title} From {date_range}"
+            #pdf_title = f"{title} From {date_range}"
             pdf_filename = f"Unofficial Elo Scores for ACBL {club_or_tournament} MatchPoint Games - Top {top_n} {rating_type} {created_on}.pdf"
             # Generate PDF
             try:
                 # Enable shrink_to_fit for Pair reports to better fit the wider tables
                 shrink_pairs = (rating_type == "Pairs")
-                pdf_bytes = create_pdf([f"## {pdf_title}", "### Created by https://elo.7nt.info", table_df], pdf_title, max_rows=int(top_n), rows_per_page=(19, 24), shrink_to_fit=shrink_pairs)
+                # really want title, from date to be centered with reduced line spacing between them.
+                pdf_bytes = create_pdf([f"## {title}", f"### From {date_range}", "### Created by https://elo.7nt.info", table_df], title, max_rows=int(top_n), rows_per_page=(19, 24), shrink_to_fit=shrink_pairs)
             except Exception as e:
                 st.error(f"❌ PDF Creation Failed: {e}")
                 st.error("Unable to create PDF file. Please try again or contact support if the problem persists.")
