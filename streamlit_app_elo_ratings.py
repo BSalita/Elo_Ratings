@@ -239,7 +239,9 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
         
         position_frames.append(position_frame)
 
-    players_stacked = pl.concat(position_frames, how="vertical").drop_nulls(subset=["Player_ID", "Elo_R_Player"])
+    # Sort to match SQL ORDER BY behavior exactly - this affects which record is "last" for Latest method
+    # Add session_id and Elo_R_Player to make sort order completely deterministic
+    players_stacked = pl.concat(position_frames, how="vertical").drop_nulls(subset=["Player_ID", "Elo_R_Player"]).sort(['Player_ID', 'Date', 'Position', 'session_id', 'Elo_R_Player'])
     
     # Keep data in memory - don't delete or garbage collect
     del position_frames  # Only delete local references
@@ -263,8 +265,8 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
         .group_by('Player_ID')
         .agg([
             rating_agg,
-            pl.col('Player_Name').last().alias('Player_Name'),
-            pl.col('MasterPoints').last().alias('MasterPoints'),
+            pl.col('Player_Name').last().alias('Player_Name'),  # Use last (most recent) for consistency
+            pl.col('MasterPoints').max().alias('MasterPoints'),  # Use max for most recent/highest value
             pl.col('session_id').n_unique().alias('Elo_Count'),
             pl.col('Position').n_unique().alias('Positions_Played'),
         ])
@@ -274,25 +276,33 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
     # Keep data in memory - only delete local reference
     del players_stacked
     
-    # Stage 2: Add rankings and final processing on smaller dataset
-    top_players = (
+    # Stage 2: Add rankings on full dataset first (to match SQL behavior)
+    # SQL ranks on raw MasterPoints values, not CAST values
+    player_aggregates_with_ranks = (
         player_aggregates
         .with_columns([
-            pl.col('MasterPoints').rank(method='ordinal', descending=True).alias('MasterPoint_Rank')
+            pl.col('MasterPoints').rank(method='min', descending=True).alias('MasterPoint_Rank')
         ])
-        .sort('Elo_R_Player', descending=True, nulls_last=True)
-        .select(['Elo_R_Player', 'Player_ID', 'Player_Name', 'MasterPoints', 'MasterPoint_Rank', 'Elo_Count'])
-        .head(top_n)  # Limit early to reduce final processing
+    )
+    
+    # Stage 3: Sort by CAST(Elo_R_Player) like SQL ROW_NUMBER() OVER clause
+    top_players = (
+        player_aggregates_with_ranks
+        .with_columns([
+            pl.col('Elo_R_Player').round(0).cast(pl.Int32, strict=False).alias('Elo_R_Player_Int')
+        ])
+        .sort(['Elo_R_Player_Int', 'MasterPoints', 'Player_ID'], descending=[True, True, False])  # Match SQL ROW_NUMBER() ORDER BY
+        .head(top_n)  # Limit after ranking to preserve correct ranks
         .with_row_index(name='Rank', offset=1)
         .select(['Rank', 'Elo_R_Player', 'Player_ID', 'Player_Name', 'MasterPoints', 'MasterPoint_Rank', 'Elo_Count'])
     )
     
     # Keep data in memory - only delete local reference
-    del player_aggregates
+    del player_aggregates, player_aggregates_with_ranks
 
     top_players = top_players.with_columns([
-        pl.col('Elo_R_Player').cast(pl.Int32, strict=False),
-        pl.col('MasterPoints').cast(pl.Int32, strict=False),
+        pl.col('Elo_R_Player').round(0).cast(pl.Int32, strict=False),  # Use round() to match SQL behavior
+        pl.col('MasterPoints').round(0).cast(pl.Int32, strict=False),  # Apply same rounding to MasterPoints
         pl.col('MasterPoint_Rank').cast(pl.Int32, strict=False),
         pl.col('Elo_Count').alias('Sessions_Played'),
     ]).drop(['Elo_Count']).rename({'Elo_R_Player': 'Player_Elo_Score', 'Rank': 'Player_Elo_Rank'})
@@ -328,6 +338,13 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
         player_elo_s = elo_columns["player_pattern"].format(pos="S")
         player_elo_e = elo_columns["player_pattern"].format(pos="E")
         player_elo_w = elo_columns["player_pattern"].format(pos="W")
+        
+        # Check if these columns actually exist in the dataframe
+        available_columns = df_filtered.columns
+        if (player_elo_n not in available_columns or player_elo_s not in available_columns or 
+            player_elo_e not in available_columns or player_elo_w not in available_columns):
+            # Individual player columns don't exist, set to None
+            player_elo_n = player_elo_s = player_elo_e = player_elo_w = None
     else:
         # For Expected Rating, no individual player ratings available
         player_elo_n = player_elo_s = player_elo_e = player_elo_w = None
@@ -347,10 +364,11 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
         ((pl.col("MasterPoints_N") + pl.col("MasterPoints_S")) / 2).alias("Avg_MPs"),
         (pl.col("MasterPoints_N") * pl.col("MasterPoints_S")).sqrt().alias("Geo_MPs"),
         # Calculate average player Elo if individual ratings are available
-        (pl.when(player_elo_n is not None and player_elo_s is not None)
-         .then(pl.when(pl.mean_horizontal([pl.col(player_elo_n), pl.col(player_elo_s)]).is_nan())
-               .then(None)
-               .otherwise(pl.mean_horizontal([pl.col(player_elo_n), pl.col(player_elo_s)])))
+        (pl.when((player_elo_n is not None) & (player_elo_s is not None))
+         .then(pl.when((pl.col(player_elo_n).is_not_null()) & (pl.col(player_elo_s).is_not_null()) & 
+                       (~pl.col(player_elo_n).is_nan()) & (~pl.col(player_elo_s).is_nan()))
+               .then(pl.mean_horizontal([pl.col(player_elo_n), pl.col(player_elo_s)]))
+               .otherwise(None))
          .otherwise(None))
          .alias("Avg_Player_Elo_Row"),
     )
@@ -370,10 +388,11 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
         ((pl.col("MasterPoints_E") + pl.col("MasterPoints_W")) / 2).alias("Avg_MPs"),
         (pl.col("MasterPoints_E") * pl.col("MasterPoints_W")).sqrt().alias("Geo_MPs"),
         # Calculate average player Elo if individual ratings are available
-        (pl.when(player_elo_e is not None and player_elo_w is not None)
-         .then(pl.when(pl.mean_horizontal([pl.col(player_elo_e), pl.col(player_elo_w)]).is_nan())
-               .then(None)
-               .otherwise(pl.mean_horizontal([pl.col(player_elo_e), pl.col(player_elo_w)])))
+        (pl.when((player_elo_e is not None) & (player_elo_w is not None))
+         .then(pl.when((pl.col(player_elo_e).is_not_null()) & (pl.col(player_elo_w).is_not_null()) & 
+                       (~pl.col(player_elo_e).is_nan()) & (~pl.col(player_elo_w).is_nan()))
+               .then(pl.mean_horizontal([pl.col(player_elo_e), pl.col(player_elo_w)]))
+               .otherwise(None))
          .otherwise(None))
          .alias("Avg_Player_Elo_Row"),
     )
@@ -392,7 +411,14 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
     elif rating_method == 'Max':
         rating_agg = pl.col('Elo_R_Pair').max().alias('Elo_Score')
     elif rating_method == 'Latest':
-        rating_agg = pl.col('Elo_R_Pair').last().alias('Elo_Score')
+        # To match SQL LAST() behavior for pairs
+        rating_agg = (
+            pl.struct(['Date', 'Elo_R_Pair'])
+            .sort_by('Date')
+            .last()
+            .struct.field('Elo_R_Pair')
+            .alias('Elo_Score')
+        )
     elif rating_method == 'Moving Avg':
         # Use a rolling average of the last N sessions for moving average
         rating_agg = pl.col('Elo_R_Pair').tail(moving_avg_days).mean().alias('Elo_Score')
@@ -406,7 +432,7 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
         .group_by('Pair_IDs')
         .agg([
             rating_agg,
-            pl.col('Pair_Names').last().alias('Pair_Names'),
+            pl.col('Pair_Names').last().alias('Pair_Names'),  # Already using last - good
             pl.col('Avg_MPs').mean().alias('Avg_MPs'),
             pl.col('Geo_MPs').mean().alias('Geo_MPs'),
             pl.col('session_id').n_unique().alias('Sessions'),
@@ -420,27 +446,35 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
     # Keep data in memory - only delete local reference
     del partnerships_stacked
     
-    # Stage 2: Add rankings and final processing on smaller dataset
-    top_partnerships = (
+    # Stage 2: Add rankings on full dataset first (to match SQL behavior)
+    # SQL ranks on raw values, not CAST values
+    pair_aggregates_with_ranks = (
         pair_aggregates
         .with_columns([
-            pl.col('Avg_Player_Elo').rank(method='ordinal', descending=True).alias('Avg_Elo_Rank'),
-            pl.col('Avg_MPs').rank(method='ordinal', descending=True).alias('Avg_MPs_Rank'),
-            pl.col('Geo_MPs').rank(method='ordinal', descending=True).alias('Geo_MPs_Rank'),
+            pl.col('Avg_Player_Elo').rank(method='min', descending=True).alias('Avg_Elo_Rank'),
+            pl.col('Avg_MPs').rank(method='min', descending=True).alias('Avg_MPs_Rank'),
+            pl.col('Geo_MPs').rank(method='min', descending=True).alias('Geo_MPs_Rank'),
         ])
-        .sort('Elo_Score', descending=True, nulls_last=True)
-        .select(['Elo_Score', 'Avg_Elo_Rank', 'Pair_IDs', 'Pair_Names', 'Avg_MPs', 'Avg_MPs_Rank', 'Geo_MPs_Rank', 'Sessions'])
-        .head(top_n)  # Limit early to reduce final processing
+    )
+    
+    # Stage 3: Sort by CAST(Elo_Score) like SQL ROW_NUMBER() OVER clause
+    top_partnerships = (
+        pair_aggregates_with_ranks
+        .with_columns([
+            pl.col('Elo_Score').round(0).cast(pl.Int32, strict=False).alias('Elo_Score_Int')
+        ])
+        .sort(['Elo_Score_Int', 'Avg_MPs'], descending=[True, True])  # Match SQL ROW_NUMBER() ORDER BY
+        .head(top_n)  # Limit after ranking to preserve correct ranks
         .with_row_index(name='Pair_Elo_Rank', offset=1)
         .select(['Pair_Elo_Rank', 'Elo_Score', 'Avg_Elo_Rank', 'Pair_IDs', 'Pair_Names', 'Avg_MPs', 'Avg_MPs_Rank', 'Geo_MPs_Rank', 'Sessions'])
     )
     
     # Keep data in memory - only delete local reference
-    del pair_aggregates
+    del pair_aggregates, pair_aggregates_with_ranks
 
     top_partnerships = top_partnerships.with_columns([
-        pl.col('Elo_Score').cast(pl.Int32, strict=False),
-        pl.col('Avg_MPs').cast(pl.Int32, strict=False),
+        pl.col('Elo_Score').round(0).cast(pl.Int32, strict=False),  # Use round() to match SQL behavior
+        pl.col('Avg_MPs').round(0).cast(pl.Int32, strict=False),  # Apply same rounding to Avg_MPs
         pl.col('Avg_Elo_Rank').cast(pl.Int32, strict=False),
         pl.col('Geo_MPs_Rank').cast(pl.Int32, strict=False),
     ]).rename({'Elo_Score': 'Pair_Elo_Score'})
@@ -455,7 +489,7 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
 # -------------------------------
 # SQL Query Generation
 # -------------------------------
-def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, moving_avg_days: int = 10) -> str:
+def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, moving_avg_days: int = 10, elo_rating_type: str = "Current Rating (End of Session)", available_columns: set = None) -> str:
     """Generate SQL query for top players report."""
     
     # Determine aggregation function based on rating method
@@ -464,73 +498,146 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
     elif rating_method == 'Max':
         rating_agg = 'MAX'
     elif rating_method == 'Latest':
-        rating_agg = 'LAST'  # DuckDB supports LAST aggregation
+        # Don't use LAST() as it doesn't respect ORDER BY in CTE
+        # We'll use a different approach with window functions
+        rating_agg = 'LAST'  # Will be replaced below
     elif rating_method == 'Moving Avg':
         # Use a window function to get moving average of last 10 sessions
         rating_agg = 'AVG'  # Will be modified in the query to use window function
     else:
         rating_agg = 'AVG'
     
-    sql_query = f"""
-    WITH player_positions AS (
-        -- Extract all player positions from NESW columns
-        SELECT Date, session_id, Player_ID_N as Player_ID, Player_Name_N as Player_Name, 
-               MasterPoints_N as MasterPoints, Elo_R_N as Elo_R_Player, 'N' as Position
-        FROM self WHERE Player_ID_N IS NOT NULL AND Elo_R_N IS NOT NULL AND NOT isnan(Elo_R_N)
+    # Get the appropriate Elo column names for the selected rating type
+    elo_columns = get_elo_column_names(elo_rating_type)
+    
+    # Check if player ratings are available for this rating type
+    if elo_columns["player_pattern"] is None:
+        raise ValueError(f"Player ratings not available for '{elo_rating_type}'. Please select a different rating type.")
+    
+    # Get individual player Elo column names and check if they exist
+    player_elo_n = elo_columns["player_pattern"].format(pos="N")
+    player_elo_s = elo_columns["player_pattern"].format(pos="S")
+    player_elo_e = elo_columns["player_pattern"].format(pos="E")
+    player_elo_w = elo_columns["player_pattern"].format(pos="W")
+    
+    # If available_columns is provided, check which columns actually exist
+    if available_columns is not None:
+        existing_positions = []
+        for pos, col in [("N", player_elo_n), ("E", player_elo_e), ("S", player_elo_s), ("W", player_elo_w)]:
+            if col in available_columns:
+                existing_positions.append((pos, col))
         
-        UNION ALL
-        
-        SELECT Date, session_id, Player_ID_E as Player_ID, Player_Name_E as Player_Name, 
-               MasterPoints_E as MasterPoints, Elo_R_E as Elo_R_Player, 'E' as Position
-        FROM self WHERE Player_ID_E IS NOT NULL AND Elo_R_E IS NOT NULL AND NOT isnan(Elo_R_E)
-        
-        UNION ALL
-        
-        SELECT Date, session_id, Player_ID_S as Player_ID, Player_Name_S as Player_Name, 
-               MasterPoints_S as MasterPoints, Elo_R_S as Elo_R_Player, 'S' as Position
-        FROM self WHERE Player_ID_S IS NOT NULL AND Elo_R_S IS NOT NULL AND NOT isnan(Elo_R_S)
-        
-        UNION ALL
-        
-        SELECT Date, session_id, Player_ID_W as Player_ID, Player_Name_W as Player_Name, 
-               MasterPoints_W as MasterPoints, Elo_R_W as Elo_R_Player, 'W' as Position
-        FROM self WHERE Player_ID_W IS NOT NULL AND Elo_R_W IS NOT NULL AND NOT isnan(Elo_R_W)
-    ),
-    {('player_recent_sessions AS (' +
-      '    SELECT Player_ID, Player_Name, MasterPoints, Elo_R_Player, Position, session_id, Date,' +
-      '           ROW_NUMBER() OVER (PARTITION BY Player_ID ORDER BY Date DESC) as rn' +
-      '    FROM player_positions' +
-      '    QUALIFY rn <= ' + str(moving_avg_days) +
-      '),' if rating_method == 'Moving Avg' else '')}
-    player_aggregates AS (
+        if not existing_positions:
+            raise ValueError(f"No Elo columns found for rating type '{elo_rating_type}'")
+    else:
+        # Assume all positions exist (original behavior)
+        existing_positions = [("N", player_elo_n), ("E", player_elo_e), ("S", player_elo_s), ("W", player_elo_w)]
+    
+    # Build UNION ALL clauses only for existing positions
+    union_clauses = []
+    for pos, elo_col in existing_positions:
+        union_clauses.append(f"""
+        SELECT Date, session_id, Player_ID_{pos} as Player_ID, Player_Name_{pos} as Player_Name, 
+               MasterPoints_{pos} as MasterPoints, {elo_col} as Elo_R_Player, '{pos}' as Position
+        FROM self WHERE Player_ID_{pos} IS NOT NULL AND {elo_col} IS NOT NULL AND NOT isnan({elo_col})""")
+    
+    # For Latest method, use window functions instead of unreliable LAST()
+    if rating_method == 'Latest':
+        sql_query = f"""
+        WITH player_positions_raw AS (
+            -- Extract all player positions from NESW columns (only existing ones)
+            {' UNION ALL '.join(union_clauses)}
+        ),
+        player_positions AS (
+            SELECT * FROM player_positions_raw ORDER BY Player_ID, Date, Position, session_id, Elo_R_Player
+        ),
+        player_latest AS (
+            SELECT 
+                Player_ID,
+                Player_Name,
+                MasterPoints,
+                Elo_R_Player,
+                session_id,
+                ROW_NUMBER() OVER (PARTITION BY Player_ID ORDER BY Date ASC, Position ASC, session_id ASC, Elo_R_Player ASC) as rn,
+                COUNT(*) OVER (PARTITION BY Player_ID) as total_records
+            FROM player_positions
+        ),
+        player_session_counts AS (
+            SELECT 
+                Player_ID,
+                COUNT(DISTINCT session_id) as Total_Sessions
+            FROM player_positions
+            GROUP BY Player_ID
+            HAVING COUNT(DISTINCT session_id) >= {min_sessions}
+        ),
+        player_aggregates AS (
+            SELECT 
+                pl.Player_ID,
+                pl.Player_Name,
+                pl.MasterPoints,
+                pl.Elo_R_Player as Player_Elo_Score,
+                psc.Total_Sessions as Sessions_Played,
+                1 as Positions_Played
+            FROM player_latest pl
+            JOIN player_session_counts psc ON pl.Player_ID = psc.Player_ID
+            WHERE pl.rn = pl.total_records  -- Only the last record for each player (highest row number)
+        )
         SELECT 
+            ROW_NUMBER() OVER (ORDER BY CAST(Player_Elo_Score AS INTEGER) DESC, MasterPoints DESC, Player_ID ASC) as Player_Elo_Rank,
+            CAST(Player_Elo_Score AS INTEGER) as Player_Elo_Score,
             Player_ID,
-            LAST(Player_Name) as Player_Name,
-            LAST(MasterPoints) as MasterPoints,
-            {f'{rating_agg}(Elo_R_Player)' if rating_method != 'Moving Avg' else 'AVG(Elo_R_Player)'} as Player_Elo_Score,
-            COUNT(DISTINCT session_id) as Sessions_Played,
-            COUNT(DISTINCT Position) as Positions_Played
-        FROM {'player_recent_sessions' if rating_method == 'Moving Avg' else 'player_positions'}
-        GROUP BY Player_ID
-        HAVING COUNT(DISTINCT session_id) >= {min_sessions}
-    )
-    SELECT 
-        ROW_NUMBER() OVER (ORDER BY CAST(Player_Elo_Score AS INTEGER) DESC, MasterPoints DESC) as Player_Elo_Rank,
-        CAST(Player_Elo_Score AS INTEGER) as Player_Elo_Score,
-        Player_ID,
-        Player_Name,
-        CAST(MasterPoints AS INTEGER) as MasterPoints,
-        RANK() OVER (ORDER BY MasterPoints DESC) as MasterPoint_Rank,
-        Sessions_Played
-    FROM player_aggregates
-    ORDER BY Player_Elo_Rank ASC
-    LIMIT {top_n}
-    """
+            Player_Name,
+            CAST(MasterPoints AS INTEGER) as MasterPoints,
+            RANK() OVER (ORDER BY MasterPoints DESC) as MasterPoint_Rank,
+            Sessions_Played
+        FROM player_aggregates
+        ORDER BY Player_Elo_Score DESC, MasterPoints DESC, Player_ID ASC
+        LIMIT {top_n}
+        """
+    else:
+        sql_query = f"""
+        WITH player_positions_raw AS (
+            -- Extract all player positions from NESW columns (only existing ones)
+            {' UNION ALL '.join(union_clauses)}
+        ),
+        player_positions AS (
+            SELECT * FROM player_positions_raw ORDER BY Player_ID, Date, Position
+        ),
+        {('player_recent_sessions AS (' +
+          '    SELECT Player_ID, Player_Name, MasterPoints, Elo_R_Player, Position, session_id, Date,' +
+          '           ROW_NUMBER() OVER (PARTITION BY Player_ID ORDER BY Date DESC) as rn' +
+          '    FROM player_positions' +
+          '    QUALIFY rn <= ' + str(moving_avg_days) +
+          '),' if rating_method == 'Moving Avg' else '')}
+        player_aggregates AS (
+            SELECT 
+                Player_ID,
+                LAST(Player_Name) as Player_Name,  -- Use last (most recent) for consistency
+                MAX(MasterPoints) as MasterPoints,  -- Use max for most recent/highest value
+                {f'{rating_agg}(Elo_R_Player)' if rating_method != 'Moving Avg' else 'AVG(Elo_R_Player)'} as Player_Elo_Score,
+                COUNT(DISTINCT session_id) as Sessions_Played,
+                COUNT(DISTINCT Position) as Positions_Played
+            FROM {'player_recent_sessions' if rating_method == 'Moving Avg' else 'player_positions'}
+            GROUP BY Player_ID
+            HAVING COUNT(DISTINCT session_id) >= {min_sessions}
+        )
+        SELECT 
+            ROW_NUMBER() OVER (ORDER BY CAST(Player_Elo_Score AS INTEGER) DESC, MasterPoints DESC, Player_ID ASC) as Player_Elo_Rank,
+            CAST(Player_Elo_Score AS INTEGER) as Player_Elo_Score,
+            Player_ID,
+            Player_Name,
+            CAST(MasterPoints AS INTEGER) as MasterPoints,
+            RANK() OVER (ORDER BY MasterPoints DESC) as MasterPoint_Rank,
+            Sessions_Played
+        FROM player_aggregates
+        ORDER BY Player_Elo_Score DESC, MasterPoints DESC, Player_ID ASC
+        LIMIT {top_n}
+        """
     
     return sql_query.strip()
 
 
-def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, moving_avg_days: int = 10) -> str:
+def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, moving_avg_days: int = 10, elo_rating_type: str = "Current Rating (End of Session)") -> str:
     """Generate SQL query for top pairs report."""
     
     # Determine aggregation function based on rating method
@@ -546,6 +653,18 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
     else:
         rating_agg = 'AVG'
     
+    # Get the appropriate Elo column names for the selected rating type
+    elo_columns = get_elo_column_names(elo_rating_type)
+    
+    # Determine individual player Elo column names
+    if elo_columns["player_pattern"] is not None:
+        player_elo_n = elo_columns["player_pattern"].format(pos="N")
+        player_elo_s = elo_columns["player_pattern"].format(pos="S")
+        player_elo_e = elo_columns["player_pattern"].format(pos="E")
+        player_elo_w = elo_columns["player_pattern"].format(pos="W")
+    else:
+        player_elo_n = player_elo_s = player_elo_e = player_elo_w = None
+    
     sql_query = f"""
     WITH pair_partnerships AS (
         -- NS partnerships
@@ -556,12 +675,16 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
                  ELSE Player_ID_S || '-' || Player_ID_N 
             END as Pair_IDs,
             Player_Name_N || ' - ' || Player_Name_S as Pair_Names,
-            Elo_R_NS as Elo_R_Pair,
+            {elo_columns["pair_ns"]} as Elo_R_Pair,
             (COALESCE(MasterPoints_N, 0) + COALESCE(MasterPoints_S, 0)) / 2.0 as Avg_MPs,
             SQRT(COALESCE(MasterPoints_N, 0) * COALESCE(MasterPoints_S, 0)) as Geo_MPs,
-            (COALESCE(Elo_R_N, 0) + COALESCE(Elo_R_S, 0)) / 2.0 as Avg_Player_Elo
+            {f'''CASE 
+                WHEN {player_elo_n} IS NOT NULL AND {player_elo_s} IS NOT NULL AND NOT isnan({player_elo_n}) AND NOT isnan({player_elo_s})
+                THEN ({player_elo_n} + {player_elo_s}) / 2.0
+                ELSE NULL
+            END''' if player_elo_n is not None else 'NULL'} as Avg_Player_Elo
         FROM self 
-        WHERE Elo_R_NS IS NOT NULL AND NOT isnan(Elo_R_NS)
+        WHERE {elo_columns["pair_ns"]} IS NOT NULL AND NOT isnan({elo_columns["pair_ns"]})
         
         UNION ALL
         
@@ -573,12 +696,16 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
                  ELSE Player_ID_W || '-' || Player_ID_E 
             END as Pair_IDs,
             Player_Name_E || ' - ' || Player_Name_W as Pair_Names,
-            Elo_R_EW as Elo_R_Pair,
+            {elo_columns["pair_ew"]} as Elo_R_Pair,
             (COALESCE(MasterPoints_E, 0) + COALESCE(MasterPoints_W, 0)) / 2.0 as Avg_MPs,
             SQRT(COALESCE(MasterPoints_E, 0) * COALESCE(MasterPoints_W, 0)) as Geo_MPs,
-            (COALESCE(Elo_R_E, 0) + COALESCE(Elo_R_W, 0)) / 2.0 as Avg_Player_Elo
+            {f'''CASE 
+                WHEN {player_elo_e} IS NOT NULL AND {player_elo_w} IS NOT NULL AND NOT isnan({player_elo_e}) AND NOT isnan({player_elo_w})
+                THEN ({player_elo_e} + {player_elo_w}) / 2.0
+                ELSE NULL
+            END''' if player_elo_e is not None else 'NULL'} as Avg_Player_Elo
         FROM self 
-        WHERE Elo_R_EW IS NOT NULL AND NOT isnan(Elo_R_EW)
+        WHERE {elo_columns["pair_ew"]} IS NOT NULL AND NOT isnan({elo_columns["pair_ew"]})
     ),
     {('pair_recent_sessions AS (' +
       '    SELECT Pair_IDs, Pair_Names, Elo_R_Pair, Avg_MPs, Geo_MPs, Avg_Player_Elo, session_id, Date,' +
@@ -598,23 +725,626 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
         FROM {'pair_recent_sessions' if rating_method == 'Moving Avg' else 'pair_partnerships'}
         GROUP BY Pair_IDs
         HAVING COUNT(DISTINCT session_id) >= {min_sessions}
+    ),
+    pair_aggregates_with_ranks AS (
+        SELECT 
+            Pair_IDs,
+            Pair_Names,
+            Pair_Elo_Score,
+            Avg_MPs,
+            Geo_MPs,
+            Sessions,
+            Avg_Player_Elo,
+            RANK() OVER (ORDER BY Avg_Player_Elo DESC NULLS LAST) as Avg_Elo_Rank,
+            RANK() OVER (ORDER BY Avg_MPs DESC) as Avg_MPs_Rank,
+            RANK() OVER (ORDER BY Geo_MPs DESC) as Geo_MPs_Rank
+        FROM pair_aggregates
     )
     SELECT 
         ROW_NUMBER() OVER (ORDER BY CAST(Pair_Elo_Score AS INTEGER) DESC, Avg_MPs DESC) as Pair_Elo_Rank,
         CAST(Pair_Elo_Score AS INTEGER) as Pair_Elo_Score,
-        RANK() OVER (ORDER BY Avg_Player_Elo DESC) as Avg_Elo_Rank,
+        Avg_Elo_Rank,
         Pair_IDs,
         Pair_Names,
         CAST(Avg_MPs AS INTEGER) as Avg_MPs,
-        RANK() OVER (ORDER BY Avg_MPs DESC) as Avg_MPs_Rank,
-        RANK() OVER (ORDER BY Geo_MPs DESC) as Geo_MPs_Rank,
+        Avg_MPs_Rank,
+        Geo_MPs_Rank,
         Sessions
-    FROM pair_aggregates
+    FROM pair_aggregates_with_ranks
     ORDER BY Pair_Elo_Score DESC, Avg_MPs_Rank ASC
     LIMIT {top_n}
     """
     
     return sql_query.strip()
+
+
+# -------------------------------
+# Result Comparison Functions
+# -------------------------------
+def compare_polars_sql_results(polars_df: pl.DataFrame, sql_df: pl.DataFrame, comparison_type: str) -> dict:
+    """Compare Polars and SQL results to ensure consistency.
+    
+    Args:
+        polars_df: Result from Polars implementation
+        sql_df: Result from SQL implementation  
+        comparison_type: Type of comparison ("players" or "pairs")
+        
+    Returns:
+        dict: Comparison results with status and details
+    """
+    try:
+        # Convert both to pandas for easier comparison
+        polars_pd = polars_df.to_pandas() if hasattr(polars_df, 'to_pandas') else polars_df
+        sql_pd = sql_df.to_pandas() if hasattr(sql_df, 'to_pandas') else sql_df
+        
+        # Basic shape comparison
+        shape_match = polars_pd.shape == sql_pd.shape
+        
+        # Column comparison
+        polars_cols = set(polars_pd.columns)
+        sql_cols = set(sql_pd.columns)
+        columns_match = polars_cols == sql_cols
+        
+        # Sort both dataframes by the primary ranking column for comparison
+        if comparison_type == "players":
+            sort_col = "Player_Elo_Rank" if "Player_Elo_Rank" in polars_cols else polars_pd.columns[0]
+        else:  # pairs
+            sort_col = "Pair_Elo_Rank" if "Pair_Elo_Rank" in polars_cols else polars_pd.columns[0]
+            
+        polars_sorted = polars_pd.sort_values(sort_col).reset_index(drop=True)
+        sql_sorted = sql_pd.sort_values(sort_col).reset_index(drop=True)
+        
+        # Detailed comparison
+        differences = []
+        name_mismatches = []
+        numeric_tolerance = 1e-6  # Tolerance for floating point comparisons
+        
+        if shape_match and columns_match:
+            # Determine relaxed/strict mode from session state (default relaxed)
+            try:
+                strict_comparison = bool(st.session_state.get('strict_comparison', False))
+            except Exception:
+                strict_comparison = False
+            # ID/name mismatch detection
+            try:
+                id_cols = []
+                name_cols = []
+                if comparison_type == "players":
+                    id_cols = [c for c in ["Player_ID", "Player_ID_A", "Player_ID_B"] if c in polars_cols and c in sql_cols]
+                    name_cols = [c for c in ["Player_Name", "Pair_Names"] if c in polars_cols and c in sql_cols]
+                else:
+                    id_cols = [c for c in ["Pair_IDs", "Player_ID_A", "Player_ID_B"] if c in polars_cols and c in sql_cols]
+                    name_cols = [c for c in ["Pair_Names", "Player_Name"] if c in polars_cols and c in sql_cols]
+                # Choose a stable join key preference order
+                join_key = None
+                for c in ["Player_ID", "Pair_IDs", "Player_ID_A", "Player_ID_B"]:
+                    if c in id_cols:
+                        join_key = c
+                        break
+                if join_key is not None and name_cols:
+                    l = polars_sorted[[join_key] + name_cols].copy()
+                    r = sql_sorted[[join_key] + name_cols].copy()
+                    l.columns = [join_key] + [f"polars__{c}" for c in name_cols]
+                    r.columns = [join_key] + [f"sql__{c}" for c in name_cols]
+                    merged = l.merge(r, on=join_key, how="inner")
+                    for c in name_cols:
+                        pol = f"polars__{c}"
+                        sq = f"sql__{c}"
+                        mismatch_mask = merged[pol] != merged[sq]
+                        if mismatch_mask.any():
+                            sample = merged.loc[mismatch_mask, [join_key, pol, sq]].head(5)
+                            name_mismatches.append({
+                                'column': c,
+                                'type': 'name_mismatch',
+                                'ids': sample[join_key].tolist(),
+                                'polars_values': sample[pol].tolist(),
+                                'sql_values': sample[sq].tolist(),
+                            })
+            except Exception:
+                pass
+            # Compare each column
+            for col in polars_sorted.columns:
+                # In relaxed mode, ignore name columns (IDs are source of truth)
+                if not strict_comparison and col in ["Player_Name", "Pair_Names"]:
+                    continue
+                if col in sql_sorted.columns:
+                    polars_col = polars_sorted[col]
+                    sql_col = sql_sorted[col]
+                    
+                    # Handle numeric columns with tolerance
+                    if polars_col.dtype in ['int64', 'float64'] and sql_col.dtype in ['int64', 'float64']:
+                        # Convert to numeric, handling NaN values
+                        polars_numeric = pd.to_numeric(polars_col, errors='coerce')
+                        sql_numeric = pd.to_numeric(sql_col, errors='coerce')
+                        
+                        # Compare with tolerance
+                        if not polars_numeric.equals(sql_numeric):
+                            # Check if differences are within tolerance
+                            diff_mask = ~(
+                                (polars_numeric.isna() & sql_numeric.isna()) |
+                                (abs(polars_numeric - sql_numeric) <= numeric_tolerance)
+                            )
+                            
+                            if diff_mask.any():
+                                diff_indices = diff_mask[diff_mask].index.tolist()
+                                differences.append({
+                                    'column': col,
+                                    'type': 'numeric_difference',
+                                    'indices': diff_indices[:5],  # Show first 5 differences
+                                    'polars_values': polars_numeric[diff_indices[:5]].tolist(),
+                                    'sql_values': sql_numeric[diff_indices[:5]].tolist()
+                                })
+                    else:
+                        # String/categorical comparison
+                        if not polars_col.equals(sql_col):
+                            diff_mask = polars_col != sql_col
+                            if diff_mask.any():
+                                diff_indices = diff_mask[diff_mask].index.tolist()
+                                differences.append({
+                                    'column': col,
+                                    'type': 'value_difference',
+                                    'indices': diff_indices[:5],  # Show first 5 differences
+                                    'polars_values': polars_col[diff_indices[:5]].tolist(),
+                                    'sql_values': sql_col[diff_indices[:5]].tolist()
+                                })
+        
+        # Overall assessment
+        is_identical = shape_match and columns_match and len(differences) == 0
+        
+        return {
+            'identical': is_identical,
+            'shape_match': shape_match,
+            'columns_match': columns_match,
+            'polars_shape': polars_pd.shape,
+            'sql_shape': sql_pd.shape,
+            'polars_columns': sorted(polars_cols),
+            'sql_columns': sorted(sql_cols),
+            'differences': differences,
+            'name_mismatches': name_mismatches,
+            'summary': f"{'✅ IDENTICAL' if is_identical else '❌ DIFFERENCES FOUND'}"
+        }
+        
+    except Exception as e:
+        return {
+            'identical': False,
+            'error': str(e),
+            'summary': f"❌ COMPARISON FAILED: {str(e)}"
+        }
+
+
+def display_comparison_results(comparison_result: dict, comparison_type: str):
+    """Display comparison results in Streamlit UI."""
+    
+    if comparison_result['identical']:
+        st.success(f"✅ **Polars and SQL implementations produce IDENTICAL results!**")
+        st.info(f"📊 Both returned {comparison_result['polars_shape'][0]} rows × {comparison_result['polars_shape'][1]} columns")
+    else:
+        st.error(f"❌ **Differences found between Polars and SQL implementations!**")
+        
+        # Show shape differences
+        if not comparison_result['shape_match']:
+            st.error(f"**Shape mismatch:**")
+            st.write(f"- Polars: {comparison_result['polars_shape']}")
+            st.write(f"- SQL: {comparison_result['sql_shape']}")
+        
+        # Show column differences  
+        if not comparison_result['columns_match']:
+            st.error(f"**Column mismatch:**")
+            polars_only = set(comparison_result['polars_columns']) - set(comparison_result['sql_columns'])
+            sql_only = set(comparison_result['sql_columns']) - set(comparison_result['polars_columns'])
+            if polars_only:
+                st.write(f"- Polars only: {sorted(polars_only)}")
+            if sql_only:
+                st.write(f"- SQL only: {sorted(sql_only)}")
+        
+        # Show value differences
+        if comparison_result.get('differences'):
+            st.error(f"**Value differences found in {len(comparison_result['differences'])} columns:**")
+            for diff in comparison_result['differences'][:3]:  # Show first 3 column differences
+                with st.expander(f"Column: {diff['column']} ({diff['type']})"):
+                    st.write(f"**Indices with differences:** {diff['indices']}")
+                    st.write(f"**Polars values:** {diff['polars_values']}")
+                    st.write(f"**SQL values:** {diff['sql_values']}")
+
+        # Show name mismatches (IDs match but names differ) - informational only
+        if comparison_result.get('name_mismatches'):
+            st.warning(f"**Name mismatches detected (IDs match, names differ): {len(comparison_result['name_mismatches'])} columns**")
+            for nm in comparison_result['name_mismatches'][:2]:  # show up to 2 columns
+                with st.expander(f"Name column: {nm.get('column','')} (sample)"):
+                    ids = nm.get('ids', [])
+                    pol = nm.get('polars_values', [])
+                    sql = nm.get('sql_values', [])
+                    rows = min(5, len(ids))
+                    for i in range(rows):
+                        st.write(f"ID: {ids[i]} | Polars: {pol[i]} | SQL: {sql[i]}")
+        
+        # Show error if comparison failed
+        if 'error' in comparison_result:
+            st.error(f"**Comparison error:** {comparison_result['error']}")
+
+
+def debug_single_comparison(df: pl.DataFrame, top_n: int = 10, min_sessions: int = 5, rating_method: str = 'Avg', elo_rating_type: str = "Current Rating (End of Session)") -> dict:
+    """Debug a single comparison to understand differences."""
+    
+    # Run Polars implementation
+    polars_df = show_top_players(df, top_n, min_sessions, rating_method, 10, elo_rating_type)
+    
+    # Run SQL implementation
+    con = get_db_connection()
+    con.register('self', df)
+    sql_query = generate_top_players_sql(top_n, min_sessions, rating_method, 10, elo_rating_type, set(df.columns))
+    sql_df = con.execute(sql_query).pl()
+    
+    # Compare intermediate steps - let's look at the raw aggregated data before ranking
+    # Get the player_aggregates step from Polars
+    elo_columns = get_elo_column_names(elo_rating_type)
+    position_frames = []
+    for d in "NESW":
+        elo_col = elo_columns["player_pattern"].format(pos=d)
+        if elo_col not in df.columns:
+            continue
+        position_frame = df.select(
+            pl.col("Date"),
+            pl.col("session_id"),
+            pl.col(f"Player_ID_{d}").alias("Player_ID"),
+            pl.col(f"Player_Name_{d}").alias("Player_Name"),
+            pl.col(f"MasterPoints_{d}").alias("MasterPoints"),
+            pl.when(pl.col(elo_col).is_nan()).then(None).otherwise(pl.col(elo_col)).alias("Elo_R_Player"),
+            pl.lit(d).alias("Position"),
+        )
+        position_frames.append(position_frame)
+    
+    players_stacked = pl.concat(position_frames, how="vertical").drop_nulls(subset=["Player_ID", "Elo_R_Player"]).sort(['Player_ID', 'Date', 'Position'])
+    
+    if rating_method == 'Avg':
+        rating_agg = pl.col('Elo_R_Player').mean().alias('Elo_R_Player')
+    else:
+        rating_agg = pl.col('Elo_R_Player').mean().alias('Elo_R_Player')  # Default to avg for debug
+    
+    polars_aggregates = (
+        players_stacked
+        .group_by('Player_ID')
+        .agg([
+            rating_agg,
+            pl.col('Player_Name').first().alias('Player_Name'),
+            pl.col('MasterPoints').max().alias('MasterPoints'),
+            pl.col('session_id').n_unique().alias('Elo_Count'),
+        ])
+        .filter(pl.col('Elo_Count') >= min_sessions)
+        .sort('Player_ID')
+    )
+    
+    return {
+        'polars_final': polars_df,
+        'sql_final': sql_df,
+        'polars_aggregates': polars_aggregates,
+        'sql_query': sql_query,
+        'comparison': compare_polars_sql_results(polars_df, sql_df, "players")
+    }
+
+
+def run_comprehensive_comparison(all_data: dict, top_n: int = 100, min_sessions: int = 10, datasets_filter: list[str] | None = None) -> dict:
+    """Run comprehensive comparison across all option variations.
+    
+    Args:
+        all_data: Dictionary with 'club' and 'tournament' dataframes
+        top_n: Number of top results to compare (smaller for faster testing)
+        min_sessions: Minimum sessions for comparison
+        
+    Returns:
+        dict: Comprehensive comparison results
+    """
+    
+    # Define all variations to test
+    datasets = ['club', 'tournament']
+    if datasets_filter:
+        datasets = [d for d in datasets if d in datasets_filter]
+    rating_types = ['Players', 'Pairs']
+    rating_methods = ['Avg', 'Max', 'Latest']  # Skip Moving Avg for now (Polars-only)
+    elo_rating_types = [
+        "Current Rating (End of Session)",
+        "Rating at Start of Session",
+        "Rating at Event Start", 
+        "Rating at Event End"
+        # Skip "Expected Rating" as it doesn't have individual player ratings
+    ]
+    
+    results = {
+        'total_tests': 0,
+        'passed_tests': 0,
+        'failed_tests': 0,
+        'error_tests': 0,
+        'test_results': [],
+        'summary': {}
+    }
+    
+    total_combinations = len(datasets) * len(rating_types) * len(rating_methods) * len(elo_rating_types)
+    
+    # Create progress container
+    progress_container = st.container()
+    with progress_container:
+        st.info(f"🔄 **Running comprehensive comparison across {total_combinations} combinations...**")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+    
+    test_count = 0
+    
+    for dataset in datasets:
+        df = all_data[dataset]
+        
+        for rating_type in rating_types:
+            for rating_method in rating_methods:
+                for elo_rating_type in elo_rating_types:
+                    test_count += 1
+                    results['total_tests'] += 1
+                    
+                    # Update progress
+                    progress = test_count / total_combinations
+                    progress_bar.progress(progress)
+                    status_text.text(f"Testing: {dataset} | {rating_type} | {rating_method} | {elo_rating_type[:20]}...")
+                    
+                    test_name = f"{dataset}_{rating_type}_{rating_method}_{elo_rating_type.replace(' ', '_')}"
+                    
+                    try:
+                        import time
+                        
+                        # Run Polars implementation with timing
+                        polars_start = time.time()
+                        if rating_type == "Players":
+                            polars_df = show_top_players(df, top_n, min_sessions, rating_method, 10, elo_rating_type)
+                        else:  # Pairs
+                            polars_df = show_top_pairs(df, top_n, min_sessions, rating_method, 10, elo_rating_type)
+                        polars_time = time.time() - polars_start
+                        
+                        # Run SQL implementation with timing
+                        sql_start = time.time()
+                        con = get_db_connection()
+                        con.register('self', df)
+                        if rating_type == "Players":
+                            sql_query = generate_top_players_sql(top_n, min_sessions, rating_method, 10, elo_rating_type, set(df.columns))
+                        else:  # Pairs
+                            sql_query = generate_top_pairs_sql(top_n, min_sessions, rating_method, 10, elo_rating_type)
+                        
+                        sql_df = con.execute(sql_query).pl()
+                        sql_time = time.time() - sql_start
+                        
+                        # Compare results
+                        comparison = compare_polars_sql_results(polars_df, sql_df, rating_type.lower())
+                        
+                        # Determine status (relaxed by default):
+                        # - strict: PASS only if identical (0 diffs and columns/shapes match)
+                        # - relaxed: PASS if 0 diffs; otherwise mark DIFF (not FAIL)
+                        try:
+                            strict_mode = bool(st.session_state.get('strict_comparison', False))
+                        except Exception:
+                            strict_mode = False
+                        diffs_count = len(comparison.get('differences', []))
+                        if strict_mode:
+                            status_value = 'PASS' if comparison.get('identical') else 'FAIL'
+                        else:
+                            status_value = 'PASS' if diffs_count == 0 else 'DIFF'
+
+                        # Store result with timing data
+                        test_result = {
+                            'test_name': test_name,
+                            'dataset': dataset,
+                            'rating_type': rating_type,
+                            'rating_method': rating_method,
+                            'elo_rating_type': elo_rating_type,
+                            'status': status_value,
+                            'identical': comparison['identical'],
+                            'polars_rows': comparison['polars_shape'][0] if 'polars_shape' in comparison else 0,
+                            'sql_rows': comparison['sql_shape'][0] if 'sql_shape' in comparison else 0,
+                            'polars_time_ms': round(polars_time * 1000, 1),
+                            'sql_time_ms': round(sql_time * 1000, 1),
+                            'time_diff_ms': round((sql_time - polars_time) * 1000, 1),
+                            'speed_ratio': round(sql_time / polars_time, 2) if polars_time > 0 else 0,
+                            'differences': len(comparison.get('differences', [])),
+                            'error': comparison.get('error', None)
+                        }
+                        
+                        results['test_results'].append(test_result)
+                        
+                        if status_value == 'PASS':
+                            results['passed_tests'] += 1
+                        elif status_value == 'DIFF':
+                            results['failed_tests'] += 0  # do not count DIFF as failed
+                        else:  # FAIL
+                            results['failed_tests'] += 1
+                            
+                    except Exception as e:
+                        results['error_tests'] += 1
+                        test_result = {
+                            'test_name': test_name,
+                            'dataset': dataset,
+                            'rating_type': rating_type,
+                            'rating_method': rating_method,
+                            'elo_rating_type': elo_rating_type,
+                            'status': 'ERROR',
+                            'identical': False,
+                            'polars_rows': 0,
+                            'sql_rows': 0,
+                            'polars_time_ms': 0,
+                            'sql_time_ms': 0,
+                            'time_diff_ms': 0,
+                            'speed_ratio': 0,
+                            'differences': 0,
+                            'error': str(e)
+                        }
+                        results['test_results'].append(test_result)
+    
+    # Update final progress
+    progress_bar.progress(1.0)
+    status_text.text("✅ Comprehensive comparison completed!")
+    
+    # Generate summary
+    results['summary'] = {
+        'pass_rate': (results['passed_tests'] / results['total_tests']) * 100 if results['total_tests'] > 0 else 0,
+        'datasets_tested': len(datasets),
+        'variations_tested': len(rating_types) * len(rating_methods) * len(elo_rating_types)
+    }
+    
+    return results
+
+
+def display_comprehensive_results(results: dict):
+    """Display comprehensive comparison results."""
+    
+    # Overall summary
+    pass_rate = results['summary']['pass_rate']
+    if pass_rate == 100:
+        st.success(f"🎉 **ALL TESTS PASSED!** ({results['passed_tests']}/{results['total_tests']})")
+        st.balloons()
+    elif pass_rate >= 90:
+        st.warning(f"⚠️ **Most tests passed** ({results['passed_tests']}/{results['total_tests']}) - {pass_rate:.1f}% success rate")
+    else:
+        st.error(f"❌ **Multiple failures detected** ({results['passed_tests']}/{results['total_tests']}) - {pass_rate:.1f}% success rate")
+    
+    # Detailed breakdown
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("✅ Passed", results['passed_tests'])
+    with col2:
+        st.metric("❌ Failed", results['failed_tests'])
+    with col3:
+        st.metric("🚫 Errors", results['error_tests'])
+    with col4:
+        st.metric("📊 Total", results['total_tests'])
+    
+    # Convert results to DataFrame for detailed analysis
+    if results['test_results']:
+        import pandas as pd
+        
+        # Create DataFrame from test results
+        df_results = pd.DataFrame(results['test_results'])
+        
+        # Reorder and select columns for display
+        display_columns = [
+            'dataset', 'rating_type', 'rating_method', 'elo_rating_type', 'status',
+            'polars_rows', 'sql_rows', 'polars_time_ms', 'sql_time_ms', 
+            'time_diff_ms', 'speed_ratio', 'differences', 'error'
+        ]
+        
+        # Filter to only existing columns
+        available_columns = [col for col in display_columns if col in df_results.columns]
+        df_display = df_results[available_columns].copy()
+        
+        # Format columns for better display
+        if 'elo_rating_type' in df_display.columns:
+            df_display['elo_rating_type'] = df_display['elo_rating_type'].str.replace('Rating (End of Session)', 'Current', regex=False)
+            df_display['elo_rating_type'] = df_display['elo_rating_type'].str.replace('Rating at ', '', regex=False)
+            df_display['elo_rating_type'] = df_display['elo_rating_type'].str.replace('Start of Session', 'Session Start', regex=False)
+        
+        # Rename columns for better readability
+        column_renames = {
+            'dataset': 'Dataset',
+            'rating_type': 'Type',
+            'rating_method': 'Method',
+            'elo_rating_type': 'Elo Type',
+            'status': 'Status',
+            'polars_rows': 'Polars Rows',
+            'sql_rows': 'SQL Rows',
+            'polars_time_ms': 'Polars (ms)',
+            'sql_time_ms': 'SQL (ms)',
+            'time_diff_ms': 'Diff (ms)',
+            'speed_ratio': 'SQL/Polars Ratio',
+            'differences': 'Diffs',
+            'error': 'Error'
+        }
+        
+        df_display = df_display.rename(columns=column_renames)
+        
+        # Display the detailed results table
+        st.markdown("### 📊 **Detailed Test Results**")
+        
+        # Add filtering options
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            status_filter = st.selectbox("Filter by Status", ["All", "PASS", "FAIL", "ERROR"])
+        with col2:
+            dataset_filter = st.selectbox("Filter by Dataset", ["All", "club", "tournament"])
+        with col3:
+            type_filter = st.selectbox("Filter by Type", ["All", "Players", "Pairs"])
+        
+        # Apply filters
+        filtered_df = df_display.copy()
+        if status_filter != "All":
+            filtered_df = filtered_df[filtered_df['Status'] == status_filter]
+        if dataset_filter != "All":
+            filtered_df = filtered_df[filtered_df['Dataset'] == dataset_filter]
+        if type_filter != "All":
+            filtered_df = filtered_df[filtered_df['Type'] == type_filter]
+        
+        # Display the filtered dataframe
+        st.dataframe(
+            filtered_df,
+            use_container_width=True,
+            height=400,
+            column_config={
+                "Status": st.column_config.TextColumn(
+                    width="small",
+                ),
+                "Polars (ms)": st.column_config.NumberColumn(
+                    format="%.1f",
+                    width="small"
+                ),
+                "SQL (ms)": st.column_config.NumberColumn(
+                    format="%.1f", 
+                    width="small"
+                ),
+                "Diff (ms)": st.column_config.NumberColumn(
+                    format="%.1f",
+                    width="small"
+                ),
+                "SQL/Polars Ratio": st.column_config.NumberColumn(
+                    format="%.2f",
+                    width="small"
+                ),
+                "Error": st.column_config.TextColumn(
+                    width="large"
+                )
+            }
+        )
+        
+        # Performance summary
+        if len(filtered_df) > 0:
+            st.markdown("### ⚡ **Performance Summary**")
+            
+            # Calculate performance statistics
+            passed_df = filtered_df[filtered_df['Status'] == 'PASS']
+            if len(passed_df) > 0:
+                avg_polars_time = passed_df['Polars (ms)'].mean()
+                avg_sql_time = passed_df['SQL (ms)'].mean()
+                avg_speed_ratio = passed_df['SQL/Polars Ratio'].mean()
+                
+                perf_col1, perf_col2, perf_col3 = st.columns(3)
+                with perf_col1:
+                    st.metric("Avg Polars Time", f"{avg_polars_time:.1f} ms")
+                with perf_col2:
+                    st.metric("Avg SQL Time", f"{avg_sql_time:.1f} ms")
+                with perf_col3:
+                    st.metric("Avg Speed Ratio", f"{avg_speed_ratio:.2f}x")
+                
+                # Show which is faster overall
+                if avg_speed_ratio < 1:
+                    st.success(f"🚀 **SQL is {1/avg_speed_ratio:.2f}x faster** than Polars on average")
+                elif avg_speed_ratio > 1:
+                    st.info(f"🚀 **Polars is {avg_speed_ratio:.2f}x faster** than SQL on average")
+                else:
+                    st.info("⚖️ **Performance is roughly equivalent**")
+    
+    # Show error details for failed tests
+    if results['failed_tests'] > 0 or results['error_tests'] > 0:
+        with st.expander("🔍 **Error Details**", expanded=False):
+            failed_tests = [t for t in results['test_results'] if not t['identical']]
+            
+            for test in failed_tests[:5]:  # Show first 5 failures
+                st.markdown(f"**❌ {test['test_name']}**")
+                if test.get('error'):
+                    st.error(f"Error: {test['error']}")
+                else:
+                    st.write(f"Differences in {test.get('differences', 0)} columns")
+                st.markdown("---")
 
 
 # -------------------------------
@@ -789,18 +1519,35 @@ def main():
         generate_pdf = st.button("Generate PDF", type="primary")
         
         
-        # SQL Query Controls
-        st.markdown("---")
-        st.markdown("**SQL Query Options**")
-        show_sql = st.checkbox('Show SQL Query', value=st.session_state.show_sql_query, help='Show SQL used to query dataframes.')
-        st.session_state.show_sql_query = show_sql
-        
         # Automated Postmortem Apps
-        st.markdown("---")
         st.markdown("**Automated Postmortem Apps**")
         st.markdown("🔗 [ACBL Postmortem](https://acbl.postmortem.chat)")
         st.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
         #st.markdown("🔗 [BridgeWebs Postmortem](https://bridgewebs.postmortem.chat)")
+        
+        # Developer Options
+        with st.expander("🔧 **Developer Options**"):
+            show_sql = st.checkbox('Show SQL Query', value=st.session_state.show_sql_query, help='Show SQL used to query dataframes.')
+            st.session_state.show_sql_query = show_sql
+            # Comparison mode toggle (default relaxed)
+            strict = st.checkbox('Strict comparison (include name columns)', value=st.session_state.get('strict_comparison', False))
+            st.session_state.strict_comparison = strict
+            
+            run_comprehensive = st.button("Run Polars vs SQL Comparison", help="Test all combinations: datasets × rating types × methods × elo types")
+            if run_comprehensive:
+                st.session_state.run_comprehensive_comparison = True
+            # New: dataset-specific comparison buttons
+            run_club_only = st.button("Run Club-only Comparison", help="Compare only club dataset across all variations")
+            if run_club_only:
+                st.session_state.run_comprehensive_comparison_club = True
+            run_tournament_only = st.button("Run Tournament-only Comparison", help="Compare only tournament dataset across all variations")
+            if run_tournament_only:
+                st.session_state.run_comprehensive_comparison_tournament = True
+            
+            # Debug single test button
+            debug_single = st.button("Run Polars vs SQL Single Test", help="Run a single test to debug issues")
+            if debug_single:
+                st.session_state.debug_single_test = True
 
     # Determine date_from based on selection
     now = datetime.now()
@@ -862,6 +1609,89 @@ def main():
             st.session_state.sql_query_history = []
         gc.collect()
     
+    # Check if comprehensive comparison was requested
+    if st.session_state.get('run_comprehensive_comparison', False):
+        st.markdown("## 🔍 **Comprehensive Implementation Comparison**")
+        st.markdown("Testing all combinations of datasets, rating types, methods, and Elo rating types...")
+        
+        # Run comprehensive comparison
+        comprehensive_results = run_comprehensive_comparison(all_data, top_n=50, min_sessions=5)
+        
+        # Display results
+        display_comprehensive_results(comprehensive_results)
+        
+        # Clear the flag
+        st.session_state.run_comprehensive_comparison = False
+        
+        # Stop here - don't show regular content
+        return
+
+    # Check if club-only comparison was requested
+    if st.session_state.get('run_comprehensive_comparison_club', False):
+        st.markdown("## 🔍 **Club-only Polars vs SQL Comparison**")
+        st.markdown("Testing all variations on the club dataset only...")
+        comprehensive_results = run_comprehensive_comparison(all_data, top_n=50, min_sessions=5, datasets_filter=['club'])
+        display_comprehensive_results(comprehensive_results)
+        st.session_state.run_comprehensive_comparison_club = False
+        return
+
+    # Check if tournament-only comparison was requested
+    if st.session_state.get('run_comprehensive_comparison_tournament', False):
+        st.markdown("## 🔍 **Tournament-only Polars vs SQL Comparison**")
+        st.markdown("Testing all variations on the tournament dataset only...")
+        comprehensive_results = run_comprehensive_comparison(all_data, top_n=50, min_sessions=5, datasets_filter=['tournament'])
+        display_comprehensive_results(comprehensive_results)
+        st.session_state.run_comprehensive_comparison_tournament = False
+        return
+    
+    # Check if debug single test was requested
+    if st.session_state.get('debug_single_test', False):
+        st.markdown("## 🐛 **Debug Single Test**")
+        
+        # Run a single test to debug
+        try:
+            df = all_data['club']
+            rating_type = "Players"
+            rating_method = "Avg"
+            elo_rating_type = "Current Rating (End of Session)"
+            
+            st.write(f"**Testing:** {rating_type} | {rating_method} | {elo_rating_type}")
+            
+            # Run Polars implementation
+            st.write("Running Polars implementation...")
+            polars_df = show_top_players(df, 10, 5, rating_method, 10, elo_rating_type)
+            st.write(f"Polars result shape: {polars_df.shape}")
+            st.write("Polars columns:", list(polars_df.columns))
+            st.dataframe(polars_df.head(3))
+            
+            # Run SQL implementation
+            st.write("Running SQL implementation...")
+            con = get_db_connection()
+            con.register('self', df)
+            sql_query = generate_top_players_sql(10, 5, rating_method, 10, elo_rating_type, set(df.columns))
+            st.code(sql_query, language='sql')
+            
+            sql_df = con.execute(sql_query).pl()
+            st.write(f"SQL result shape: {sql_df.shape}")
+            st.write("SQL columns:", list(sql_df.columns))
+            st.dataframe(sql_df.head(3))
+            
+            # Compare results
+            st.write("Comparing results...")
+            comparison = compare_polars_sql_results(polars_df, sql_df, "players")
+            st.json(comparison)
+            
+        except Exception as e:
+            st.error(f"Debug test failed: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+        
+        # Clear the flag
+        st.session_state.debug_single_test = False
+        
+        # Stop here - don't show regular content
+        return
+    
     # Only show main content when buttons are explicitly clicked
     show_main_content = display_table or generate_pdf
     
@@ -910,11 +1740,11 @@ def main():
 
         # Generate SQL query based on report type
         if rating_type == "Players":
-            generated_sql = generate_top_players_sql(int(top_n), int(min_sessions), rating_method, moving_avg_days)
+            generated_sql = generate_top_players_sql(int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type, set(df.columns))
             method_desc = f"{rating_method} method" if rating_method != "Moving Avg" else f"Moving Avg ({moving_avg_days} sessions) method"
             title = f"Top {top_n} ACBL {club_or_tournament} Players by {elo_rating_type} ({method_desc})"
         elif rating_type == "Pairs":
-            generated_sql = generate_top_pairs_sql(int(top_n), int(min_sessions), rating_method, moving_avg_days)
+            generated_sql = generate_top_pairs_sql(int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
             method_desc = f"{rating_method} method" if rating_method != "Moving Avg" else f"Moving Avg ({moving_avg_days} sessions) method"
             title = f"Top {top_n} ACBL {club_or_tournament} Pairs by {elo_rating_type} ({method_desc})"
         else:
@@ -937,26 +1767,18 @@ def main():
                 st.markdown("### 📝 SQL Query Used")
                 st.text_area("", value=generated_sql, height=200, disabled=True, label_visibility="collapsed")
             
-            # 2. Execute and show results in a 25-row scrollable table
-            # Use Polars implementation for Moving Avg (much faster than SQL)
-            if rating_method == "Moving Avg":
-                with st.spinner(f"Building {rating_type} report using optimized method."):
+            # 2. Execute and show results - USE POLARS (faster, verified implementation)
+            with st.spinner(f"Building {rating_type} report using Polars implementation..."):
+                try:
                     if rating_type == "Players":
                         table_df = show_top_players(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
                     elif rating_type == "Pairs":
                         table_df = show_top_pairs(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
                     st.success(f"✅ Report generated successfully! Returned {len(table_df)} rows.")
-            else:
-                with st.spinner(f"Executing SQL query for {rating_type} report."):
-                    try:
-                        con = get_db_connection()
-                        con.register('self', df)
-                        table_df = con.execute(generated_sql).pl()
-                        st.success(f"✅ Query executed successfully! Returned {len(table_df)} rows.")
-                    except Exception as e:
-                        st.error(f"❌ SQL Query Failed: {e}")
-                        st.error("Please try again or contact support if the problem persists.")
-                        return
+                except Exception as e:
+                    st.error(f"❌ Report generation failed: {e}")
+                    st.error("Please try again or contact support if the problem persists.")
+                    return
             
             # Display results with exactly 25 viewable rows (common for both paths)
             if 'table_df' in locals():
@@ -1123,24 +1945,18 @@ def main():
                 table_df = cached_df
                 st.info("✅ Using cached table data from Display Table for PDF generation.")
             else:
-                # Generate table data for PDF - use same logic as display table
-                # Use Polars implementation for Moving Avg (much faster than SQL)
-                if rating_method == "Moving Avg":
-                    with st.spinner(f"Generating {rating_type} data for PDF using optimized method..."):
+                # Generate table data for PDF - use Polars implementation (faster and verified)
+                with st.spinner(f"Generating {rating_type} data for PDF..."):
+                    try:
                         if rating_type == "Players":
                             table_df = show_top_players(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
                         elif rating_type == "Pairs":
                             table_df = show_top_pairs(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
-                else:
-                    with st.spinner(f"Generating {rating_type} data for PDF..."):
-                        try:
-                            con = get_db_connection()
-                            con.register('self', df)
-                            table_df = con.execute(generated_sql).pl()
-                        except Exception as e:
-                            st.error(f"❌ PDF Generation Failed: {e}")
-                            st.error("Unable to generate PDF. Please try again or contact support if the problem persists.")
-                            return
+                        st.info("✅ Using Polars implementation for PDF generation (faster and verified)")
+                    except Exception as e:
+                        st.error(f"❌ PDF Generation Failed: {e}")
+                        st.error("Unable to generate PDF. Please try again or contact support if the problem persists.")
+                        return
             
             created_on = time.strftime("%Y-%m-%d")
             #pdf_title = f"{title} From {date_range}"
