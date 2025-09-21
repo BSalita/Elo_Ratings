@@ -34,6 +34,19 @@ def get_db_connection():
     if 'db_connection' not in st.session_state:
         # Create a new connection for this session
         st.session_state.db_connection = duckdb.connect()
+    # Configure DuckDB pragmas on every access (idempotent), so existing sessions pick up settings
+    try:
+        import tempfile, os
+        tmp_dir = tempfile.gettempdir().replace('\\', '/')
+        st.session_state.db_connection.execute(f"PRAGMA temp_directory='{tmp_dir}';")
+        # Use a conservative memory limit and enable parallelism sensibly
+        st.session_state.db_connection.execute("PRAGMA memory_limit='3GB';")
+        threads = max(2, (os.cpu_count() or 4) // 2)
+        st.session_state.db_connection.execute(f"PRAGMA threads={threads};")
+        # Reduce overhead in certain aggregations
+        st.session_state.db_connection.execute("PRAGMA preserve_insertion_order=false;")
+    except Exception:
+        pass
     return st.session_state.db_connection
 
 def execute_sql_query(df, query, key):
@@ -239,9 +252,13 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
         
         position_frames.append(position_frame)
 
-    # Sort to match SQL ORDER BY behavior exactly - this affects which record is "last" for Latest method
-    # Add session_id and Elo_R_Player to make sort order completely deterministic
-    players_stacked = pl.concat(position_frames, how="vertical").drop_nulls(subset=["Player_ID", "Elo_R_Player"]).sort(['Player_ID', 'Date', 'Position', 'session_id', 'Elo_R_Player'])
+    # Concat and clean data
+    players_stacked = pl.concat(position_frames, how="vertical").drop_nulls(subset=["Player_ID", "Elo_R_Player"])
+    
+    # Only sort if needed for Latest method (sorting 447M rows takes 90+ seconds!)
+    if rating_method == 'Latest' or rating_method == 'Moving Avg':
+        # Sort to match SQL ORDER BY behavior exactly - this affects which record is "last"
+        players_stacked = players_stacked.sort(['Player_ID', 'Date', 'Position', 'session_id', 'Elo_R_Player'])
     
     # Keep data in memory - don't delete or garbage collect
     del position_frames  # Only delete local references
@@ -360,7 +377,11 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
         pl.min_horizontal(pl.col('Player_ID_N'), pl.col('Player_ID_S')).alias("Player_ID_A"),
         pl.max_horizontal(pl.col('Player_ID_N'), pl.col('Player_ID_S')).alias("Player_ID_B"),
         pl.when(pl.col(elo_columns["pair_ns"]).is_nan()).then(None).otherwise(pl.col(elo_columns["pair_ns"])).alias("Elo_R_Pair"),
-        (pl.col("Player_Name_N") + " - " + pl.col("Player_Name_S")).str.replace_all("(swap names)", "", literal=True).alias("Pair_Names"),
+        (
+            pl.when(pl.col('Player_ID_N') <= pl.col('Player_ID_S'))
+              .then(pl.col('Player_Name_N') + " - " + pl.col('Player_Name_S'))
+              .otherwise(pl.col('Player_Name_S') + " - " + pl.col('Player_Name_N'))
+        ).str.replace_all("(swap names)", "", literal=True).alias("Pair_Names"),
         ((pl.col("MasterPoints_N") + pl.col("MasterPoints_S")) / 2).alias("Avg_MPs"),
         (pl.col("MasterPoints_N") * pl.col("MasterPoints_S")).sqrt().alias("Geo_MPs"),
         # Calculate average player Elo if individual ratings are available
@@ -384,7 +405,11 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
         pl.min_horizontal(pl.col('Player_ID_E'), pl.col('Player_ID_W')).alias("Player_ID_A"),
         pl.max_horizontal(pl.col('Player_ID_E'), pl.col('Player_ID_W')).alias("Player_ID_B"),
         pl.when(pl.col(elo_columns["pair_ew"]).is_nan()).then(None).otherwise(pl.col(elo_columns["pair_ew"])).alias("Elo_R_Pair"),
-        (pl.col("Player_Name_E") + " - " + pl.col("Player_Name_W")).str.replace_all("(swap names)", "", literal=True).alias("Pair_Names"),
+        (
+            pl.when(pl.col('Player_ID_E') <= pl.col('Player_ID_W'))
+              .then(pl.col('Player_Name_E') + " - " + pl.col('Player_Name_W'))
+              .otherwise(pl.col('Player_Name_W') + " - " + pl.col('Player_Name_E'))
+        ).str.replace_all("(swap names)", "", literal=True).alias("Pair_Names"),
         ((pl.col("MasterPoints_E") + pl.col("MasterPoints_W")) / 2).alias("Avg_MPs"),
         (pl.col("MasterPoints_E") * pl.col("MasterPoints_W")).sqrt().alias("Geo_MPs"),
         # Calculate average player Elo if individual ratings are available
@@ -541,50 +566,28 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
                MasterPoints_{pos} as MasterPoints, {elo_col} as Elo_R_Player, '{pos}' as Position
         FROM self WHERE Player_ID_{pos} IS NOT NULL AND {elo_col} IS NOT NULL AND NOT isnan({elo_col})""")
     
-    # For Latest method, use window functions instead of unreliable LAST()
+    # For Latest method, use simple LAST() aggregation like pairs do
     if rating_method == 'Latest':
         sql_query = f"""
-        WITH player_positions_raw AS (
+        WITH player_positions AS (
             -- Extract all player positions from NESW columns (only existing ones)
             {' UNION ALL '.join(union_clauses)}
         ),
-        player_positions AS (
-            SELECT * FROM player_positions_raw ORDER BY Player_ID, Date, Position, session_id, Elo_R_Player
-        ),
-        player_latest AS (
+        player_aggregates AS (
             SELECT 
                 Player_ID,
-                Player_Name,
-                MasterPoints,
-                Elo_R_Player,
-                session_id,
-                ROW_NUMBER() OVER (PARTITION BY Player_ID ORDER BY Date ASC, Position ASC, session_id ASC, Elo_R_Player ASC) as rn,
-                COUNT(*) OVER (PARTITION BY Player_ID) as total_records
-            FROM player_positions
-        ),
-        player_session_counts AS (
-            SELECT 
-                Player_ID,
-                COUNT(DISTINCT session_id) as Total_Sessions
+                LAST(Player_Name) as Player_Name,
+                MAX(MasterPoints) as MasterPoints,
+                LAST(Elo_R_Player) as Player_Elo_Score,
+                COUNT(DISTINCT session_id) as Sessions_Played,
+                COUNT(DISTINCT Position) as Positions_Played
             FROM player_positions
             GROUP BY Player_ID
             HAVING COUNT(DISTINCT session_id) >= {min_sessions}
-        ),
-        player_aggregates AS (
-            SELECT 
-                pl.Player_ID,
-                pl.Player_Name,
-                pl.MasterPoints,
-                pl.Elo_R_Player as Player_Elo_Score,
-                psc.Total_Sessions as Sessions_Played,
-                1 as Positions_Played
-            FROM player_latest pl
-            JOIN player_session_counts psc ON pl.Player_ID = psc.Player_ID
-            WHERE pl.rn = pl.total_records  -- Only the last record for each player (highest row number)
         )
         SELECT 
-            ROW_NUMBER() OVER (ORDER BY CAST(Player_Elo_Score AS INTEGER) DESC, MasterPoints DESC, Player_ID ASC) as Player_Elo_Rank,
-            CAST(Player_Elo_Score AS INTEGER) as Player_Elo_Score,
+            ROW_NUMBER() OVER (ORDER BY CAST(COALESCE(Player_Elo_Score, 0) AS INTEGER) DESC, MasterPoints DESC, Player_ID ASC) as Player_Elo_Rank,
+            CAST(COALESCE(Player_Elo_Score, 0) AS INTEGER) as Player_Elo_Score,
             Player_ID,
             Player_Name,
             CAST(MasterPoints AS INTEGER) as MasterPoints,
@@ -595,13 +598,11 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
         LIMIT {top_n}
         """
     else:
+        # Use simplified approach for Avg/Max methods like Latest method
         sql_query = f"""
-        WITH player_positions_raw AS (
+        WITH player_positions AS (
             -- Extract all player positions from NESW columns (only existing ones)
             {' UNION ALL '.join(union_clauses)}
-        ),
-        player_positions AS (
-            SELECT * FROM player_positions_raw ORDER BY Player_ID, Date, Position
         ),
         {('player_recent_sessions AS (' +
           '    SELECT Player_ID, Player_Name, MasterPoints, Elo_R_Player, Position, session_id, Date,' +
@@ -612,8 +613,8 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
         player_aggregates AS (
             SELECT 
                 Player_ID,
-                LAST(Player_Name) as Player_Name,  -- Use last (most recent) for consistency
-                MAX(MasterPoints) as MasterPoints,  -- Use max for most recent/highest value
+                LAST(Player_Name) as Player_Name,
+                MAX(MasterPoints) as MasterPoints,
                 {f'{rating_agg}(Elo_R_Player)' if rating_method != 'Moving Avg' else 'AVG(Elo_R_Player)'} as Player_Elo_Score,
                 COUNT(DISTINCT session_id) as Sessions_Played,
                 COUNT(DISTINCT Position) as Positions_Played
@@ -622,8 +623,8 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
             HAVING COUNT(DISTINCT session_id) >= {min_sessions}
         )
         SELECT 
-            ROW_NUMBER() OVER (ORDER BY CAST(Player_Elo_Score AS INTEGER) DESC, MasterPoints DESC, Player_ID ASC) as Player_Elo_Rank,
-            CAST(Player_Elo_Score AS INTEGER) as Player_Elo_Score,
+            ROW_NUMBER() OVER (ORDER BY CAST(COALESCE(Player_Elo_Score, 0) AS INTEGER) DESC, MasterPoints DESC, Player_ID ASC) as Player_Elo_Rank,
+            CAST(COALESCE(Player_Elo_Score, 0) AS INTEGER) as Player_Elo_Score,
             Player_ID,
             Player_Name,
             CAST(MasterPoints AS INTEGER) as MasterPoints,
@@ -637,7 +638,7 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
     return sql_query.strip()
 
 
-def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, moving_avg_days: int = 10, elo_rating_type: str = "Current Rating (End of Session)") -> str:
+def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, moving_avg_days: int = 10, elo_rating_type: str = "Current Rating (End of Session)", available_columns: set | None = None) -> str:
     """Generate SQL query for top pairs report."""
     
     # Determine aggregation function based on rating method
@@ -665,6 +666,32 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
     else:
         player_elo_n = player_elo_s = player_elo_e = player_elo_w = None
     
+    # Adjust for datasets with alternative pair column naming (e.g., Elo_R_NS vs Elo_R_Pair_NS)
+    if available_columns is not None:
+        def pick_col(candidates: list[str]) -> str | None:
+            for c in candidates:
+                if c in available_columns:
+                    return c
+            return None
+        if elo_rating_type == "Current Rating (End of Session)":
+            pair_ns_col = pick_col(["Elo_R_NS", "Elo_R_Pair_NS"])  # prefer standard, fallback pair_
+            pair_ew_col = pick_col(["Elo_R_EW", "Elo_R_Pair_EW"])  # prefer standard, fallback pair_
+        elif elo_rating_type == "Rating at Start of Session":
+            pair_ns_col = pick_col(["Elo_R_NS_Before", "Elo_R_Pair_NS_Before"])  # if exists
+            pair_ew_col = pick_col(["Elo_R_EW_Before", "Elo_R_Pair_EW_Before"])  # if exists
+        elif elo_rating_type == "Rating at Event Start":
+            pair_ns_col = pick_col(["Elo_R_Pair_NS_EventStart", "Elo_R_NS_EventStart"])  # prefer explicit pair naming
+            pair_ew_col = pick_col(["Elo_R_Pair_EW_EventStart", "Elo_R_EW_EventStart"])  # prefer explicit pair naming
+        elif elo_rating_type == "Rating at Event End":
+            pair_ns_col = pick_col(["Elo_R_Pair_NS_EventEnd", "Elo_R_NS_EventEnd"])  # prefer explicit pair naming
+            pair_ew_col = pick_col(["Elo_R_Pair_EW_EventEnd", "Elo_R_EW_EventEnd"])  # prefer explicit pair naming
+        else:
+            pair_ns_col = pick_col([elo_columns["pair_ns"]])
+            pair_ew_col = pick_col([elo_columns["pair_ew"]])
+    else:
+        pair_ns_col = elo_columns["pair_ns"]
+        pair_ew_col = elo_columns["pair_ew"]
+    
     sql_query = f"""
     WITH pair_partnerships AS (
         -- NS partnerships
@@ -674,8 +701,11 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
                  THEN Player_ID_N || '-' || Player_ID_S 
                  ELSE Player_ID_S || '-' || Player_ID_N 
             END as Pair_IDs,
-            Player_Name_N || ' - ' || Player_Name_S as Pair_Names,
-            {elo_columns["pair_ns"]} as Elo_R_Pair,
+            CASE WHEN Player_ID_N <= Player_ID_S
+                 THEN Player_Name_N || ' - ' || Player_Name_S
+                 ELSE Player_Name_S || ' - ' || Player_Name_N
+            END as Pair_Names,
+            {('NULL' if available_columns is not None and pair_ns_col is None else pair_ns_col)} as Elo_R_Pair,
             (COALESCE(MasterPoints_N, 0) + COALESCE(MasterPoints_S, 0)) / 2.0 as Avg_MPs,
             SQRT(COALESCE(MasterPoints_N, 0) * COALESCE(MasterPoints_S, 0)) as Geo_MPs,
             {f'''CASE 
@@ -684,7 +714,7 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
                 ELSE NULL
             END''' if player_elo_n is not None else 'NULL'} as Avg_Player_Elo
         FROM self 
-        WHERE {elo_columns["pair_ns"]} IS NOT NULL AND NOT isnan({elo_columns["pair_ns"]})
+        WHERE {('1=0' if available_columns is not None and pair_ns_col is None else f"{pair_ns_col} IS NOT NULL AND NOT isnan({pair_ns_col})")}
         
         UNION ALL
         
@@ -695,8 +725,11 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
                  THEN Player_ID_E || '-' || Player_ID_W 
                  ELSE Player_ID_W || '-' || Player_ID_E 
             END as Pair_IDs,
-            Player_Name_E || ' - ' || Player_Name_W as Pair_Names,
-            {elo_columns["pair_ew"]} as Elo_R_Pair,
+            CASE WHEN Player_ID_E <= Player_ID_W
+                 THEN Player_Name_E || ' - ' || Player_Name_W
+                 ELSE Player_Name_W || ' - ' || Player_Name_E
+            END as Pair_Names,
+            {('NULL' if available_columns is not None and pair_ew_col is None else pair_ew_col)} as Elo_R_Pair,
             (COALESCE(MasterPoints_E, 0) + COALESCE(MasterPoints_W, 0)) / 2.0 as Avg_MPs,
             SQRT(COALESCE(MasterPoints_E, 0) * COALESCE(MasterPoints_W, 0)) as Geo_MPs,
             {f'''CASE 
@@ -705,7 +738,7 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
                 ELSE NULL
             END''' if player_elo_e is not None else 'NULL'} as Avg_Player_Elo
         FROM self 
-        WHERE {elo_columns["pair_ew"]} IS NOT NULL AND NOT isnan({elo_columns["pair_ew"]})
+        WHERE {('1=0' if available_columns is not None and pair_ew_col is None else f"{pair_ew_col} IS NOT NULL AND NOT isnan({pair_ew_col})")}
     ),
     {('pair_recent_sessions AS (' +
       '    SELECT Pair_IDs, Pair_Names, Elo_R_Pair, Avg_MPs, Geo_MPs, Avg_Player_Elo, session_id, Date,' +
@@ -1088,22 +1121,37 @@ def run_comprehensive_comparison(all_data: dict, top_n: int = 100, min_sessions:
                     try:
                         import time
                         
+                        # Apply fast comparison filter for club dataset if enabled
+                        df_use = df
+                        try:
+                            if st.session_state.get('fast_comparison', True) and dataset == 'club' and 'Date' in df.columns:
+                                days = int(st.session_state.get('fast_comparison_days', 180))
+                                cutoff = datetime.now() - timedelta(days=days)
+                                df_use = df.filter(pl.col('Date') >= pl.lit(cutoff))
+                        except Exception:
+                            df_use = df
+                        
                         # Run Polars implementation with timing
                         polars_start = time.time()
                         if rating_type == "Players":
-                            polars_df = show_top_players(df, top_n, min_sessions, rating_method, 10, elo_rating_type)
+                            polars_df = show_top_players(df_use, top_n, min_sessions, rating_method, 10, elo_rating_type)
                         else:  # Pairs
-                            polars_df = show_top_pairs(df, top_n, min_sessions, rating_method, 10, elo_rating_type)
+                            polars_df = show_top_pairs(df_use, top_n, min_sessions, rating_method, 10, elo_rating_type)
                         polars_time = time.time() - polars_start
                         
                         # Run SQL implementation with timing
                         sql_start = time.time()
                         con = get_db_connection()
-                        con.register('self', df)
+                        con.register('self', df_use)
+                        # Ensure PRAGMAs are applied for potentially large club queries
+                        try:
+                            con.execute("PRAGMA preserve_insertion_order=false;")
+                        except Exception:
+                            pass
                         if rating_type == "Players":
-                            sql_query = generate_top_players_sql(top_n, min_sessions, rating_method, 10, elo_rating_type, set(df.columns))
+                            sql_query = generate_top_players_sql(top_n, min_sessions, rating_method, 10, elo_rating_type, set(df_use.columns))
                         else:  # Pairs
-                            sql_query = generate_top_pairs_sql(top_n, min_sessions, rating_method, 10, elo_rating_type)
+                            sql_query = generate_top_pairs_sql(top_n, min_sessions, rating_method, 10, elo_rating_type, set(df_use.columns))
                         
                         sql_df = con.execute(sql_query).pl()
                         sql_time = time.time() - sql_start
@@ -1532,6 +1580,11 @@ def main():
             # Comparison mode toggle (default relaxed)
             strict = st.checkbox('Strict comparison (include name columns)', value=st.session_state.get('strict_comparison', False))
             st.session_state.strict_comparison = strict
+            # Fast comparison options (limit club dataset by recent days)
+            fast_comp = st.checkbox('Fast comparison (limit club to recent days)', value=st.session_state.get('fast_comparison', True))
+            st.session_state.fast_comparison = fast_comp
+            fast_days = st.number_input('Fast comparison club days', min_value=30, max_value=3650, value=int(st.session_state.get('fast_comparison_days', 180)) if isinstance(st.session_state.get('fast_comparison_days', 180), int) else 180, step=30, help='When enabled, comparisons filter club data to the most recent N days for speed.')
+            st.session_state.fast_comparison_days = int(fast_days)
             
             run_comprehensive = st.button("Run Polars vs SQL Comparison", help="Test all combinations: datasets × rating types × methods × elo types")
             if run_comprehensive:
@@ -1744,7 +1797,7 @@ def main():
             method_desc = f"{rating_method} method" if rating_method != "Moving Avg" else f"Moving Avg ({moving_avg_days} sessions) method"
             title = f"Top {top_n} ACBL {club_or_tournament} Players by {elo_rating_type} ({method_desc})"
         elif rating_type == "Pairs":
-            generated_sql = generate_top_pairs_sql(int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
+            generated_sql = generate_top_pairs_sql(int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type, set(df.columns))
             method_desc = f"{rating_method} method" if rating_method != "Moving Avg" else f"Moving Avg ({moving_avg_days} sessions) method"
             title = f"Top {top_n} ACBL {club_or_tournament} Pairs by {elo_rating_type} ({method_desc})"
         else:
