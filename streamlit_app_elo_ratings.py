@@ -1223,7 +1223,7 @@ def run_comprehensive_comparison(all_data: dict, top_n: int = 100, min_sessions:
     
     # Update final progress
     progress_bar.progress(1.0)
-    status_text.text("✅ Comprehensive comparison completed!")
+    status_text.text("Comprehensive comparison completed.")
     
     # Generate summary
     results['summary'] = {
@@ -1326,7 +1326,7 @@ def display_comprehensive_results(results: dict):
         # Display the filtered dataframe
         st.dataframe(
             filtered_df,
-            use_container_width=True,
+            width='stretch',
             height=400,
             column_config={
                 "Status": st.column_config.TextColumn(
@@ -1414,6 +1414,8 @@ def initialize_session_state():
             st.session_state.show_sql_query = False
         if 'sql_queries' not in st.session_state:
             st.session_state.sql_queries = []
+        if 'use_sql_engine' not in st.session_state:
+            st.session_state.use_sql_engine = True  # Default to SQL (faster)
     else:
         st.session_state.first_time = False
 
@@ -1547,14 +1549,27 @@ def main():
         else:
             moving_avg_days = 10  # Default value when not using Moving Avg
         
-        # Elo rating type selector
-        elo_rating_type = st.selectbox("Elo rating type", options=[
-            "Current Rating (End of Session)",
-            "Rating at Start of Session", 
-            "Rating at Event Start",
-            "Rating at Event End",
-            "Expected Rating"
-        ], index=0, help="Choose which Elo rating statistic to analyze")
+        # Elo rating type selector - filter options based on rating type
+        if rating_type == "Players":
+            # Players don't have Expected Rating (only individual player ratings)
+            elo_options = [
+                "Current Rating (End of Session)",
+                "Rating at Start of Session", 
+                "Rating at Event Start",
+                "Rating at Event End"
+            ]
+        else:  # Pairs
+            # Pairs have all rating types including Expected Rating
+            elo_options = [
+                "Current Rating (End of Session)",
+                "Rating at Start of Session", 
+                "Rating at Event Start",
+                "Rating at Event End",
+                "Expected Rating"
+            ]
+        
+        elo_rating_type = st.selectbox("Elo rating type", options=elo_options, index=0, 
+                                     help="Choose which Elo rating statistic to analyze")
         
         # Date range quick filter (default All time)
         date_range_choice = st.selectbox(
@@ -1577,6 +1592,12 @@ def main():
         with st.expander("🔧 **Developer Options**"):
             show_sql = st.checkbox('Show SQL Query', value=st.session_state.show_sql_query, help='Show SQL used to query dataframes.')
             st.session_state.show_sql_query = show_sql
+            
+            # Query engine selection (SQL is 2-3x faster)
+            use_sql_engine = st.checkbox('Use SQL Engine (2-3x faster)', value=st.session_state.get('use_sql_engine', True), 
+                                        help='SQL engine is 2-3x faster than Polars. Uncheck to use Polars engine for comparison.')
+            st.session_state.use_sql_engine = use_sql_engine
+            
             # Comparison mode toggle (default relaxed)
             strict = st.checkbox('Strict comparison (include name columns)', value=st.session_state.get('strict_comparison', False))
             st.session_state.strict_comparison = strict
@@ -1820,16 +1841,27 @@ def main():
                 st.markdown("### 📝 SQL Query Used")
                 st.text_area("", value=generated_sql, height=200, disabled=True, label_visibility="collapsed")
             
-            # 2. Execute and show results - USE POLARS (faster, verified implementation)
-            with st.spinner(f"Building {rating_type} report using Polars implementation..."):
+            # 2. Execute and show results - Use selected engine (SQL is 2-3x faster)
+            use_sql = st.session_state.get('use_sql_engine', True)
+            engine_name = "SQL" if use_sql else "Polars"
+            
+            with st.spinner(f"Building {rating_type} report using {engine_name} engine..."):
                 try:
-                    if rating_type == "Players":
-                        table_df = show_top_players(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
-                    elif rating_type == "Pairs":
-                        table_df = show_top_pairs(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
-                    st.success(f"✅ Report generated successfully! Returned {len(table_df)} rows.")
+                    if use_sql:
+                        # Use SQL engine (faster)
+                        con = get_db_connection()
+                        con.register('self', df)
+                        table_df = con.execute(generated_sql).pl()
+                    else:
+                        # Use Polars engine (for comparison/debugging)
+                        if rating_type == "Players":
+                            table_df = show_top_players(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
+                        elif rating_type == "Pairs":
+                            table_df = show_top_pairs(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
+                    
+                    st.success(f"✅ Report generated successfully using {engine_name} engine. Returned {len(table_df)} rows.")
                 except Exception as e:
-                    st.error(f"❌ Report generation failed: {e}")
+                    st.error(f"❌ Report generation failed with {engine_name} engine: {e}")
                     st.error("Please try again or contact support if the problem persists.")
                     return
             
@@ -1963,7 +1995,7 @@ def main():
                 # Clear results when button is pressed
                 if clear_results:
                     st.session_state.sql_query_history = []
-                    st.success("🗑️ Query results cleared!")
+                    st.success("🗑️ Query results cleared")
                 
                 # Display additional query results (excluding the auto-generated one already shown above)
                 additional_queries = [q for q in st.session_state.sql_query_history if not q.get('auto_generated', False)]
@@ -1996,18 +2028,29 @@ def main():
                 cached_settings == current_settings):
                 # Reuse cached dataframe
                 table_df = cached_df
-                st.info("✅ Using cached table data from Display Table for PDF generation.")
+                st.info("✅ Using cached table data for faster PDF generation.")
             else:
-                # Generate table data for PDF - use Polars implementation (faster and verified)
-                with st.spinner(f"Generating {rating_type} data for PDF..."):
+                # Generate table data for PDF - use selected engine (SQL is 2-3x faster)
+                use_sql = st.session_state.get('use_sql_engine', True)
+                engine_name = "SQL" if use_sql else "Polars"
+                
+                with st.spinner(f"Generating {rating_type} data for PDF using {engine_name} engine..."):
                     try:
-                        if rating_type == "Players":
-                            table_df = show_top_players(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
-                        elif rating_type == "Pairs":
-                            table_df = show_top_pairs(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
-                        st.info("✅ Using Polars implementation for PDF generation (faster and verified)")
+                        if use_sql:
+                            # Use SQL engine (faster)
+                            con = get_db_connection()
+                            con.register('self', df)
+                            table_df = con.execute(generated_sql).pl()
+                        else:
+                            # Use Polars engine (for comparison/debugging)
+                            if rating_type == "Players":
+                                table_df = show_top_players(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
+                            elif rating_type == "Pairs":
+                                table_df = show_top_pairs(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
+                        
+                        st.info(f"✅ Using {engine_name} engine for PDF generation")
                     except Exception as e:
-                        st.error(f"❌ PDF Generation Failed: {e}")
+                        st.error(f"❌ PDF Generation Failed with {engine_name} engine: {e}")
                         st.error("Unable to generate PDF. Please try again or contact support if the problem persists.")
                         return
             
@@ -2019,7 +2062,7 @@ def main():
                 # Enable shrink_to_fit for Pair reports to better fit the wider tables
                 shrink_pairs = (rating_type == "Pairs")
                 # really want title, from date to be centered with reduced line spacing between them.
-                pdf_bytes = create_pdf([f"## {title}", f"### From {date_range}", "### Created by https://elo.7nt.info", table_df], title, max_rows=int(top_n), rows_per_page=(19, 24), shrink_to_fit=shrink_pairs)
+                pdf_bytes = create_pdf([f"## {title}", f"### From {date_range}", "### Created by https://elo.7nt.info", table_df], title, max_rows=int(top_n), rows_per_page=(17, 24), shrink_to_fit=shrink_pairs)
             except Exception as e:
                 st.error(f"❌ PDF Creation Failed: {e}")
                 st.error("Unable to create PDF file. Please try again or contact support if the problem persists.")
