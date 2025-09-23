@@ -40,7 +40,7 @@ def get_db_connection():
         tmp_dir = tempfile.gettempdir().replace('\\', '/')
         st.session_state.db_connection.execute(f"PRAGMA temp_directory='{tmp_dir}';")
         # Use a conservative memory limit and enable parallelism sensibly
-        st.session_state.db_connection.execute("PRAGMA memory_limit='3GB';")
+        st.session_state.db_connection.execute("PRAGMA memory_limit='6GB';")
         threads = max(2, (os.cpu_count() or 4) // 2)
         st.session_state.db_connection.execute(f"PRAGMA threads={threads};")
         # Reduce overhead in certain aggregations
