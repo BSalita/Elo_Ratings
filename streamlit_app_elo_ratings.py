@@ -41,7 +41,7 @@ def get_db_connection():
         st.session_state.db_connection.execute(f"PRAGMA temp_directory='{tmp_dir}';")
         # Use a conservative memory limit and enable parallelism sensibly
         st.session_state.db_connection.execute("PRAGMA memory_limit='6GB';")
-        threads = max(2, (os.cpu_count() or 4) // 2)
+        threads = max(4, (os.cpu_count() or 4) // 2)
         st.session_state.db_connection.execute(f"PRAGMA threads={threads};")
         # Reduce overhead in certain aggregations
         st.session_state.db_connection.execute("PRAGMA preserve_insertion_order=false;")
@@ -256,7 +256,7 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
     players_stacked = pl.concat(position_frames, how="vertical").drop_nulls(subset=["Player_ID", "Elo_R_Player"])
     
     # Only sort if needed for Latest method (sorting 447M rows takes 90+ seconds!)
-    if rating_method == 'Latest' or rating_method == 'Moving Avg':
+    if rating_method == 'Latest':
         # Sort to match SQL ORDER BY behavior exactly - this affects which record is "last"
         players_stacked = players_stacked.sort(['Player_ID', 'Date', 'Position', 'session_id', 'Elo_R_Player'])
     
@@ -269,11 +269,8 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
         rating_agg = pl.col('Elo_R_Player').max().alias('Elo_R_Player')
     elif rating_method == 'Latest':
         rating_agg = pl.col('Elo_R_Player').last().alias('Elo_R_Player')
-    elif rating_method == 'Moving Avg':
-        # Use a rolling average of the last N sessions for moving average
-        rating_agg = pl.col('Elo_R_Player').tail(moving_avg_days).mean().alias('Elo_R_Player')
     else:
-        raise ValueError(f"Invalid rating method: {rating_method}")
+        raise ValueError(f"Invalid rating method: {rating_method}. Supported methods: Avg, Max, Latest")
 
     # Memory optimization: Process aggregation in stages to reduce peak memory
     # Stage 1: Group and aggregate core metrics
@@ -444,11 +441,8 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
             .struct.field('Elo_R_Pair')
             .alias('Elo_Score')
         )
-    elif rating_method == 'Moving Avg':
-        # Use a rolling average of the last N sessions for moving average
-        rating_agg = pl.col('Elo_R_Pair').tail(moving_avg_days).mean().alias('Elo_Score')
     else:
-        raise ValueError(f"Invalid rating method: {rating_method}")
+        raise ValueError(f"Invalid rating method: {rating_method}. Supported methods: Avg, Max, Latest")
 
     # Memory optimization: Process pairs aggregation in stages
     # Stage 1: Group and aggregate core metrics
@@ -526,11 +520,8 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
         # Don't use LAST() as it doesn't respect ORDER BY in CTE
         # We'll use a different approach with window functions
         rating_agg = 'LAST'  # Will be replaced below
-    elif rating_method == 'Moving Avg':
-        # Use a window function to get moving average of last 10 sessions
-        rating_agg = 'AVG'  # Will be modified in the query to use window function
     else:
-        rating_agg = 'AVG'
+        raise ValueError(f"Invalid rating method: {rating_method}. Supported methods: Avg, Max, Latest")
     
     # Get the appropriate Elo column names for the selected rating type
     elo_columns = get_elo_column_names(elo_rating_type)
@@ -604,21 +595,15 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
             -- Extract all player positions from NESW columns (only existing ones)
             {' UNION ALL '.join(union_clauses)}
         ),
-        {('player_recent_sessions AS (' +
-          '    SELECT Player_ID, Player_Name, MasterPoints, Elo_R_Player, Position, session_id, Date,' +
-          '           ROW_NUMBER() OVER (PARTITION BY Player_ID ORDER BY Date DESC) as rn' +
-          '    FROM player_positions' +
-          '    QUALIFY rn <= ' + str(moving_avg_days) +
-          '),' if rating_method == 'Moving Avg' else '')}
         player_aggregates AS (
             SELECT 
                 Player_ID,
                 LAST(Player_Name) as Player_Name,
                 MAX(MasterPoints) as MasterPoints,
-                {f'{rating_agg}(Elo_R_Player)' if rating_method != 'Moving Avg' else 'AVG(Elo_R_Player)'} as Player_Elo_Score,
+                {f'{rating_agg}(Elo_R_Player)'} as Player_Elo_Score,
                 COUNT(DISTINCT session_id) as Sessions_Played,
                 COUNT(DISTINCT Position) as Positions_Played
-            FROM {'player_recent_sessions' if rating_method == 'Moving Avg' else 'player_positions'}
+            FROM player_positions
             GROUP BY Player_ID
             HAVING COUNT(DISTINCT session_id) >= {min_sessions}
         )
@@ -648,11 +633,8 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
         rating_agg = 'MAX'
     elif rating_method == 'Latest':
         rating_agg = 'LAST'
-    elif rating_method == 'Moving Avg':
-        # Use a window function to get moving average of last 10 sessions
-        rating_agg = 'AVG'  # Will be modified in the query to use window function
     else:
-        rating_agg = 'AVG'
+        raise ValueError(f"Invalid rating method: {rating_method}. Supported methods: Avg, Max, Latest")
     
     # Get the appropriate Elo column names for the selected rating type
     elo_columns = get_elo_column_names(elo_rating_type)
@@ -740,22 +722,16 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
         FROM self 
         WHERE {('1=0' if available_columns is not None and pair_ew_col is None else f"{pair_ew_col} IS NOT NULL AND NOT isnan({pair_ew_col})")}
     ),
-    {('pair_recent_sessions AS (' +
-      '    SELECT Pair_IDs, Pair_Names, Elo_R_Pair, Avg_MPs, Geo_MPs, Avg_Player_Elo, session_id, Date,' +
-      '           ROW_NUMBER() OVER (PARTITION BY Pair_IDs ORDER BY Date DESC) as rn' +
-      '    FROM pair_partnerships' +
-      '    QUALIFY rn <= ' + str(moving_avg_days) +
-      '),' if rating_method == 'Moving Avg' else '')}
     pair_aggregates AS (
         SELECT 
             Pair_IDs,
             LAST(Pair_Names) as Pair_Names,
-            {f'{rating_agg}(Elo_R_Pair)' if rating_method != 'Moving Avg' else 'AVG(Elo_R_Pair)'} as Pair_Elo_Score,
+            {f'{rating_agg}(Elo_R_Pair)'} as Pair_Elo_Score,
             AVG(Avg_MPs) as Avg_MPs,
             AVG(Geo_MPs) as Geo_MPs,
             COUNT(DISTINCT session_id) as Sessions,
             AVG(Avg_Player_Elo) as Avg_Player_Elo
-        FROM {'pair_recent_sessions' if rating_method == 'Moving Avg' else 'pair_partnerships'}
+        FROM pair_partnerships
         GROUP BY Pair_IDs
         HAVING COUNT(DISTINCT session_id) >= {min_sessions}
     ),
@@ -1073,7 +1049,7 @@ def run_comprehensive_comparison(all_data: dict, top_n: int = 100, min_sessions:
     if datasets_filter:
         datasets = [d for d in datasets if d in datasets_filter]
     rating_types = ['Players', 'Pairs']
-    rating_methods = ['Avg', 'Max', 'Latest']  # Skip Moving Avg for now (Polars-only)
+    rating_methods = ['Avg', 'Max', 'Latest']  # Moving Avg disabled due to memory issues
     elo_rating_types = [
         "Current Rating (End of Session)",
         "Rating at Start of Session",
@@ -1490,10 +1466,10 @@ def main():
     # -------------------------------
 
     def load_and_enrich_datasets(date_from_str: str):
-        """Load datasets from RAM disk or fallback to original files."""
+        """Load datasets (benefits from RAM disk if mounted)."""
         date_from = None if date_from_str == "None" else datetime.fromisoformat(date_from_str)
         
-        # Load both datasets (optimized for RAM disk usage)
+        # Load both datasets
         club_df = load_elo_ratings("club", columns=None, date_from=date_from)
         tournament_df = load_elo_ratings("tournament", columns=None, date_from=date_from)
         
@@ -1505,7 +1481,7 @@ def main():
     # Convert date_from to string for caching key
     date_from_str = "None" if date_from is None else date_from.isoformat()
 
-    # Load datasets once at startup (optimized for RAM disk)
+    # Load datasets once at startup
     if 'all_data' not in st.session_state or 'data_date_from' not in st.session_state or st.session_state.data_date_from != date_from_str:
         try:
             with st.spinner("Loading club and tournament datasets..."):
@@ -1539,14 +1515,10 @@ def main():
         rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=False)
         top_n = st.number_input("Top N", min_value=50, max_value=5000, value=1000, step=50)
         min_sessions = st.number_input("Minimum sessions played", min_value=1, max_value=200, value=30, step=1)
-        rating_method = st.selectbox("Rating method", options=["Avg", "Max", "Latest", "Moving Avg"], index=0)
+        rating_method = st.selectbox("Rating method", options=["Avg", "Max", "Latest"], index=0)
         
-        # Moving average days control (only show when Moving Avg is selected)
-        if rating_method == "Moving Avg":
-            moving_avg_days = st.number_input("Moving average sessions", min_value=1, max_value=50, value=10, step=1, 
-                                            help="Number of most recent sessions to include in the moving average")
-        else:
-            moving_avg_days = 10  # Default value when not using Moving Avg
+        # Moving average days - not used anymore (Moving Avg disabled due to memory issues)
+        moving_avg_days = 10  # Default value
         
         # Elo rating type selector - filter options based on rating type
         if rating_type == "Players":
@@ -1814,11 +1786,11 @@ def main():
         # Generate SQL query based on report type
         if rating_type == "Players":
             generated_sql = generate_top_players_sql(int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type, set(df.columns))
-            method_desc = f"{rating_method} method" if rating_method != "Moving Avg" else f"Moving Avg ({moving_avg_days} sessions) method"
+            method_desc = f"{rating_method} method"
             title = f"Top {top_n} ACBL {club_or_tournament} Players by {elo_rating_type} ({method_desc})"
         elif rating_type == "Pairs":
             generated_sql = generate_top_pairs_sql(int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type, set(df.columns))
-            method_desc = f"{rating_method} method" if rating_method != "Moving Avg" else f"Moving Avg ({moving_avg_days} sessions) method"
+            method_desc = f"{rating_method} method"
             title = f"Top {top_n} ACBL {club_or_tournament} Pairs by {elo_rating_type} ({method_desc})"
         else:
             raise ValueError(f"Invalid rating type: {rating_type}")
