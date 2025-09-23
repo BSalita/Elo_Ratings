@@ -1489,12 +1489,11 @@ def main():
     # Data Loading
     # -------------------------------
 
-    #@st.cache_data(ttl=3600)
     def load_and_enrich_datasets(date_from_str: str):
-        """Load and enrich datasets."""
+        """Load datasets from RAM disk or fallback to original files."""
         date_from = None if date_from_str == "None" else datetime.fromisoformat(date_from_str)
         
-        # Load both datasets
+        # Load both datasets (optimized for RAM disk usage)
         club_df = load_elo_ratings("club", columns=None, date_from=date_from)
         tournament_df = load_elo_ratings("tournament", columns=None, date_from=date_from)
         
@@ -1506,14 +1505,14 @@ def main():
     # Convert date_from to string for caching key
     date_from_str = "None" if date_from is None else date_from.isoformat()
 
-    # Load data only if not already loaded in session state
+    # Load datasets once at startup (optimized for RAM disk)
     if 'all_data' not in st.session_state or 'data_date_from' not in st.session_state or st.session_state.data_date_from != date_from_str:
         try:
             with st.spinner("Loading club and tournament datasets..."):
                 all_data = load_and_enrich_datasets(date_from_str)
-            st.success("✅ Datasets loaded successfully.")
+            st.success("Datasets loaded successfully")
             
-            # Store data in session state for SQL queries
+            # Store data in session state for reuse
             st.session_state.all_data = all_data
             st.session_state.data_date_from = date_from_str
             
@@ -1521,7 +1520,7 @@ def main():
             st.error(f"❌ Failed to load datasets: {e}")
             st.stop()
     else:
-        # Data already loaded, use cached version
+        # Use already loaded data
         all_data = st.session_state.all_data
     
     # Initialize SQL query settings
