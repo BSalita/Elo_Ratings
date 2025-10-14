@@ -248,6 +248,10 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
             pl.col(f"MasterPoints_{d}").alias("MasterPoints"),
             pl.when(pl.col(elo_col).is_nan()).then(None).otherwise(pl.col(elo_col)).alias("Elo_R_Player"),
             pl.lit(d).alias("Position"),
+            pl.col("Is_Par_Suit"),
+            pl.col("Is_Par_Contract"),
+            pl.col("Is_Sacrifice"),
+            pl.col("DD_Tricks_Diff"),
         )
         
         position_frames.append(position_frame)
@@ -283,6 +287,11 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
             pl.col('MasterPoints').max().alias('MasterPoints'),  # Use max for most recent/highest value
             pl.col('session_id').n_unique().alias('Elo_Count'),
             pl.col('Position').n_unique().alias('Positions_Played'),
+            # Add ability aggregations (average rates)
+            pl.col('Is_Par_Suit').mean().alias('Par_Suit_Rate'),
+            pl.col('Is_Par_Contract').mean().alias('Par_Contract_Rate'),
+            pl.col('Is_Sacrifice').mean().alias('Sacrifice_Rate'),
+            pl.col('DD_Tricks_Diff').mean().alias('DD_Tricks_Diff_Avg'),
         ])
         .filter(pl.col('Elo_Count') >= min_elo_count)  # Filter early to reduce data
     )
@@ -295,7 +304,12 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
     player_aggregates_with_ranks = (
         player_aggregates
         .with_columns([
-            pl.col('MasterPoints').rank(method='min', descending=True).alias('MasterPoint_Rank')
+            pl.col('MasterPoints').rank(method='min', descending=True).alias('MasterPoint_Rank'),
+            # Add ability rankings (higher rates = better rank)
+            pl.col('Par_Suit_Rate').rank(method='min', descending=True).alias('Par_Suit_Rank'),
+            pl.col('Par_Contract_Rate').rank(method='min', descending=True).alias('Par_Contract_Rank'),
+            pl.col('Sacrifice_Rate').rank(method='min', descending=True).alias('Sacrifice_Rank'),
+            pl.col('DD_Tricks_Diff_Avg').rank(method='min', descending=True).alias('DD_Tricks_Diff_Rank'),
         ])
     )
     
@@ -308,7 +322,9 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
         .sort(['Elo_R_Player_Int', 'MasterPoints', 'Player_ID'], descending=[True, True, False])  # Match SQL ROW_NUMBER() ORDER BY
         .head(top_n)  # Limit after ranking to preserve correct ranks
         .with_row_index(name='Rank', offset=1)
-        .select(['Rank', 'Elo_R_Player', 'Player_ID', 'Player_Name', 'MasterPoints', 'MasterPoint_Rank', 'Elo_Count'])
+        .select(['Rank', 'Elo_R_Player', 'Player_ID', 'Player_Name', 'MasterPoints', 'MasterPoint_Rank', 'Elo_Count', 
+                 'Par_Suit_Rate', 'Par_Suit_Rank', 'Par_Contract_Rate', 'Par_Contract_Rank', 'Sacrifice_Rate', 'Sacrifice_Rank',
+                 'DD_Tricks_Diff_Avg', 'DD_Tricks_Diff_Rank'])
     )
     
     # Keep data in memory - only delete local reference
@@ -319,7 +335,16 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
         pl.col('MasterPoints').round(0).cast(pl.Int32, strict=False),  # Apply same rounding to MasterPoints
         pl.col('MasterPoint_Rank').cast(pl.Int32, strict=False),
         pl.col('Elo_Count').alias('Sessions_Played'),
-    ]).drop(['Elo_Count']).rename({'Elo_R_Player': 'Player_Elo_Score', 'Rank': 'Player_Elo_Rank'})
+        # Format ability rates as percentages and cast ranks to integers
+        (pl.col('Par_Suit_Rate') * 100).round(1).alias('Par_Suit_Rate_Pct'),
+        (pl.col('Par_Contract_Rate') * 100).round(1).alias('Par_Contract_Rate_Pct'),
+        (pl.col('Sacrifice_Rate') * 100).round(1).alias('Sacrifice_Rate_Pct'),
+        pl.col('DD_Tricks_Diff_Avg').round(2).alias('DD_Tricks_Diff_Avg'),
+        pl.col('Par_Suit_Rank').cast(pl.Int32, strict=False),
+        pl.col('Par_Contract_Rank').cast(pl.Int32, strict=False),
+        pl.col('Sacrifice_Rank').cast(pl.Int32, strict=False),
+        pl.col('DD_Tricks_Diff_Rank').cast(pl.Int32, strict=False),
+    ]).drop(['Elo_Count', 'Par_Suit_Rate', 'Par_Contract_Rate', 'Sacrifice_Rate']).rename({'Elo_R_Player': 'Player_Elo_Score', 'Rank': 'Player_Elo_Rank'})
 
     # Force garbage collection to free intermediate DataFrames
     import gc
@@ -389,6 +414,7 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
                .otherwise(None))
          .otherwise(None))
          .alias("Avg_Player_Elo_Row"),
+        pl.col("DD_Tricks_Diff"),
     )
 
     # Process EW partnerships from filtered data  
@@ -417,6 +443,7 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
                .otherwise(None))
          .otherwise(None))
          .alias("Avg_Player_Elo_Row"),
+        pl.col("DD_Tricks_Diff"),
     )
 
     # Apply filtering to each partnership DataFrame before concatenation
@@ -458,6 +485,7 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
             pl.col('Player_ID_A').first().alias('Player_ID_A'),
             pl.col('Player_ID_B').first().alias('Player_ID_B'),
             pl.col('Avg_Player_Elo_Row').mean().alias('Avg_Player_Elo'),
+            pl.col('DD_Tricks_Diff').mean().alias('DD_Tricks_Diff_Avg'),
         ])
         .filter(pl.col('Sessions') >= min_elo_count)  # Filter early to reduce data
     )
@@ -473,6 +501,7 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
             pl.col('Avg_Player_Elo').rank(method='min', descending=True).alias('Avg_Elo_Rank'),
             pl.col('Avg_MPs').rank(method='min', descending=True).alias('Avg_MPs_Rank'),
             pl.col('Geo_MPs').rank(method='min', descending=True).alias('Geo_MPs_Rank'),
+            pl.col('DD_Tricks_Diff_Avg').rank(method='min', descending=True).alias('DD_Tricks_Diff_Rank'),
         ])
     )
     
@@ -485,7 +514,7 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
         .sort(['Elo_Score_Int', 'Avg_MPs'], descending=[True, True])  # Match SQL ROW_NUMBER() ORDER BY
         .head(top_n)  # Limit after ranking to preserve correct ranks
         .with_row_index(name='Pair_Elo_Rank', offset=1)
-        .select(['Pair_Elo_Rank', 'Elo_Score', 'Avg_Elo_Rank', 'Pair_IDs', 'Pair_Names', 'Avg_MPs', 'Avg_MPs_Rank', 'Geo_MPs_Rank', 'Sessions'])
+        .select(['Pair_Elo_Rank', 'Elo_Score', 'Avg_Elo_Rank', 'Pair_IDs', 'Pair_Names', 'Avg_MPs', 'Avg_MPs_Rank', 'Geo_MPs_Rank', 'Sessions', 'DD_Tricks_Diff_Avg', 'DD_Tricks_Diff_Rank'])
     )
     
     # Keep data in memory - only delete local reference
@@ -496,6 +525,8 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
         pl.col('Avg_MPs').round(0).cast(pl.Int32, strict=False),  # Apply same rounding to Avg_MPs
         pl.col('Avg_Elo_Rank').cast(pl.Int32, strict=False),
         pl.col('Geo_MPs_Rank').cast(pl.Int32, strict=False),
+        pl.col('DD_Tricks_Diff_Avg').round(2).alias('DD_Tricks_Diff_Avg'),
+        pl.col('DD_Tricks_Diff_Rank').cast(pl.Int32, strict=False),
     ]).rename({'Elo_Score': 'Pair_Elo_Score'})
 
     # Force garbage collection to free intermediate DataFrames
@@ -554,7 +585,8 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
     for pos, elo_col in existing_positions:
         union_clauses.append(f"""
         SELECT Date, session_id, Player_ID_{pos} as Player_ID, Player_Name_{pos} as Player_Name, 
-               MasterPoints_{pos} as MasterPoints, {elo_col} as Elo_R_Player, '{pos}' as Position
+               MasterPoints_{pos} as MasterPoints, {elo_col} as Elo_R_Player, '{pos}' as Position,
+               Is_Par_Suit, Is_Par_Contract, Is_Sacrifice, DD_Tricks_Diff
         FROM self WHERE Player_ID_{pos} IS NOT NULL AND {elo_col} IS NOT NULL AND NOT isnan({elo_col})""")
     
     # For Latest method, use simple LAST() aggregation like pairs do
@@ -571,7 +603,11 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
                 MAX(MasterPoints) as MasterPoints,
                 LAST(Elo_R_Player) as Player_Elo_Score,
                 COUNT(DISTINCT session_id) as Sessions_Played,
-                COUNT(DISTINCT Position) as Positions_Played
+                COUNT(DISTINCT Position) as Positions_Played,
+                AVG(Is_Par_Suit) as Par_Suit_Rate,
+                AVG(Is_Par_Contract) as Par_Contract_Rate,
+                AVG(Is_Sacrifice) as Sacrifice_Rate,
+                AVG(DD_Tricks_Diff) as DD_Tricks_Diff_Avg
             FROM player_positions
             GROUP BY Player_ID
             HAVING COUNT(DISTINCT session_id) >= {min_sessions}
@@ -583,7 +619,15 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
             Player_Name,
             CAST(MasterPoints AS INTEGER) as MasterPoints,
             RANK() OVER (ORDER BY MasterPoints DESC) as MasterPoint_Rank,
-            Sessions_Played
+            Sessions_Played,
+            ROUND(Par_Suit_Rate * 100, 1) as Par_Suit_Rate_Pct,
+            RANK() OVER (ORDER BY Par_Suit_Rate DESC) as Par_Suit_Rank,
+            ROUND(Par_Contract_Rate * 100, 1) as Par_Contract_Rate_Pct,
+            RANK() OVER (ORDER BY Par_Contract_Rate DESC) as Par_Contract_Rank,
+            ROUND(Sacrifice_Rate * 100, 1) as Sacrifice_Rate_Pct,
+            RANK() OVER (ORDER BY Sacrifice_Rate DESC) as Sacrifice_Rank,
+            ROUND(DD_Tricks_Diff_Avg, 2) as DD_Tricks_Diff_Avg,
+            RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC) as DD_Tricks_Diff_Rank
         FROM player_aggregates
         ORDER BY Player_Elo_Score DESC, MasterPoints DESC, Player_ID ASC
         LIMIT {top_n}
@@ -602,7 +646,11 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
                 MAX(MasterPoints) as MasterPoints,
                 {f'{rating_agg}(Elo_R_Player)'} as Player_Elo_Score,
                 COUNT(DISTINCT session_id) as Sessions_Played,
-                COUNT(DISTINCT Position) as Positions_Played
+                COUNT(DISTINCT Position) as Positions_Played,
+                AVG(Is_Par_Suit) as Par_Suit_Rate,
+                AVG(Is_Par_Contract) as Par_Contract_Rate,
+                AVG(Is_Sacrifice) as Sacrifice_Rate,
+                AVG(DD_Tricks_Diff) as DD_Tricks_Diff_Avg
             FROM player_positions
             GROUP BY Player_ID
             HAVING COUNT(DISTINCT session_id) >= {min_sessions}
@@ -614,7 +662,15 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
             Player_Name,
             CAST(MasterPoints AS INTEGER) as MasterPoints,
             RANK() OVER (ORDER BY MasterPoints DESC) as MasterPoint_Rank,
-            Sessions_Played
+            Sessions_Played,
+            ROUND(Par_Suit_Rate * 100, 1) as Par_Suit_Rate_Pct,
+            RANK() OVER (ORDER BY Par_Suit_Rate DESC) as Par_Suit_Rank,
+            ROUND(Par_Contract_Rate * 100, 1) as Par_Contract_Rate_Pct,
+            RANK() OVER (ORDER BY Par_Contract_Rate DESC) as Par_Contract_Rank,
+            ROUND(Sacrifice_Rate * 100, 1) as Sacrifice_Rate_Pct,
+            RANK() OVER (ORDER BY Sacrifice_Rate DESC) as Sacrifice_Rank,
+            ROUND(DD_Tricks_Diff_Avg, 2) as DD_Tricks_Diff_Avg,
+            RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC) as DD_Tricks_Diff_Rank
         FROM player_aggregates
         ORDER BY Player_Elo_Score DESC, MasterPoints DESC, Player_ID ASC
         LIMIT {top_n}
@@ -694,7 +750,8 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
                 WHEN {player_elo_n} IS NOT NULL AND {player_elo_s} IS NOT NULL AND NOT isnan({player_elo_n}) AND NOT isnan({player_elo_s})
                 THEN ({player_elo_n} + {player_elo_s}) / 2.0
                 ELSE NULL
-            END''' if player_elo_n is not None else 'NULL'} as Avg_Player_Elo
+            END''' if player_elo_n is not None else 'NULL'} as Avg_Player_Elo,
+            DD_Tricks_Diff
         FROM self 
         WHERE {('1=0' if available_columns is not None and pair_ns_col is None else f"{pair_ns_col} IS NOT NULL AND NOT isnan({pair_ns_col})")}
         
@@ -718,7 +775,8 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
                 WHEN {player_elo_e} IS NOT NULL AND {player_elo_w} IS NOT NULL AND NOT isnan({player_elo_e}) AND NOT isnan({player_elo_w})
                 THEN ({player_elo_e} + {player_elo_w}) / 2.0
                 ELSE NULL
-            END''' if player_elo_e is not None else 'NULL'} as Avg_Player_Elo
+            END''' if player_elo_e is not None else 'NULL'} as Avg_Player_Elo,
+            DD_Tricks_Diff
         FROM self 
         WHERE {('1=0' if available_columns is not None and pair_ew_col is None else f"{pair_ew_col} IS NOT NULL AND NOT isnan({pair_ew_col})")}
     ),
@@ -730,7 +788,8 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
             AVG(Avg_MPs) as Avg_MPs,
             AVG(Geo_MPs) as Geo_MPs,
             COUNT(DISTINCT session_id) as Sessions,
-            AVG(Avg_Player_Elo) as Avg_Player_Elo
+            AVG(Avg_Player_Elo) as Avg_Player_Elo,
+            AVG(DD_Tricks_Diff) as DD_Tricks_Diff_Avg
         FROM pair_partnerships
         GROUP BY Pair_IDs
         HAVING COUNT(DISTINCT session_id) >= {min_sessions}
@@ -746,7 +805,9 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
             Avg_Player_Elo,
             RANK() OVER (ORDER BY Avg_Player_Elo DESC NULLS LAST) as Avg_Elo_Rank,
             RANK() OVER (ORDER BY Avg_MPs DESC) as Avg_MPs_Rank,
-            RANK() OVER (ORDER BY Geo_MPs DESC) as Geo_MPs_Rank
+            RANK() OVER (ORDER BY Geo_MPs DESC) as Geo_MPs_Rank,
+            DD_Tricks_Diff_Avg,
+            RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC) as DD_Tricks_Diff_Rank
         FROM pair_aggregates
     )
     SELECT 
@@ -758,7 +819,9 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
         CAST(Avg_MPs AS INTEGER) as Avg_MPs,
         Avg_MPs_Rank,
         Geo_MPs_Rank,
-        Sessions
+        Sessions,
+        ROUND(DD_Tricks_Diff_Avg, 2) as DD_Tricks_Diff_Avg,
+        DD_Tricks_Diff_Rank
     FROM pair_aggregates_with_ranks
     ORDER BY Pair_Elo_Score DESC, Avg_MPs_Rank ASC
     LIMIT {top_n}
@@ -1000,6 +1063,10 @@ def debug_single_comparison(df: pl.DataFrame, top_n: int = 10, min_sessions: int
             pl.col(f"MasterPoints_{d}").alias("MasterPoints"),
             pl.when(pl.col(elo_col).is_nan()).then(None).otherwise(pl.col(elo_col)).alias("Elo_R_Player"),
             pl.lit(d).alias("Position"),
+            pl.col("Is_Par_Suit"),
+            pl.col("Is_Par_Contract"),
+            pl.col("Is_Sacrifice"),
+            pl.col("DD_Tricks_Diff"),
         )
         position_frames.append(position_frame)
     
@@ -1106,6 +1173,15 @@ def run_comprehensive_comparison(all_data: dict, top_n: int = 100, min_sessions:
                                 df_use = df.filter(pl.col('Date') >= pl.lit(cutoff))
                         except Exception:
                             df_use = df
+                        
+                        # Apply online filter if it exists in session state
+                        online_filter = st.session_state.get('online_filter', 'All')
+                        if online_filter == "Local Only":
+                            if "is_online" in df_use.columns:
+                                df_use = df_use.filter(pl.col("is_online") != 1)
+                        elif online_filter == "Online Only":
+                            if "is_online" in df_use.columns:
+                                df_use = df_use.filter(pl.col("is_online") == 1)
                         
                         # Run Polars implementation with timing
                         polars_start = time.time()
@@ -1549,6 +1625,14 @@ def main():
             index=0,
         )
         
+        # Is Online filter
+        online_filter = st.selectbox(
+            "Game Type",
+            options=["All", "Local Only", "Online Only"],
+            index=0,
+            help="Filter by game type: Local (in-person), Online (virtual), or All games"
+        )
+        
         display_table = st.button("Display Table", type="primary")
         generate_pdf = st.button("Generate PDF", type="primary")
         
@@ -1628,6 +1712,7 @@ def main():
         "moving_avg_days": moving_avg_days,
         "elo_rating_type": elo_rating_type,
         "date_range_choice": date_range_choice,
+        "online_filter": online_filter,
     }
     
     # Check if settings have changed since last report
@@ -1769,7 +1854,22 @@ def main():
         # Get data
         dataset_type = club_or_tournament.lower()
         df = all_data[dataset_type]
-        st.info(f"✅ Using {dataset_type} dataset with {len(df):,} rows")
+        
+        # Apply online filter if specified
+        if online_filter == "Local Only":
+            # Local games: exclude rows where is_online = 1
+            if "is_online" in df.columns:
+                df = df.filter(pl.col("is_online") != 1)
+        elif online_filter == "Online Only":
+            # Online games: include only rows where is_online = 1
+            if "is_online" in df.columns:
+                df = df.filter(pl.col("is_online") == 1)
+        # For "All", no filtering is applied
+        
+        # Store online filter in session state for comprehensive comparison
+        st.session_state.online_filter = online_filter
+        
+        st.info(f"✅ Using {dataset_type} dataset with {len(df):,} rows ({online_filter.lower()} games)")
         
         # Store current dataset type and register with DuckDB for SQL queries
         st.session_state.current_dataset_type = dataset_type
