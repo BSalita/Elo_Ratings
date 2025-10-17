@@ -19,6 +19,11 @@ from streamlitlib.streamlitlib import (
 )
 
 # -------------------------------
+# Config / Paths
+# -------------------------------
+DATA_ROOT = pathlib.Path('data')
+
+# -------------------------------
 # SQL Query Support
 # -------------------------------
 
@@ -92,14 +97,6 @@ def sql_input_callback():
             if 'sql_queries' not in st.session_state:
                 st.session_state.sql_queries = []
             st.session_state.sql_queries.append(query)
-
-
-
-
-# -------------------------------
-# Config / Paths
-# -------------------------------
-DATA_ROOT = pathlib.Path('data')
 
 
 # -------------------------------
@@ -604,9 +601,9 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
                 LAST(Elo_R_Player) as Player_Elo_Score,
                 COUNT(DISTINCT session_id) as Sessions_Played,
                 COUNT(DISTINCT Position) as Positions_Played,
-                AVG(Is_Par_Suit) as Par_Suit_Rate,
-                AVG(Is_Par_Contract) as Par_Contract_Rate,
-                AVG(Is_Sacrifice) as Sacrifice_Rate,
+                AVG(CAST(Is_Par_Suit AS INTEGER)) as Par_Suit_Rate,
+                AVG(CAST(Is_Par_Contract AS INTEGER)) as Par_Contract_Rate,
+                AVG(CAST(Is_Sacrifice AS INTEGER)) as Sacrifice_Rate,
                 AVG(DD_Tricks_Diff) as DD_Tricks_Diff_Avg
             FROM player_positions
             GROUP BY Player_ID
@@ -647,9 +644,9 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
                 {f'{rating_agg}(Elo_R_Player)'} as Player_Elo_Score,
                 COUNT(DISTINCT session_id) as Sessions_Played,
                 COUNT(DISTINCT Position) as Positions_Played,
-                AVG(Is_Par_Suit) as Par_Suit_Rate,
-                AVG(Is_Par_Contract) as Par_Contract_Rate,
-                AVG(Is_Sacrifice) as Sacrifice_Rate,
+                AVG(CAST(Is_Par_Suit AS INTEGER)) as Par_Suit_Rate,
+                AVG(CAST(Is_Par_Contract AS INTEGER)) as Par_Contract_Rate,
+                AVG(CAST(Is_Sacrifice AS INTEGER)) as Sacrifice_Rate,
                 AVG(DD_Tricks_Diff) as DD_Tricks_Diff_Avg
             FROM player_positions
             GROUP BY Player_ID
