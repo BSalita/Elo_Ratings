@@ -165,7 +165,15 @@ def load_elo_ratings(
         lf = lf.filter(pl.col('Date') >= pl.lit(date_from))
 
     # Collect with streaming engine for memory efficiency
-    return lf.collect(engine="streaming")
+    df = lf.collect(engine="streaming")
+    
+    # Clean up Player_Name columns - remove '(swap names)' suffix
+    # todo: do this in previous step. maybe in sql_to_board_results_clean?
+    #df = df.with_columns(
+    #    pl.col('^Player_Name_[NESW]$').str.replace_all(r'\s*\(swap names\)\s*$', '', literal=False)
+    #)
+    
+    return df
 
 
 # -------------------------------
@@ -400,7 +408,7 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
             pl.when(pl.col('Player_ID_N') <= pl.col('Player_ID_S'))
               .then(pl.col('Player_Name_N') + " - " + pl.col('Player_Name_S'))
               .otherwise(pl.col('Player_Name_S') + " - " + pl.col('Player_Name_N'))
-        ).str.replace_all("(swap names)", "", literal=True).alias("Pair_Names"),
+        ),#.str.replace_all("(swap names)", "", literal=True).alias("Pair_Names"),
         ((pl.col("MasterPoints_N") + pl.col("MasterPoints_S")) / 2).alias("Avg_MPs"),
         (pl.col("MasterPoints_N") * pl.col("MasterPoints_S")).sqrt().alias("Geo_MPs"),
         # Calculate average player Elo if individual ratings are available
@@ -429,7 +437,7 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
             pl.when(pl.col('Player_ID_E') <= pl.col('Player_ID_W'))
               .then(pl.col('Player_Name_E') + " - " + pl.col('Player_Name_W'))
               .otherwise(pl.col('Player_Name_W') + " - " + pl.col('Player_Name_E'))
-        ).str.replace_all("(swap names)", "", literal=True).alias("Pair_Names"),
+        ),#.str.replace_all("(swap names)", "", literal=True).alias("Pair_Names"),
         ((pl.col("MasterPoints_E") + pl.col("MasterPoints_W")) / 2).alias("Avg_MPs"),
         (pl.col("MasterPoints_E") * pl.col("MasterPoints_W")).sqrt().alias("Geo_MPs"),
         # Calculate average player Elo if individual ratings are available
@@ -748,6 +756,9 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
                 THEN ({player_elo_n} + {player_elo_s}) / 2.0
                 ELSE NULL
             END''' if player_elo_n is not None else 'NULL'} as Avg_Player_Elo,
+            Is_Par_Suit,
+            Is_Par_Contract,
+            Is_Sacrifice,
             DD_Tricks_Diff
         FROM self 
         WHERE {('1=0' if available_columns is not None and pair_ns_col is None else f"{pair_ns_col} IS NOT NULL AND NOT isnan({pair_ns_col})")}
@@ -773,6 +784,9 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
                 THEN ({player_elo_e} + {player_elo_w}) / 2.0
                 ELSE NULL
             END''' if player_elo_e is not None else 'NULL'} as Avg_Player_Elo,
+            Is_Par_Suit,
+            Is_Par_Contract,
+            Is_Sacrifice,
             DD_Tricks_Diff
         FROM self 
         WHERE {('1=0' if available_columns is not None and pair_ew_col is None else f"{pair_ew_col} IS NOT NULL AND NOT isnan({pair_ew_col})")}
@@ -786,6 +800,9 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
             AVG(Geo_MPs) as Geo_MPs,
             COUNT(DISTINCT session_id) as Sessions,
             AVG(Avg_Player_Elo) as Avg_Player_Elo,
+            AVG(CAST(Is_Par_Suit AS INTEGER)) as Par_Suit_Rate,
+            AVG(CAST(Is_Par_Contract AS INTEGER)) as Par_Contract_Rate,
+            AVG(CAST(Is_Sacrifice AS INTEGER)) as Sacrifice_Rate,
             AVG(DD_Tricks_Diff) as DD_Tricks_Diff_Avg
         FROM pair_partnerships
         GROUP BY Pair_IDs
@@ -803,6 +820,12 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
             RANK() OVER (ORDER BY Avg_Player_Elo DESC NULLS LAST) as Avg_Elo_Rank,
             RANK() OVER (ORDER BY Avg_MPs DESC) as Avg_MPs_Rank,
             RANK() OVER (ORDER BY Geo_MPs DESC) as Geo_MPs_Rank,
+            Par_Suit_Rate,
+            RANK() OVER (ORDER BY Par_Suit_Rate DESC) as Par_Suit_Rank,
+            Par_Contract_Rate,
+            RANK() OVER (ORDER BY Par_Contract_Rate DESC) as Par_Contract_Rank,
+            Sacrifice_Rate,
+            RANK() OVER (ORDER BY Sacrifice_Rate DESC) as Sacrifice_Rank,
             DD_Tricks_Diff_Avg,
             RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC) as DD_Tricks_Diff_Rank
         FROM pair_aggregates
@@ -817,6 +840,12 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
         Avg_MPs_Rank,
         Geo_MPs_Rank,
         Sessions,
+        ROUND(Par_Suit_Rate * 100, 1) as Par_Suit_Rate_Pct,
+        Par_Suit_Rank,
+        ROUND(Par_Contract_Rate * 100, 1) as Par_Contract_Rate_Pct,
+        Par_Contract_Rank,
+        ROUND(Sacrifice_Rate * 100, 1) as Sacrifice_Rate_Pct,
+        Sacrifice_Rank,
         ROUND(DD_Tricks_Diff_Avg, 2) as DD_Tricks_Diff_Avg,
         DD_Tricks_Diff_Rank
     FROM pair_aggregates_with_ranks
@@ -1622,13 +1651,19 @@ def main():
             index=0,
         )
         
-        # Is Online filter
-        online_filter = st.selectbox(
-            "Game Type",
-            options=["All", "Local Only", "Online Only"],
-            index=0,
-            help="Filter by game type: Local (in-person), Online (virtual), or All games"
-        )
+        # Is Online filter - only show if data is loaded and has is_online column
+        online_filter = "All"  # Default value
+        if 'all_data' in st.session_state:
+            dataset_type = club_or_tournament.lower()
+            if dataset_type in st.session_state.all_data:
+                dataset_df = st.session_state.all_data[dataset_type]
+                if "is_online" in dataset_df.columns:
+                    online_filter = st.selectbox(
+                        "Game Type",
+                        options=["All", "Local Only", "Online Only"],
+                        index=0,
+                        help="Filter by game type: Local (in-person), Online (virtual), or All games"
+                    )
         
         display_table = st.button("Display Table", type="primary")
         generate_pdf = st.button("Generate PDF", type="primary")
@@ -1819,8 +1854,22 @@ def main():
         # Stop here - don't show regular content
         return
     
-    # Only show main content when buttons are explicitly clicked
-    show_main_content = display_table or generate_pdf
+    # Persist the display state in session_state
+    if display_table:
+        st.session_state.show_main_content = True
+        st.session_state.content_mode = 'table'
+    elif generate_pdf:
+        st.session_state.show_main_content = True
+        st.session_state.content_mode = 'pdf'
+    
+    # Check if settings have changed - if so, reset display state
+    if 'previous_settings' in st.session_state:
+        if st.session_state.previous_settings != current_settings:
+            st.session_state.show_main_content = False
+    st.session_state.previous_settings = current_settings.copy()
+    
+    # Only show main content when display state is active
+    show_main_content = st.session_state.get('show_main_content', False)
     
     if not show_main_content:
         st.info("Select left sidebar options then click 'Display Table' or 'Generate PDF' button.")
@@ -1896,8 +1945,8 @@ def main():
         st.session_state.generated_sql = generated_sql
         st.session_state.report_title = title
 
-        # Show SQL-based interface when requested or if previously displayed
-        show_table = display_table or (st.session_state.get('table_displayed', False) and not generate_pdf)
+        # Show SQL-based interface when in table mode
+        show_table = st.session_state.get('content_mode') == 'table'
         if show_table:
             if date_range:
                 st.subheader(f"{title} From {date_range}")
@@ -1907,31 +1956,42 @@ def main():
             # 1. Show the SQL query used in a compact scrollable container (only if enabled)
             if st.session_state.get('show_sql_query', False):
                 st.markdown("### 📝 SQL Query Used")
-                st.text_area("", value=generated_sql, height=200, disabled=True, label_visibility="collapsed")
+                st.text_area("SQL Query", value=generated_sql, height=200, disabled=True, label_visibility="collapsed")
             
             # 2. Execute and show results - Use selected engine (SQL is 2-3x faster)
             use_sql = st.session_state.get('use_sql_engine', True)
             engine_name = "SQL" if use_sql else "Polars"
             
-            with st.spinner(f"Building {rating_type} report using {engine_name} engine..."):
-                try:
-                    if use_sql:
-                        # Use SQL engine (faster)
-                        con = get_db_connection()
-                        con.register('self', df)
-                        table_df = con.execute(generated_sql).pl()
-                    else:
-                        # Use Polars engine (for comparison/debugging)
-                        if rating_type == "Players":
-                            table_df = show_top_players(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
-                        elif rating_type == "Pairs":
-                            table_df = show_top_pairs(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
-                    
-                    st.success(f"✅ Report generated successfully using {engine_name} engine. Returned {len(table_df)} rows.")
-                except Exception as e:
-                    st.error(f"❌ Report generation failed with {engine_name} engine: {e}")
-                    st.error("Please try again or contact support if the problem persists.")
-                    return
+            # Cache the table_df to avoid regenerating on every rerun (e.g., when Execute Query button is clicked)
+            cache_key = f"cached_table_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{elo_rating_type}"
+            
+            if cache_key in st.session_state:
+                # Use cached result
+                table_df = st.session_state[cache_key]
+                st.info(f"✅ Using cached {rating_type} report ({len(table_df)} rows)")
+            else:
+                # Generate new result
+                with st.spinner(f"Building {rating_type} report using {engine_name} engine..."):
+                    try:
+                        if use_sql:
+                            # Use SQL engine (faster)
+                            con = get_db_connection()
+                            con.register('self', df)
+                            table_df = con.execute(generated_sql).pl()
+                        else:
+                            # Use Polars engine (for comparison/debugging)
+                            if rating_type == "Players":
+                                table_df = show_top_players(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
+                            elif rating_type == "Pairs":
+                                table_df = show_top_pairs(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
+                        
+                        # Cache the result
+                        st.session_state[cache_key] = table_df
+                        st.success(f"✅ Report generated successfully using {engine_name} engine. Returned {len(table_df)} rows.")
+                    except Exception as e:
+                        st.error(f"❌ Report generation failed with {engine_name} engine: {e}")
+                        st.error("Please try again or contact support if the problem persists.")
+                        return
             
             # Display results with exactly 25 viewable rows (common for both paths)
             if 'table_df' in locals():
@@ -2005,7 +2065,8 @@ def main():
                     st.session_state.sql_query_history = []
                 
                 # Add the generated query to history automatically (only once)
-                if display_table and st.session_state.get('generated_sql'):
+                content_is_table = st.session_state.get('content_mode') == 'table'
+                if content_is_table and st.session_state.get('generated_sql'):
                     if not any(h['query'] == st.session_state.generated_sql for h in st.session_state.sql_query_history):
                         st.session_state.sql_query_history.append({
                             'query': st.session_state.generated_sql,
@@ -2013,57 +2074,6 @@ def main():
                             'timestamp': datetime.now().strftime('%H:%M:%S'),
                             'auto_generated': True
                         })
-                
-                # SQL Query input - pre-populate with generated query
-                default_query = st.session_state.get('generated_sql', '') if display_table else ''
-                query = st.text_area(
-                    "Enter SQL Query:",
-                    value=default_query,
-                    placeholder="SELECT * FROM self WHERE Player_Elo_Score > 1500 ORDER BY Player_Elo_Rank LIMIT 10",
-                    height=150,
-                    key="sql_query_text_area"
-                )
-                
-                col1, col2, col3 = st.columns([1, 1, 4])
-                with col1:
-                    execute_query = st.button("Execute Query", type="primary")
-                with col2:
-                    clear_results = st.button("Clear Results")
-                
-                # Execute query when button is pressed
-                if execute_query and query.strip():
-                    try:
-                        # Show the query being executed
-                        if st.session_state.get('show_sql_query', False):
-                            st.code(query, language='sql')
-                        
-                        # Process query
-                        processed_query = query.strip()
-                        if 'from ' not in processed_query.lower():
-                            processed_query = 'FROM self ' + processed_query
-                        
-                        # Execute query on the query results table, not the raw dataset
-                        con = get_db_connection()
-                        con.register('self', table_df)  # Register the query results dataframe
-                        result_df = con.execute(processed_query).pl()
-                        
-                        # Store in history
-                        st.session_state.sql_query_history.append({
-                            'query': query,
-                            'result': result_df,
-                            'timestamp': datetime.now().strftime('%H:%M:%S')
-                        })
-                        
-                        st.success(f"✅ Query executed successfully! Returned {len(result_df)} rows.")
-                        
-                    except Exception as e:
-                        st.error(f"❌ SQL Error: {e}")
-                        st.code(query, language='sql')
-                
-                # Clear results when button is pressed
-                if clear_results:
-                    st.session_state.sql_query_history = []
-                    st.success("🗑️ Query results cleared")
                 
                 # Display additional query results (excluding the auto-generated one already shown above)
                 additional_queries = [q for q in st.session_state.sql_query_history if not q.get('auto_generated', False)]
@@ -2076,27 +2086,85 @@ def main():
                         
                         with st.expander(query_label, expanded=(i == 0)):
                             st.code(query_result['query'], language='sql')
-                            st.caption(f"Returned {len(query_result['result'])} rows")
                             ShowDataFrameTable(
                                 query_result['result'], 
                                 key=f"sql_result_{len(additional_queries) - i}",
                                 output_method='aggrid',
                                 height_rows=25
                             )
-            
+                
+                # SQL Query input - fixed at bottom using streamlit-extras bottom container
+                with bottom():
+                    query = st.text_input(
+                        "💬 SQL Query (press Enter to execute):",
+                        value='',
+                        placeholder="SELECT * FROM self WHERE Player_Elo_Score > 1500 ORDER BY Player_Elo_Rank LIMIT 10",
+                        key="sql_query_text_input",
+                        on_change=lambda: st.session_state.update({"execute_query_now": True})
+                    )
 
-        # PDF generation regardless of whether table is shown
-        if generate_pdf:
-            # Check if we can reuse cached table data from Display Table
-            cached_df = st.session_state.get('cached_table_df')
-            cached_settings = st.session_state.get('cached_table_settings')
+                # Execute query when Enter pressed
+                if st.session_state.get('execute_query_now') and st.session_state.get('sql_query_text_input', '').strip():
+                    with st.spinner('⏳ Executing query...'):
+                        try:
+                            # Process query
+                            processed_query = st.session_state.get('sql_query_text_input', '').strip()
+                            if 'from ' not in processed_query.lower():
+                                processed_query = 'FROM self ' + processed_query
+                            
+                            # Show the query being executed
+                            if st.session_state.get('show_sql_query', False):
+                                st.code(processed_query, language='sql')
+                            
+                            # Execute query on the query results table, not the raw dataset
+                            con = get_db_connection()
+                            
+                            # Unregister 'self' if it exists, then register fresh
+                            try:
+                                con.unregister('self')
+                            except:
+                                pass  # Ignore if 'self' wasn't registered
+                            
+                            con.register('self', table_df)  # Register the query results dataframe
+                            result_df = con.execute(processed_query).pl()
+                            
+                            # Store in history
+                            st.session_state.sql_query_history.append({
+                                'query': st.session_state.get('sql_query_text_input', ''),
+                                'result': result_df,
+                                'timestamp': datetime.now().strftime('%H:%M:%S')
+                            })
+                            
+                            st.success(f"✅ Query executed successfully! Returned {len(result_df)} rows.")
+                            
+                            # Display the result immediately
+                            st.markdown("### 📊 Query Result")
+                            st.code(st.session_state.get('sql_query_text_input', ''), language='sql')
+                            ShowDataFrameTable(
+                                result_df, 
+                                key=f"sql_result_current_{datetime.now().strftime('%H%M%S')}",
+                                output_method='aggrid',
+                                height_rows=25
+                            )
+                            
+                        except Exception as e:
+                            st.error(f"❌ SQL Error: {e}")
+                            if 'processed_query' in locals():
+                                st.info(f"📝 Your query was transformed to:")
+                                st.code(processed_query, language='sql')
+                        finally:
+                            # Reset flag so we don't re-run on each rerun
+                            st.session_state.execute_query_now = False
+
+        # PDF generation when in PDF mode
+        if st.session_state.get('content_mode') == 'pdf':
+            # Use the same caching mechanism as Display Table
+            cache_key = f"cached_table_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{elo_rating_type}"
             
-            if (cached_df is not None and 
-                cached_settings is not None and 
-                cached_settings == current_settings):
+            if cache_key in st.session_state:
                 # Reuse cached dataframe
-                table_df = cached_df
-                st.info("✅ Using cached table data for faster PDF generation.")
+                table_df = st.session_state[cache_key]
+                st.info(f"✅ Using cached {rating_type} report for PDF generation ({len(table_df)} rows)")
             else:
                 # Generate table data for PDF - use selected engine (SQL is 2-3x faster)
                 use_sql = st.session_state.get('use_sql_engine', True)
@@ -2116,6 +2184,8 @@ def main():
                             elif rating_type == "Pairs":
                                 table_df = show_top_pairs(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
                         
+                        # Cache the result
+                        st.session_state[cache_key] = table_df
                         st.info(f"✅ Using {engine_name} engine for PDF generation")
                     except Exception as e:
                         st.error(f"❌ PDF Generation Failed with {engine_name} engine: {e}")
@@ -2127,10 +2197,9 @@ def main():
             pdf_filename = f"Unofficial Elo Scores for ACBL {club_or_tournament} MatchPoint Games - Top {top_n} {rating_type} {created_on}.pdf"
             # Generate PDF
             try:
-                # Enable shrink_to_fit for Pair reports to better fit the wider tables
-                shrink_pairs = (rating_type == "Pairs")
+                # Enable shrink_to_fit for both Player and Pair reports to prevent truncation
                 # really want title, from date to be centered with reduced line spacing between them.
-                pdf_bytes = create_pdf([f"## {title}", f"### From {date_range}", "### Created by https://elo.7nt.info", table_df], title, max_rows=int(top_n), rows_per_page=(17, 24), shrink_to_fit=shrink_pairs)
+                pdf_bytes = create_pdf([f"## {title}", f"### From {date_range}", "### Created by https://elo.7nt.info", table_df], title, max_rows=int(top_n), max_cols=None, rows_per_page=(21, 28), shrink_to_fit=True)
             except Exception as e:
                 st.error(f"❌ PDF Creation Failed: {e}")
                 st.error("Unable to create PDF file. Please try again or contact support if the problem persists.")
@@ -2146,3 +2215,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
