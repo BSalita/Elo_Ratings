@@ -1665,16 +1665,20 @@ def main():
         if 'all_data' in st.session_state:
             dataset_type = club_or_tournament.lower()
             if dataset_type in st.session_state.all_data:
-                dataset_df = st.session_state.all_data[dataset_type]
-                # Convert columns to list to avoid mutable borrow error
-                columns_list = list(dataset_df.columns)
-                if "is_online" in columns_list:
-                    online_filter = st.selectbox(
-                        "Game Type",
-                        options=["All", "Local Only", "Online Only"],
-                        index=0,
-                        help="Filter by game type: Local (in-person), Online (virtual), or All games"
-                    )
+                # Use try-except to safely check for is_online column without mutable borrow error
+                try:
+                    dataset_df = st.session_state.all_data[dataset_type]
+                    # Try to access the column - if it exists, show the selectbox
+                    if hasattr(dataset_df, 'select') and 'is_online' in dataset_df.schema:
+                        online_filter = st.selectbox(
+                            "Game Type",
+                            options=["All", "Local Only", "Online Only"],
+                            index=0,
+                            help="Filter by game type: Local (in-person), Online (virtual), or All games"
+                        )
+                except (RuntimeError, AttributeError, KeyError):
+                    # If any error occurs, just use default "All"
+                    pass
         
         display_table = st.button("Display Table", type="primary")
         generate_pdf = st.button("Generate PDF", type="primary")
