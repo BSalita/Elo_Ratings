@@ -225,8 +225,8 @@ def get_elo_column_names(elo_rating_type: str) -> dict:
 # -------------------------------
 def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating_method: str = 'Avg', moving_avg_days: int = 10, elo_rating_type: str = "Current Rating (End of Session)") -> pl.DataFrame:
     
-    if 'MasterPoints_N' not in df.columns:
-        df = df.with_columns([pl.lit(None).alias(f"MasterPoints_{d}") for d in "NESW"])
+    # if 'MasterPoints_N' not in df.columns:
+    #     df = df.with_columns([pl.lit(None).alias(f"MasterPoints_{d}") for d in "NESW"])
 
     # Get the appropriate Elo column names for the selected rating type
     elo_columns = get_elo_column_names(elo_rating_type)
@@ -339,7 +339,7 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
         pl.col('Elo_R_Player').round(0).cast(pl.Int32, strict=False),  # Use round() to match SQL behavior
         pl.col('MasterPoints').round(0).cast(pl.Int32, strict=False),  # Apply same rounding to MasterPoints
         pl.col('MasterPoint_Rank').cast(pl.Int32, strict=False),
-        pl.col('Elo_Count').alias('Sessions_Played'),
+        pl.col('Elo_Count').cast(pl.Int32, strict=False).alias('Sessions_Played'),
         # Format ability rates as percentages and cast ranks to integers
         (pl.col('Par_Suit_Rate') * 100).round(1).alias('Par_Suit_Rate_Pct'),
         (pl.col('Par_Contract_Rate') * 100).round(1).alias('Par_Contract_Rate_Pct'),
@@ -360,13 +360,13 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
 
 def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating_method: str = 'Avg', moving_avg_days: int = 10, elo_rating_type: str = "Current Rating (End of Session)") -> pl.DataFrame:
     
-    if 'MasterPoints_N' not in df.columns:
-        df = df.with_columns(
-            pl.lit(None).alias('MasterPoints_N'),
-            pl.lit(None).alias('MasterPoints_S'),
-            pl.lit(None).alias('MasterPoints_E'),
-            pl.lit(None).alias('MasterPoints_W')
-        )
+    # if 'MasterPoints_N' not in df.columns:
+    #     df = df.with_columns(
+    #         pl.lit(None).alias('MasterPoints_N'),
+    #         pl.lit(None).alias('MasterPoints_S'),
+    #         pl.lit(None).alias('MasterPoints_E'),
+    #         pl.lit(None).alias('MasterPoints_W')
+    #     )
     
     # Get the appropriate Elo column names for the selected rating type
     elo_columns = get_elo_column_names(elo_rating_type)
@@ -530,6 +530,7 @@ def show_top_pairs(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rating
         pl.col('Avg_MPs').round(0).cast(pl.Int32, strict=False),  # Apply same rounding to Avg_MPs
         pl.col('Avg_Elo_Rank').cast(pl.Int32, strict=False),
         pl.col('Geo_MPs_Rank').cast(pl.Int32, strict=False),
+        pl.col('Sessions').cast(pl.Int32, strict=False),
         pl.col('DD_Tricks_Diff_Avg').round(2).alias('DD_Tricks_Diff_Avg'),
         pl.col('DD_Tricks_Diff_Rank').cast(pl.Int32, strict=False),
     ]).rename({'Elo_Score': 'Pair_Elo_Score'})
@@ -618,21 +619,21 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
             HAVING COUNT(DISTINCT session_id) >= {min_sessions}
         )
         SELECT 
-            ROW_NUMBER() OVER (ORDER BY CAST(COALESCE(Player_Elo_Score, 0) AS INTEGER) DESC, MasterPoints DESC, Player_ID ASC) as Player_Elo_Rank,
+            CAST(ROW_NUMBER() OVER (ORDER BY CAST(COALESCE(Player_Elo_Score, 0) AS INTEGER) DESC, MasterPoints DESC, Player_ID ASC) AS INTEGER) as Player_Elo_Rank,
             CAST(COALESCE(Player_Elo_Score, 0) AS INTEGER) as Player_Elo_Score,
             Player_ID,
             Player_Name,
             CAST(MasterPoints AS INTEGER) as MasterPoints,
-            RANK() OVER (ORDER BY MasterPoints DESC) as MasterPoint_Rank,
-            Sessions_Played,
+            CAST(RANK() OVER (ORDER BY MasterPoints DESC) AS INTEGER) as MasterPoint_Rank,
+            CAST(Sessions_Played AS INTEGER) as Sessions_Played,
             ROUND(Par_Suit_Rate * 100, 1) as Par_Suit_Rate_Pct,
-            RANK() OVER (ORDER BY Par_Suit_Rate DESC) as Par_Suit_Rank,
+            CAST(RANK() OVER (ORDER BY Par_Suit_Rate DESC) AS INTEGER) as Par_Suit_Rank,
             ROUND(Par_Contract_Rate * 100, 1) as Par_Contract_Rate_Pct,
-            RANK() OVER (ORDER BY Par_Contract_Rate DESC) as Par_Contract_Rank,
+            CAST(RANK() OVER (ORDER BY Par_Contract_Rate DESC) AS INTEGER) as Par_Contract_Rank,
             ROUND(Sacrifice_Rate * 100, 1) as Sacrifice_Rate_Pct,
-            RANK() OVER (ORDER BY Sacrifice_Rate DESC) as Sacrifice_Rank,
+            CAST(RANK() OVER (ORDER BY Sacrifice_Rate DESC) AS INTEGER) as Sacrifice_Rank,
             ROUND(DD_Tricks_Diff_Avg, 2) as DD_Tricks_Diff_Avg,
-            RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC) as DD_Tricks_Diff_Rank
+            CAST(RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC) AS INTEGER) as DD_Tricks_Diff_Rank
         FROM player_aggregates
         ORDER BY Player_Elo_Score DESC, MasterPoints DESC, Player_ID ASC
         LIMIT {top_n}
@@ -661,21 +662,21 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
             HAVING COUNT(DISTINCT session_id) >= {min_sessions}
         )
         SELECT 
-            ROW_NUMBER() OVER (ORDER BY CAST(COALESCE(Player_Elo_Score, 0) AS INTEGER) DESC, MasterPoints DESC, Player_ID ASC) as Player_Elo_Rank,
+            CAST(ROW_NUMBER() OVER (ORDER BY CAST(COALESCE(Player_Elo_Score, 0) AS INTEGER) DESC, MasterPoints DESC, Player_ID ASC) AS INTEGER) as Player_Elo_Rank,
             CAST(COALESCE(Player_Elo_Score, 0) AS INTEGER) as Player_Elo_Score,
             Player_ID,
             Player_Name,
             CAST(MasterPoints AS INTEGER) as MasterPoints,
-            RANK() OVER (ORDER BY MasterPoints DESC) as MasterPoint_Rank,
-            Sessions_Played,
+            CAST(RANK() OVER (ORDER BY MasterPoints DESC) AS INTEGER) as MasterPoint_Rank,
+            CAST(Sessions_Played AS INTEGER) as Sessions_Played,
             ROUND(Par_Suit_Rate * 100, 1) as Par_Suit_Rate_Pct,
-            RANK() OVER (ORDER BY Par_Suit_Rate DESC) as Par_Suit_Rank,
+            CAST(RANK() OVER (ORDER BY Par_Suit_Rate DESC) AS INTEGER) as Par_Suit_Rank,
             ROUND(Par_Contract_Rate * 100, 1) as Par_Contract_Rate_Pct,
-            RANK() OVER (ORDER BY Par_Contract_Rate DESC) as Par_Contract_Rank,
+            CAST(RANK() OVER (ORDER BY Par_Contract_Rate DESC) AS INTEGER) as Par_Contract_Rank,
             ROUND(Sacrifice_Rate * 100, 1) as Sacrifice_Rate_Pct,
-            RANK() OVER (ORDER BY Sacrifice_Rate DESC) as Sacrifice_Rank,
+            CAST(RANK() OVER (ORDER BY Sacrifice_Rate DESC) AS INTEGER) as Sacrifice_Rank,
             ROUND(DD_Tricks_Diff_Avg, 2) as DD_Tricks_Diff_Avg,
-            RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC) as DD_Tricks_Diff_Rank
+            CAST(RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC) AS INTEGER) as DD_Tricks_Diff_Rank
         FROM player_aggregates
         ORDER BY Player_Elo_Score DESC, MasterPoints DESC, Player_ID ASC
         LIMIT {top_n}
@@ -817,21 +818,21 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
             Geo_MPs,
             Sessions,
             Avg_Player_Elo,
-            RANK() OVER (ORDER BY Avg_Player_Elo DESC NULLS LAST) as Avg_Elo_Rank,
-            RANK() OVER (ORDER BY Avg_MPs DESC) as Avg_MPs_Rank,
-            RANK() OVER (ORDER BY Geo_MPs DESC) as Geo_MPs_Rank,
+            CAST(RANK() OVER (ORDER BY Avg_Player_Elo DESC NULLS LAST) AS INTEGER) as Avg_Elo_Rank,
+            CAST(RANK() OVER (ORDER BY Avg_MPs DESC) AS INTEGER) as Avg_MPs_Rank,
+            CAST(RANK() OVER (ORDER BY Geo_MPs DESC) AS INTEGER) as Geo_MPs_Rank,
             Par_Suit_Rate,
-            RANK() OVER (ORDER BY Par_Suit_Rate DESC) as Par_Suit_Rank,
+            CAST(RANK() OVER (ORDER BY Par_Suit_Rate DESC) AS INTEGER) as Par_Suit_Rank,
             Par_Contract_Rate,
-            RANK() OVER (ORDER BY Par_Contract_Rate DESC) as Par_Contract_Rank,
+            CAST(RANK() OVER (ORDER BY Par_Contract_Rate DESC) AS INTEGER) as Par_Contract_Rank,
             Sacrifice_Rate,
-            RANK() OVER (ORDER BY Sacrifice_Rate DESC) as Sacrifice_Rank,
+            CAST(RANK() OVER (ORDER BY Sacrifice_Rate DESC) AS INTEGER) as Sacrifice_Rank,
             DD_Tricks_Diff_Avg,
-            RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC) as DD_Tricks_Diff_Rank
+            CAST(RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC) AS INTEGER) as DD_Tricks_Diff_Rank
         FROM pair_aggregates
     )
     SELECT 
-        ROW_NUMBER() OVER (ORDER BY CAST(Pair_Elo_Score AS INTEGER) DESC, Avg_MPs DESC) as Pair_Elo_Rank,
+        CAST(ROW_NUMBER() OVER (ORDER BY CAST(Pair_Elo_Score AS INTEGER) DESC, Avg_MPs DESC) AS INTEGER) as Pair_Elo_Rank,
         CAST(Pair_Elo_Score AS INTEGER) as Pair_Elo_Score,
         Avg_Elo_Rank,
         Pair_IDs,
@@ -839,7 +840,7 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
         CAST(Avg_MPs AS INTEGER) as Avg_MPs,
         Avg_MPs_Rank,
         Geo_MPs_Rank,
-        Sessions,
+        CAST(Sessions AS INTEGER) as Sessions,
         ROUND(Par_Suit_Rate * 100, 1) as Par_Suit_Rate_Pct,
         Par_Suit_Rank,
         ROUND(Par_Contract_Rate * 100, 1) as Par_Contract_Rate_Pct,
@@ -1644,6 +1645,14 @@ def main():
         elo_rating_type = st.selectbox("Elo rating type", options=elo_options, index=0, 
                                      help="Choose which Elo rating statistic to analyze")
         
+        # Player name filter
+        player_name_filter = st.text_input(
+            "Filter by Player Name",
+            value="",
+            placeholder="Enter name to search...",
+            help="Filter results to show only players whose names contain this text (case-insensitive)"
+        )
+        
         # Date range quick filter (default All time)
         date_range_choice = st.selectbox(
             "Date range",
@@ -1963,7 +1972,7 @@ def main():
             engine_name = "SQL" if use_sql else "Polars"
             
             # Cache the table_df to avoid regenerating on every rerun (e.g., when Execute Query button is clicked)
-            cache_key = f"cached_table_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{elo_rating_type}"
+            cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}"
             
             if cache_key in st.session_state:
                 # Use cached result
@@ -2003,11 +2012,35 @@ def main():
                 else:
                     display_df = table_df
                 
+                # Apply player name filter if provided
+                if player_name_filter.strip():
+                    # Check if Player_Name column exists (for Players reports)
+                    if 'Player_Name' in display_df.columns:
+                        original_count = len(display_df)
+                        display_df = display_df[display_df['Player_Name'].str.contains(player_name_filter, case=False, na=False)]
+                        filtered_count = len(display_df)
+                        st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter}'")
+                    # Check if Pair_Names column exists (for Pairs reports)
+                    elif 'Pair_Names' in display_df.columns:
+                        original_count = len(display_df)
+                        display_df = display_df[display_df['Pair_Names'].str.contains(player_name_filter, case=False, na=False)]
+                        filtered_count = len(display_df)
+                        st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter}'")
+                    else:
+                        st.warning("⚠️ No Player_Name or Pair_Names column found to filter on")
+                
                 # Use AgGrid directly with precise height control for exactly 25 rows
                 from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme
                 
                 gb = GridOptionsBuilder.from_dataframe(display_df)
+                gb.configure_selection(selection_mode='single', use_checkbox=False)  # Enable single row selection
                 gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True, wrapHeaderText=True, autoHeaderHeight=True)
+                
+                # Configure numeric columns for proper sorting
+                for col in display_df.columns:
+                    if pd.api.types.is_numeric_dtype(display_df[col]):
+                        gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
+                
                 # Don't configure pagination - we want scrolling instead
                 gb.configure_side_bar()
                 gridOptions = gb.build()
@@ -2159,7 +2192,7 @@ def main():
         # PDF generation when in PDF mode
         if st.session_state.get('content_mode') == 'pdf':
             # Use the same caching mechanism as Display Table
-            cache_key = f"cached_table_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{elo_rating_type}"
+            cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}"
             
             if cache_key in st.session_state:
                 # Reuse cached dataframe
