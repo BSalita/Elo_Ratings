@@ -1666,7 +1666,9 @@ def main():
             dataset_type = club_or_tournament.lower()
             if dataset_type in st.session_state.all_data:
                 dataset_df = st.session_state.all_data[dataset_type]
-                if "is_online" in dataset_df.columns:
+                # Convert columns to list to avoid mutable borrow error
+                columns_list = list(dataset_df.columns)
+                if "is_online" in columns_list:
                     online_filter = st.selectbox(
                         "Game Type",
                         options=["All", "Local Only", "Online Only"],
