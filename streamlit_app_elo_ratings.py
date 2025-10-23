@@ -195,15 +195,15 @@ def get_elo_column_names(elo_rating_type: str) -> dict:
         }
     elif elo_rating_type == "Rating at Event Start":
         return {
-            "player_pattern": "Elo_R_Player_{pos}_EventStart",  # Elo_R_Player_N_EventStart, etc.
-            "pair_ns": "Elo_R_Pair_NS_EventStart",
-            "pair_ew": "Elo_R_Pair_EW_EventStart"
+            "player_pattern": "Elo_R_{pos}_EventStart",  # Elo_R_N_EventStart, etc.
+            "pair_ns": "Elo_R_NS_EventStart",
+            "pair_ew": "Elo_R_EW_EventStart"
         }
     elif elo_rating_type == "Rating at Event End":
         return {
-            "player_pattern": "Elo_R_Player_{pos}_EventEnd",  # Elo_R_Player_N_EventEnd, etc.
-            "pair_ns": "Elo_R_Pair_NS_EventEnd",
-            "pair_ew": "Elo_R_Pair_EW_EventEnd"
+            "player_pattern": "Elo_R_{pos}_EventEnd",  # Elo_R_N_EventEnd, etc.
+            "pair_ns": "Elo_R_NS_EventEnd",
+            "pair_ew": "Elo_R_EW_EventEnd"
         }
     elif elo_rating_type == "Expected Rating":
         return {
@@ -322,9 +322,9 @@ def show_top_players(df: pl.DataFrame, top_n: int, min_elo_count: int = 30, rati
     top_players = (
         player_aggregates_with_ranks
         .with_columns([
-            pl.col('Elo_R_Player').round(0).cast(pl.Int32, strict=False).alias('Elo_R_Player_Int')
+            pl.col('Elo_R_Player').round(0).cast(pl.Int32, strict=False).alias('Elo_R_Int')
         ])
-        .sort(['Elo_R_Player_Int', 'MasterPoints', 'Player_ID'], descending=[True, True, False])  # Match SQL ROW_NUMBER() ORDER BY
+        .sort(['Elo_R_Int', 'MasterPoints', 'Player_ID'], descending=[True, True, False])  # Match SQL ROW_NUMBER() ORDER BY
         .head(top_n)  # Limit after ranking to preserve correct ranks
         .with_row_index(name='Rank', offset=1)
         .select(['Rank', 'Elo_R_Player', 'Player_ID', 'Player_Name', 'MasterPoints', 'MasterPoint_Rank', 'Elo_Count', 
@@ -710,7 +710,7 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
     else:
         player_elo_n = player_elo_s = player_elo_e = player_elo_w = None
     
-    # Adjust for datasets with alternative pair column naming (e.g., Elo_R_NS vs Elo_R_Pair_NS)
+    # Adjust for datasets with alternative pair column naming (e.g., Elo_R_NS vs Elo_R_NS)
     if available_columns is not None:
         def pick_col(candidates: list[str]) -> str | None:
             for c in candidates:
@@ -718,17 +718,17 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
                     return c
             return None
         if elo_rating_type == "Current Rating (End of Session)":
-            pair_ns_col = pick_col(["Elo_R_NS", "Elo_R_Pair_NS"])  # prefer standard, fallback pair_
-            pair_ew_col = pick_col(["Elo_R_EW", "Elo_R_Pair_EW"])  # prefer standard, fallback pair_
+            pair_ns_col = pick_col(["Elo_R_NS", "Elo_R_NS"])  # prefer standard, fallback pair_
+            pair_ew_col = pick_col(["Elo_R_EW", "Elo_R_EW"])  # prefer standard, fallback pair_
         elif elo_rating_type == "Rating at Start of Session":
-            pair_ns_col = pick_col(["Elo_R_NS_Before", "Elo_R_Pair_NS_Before"])  # if exists
-            pair_ew_col = pick_col(["Elo_R_EW_Before", "Elo_R_Pair_EW_Before"])  # if exists
+            pair_ns_col = pick_col(["Elo_R_NS_Before", "Elo_R_NS_Before"])  # if exists
+            pair_ew_col = pick_col(["Elo_R_EW_Before", "Elo_R_EW_Before"])  # if exists
         elif elo_rating_type == "Rating at Event Start":
-            pair_ns_col = pick_col(["Elo_R_Pair_NS_EventStart", "Elo_R_NS_EventStart"])  # prefer explicit pair naming
-            pair_ew_col = pick_col(["Elo_R_Pair_EW_EventStart", "Elo_R_EW_EventStart"])  # prefer explicit pair naming
+            pair_ns_col = pick_col(["Elo_R_NS_EventStart", "Elo_R_NS_EventStart"])  # prefer explicit pair naming
+            pair_ew_col = pick_col(["Elo_R_EW_EventStart", "Elo_R_EW_EventStart"])  # prefer explicit pair naming
         elif elo_rating_type == "Rating at Event End":
-            pair_ns_col = pick_col(["Elo_R_Pair_NS_EventEnd", "Elo_R_NS_EventEnd"])  # prefer explicit pair naming
-            pair_ew_col = pick_col(["Elo_R_Pair_EW_EventEnd", "Elo_R_EW_EventEnd"])  # prefer explicit pair naming
+            pair_ns_col = pick_col(["Elo_R_NS_EventEnd", "Elo_R_NS_EventEnd"])  # prefer explicit pair naming
+            pair_ew_col = pick_col(["Elo_R_EW_EventEnd", "Elo_R_EW_EventEnd"])  # prefer explicit pair naming
         else:
             pair_ns_col = pick_col([elo_columns["pair_ns"]])
             pair_ew_col = pick_col([elo_columns["pair_ew"]])
@@ -1204,11 +1204,11 @@ def run_comprehensive_comparison(all_data: dict, top_n: int = 100, min_sessions:
                         # Apply online filter if it exists in session state
                         online_filter = st.session_state.get('online_filter', 'All')
                         if online_filter == "Local Only":
-                            if "is_online" in df_use.columns:
-                                df_use = df_use.filter(pl.col("is_online") != 1)
+                            if "is_virtual_game" in df_use.columns:
+                                df_use = df_use.filter(pl.col("is_virtual_game") != 1)
                         elif online_filter == "Online Only":
-                            if "is_online" in df_use.columns:
-                                df_use = df_use.filter(pl.col("is_online") == 1)
+                            if "is_virtual_game" in df_use.columns:
+                                df_use = df_use.filter(pl.col("is_virtual_game") == 1)
                         
                         # Run Polars implementation with timing
                         polars_start = time.time()
@@ -1613,12 +1613,12 @@ def main():
     # -------------------------------
 
     with st.sidebar:
-        st.header("Controls")
-        club_or_tournament = st.selectbox("Dataset", options=["Club", "Tournament"], index=0)
+        st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
+        club_or_tournament = st.selectbox("Event type", options=["Club", "Tournament"], index=0)
         rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=False)
-        top_n = st.number_input("Top N", min_value=50, max_value=5000, value=1000, step=50)
+        top_n = st.number_input("Top N players or pairs", min_value=50, max_value=5000, value=1000, step=50)
         min_sessions = st.number_input("Minimum sessions played", min_value=1, max_value=200, value=30, step=1)
-        rating_method = st.selectbox("Rating method", options=["Avg", "Max", "Latest"], index=0)
+        rating_method = st.selectbox("Elo Rating statistic", options=["Avg", "Max", "Latest"], index=0)
         
         # Moving average days - not used anymore (Moving Avg disabled due to memory issues)
         moving_avg_days = 10  # Default value
@@ -1642,15 +1642,22 @@ def main():
                 "Expected Rating"
             ]
         
-        elo_rating_type = st.selectbox("Elo rating type", options=elo_options, index=0, 
-                                     help="Choose which Elo rating statistic to analyze")
+        elo_rating_type = st.selectbox("Elo rating moment", options=elo_options, index=0, 
+                                     help="Choose timing of Elo analysis")
         
-        # Player name filter
+        # Player name filter (use a stable session key to avoid rerun inconsistencies)
+        def _on_player_name_enter():
+            # Mimic clicking "Display Table" when ENTER is pressed in the name box
+            st.session_state.show_main_content = True
+            st.session_state.content_mode = 'table'
+
         player_name_filter = st.text_input(
             "Filter by Player Name",
-            value="",
+            value=st.session_state.get("player_name_filter", ""),
             placeholder="Enter name to search...",
-            help="Filter results to show only players whose names contain this text (case-insensitive)"
+            help="Filter results to show only players whose names contain this text (case-insensitive)",
+            key="player_name_filter",
+            on_change=_on_player_name_enter
         )
         
         # Date range quick filter (default All time)
@@ -1660,22 +1667,29 @@ def main():
             index=0,
         )
         
-        # Is Online filter - only show if data is loaded and has is_online column
+        # Is Online filter - only show if data is loaded and has any online games
         online_filter = "All"  # Default value
         if 'all_data' in st.session_state:
             dataset_type = club_or_tournament.lower()
             if dataset_type in st.session_state.all_data:
-                # Use try-except to safely check for is_online column without mutable borrow error
                 try:
                     dataset_df = st.session_state.all_data[dataset_type]
-                    # Try to access the column - if it exists, show the selectbox
-                    if hasattr(dataset_df, 'select') and 'is_online' in dataset_df.schema:
-                        online_filter = st.selectbox(
-                            "Game Type",
-                            options=["All", "Local Only", "Online Only"],
-                            index=0,
-                            help="Filter by game type: Local (in-person), Online (virtual), or All games"
-                        )
+                    if hasattr(dataset_df, 'select') and 'is_virtual_game' in dataset_df.schema:
+                        # Show selectbox only if there exists at least one online game (is_virtual_game == 1/True)
+                        try:
+                            max_df = dataset_df.select(
+                                pl.col("is_virtual_game").cast(pl.Int8).max().alias("m")
+                            )
+                            has_online = bool(max_df["m"][0] or 0)
+                        except Exception:
+                            has_online = False
+                        if has_online:
+                            online_filter = st.selectbox(
+                                "Game Type",
+                                options=["All", "Local Only", "Online Only"],
+                                index=0,
+                                help="Filter by game type: Local (in-person), Online (virtual), or All games"
+                            )
                 except (RuntimeError, AttributeError, KeyError):
                     # If any error occurs, just use default "All"
                     pass
@@ -1918,24 +1932,23 @@ def main():
         
         # Apply online filter if specified
         if online_filter == "Local Only":
-            # Local games: exclude rows where is_online = 1
-            if "is_online" in df.columns:
-                df = df.filter(pl.col("is_online") != 1)
+            # Local games: exclude rows where is_virtual_game = 1
+            if "is_virtual_game" in df.columns:
+                df = df.filter(pl.col("is_virtual_game") != 1)
         elif online_filter == "Online Only":
-            # Online games: include only rows where is_online = 1
-            if "is_online" in df.columns:
-                df = df.filter(pl.col("is_online") == 1)
+            # Online games: include only rows where is_virtual_game = 1
+            if "is_virtual_game" in df.columns:
+                df = df.filter(pl.col("is_virtual_game") == 1)
         # For "All", no filtering is applied
         
         # Store online filter in session state for comprehensive comparison
         st.session_state.online_filter = online_filter
         
-        st.info(f"✅ Using {dataset_type} dataset with {len(df):,} rows ({online_filter.lower()} games)")
+        # Avoid computing len(df) which can be expensive on large datasets
+        st.info(f"✅ Using {dataset_type} dataset ({online_filter.lower()} games)")
         
-        # Store current dataset type and register with DuckDB for SQL queries
+        # Store current dataset type
         st.session_state.current_dataset_type = dataset_type
-        con = get_db_connection()
-        con.register('self', df)
 
         # Compute date range for captions
         try:
@@ -1944,13 +1957,19 @@ def main():
         except Exception:
             date_range = ""
 
+        # Prepare column names before any external registration to avoid borrow issues
+        try:
+            df_columns = set(df.schema.keys())
+        except Exception:
+            df_columns = set(df.columns)
+
         # Generate SQL query based on report type
         if rating_type == "Players":
-            generated_sql = generate_top_players_sql(int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type, set(df.columns))
+            generated_sql = generate_top_players_sql(int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type, df_columns)
             method_desc = f"{rating_method} method"
             title = f"Top {top_n} ACBL {club_or_tournament} Players by {elo_rating_type} ({method_desc})"
         elif rating_type == "Pairs":
-            generated_sql = generate_top_pairs_sql(int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type, set(df.columns))
+            generated_sql = generate_top_pairs_sql(int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type, df_columns)
             method_desc = f"{rating_method} method"
             title = f"Top {top_n} ACBL {club_or_tournament} Pairs by {elo_rating_type} ({method_desc})"
         else:
@@ -2018,20 +2037,21 @@ def main():
                 else:
                     display_df = table_df
                 
-                # Apply player name filter if provided
-                if player_name_filter.strip():
+                # Apply player name filter if provided (read from session to handle button click reruns)
+                player_name_filter_value = st.session_state.get('player_name_filter', '').strip()
+                if player_name_filter_value:
                     # Check if Player_Name column exists (for Players reports)
                     if 'Player_Name' in display_df.columns:
                         original_count = len(display_df)
-                        display_df = display_df[display_df['Player_Name'].str.contains(player_name_filter, case=False, na=False)]
+                        display_df = display_df[display_df['Player_Name'].str.contains(player_name_filter_value, case=False, na=False)]
                         filtered_count = len(display_df)
-                        st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter}'")
+                        st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter_value}'")
                     # Check if Pair_Names column exists (for Pairs reports)
                     elif 'Pair_Names' in display_df.columns:
                         original_count = len(display_df)
-                        display_df = display_df[display_df['Pair_Names'].str.contains(player_name_filter, case=False, na=False)]
+                        display_df = display_df[display_df['Pair_Names'].str.contains(player_name_filter_value, case=False, na=False)]
                         filtered_count = len(display_df)
-                        st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter}'")
+                        st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter_value}'")
                     else:
                         st.warning("⚠️ No Player_Name or Pair_Names column found to filter on")
                 
@@ -2051,15 +2071,26 @@ def main():
                 gb.configure_side_bar()
                 gridOptions = gb.build()
                 
-                # Configure for scrolling with fixed height
+                # Configure for scrolling with adjustable height
                 gridOptions['rowHeight'] = 28
                 gridOptions['suppressPaginationPanel'] = True
-                gridOptions['alwaysShowVerticalScroll'] = True  # Force vertical scrollbar
                 gridOptions['suppressHorizontalScroll'] = False  # Allow horizontal scrollbar if needed
                 gridOptions['domLayout'] = 'normal'  # Use normal layout (not autoHeight)
-                
-                # Calculate height for exactly 25 rows: header(50) + 25*row_height(28) + scrollbar(20)
-                exact_height = 50 + 25 * 28 + 20  # = 770px
+
+                # Dynamically size height: show up to 25 rows; if fewer, shrink to fit
+                header_height = 50
+                row_height = gridOptions['rowHeight']
+                max_rows_visible = 25
+                total_rows = len(display_df)
+                visible_rows = max(1, min(total_rows, max_rows_visible))
+                if total_rows <= max_rows_visible:
+                    # No vertical scrollbar needed; fit exactly to number of rows
+                    gridOptions['alwaysShowVerticalScroll'] = False
+                    exact_height = header_height + visible_rows * row_height + 20
+                else:
+                    # Use fixed height with vertical scrollbar
+                    gridOptions['alwaysShowVerticalScroll'] = True
+                    exact_height = header_height + max_rows_visible * row_height + 20
                 
                 # Custom CSS to ensure scrollbars are visible
                 custom_css = {
