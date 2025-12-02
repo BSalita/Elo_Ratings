@@ -1,3 +1,8 @@
+# streamlit_app_elo_ratings.py
+
+# Previous steps:
+# acbl/acbl_elo_ratings_create.py
+
 import os
 import pathlib
 import sys
@@ -17,6 +22,56 @@ from streamlitlib.streamlitlib import (
     stick_it_good,
     widen_scrollbars,
 )
+
+# -------------------------------
+# Masterpoints Range - Single Source of Truth
+# -------------------------------
+# Define ranges once and derive labels from bounds
+MASTERPOINT_RANGES = [
+    (0, 5),
+    (5, 20),
+    (20, 50),
+    (50, 100),
+    (100, 200),
+    (200, 300),
+    (300, 500),
+    (500, 750),
+    (750, 1000),
+    (1000, 1500),
+    (1500, 2500),
+    (2500, 3500),
+    (3500, 5000),
+    (5000, 7500),
+    (7500, 10000),
+    (10000, None),
+]
+
+def format_masterpoints_label(lower: float | int, upper: float | int | None) -> str:
+    """Build a human-readable label from bounds."""
+    if upper is None:
+        return f"{int(lower)}+"
+    return f"{int(lower)}-{int(upper)}"
+
+def get_masterpoints_bounds(range_label: str) -> tuple[float | None, float | None]:
+    """Return (lower, upper) bounds for the given range label. 'All' -> (None, None)."""
+    if not range_label or range_label == "All":
+        return (None, None)
+    for lo, hi in MASTERPOINT_RANGES:
+        if format_masterpoints_label(lo, hi) == range_label:
+            return (lo, hi)
+    return (None, None)
+
+def apply_masterpoints_filter_polars(df: pl.DataFrame, range_label: str) -> pl.DataFrame:
+    """Filter Polars DataFrame by MasterPoints according to range_label."""
+    lower, upper = get_masterpoints_bounds(range_label)
+    if ('MasterPoints' not in df.columns) or (lower is None and upper is None):
+        return df
+    mp_col = pl.col('MasterPoints').cast(pl.Float64)
+    if upper is None:
+        return df.filter(mp_col >= lower)
+    return df.filter((mp_col >= lower) & (mp_col < upper))
+
+ # No pandas fallback: filtering is standardized on Polars only
 
 # -------------------------------
 # Config / Paths
@@ -1694,6 +1749,17 @@ def main():
                     # If any error occurs, just use default "All"
                     pass
         
+        # Masterpoints range filter (Players only)
+        masterpoints_filter = "All"
+        if rating_type == "Players":
+            masterpoints_filter = st.selectbox(
+                "Masterpoints Range",
+                options=["All"] + [format_masterpoints_label(lo, hi) for (lo, hi) in MASTERPOINT_RANGES],
+                index=0,
+                help="Filter players by ACBL MasterPoints range"
+            )
+        st.session_state.masterpoints_filter = masterpoints_filter
+        
         display_table = st.button("Display Table", type="primary")
         generate_pdf = st.button("Generate PDF", type="primary")
         
@@ -1997,7 +2063,7 @@ def main():
             engine_name = "SQL" if use_sql else "Polars"
             
             # Cache the table_df to avoid regenerating on every rerun (e.g., when Execute Query button is clicked)
-            cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}"
+            cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}_{st.session_state.get('masterpoints_filter','All')}"
             
             if cache_key in st.session_state:
                 # Use cached result
@@ -2030,30 +2096,50 @@ def main():
             # Display results with exactly 25 viewable rows (common for both paths)
             if 'table_df' in locals():
                 st.markdown("### 📊 Query Results")
-                
-                # Convert to pandas for AgGrid
-                if hasattr(table_df, 'to_pandas'):
-                    display_df = table_df.to_pandas()
-                else:
-                    display_df = table_df
-                
+                # Standardize on Polars for filtering; convert to pandas only right before AgGrid
+                work_df = table_df
+                try:
+                    if not hasattr(work_df, 'select'):
+                        # Convert pandas -> Polars if needed
+                        work_df = pl.from_pandas(work_df)
+                except Exception:
+                    pass
                 # Apply player name filter if provided (read from session to handle button click reruns)
                 player_name_filter_value = st.session_state.get('player_name_filter', '').strip()
                 if player_name_filter_value:
-                    # Check if Player_Name column exists (for Players reports)
-                    if 'Player_Name' in display_df.columns:
-                        original_count = len(display_df)
-                        display_df = display_df[display_df['Player_Name'].str.contains(player_name_filter_value, case=False, na=False)]
-                        filtered_count = len(display_df)
-                        st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter_value}'")
-                    # Check if Pair_Names column exists (for Pairs reports)
-                    elif 'Pair_Names' in display_df.columns:
-                        original_count = len(display_df)
-                        display_df = display_df[display_df['Pair_Names'].str.contains(player_name_filter_value, case=False, na=False)]
-                        filtered_count = len(display_df)
-                        st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter_value}'")
-                    else:
-                        st.warning("⚠️ No Player_Name or Pair_Names column found to filter on")
+                    try:
+                        if hasattr(work_df, 'select'):  # Polars DataFrame
+                            import re
+                            pattern = '(?i)' + re.escape(player_name_filter_value)
+                            original_count = len(work_df)
+                            if 'Player_Name' in work_df.columns:
+                                work_df = work_df.filter(pl.col('Player_Name').cast(pl.Utf8).str.contains(pattern, literal=False))
+                                filtered_count = len(work_df)
+                                st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter_value}'")
+                            elif 'Pair_Names' in work_df.columns:
+                                work_df = work_df.filter(pl.col('Pair_Names').cast(pl.Utf8).str.contains(pattern, literal=False))
+                                filtered_count = len(work_df)
+                                st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter_value}'")
+                            else:
+                                st.warning("⚠️ No Player_Name or Pair_Names column found to filter on")
+                    except Exception:
+                        pass
+                
+                # Apply Masterpoints range filter for Players view
+                if rating_type == "Players":
+                    mp_filter_label = st.session_state.get('masterpoints_filter', 'All')
+                    if mp_filter_label != "All":
+                        try:
+                            original_count = len(work_df)
+                            work_df = apply_masterpoints_filter_polars(work_df, mp_filter_label)
+                            filtered_count = len(work_df)
+                            st.info(f"🎯 Masterpoints {mp_filter_label}: {filtered_count} of {original_count} players")
+                        except Exception:
+                            pass
+                
+                # Convert to pandas for AgGrid
+                # Convert to pandas for AgGrid rendering
+                display_df = work_df.to_pandas()
                 
                 # Use AgGrid directly with precise height control for exactly 25 rows
                 from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme
@@ -2229,7 +2315,7 @@ def main():
         # PDF generation when in PDF mode
         if st.session_state.get('content_mode') == 'pdf':
             # Use the same caching mechanism as Display Table
-            cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}"
+            cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}_{st.session_state.get('masterpoints_filter','All')}"
             
             if cache_key in st.session_state:
                 # Reuse cached dataframe
@@ -2267,6 +2353,17 @@ def main():
             pdf_filename = f"Unofficial Elo Scores for ACBL {club_or_tournament} MatchPoint Games - Top {top_n} {rating_type} {created_on}.pdf"
             # Generate PDF
             try:
+                # Apply Masterpoints range filter to table_df for Players PDF if requested
+                if rating_type == "Players":
+                    mp_filter_label = st.session_state.get('masterpoints_filter', 'All')
+                    if mp_filter_label != "All":
+                        try:
+                            if not hasattr(table_df, 'select'):
+                                # Ensure Polars for filtering
+                                table_df = pl.from_pandas(table_df)
+                            table_df = apply_masterpoints_filter_polars(table_df, mp_filter_label)
+                        except Exception:
+                            pass
                 # Enable shrink_to_fit for both Player and Pair reports to prevent truncation
                 # really want title, from date to be centered with reduced line spacing between them.
                 pdf_bytes = create_pdf([f"## {title}", f"### From {date_range}", "### Created by https://elo.7nt.info", table_df], title, max_rows=int(top_n), max_cols=None, rows_per_page=(21, 28), shrink_to_fit=True)
