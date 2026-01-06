@@ -651,7 +651,7 @@ def initialize_session_state():
 # -------------------------------
 def main():
     st.set_page_config(
-        page_title="FFBridge Elo Ratings (Lancelot API) Proof of Concept",
+        page_title="Unofficial FFBridge Elo Ratings",
         page_icon="🃏",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -838,7 +838,7 @@ def main():
     st.markdown(f"""
         <div style="text-align: center; padding: 0 0 1rem 0; margin-top: -2rem;">
             <h1 style="font-size: 2.5rem; margin-bottom: 0.2rem;">
-                🃏 Unofficial FFBridge Elo Ratings (Lancelot API)
+                🃏 Unofficial FFBridge Elo Ratings (Lancelot API) Proof of Concept
             </h1>
             <p style="color: #ffc107; font-size: 1.2rem; font-weight: 500; opacity: 0.9;">
                 Extended Historical Data • "{selected_tournament_label}"
@@ -1019,7 +1019,7 @@ def main():
     if generate_pdf:
         if 'display_df' in st.session_state and not st.session_state.display_df.is_empty():
             with st.spinner("Preparing PDF export..."):
-                title = st.session_state.get('report_title', 'FFBridge Elo Ratings (Lancelot)')
+                title = st.session_state.get('report_title', 'Unofficial FFBridge Elo Ratings (Lancelot API)')
                 pdf_bytes = create_pdf(
                     [f"# {title}\n\nProcessed on {datetime.now().strftime('%Y-%m-%d %H:%M')}", 
                      st.session_state.display_df],

@@ -843,7 +843,7 @@ def initialize_session_state():
 # -------------------------------
 def main():
     st.set_page_config(
-        page_title="FFBridge Elo Ratings",
+        page_title="Unofficial FFBridge Elo Ratings Playground",
         page_icon="🃏",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -1291,7 +1291,7 @@ def main():
     if generate_pdf:
         if 'display_df' in st.session_state and not st.session_state.display_df.is_empty():
             with st.spinner("Preparing PDF export..."):
-                title = st.session_state.get('report_title', 'FFBridge Elo Ratings')
+                title = st.session_state.get('report_title', 'Unofficial FFBridge Elo Ratings')
                 pdf_bytes = create_pdf(
                     [f"# {title}\n\nProcessed on {datetime.now().strftime('%Y-%m-%d %H:%M')}", 
                      st.session_state.display_df],
