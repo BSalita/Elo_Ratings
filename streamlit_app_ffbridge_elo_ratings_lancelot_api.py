@@ -413,7 +413,8 @@ def fetch_all_available_series() -> List[Dict[str, Any]]:
 def process_sessions_to_elo(
     sessions: List[Dict[str, Any]],
     series_id: int,
-    initial_players: Optional[Dict[str, Dict]] = None
+    initial_players: Optional[Dict[str, Dict]] = None,
+    use_handicap: bool = False,
 ) -> Tuple[pl.DataFrame, pl.DataFrame, Dict[str, float]]:
     """
     Process session list and calculate Elo ratings from Lancelot API data.
@@ -541,8 +542,17 @@ def process_sessions_to_elo(
             p2_id = result.get('player2_id')
             p1_name = result.get('player1_name', '')
             p2_name = result.get('player2_name', '')
-            percentage = result.get('percentage', 50.0)
-            rank = result.get('rank', 0)
+            club_pct = float(result.get('percentage', 50.0) or 50.0)
+            handicap_pct_raw = result.get('handicap_percentage')
+            try:
+                handicap_pct = float(handicap_pct_raw) if handicap_pct_raw is not None else None
+            except (ValueError, TypeError):
+                handicap_pct = None
+            percentage = handicap_pct if use_handicap and handicap_pct is not None else club_pct
+
+            rank_with_handicap = result.get('rank', 0)
+            rank_without_handicap = result.get('rank_without_handicap')
+            rank = rank_with_handicap if use_handicap else (rank_without_handicap if rank_without_handicap is not None else rank_with_handicap)
             
             # Create stable pair identification
             if p1_id and p2_id:
@@ -570,6 +580,8 @@ def process_sessions_to_elo(
                 'player2_name': str(p2_name),
                 'pair_name': str(pair_name),
                 'percentage': float(percentage),
+                'club_percentage': float(club_pct),
+                'handicap_percentage': handicap_pct,
                 'rank': int(rank) if rank is not None else 0,
                 'pe': float(result.get('pe', 0) or 0),
                 'pe_bonus': float(result.get('pe_bonus', 0) or 0),
@@ -917,6 +929,13 @@ def main():
             horizontal=True,
             help="Switch between individual and partnership rankings"
         )
+
+        # Handicap score option (controls whether we use handicap-adjusted % when available)
+        use_handicap = st.checkbox(
+            "Use handicap score",
+            value=True,
+            help="If available in the API data, uses handicap-adjusted percentage (otherwise uses club percentage)."
+        )
         
         # Number of results
         top_n = st.slider(
@@ -983,7 +1002,7 @@ def main():
     all_sessions.sort(key=lambda x: x.get('date', ''))
     
     # Create a cache key based on current selection
-    cache_key = f"lancelot_processed_{selected_series}_{len(all_sessions)}"
+    cache_key = f"lancelot_processed_{selected_series}_{len(all_sessions)}_handicap_{int(use_handicap)}"
     
     # Check if we have cached results for this selection
     if (st.session_state.get('lancelot_cache_key') == cache_key and 
@@ -998,7 +1017,8 @@ def main():
         results_df, players_df, current_ratings = process_sessions_to_elo(
             all_sessions,
             series_id=selected_series if selected_series != "all" else 3,  # Default for 'all'
-            initial_players=None
+            initial_players=None,
+            use_handicap=use_handicap,
         )
         # Cache results
         st.session_state.lancelot_cache_key = cache_key

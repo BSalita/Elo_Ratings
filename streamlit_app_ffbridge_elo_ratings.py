@@ -529,6 +529,30 @@ def fetch_tournament_results_with_session(session: Optional[requests.Session], t
                                 pct = float(team.get('percent', 0))
                             except (ValueError, TypeError):
                                 pct = 0.0
+
+                            # Handicap-adjusted percentage (field name varies by endpoint/version)
+                            handicap_pct_raw = None
+                            for k in (
+                                "handicapPercent",
+                                "handicap_percent",
+                                "handicapPercentage",
+                                "theoretical_percent",
+                                "theoreticalPercent",
+                                "theoretical_percentage",
+                                "theoreticalPercentage",
+                                "percentHandicap",
+                                "percent_handicap",
+                                "percentTheoretical",
+                                "percent_theoretical",
+                            ):
+                                v = team.get(k)
+                                if v is not None and v != "":
+                                    handicap_pct_raw = v
+                                    break
+                            try:
+                                handicap_pct = float(handicap_pct_raw) if handicap_pct_raw is not None else None
+                            except (ValueError, TypeError):
+                                handicap_pct = None
                                 
                             results.append({
                                 'team_id': str(team.get('id')),  # For roadsheets API
@@ -538,6 +562,7 @@ def fetch_tournament_results_with_session(session: Optional[requests.Session], t
                                 'player1_name': f"{p1.get('firstname', '')} {p1.get('lastname', '')}".strip(),
                                 'player2_name': f"{p2.get('firstname', '')} {p2.get('lastname', '')}".strip(),
                                 'percentage': pct,
+                                'handicap_percentage': handicap_pct,
                                 'rank': team.get('ranking', 0),
                                 'theoretical_rank': team.get('theoretical_ranking', 0),  # Handicap rank
                                 'pe': team.get('PE', 0),  # Performance points
@@ -575,7 +600,8 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", _ses
 # -------------------------------
 def process_tournaments_to_elo(
     tournaments: List[Dict[str, Any]],
-    initial_players: Optional[Dict[str, Dict]] = None
+    initial_players: Optional[Dict[str, Dict]] = None,
+    use_handicap: bool = False,
 ) -> Tuple[pl.DataFrame, pl.DataFrame, Dict[str, float]]:
     """
     Process tournament list and calculate Elo ratings.
@@ -666,9 +692,18 @@ def process_tournaments_to_elo(
             p2_id = result.get('player2_id')
             p1_name = result.get('player1_name', '')
             p2_name = result.get('player2_name', '')
-            percentage = result.get('percentage', 50.0)
-            rank = result.get('rank', 0)
-            theoretical_rank = result.get('theoretical_rank', 0)  # Handicap rank
+            club_pct = float(result.get('percentage', 50.0) or 50.0)
+            handicap_pct_raw = result.get('handicap_percentage')
+            try:
+                handicap_pct = float(handicap_pct_raw) if handicap_pct_raw is not None else None
+            except (ValueError, TypeError):
+                handicap_pct = None
+            percentage = handicap_pct if use_handicap and handicap_pct is not None else club_pct
+
+            rank_club = result.get('rank', 0)
+            rank_handicap = result.get('theoretical_rank', 0)  # Handicap rank
+            rank = rank_handicap if use_handicap and rank_handicap is not None else rank_club
+            theoretical_rank = rank_handicap
             team_id = result.get('team_id', '')  # For roadsheets
             pe = result.get('pe', 0)
             pe_bonus = result.get('pe_bonus', '0')
@@ -703,7 +738,10 @@ def process_tournaments_to_elo(
                 'player2_name': str(p2_name),
                 'pair_name': str(pair_name),
                 'percentage': float(percentage),
+                'club_percentage': float(club_pct),
+                'handicap_percentage': handicap_pct,
                 'rank': int(rank) if rank is not None else 0,
+                'rank_without_handicap': int(rank_club) if rank_club is not None else 0,
                 'theoretical_rank': int(theoretical_rank) if theoretical_rank is not None else 0,
                 'pe': float(pe) if pe is not None else 0.0,
                 'pe_bonus': str(pe_bonus) if pe_bonus is not None else '',
@@ -1050,11 +1088,11 @@ def main():
             help="Switch between individual and partnership rankings"
         )
         
-        # Handicap score option (placeholder - not yet implemented)
+        # Handicap score option (controls whether we use handicap-adjusted % when available)
         use_handicap = st.checkbox(
             "Use handicap score",
             value=True,
-            help="Use handicap-adjusted scores for Elo calculations (not yet implemented)"
+            help="If available in the API data, uses handicap-adjusted percentage (otherwise uses club percentage)."
         )
         
         # Number of results
@@ -1106,7 +1144,7 @@ def main():
             return
 
     # Create a cache key based on current selection
-    cache_key = f"ffbridge_processed_{simultaneous_type}_{len(tournaments)}"
+    cache_key = f"ffbridge_processed_{simultaneous_type}_{len(tournaments)}_handicap_{int(use_handicap)}"
     
     # Check if we have cached results for this selection
     if (st.session_state.get('ffbridge_cache_key') == cache_key and 
@@ -1120,7 +1158,7 @@ def main():
         # Process tournaments and calculate Elo
         # Note: process_tournaments_to_elo handles individual tournament fetching and disk caching
         results_df, players_df, current_ratings = process_tournaments_to_elo(
-            tournaments, initial_players=None
+            tournaments, initial_players=None, use_handicap=use_handicap
         )
         # Cache results
         st.session_state.ffbridge_cache_key = cache_key
