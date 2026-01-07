@@ -13,6 +13,7 @@ import pathlib
 import sys
 import json
 import hashlib
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict, Any
@@ -30,7 +31,6 @@ load_dotenv()
 from streamlitlib.streamlitlib import (
     ShowDataFrameTable,
     create_pdf,
-    stick_it_good,
     widen_scrollbars,
 )
 from st_aggrid import GridOptionsBuilder, AgGrid, ColumnsAutoSizeMode, AgGridTheme, JsCode
@@ -86,8 +86,6 @@ AGGRID_MAX_DISPLAY_ROWS = 10
 # -------------------------------
 def get_cache_path(identifier: str, params: Optional[Dict] = None, series_id: Optional[Any] = None) -> pathlib.Path:
     """Generate a readable, unique filename in a series-specific subdirectory."""
-    import re
-    
     # Determine the subdirectory based on series_id (friendly name)
     series_folder = SERIES_NAMES.get(series_id, "General")
     target_dir = CACHE_DIR / series_folder
@@ -479,8 +477,6 @@ def fetch_tournament_results_with_session(session: Optional[requests.Session], t
     Returns:
         Tuple of (results dict or None, was_cached bool)
     """
-    import re
-    
     # Create friendly filename: results_<tournament_id>_<date>
     date_match = re.search(r'(\d{4}-\d{2}-\d{2})', tournament_date)
     date_part = date_match.group(1) if date_match else ""
@@ -616,7 +612,6 @@ def process_tournaments_to_elo(
     cache_stats = {"cached": 0, "fetched": 0}
     
     # Filter out future tournaments
-    from datetime import datetime
     today = datetime.now().strftime('%Y-%m-%d')
     sorted_tournaments = [t for t in sorted_tournaments if t.get('date', '')[:10] <= today]
     
@@ -691,26 +686,26 @@ def process_tournaments_to_elo(
                 pair_id = result.get('pair_id') or f"{p1_id}-{p2_id}"
                 pair_name = f"{p1_name} - {p2_name}"
 
-            # Store result
+            # Store result with explicit type conversion
             result_record = {
-                'tournament_id': t_id,
-                'tournament_name': t_name,
-                'date': t_date,
-                'team_id': team_id,
-                'pair_id': pair_id,
-                'player1_id': p1_id,
-                'player2_id': p2_id,
-                'player1_name': p1_name,
-                'player2_name': p2_name,
-                'pair_name': pair_name,
-                'percentage': percentage,
-                'rank': rank,
-                'theoretical_rank': theoretical_rank,
-                'pe': pe,
-                'pe_bonus': pe_bonus,
-                'field_avg_rating': field_avg,
-                'club_id': club_id,
-                'club_name': club_name,
+                'tournament_id': str(t_id),
+                'tournament_name': str(t_name),
+                'date': str(t_date),
+                'team_id': str(team_id),
+                'pair_id': str(pair_id),
+                'player1_id': str(p1_id),
+                'player2_id': str(p2_id),
+                'player1_name': str(p1_name),
+                'player2_name': str(p2_name),
+                'pair_name': str(pair_name),
+                'percentage': float(percentage),
+                'rank': int(rank) if rank is not None else 0,
+                'theoretical_rank': int(theoretical_rank) if theoretical_rank is not None else 0,
+                'pe': float(pe) if pe is not None else 0.0,
+                'pe_bonus': str(pe_bonus) if pe_bonus is not None else '',
+                'field_avg_rating': float(field_avg),
+                'club_id': str(club_id),
+                'club_name': str(club_name),
             }
             
             # Update player 1 rating
@@ -746,17 +741,26 @@ def process_tournaments_to_elo(
     # Convert to DataFrames
     results_df = pl.DataFrame(all_results) if all_results else pl.DataFrame()
     
-    # Create player ratings summary
+    # Create player ratings summary with explicit type conversion
     player_summary = []
     for pid, rating in player_ratings.items():
         player_summary.append({
-            'player_id': pid,
-            'player_name': player_names.get(pid, pid),
-            'elo_rating': round(rating, 1),
-            'games_played': player_games.get(pid, 0)
+            'player_id': str(pid),
+            'player_name': str(player_names.get(pid, pid)),
+            'elo_rating': float(round(rating, 1)),
+            'games_played': int(player_games.get(pid, 0))
         })
     
-    players_df = pl.DataFrame(player_summary) if player_summary else pl.DataFrame()
+    # Create DataFrame with explicit schema to avoid type inference issues
+    if player_summary:
+        players_df = pl.DataFrame(player_summary, schema={
+            'player_id': pl.Utf8,
+            'player_name': pl.Utf8,
+            'elo_rating': pl.Float64,
+            'games_played': pl.Int64
+        })
+    else:
+        players_df = pl.DataFrame()
     
     return results_df, players_df, player_ratings
 
@@ -994,6 +998,7 @@ def main():
             "Filter by Club",
             options=club_options,
             index=0,
+            key="ffbridge_selected_club",
             help="Filter results to show only players/pairs from a specific club"
         )
         
@@ -1061,20 +1066,42 @@ def main():
             st.error("Failed to retrieve tournament data from FFBridge. Please verify your token.")
             return
 
-    # Process tournaments and calculate Elo
-    # Note: process_tournaments_to_elo handles individual tournament fetching and disk caching
-    results_df, players_df, current_ratings = process_tournaments_to_elo(
-        tournaments, initial_players=None
-    )
+    # Create a cache key based on current selection
+    cache_key = f"ffbridge_processed_{simultaneous_type}_{len(tournaments)}"
+    
+    # Check if we have cached results for this selection
+    if (st.session_state.get('ffbridge_cache_key') == cache_key and 
+        'ffbridge_results_df' in st.session_state and
+        'ffbridge_players_df' in st.session_state):
+        # Use cached results
+        results_df = st.session_state.ffbridge_results_df
+        players_df = st.session_state.ffbridge_players_df
+        current_ratings = st.session_state.get('ffbridge_current_ratings', {})
+    else:
+        # Process tournaments and calculate Elo
+        # Note: process_tournaments_to_elo handles individual tournament fetching and disk caching
+        results_df, players_df, current_ratings = process_tournaments_to_elo(
+            tournaments, initial_players=None
+        )
+        # Cache results
+        st.session_state.ffbridge_cache_key = cache_key
+        st.session_state.ffbridge_results_df = results_df
+        st.session_state.ffbridge_players_df = players_df
+        st.session_state.ffbridge_current_ratings = current_ratings
     
     # Update available clubs in session state for the filter dropdown
-    # Only update once per data load to avoid double-processing
     if not results_df.is_empty() and 'club_name' in results_df.columns:
         unique_clubs = sorted(set(results_df.select('club_name').to_series().to_list()))
         unique_clubs = [c for c in unique_clubs if c and c.strip()]  # Remove empty/whitespace strings
         new_clubs = ["All Clubs"] + unique_clubs
-        # Update clubs list (no rerun needed - will be available on next interaction)
-        st.session_state.available_clubs = new_clubs
+        old_clubs = st.session_state.get('available_clubs', ["All Clubs"])
+        if new_clubs != old_clubs:
+            st.session_state.available_clubs = new_clubs
+            if st.session_state.get("ffbridge_selected_club") not in new_clubs:
+                st.session_state["ffbridge_selected_club"] = "All Clubs"
+            st.rerun()
+        else:
+            st.session_state.available_clubs = new_clubs
     
     # Apply club filter if selected
     if selected_club != "All Clubs" and not results_df.is_empty():
