@@ -1295,9 +1295,9 @@ def main():
                                     pl.col('tournament_name').alias('Tournament'),
                                     pl.col('pair_name').alias('Partner'),
                                     # Show both raw % values when available
-                                    (pl.col('club_percentage') if 'club_percentage' in player_results.columns else pl.col('percentage')).round(2).alias('Club_Pct'),
-                                    (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None)).round(2).alias('Handicap_Pct'),
-                                    pl.col('percentage').round(2).alias('Pct_Used'),
+                                    (pl.col('club_percentage') if 'club_percentage' in player_results.columns else pl.col('percentage')).cast(pl.Float64, strict=False).round(2).alias('Club_Pct'),
+                                    (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_Pct'),
+                                    pl.col('percentage').cast(pl.Float64, strict=False).round(2).alias('Pct_Used'),
                                     pl.col('rank').alias('Rank'),
                                 ]
                                 if 'theoretical_rank' in player_results.columns and use_handicap:
@@ -1380,9 +1380,9 @@ def main():
                             cols_to_select = [
                                 pl.col('date').str.slice(0, 10).alias('Date'),
                                 pl.col('tournament_name').alias('Tournament'),
-                                (pl.col('club_percentage') if 'club_percentage' in pair_results.columns else pl.col('percentage')).round(2).alias('Club_Pct'),
-                                (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None)).round(2).alias('Handicap_Pct'),
-                                pl.col('percentage').round(2).alias('Pct_Used'),
+                                (pl.col('club_percentage') if 'club_percentage' in pair_results.columns else pl.col('percentage')).cast(pl.Float64, strict=False).round(2).alias('Club_Pct'),
+                                (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_Pct'),
+                                pl.col('percentage').cast(pl.Float64, strict=False).round(2).alias('Pct_Used'),
                                 pl.col('rank').alias('Rank'),
                             ]
                             # Add theoretical_rank if using handicap
