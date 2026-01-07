@@ -430,6 +430,10 @@ def process_sessions_to_elo(
     player_ratings: Dict[str, float] = {}
     player_names: Dict[str, str] = {}
     player_games: Dict[str, int] = {}
+    # Welford running stats per player for percentage (mean / sample stdev)
+    player_pct_n: Dict[str, int] = {}
+    player_pct_mean: Dict[str, float] = {}
+    player_pct_m2: Dict[str, float] = {}
     
     # Initialize from initial_players if provided
     if initial_players:
@@ -582,6 +586,18 @@ def process_sessions_to_elo(
                 player_ratings[p1_id] = new_r1
                 player_names[p1_id] = p1_name
                 player_games[p1_id] = player_games.get(p1_id, 0) + 1
+                # Update running pct stats for player 1
+                n = player_pct_n.get(p1_id, 0) + 1
+                mean = player_pct_mean.get(p1_id, 0.0)
+                m2 = player_pct_m2.get(p1_id, 0.0)
+                x = float(percentage)
+                delta = x - mean
+                mean += delta / n
+                delta2 = x - mean
+                m2 += delta * delta2
+                player_pct_n[p1_id] = n
+                player_pct_mean[p1_id] = mean
+                player_pct_m2[p1_id] = m2
             
             # Update player 2 rating
             if p2_id:
@@ -592,6 +608,18 @@ def process_sessions_to_elo(
                 player_ratings[p2_id] = new_r2
                 player_names[p2_id] = p2_name
                 player_games[p2_id] = player_games.get(p2_id, 0) + 1
+                # Update running pct stats for player 2
+                n = player_pct_n.get(p2_id, 0) + 1
+                mean = player_pct_mean.get(p2_id, 0.0)
+                m2 = player_pct_m2.get(p2_id, 0.0)
+                x = float(percentage)
+                delta = x - mean
+                mean += delta / n
+                delta2 = x - mean
+                m2 += delta * delta2
+                player_pct_n[p2_id] = n
+                player_pct_mean[p2_id] = mean
+                player_pct_m2[p2_id] = m2
             
             # Calculate pair Elo
             if p1_id and p2_id:
@@ -609,11 +637,16 @@ def process_sessions_to_elo(
     # Create player ratings summary with explicit type conversion
     player_summary = []
     for pid, rating in player_ratings.items():
+        n = player_pct_n.get(pid, 0)
+        avg_pct = float(player_pct_mean.get(pid, 0.0)) if n > 0 else None
+        stdev_pct = float((player_pct_m2.get(pid, 0.0) / (n - 1)) ** 0.5) if n > 1 else None
         player_summary.append({
             'player_id': str(pid),
             'player_name': str(player_names.get(pid, pid)),
             'elo_rating': float(round(rating, 1)),
-            'games_played': int(player_games.get(pid, 0))
+            'games_played': int(player_games.get(pid, 0)),
+            'avg_percentage': avg_pct,
+            'stdev_percentage': stdev_pct,
         })
     
     # Create DataFrame with explicit schema to avoid type inference issues
@@ -622,7 +655,9 @@ def process_sessions_to_elo(
             'player_id': pl.Utf8,
             'player_name': pl.Utf8,
             'elo_rating': pl.Float64,
-            'games_played': pl.Int64
+            'games_played': pl.Int64,
+            'avg_percentage': pl.Float64,
+            'stdev_percentage': pl.Float64,
         })
     else:
         players_df = pl.DataFrame()
@@ -646,6 +681,8 @@ def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5) -
             CAST(ROUND(elo_rating, 0) AS INTEGER) AS Elo_Rating,
             player_id AS Player_ID,
             player_name AS Player_Name,
+            ROUND(avg_percentage, 1) AS Avg_Pct,
+            ROUND(stdev_percentage, 1) AS Pct_Stdev,
             games_played AS Games_Played
         FROM filtered
         ORDER BY Rank ASC
@@ -670,6 +707,7 @@ def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5) -> 
                 FIRST(player2_id) AS player2_id,
                 AVG(pair_elo) AS avg_pair_elo,
                 AVG(percentage) AS avg_percentage,
+                STDDEV_SAMP(percentage) AS stdev_percentage,
                 COUNT(*) AS games_played
             FROM results_df
             GROUP BY pair_id
@@ -685,6 +723,7 @@ def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5) -> 
             pair_id AS Pair_ID,
             pair_name AS Pair_Name,
             ROUND(avg_percentage, 1) AS Avg_Pct,
+            ROUND(stdev_percentage, 1) AS Pct_Stdev,
             games_played AS Games
         FROM filtered
         ORDER BY Rank ASC
