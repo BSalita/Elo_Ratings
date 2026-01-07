@@ -530,29 +530,31 @@ def fetch_tournament_results_with_session(session: Optional[requests.Session], t
                             except (ValueError, TypeError):
                                 pct = 0.0
 
-                            # Handicap-adjusted percentage (field name varies by endpoint/version)
-                            handicap_pct_raw = None
+                            # Classic FFBridge tournament endpoint exposes `percent`, but in practice
+                            # it appears to already be handicap-adjusted in many events. We store it
+                            # as `handicap_percentage` and only fill `club_percentage` if we can find
+                            # an explicit "without handicap" field.
+                            handicap_pct = pct
+
+                            club_pct_raw = None
                             for k in (
-                                "handicapPercent",
-                                "handicap_percent",
-                                "handicapPercentage",
-                                "theoretical_percent",
-                                "theoreticalPercent",
-                                "theoretical_percentage",
-                                "theoreticalPercentage",
-                                "percentHandicap",
-                                "percent_handicap",
-                                "percentTheoretical",
-                                "percent_theoretical",
+                                "percentWithoutHandicap",
+                                "percent_without_handicap",
+                                "percentNoHandicap",
+                                "percent_no_handicap",
+                                "percentWithoutHcp",
+                                "percent_without_hcp",
+                                "clubPercent",
+                                "club_percent",
                             ):
                                 v = team.get(k)
                                 if v is not None and v != "":
-                                    handicap_pct_raw = v
+                                    club_pct_raw = v
                                     break
                             try:
-                                handicap_pct = float(handicap_pct_raw) if handicap_pct_raw is not None else None
+                                club_pct = float(club_pct_raw) if club_pct_raw is not None else None
                             except (ValueError, TypeError):
-                                handicap_pct = None
+                                club_pct = None
                                 
                             results.append({
                                 'team_id': str(team.get('id')),  # For roadsheets API
@@ -562,6 +564,7 @@ def fetch_tournament_results_with_session(session: Optional[requests.Session], t
                                 'player1_name': f"{p1.get('firstname', '')} {p1.get('lastname', '')}".strip(),
                                 'player2_name': f"{p2.get('firstname', '')} {p2.get('lastname', '')}".strip(),
                                 'percentage': pct,
+                                'club_percentage': club_pct,
                                 'handicap_percentage': handicap_pct,
                                 'rank': team.get('ranking', 0),
                                 'theoretical_rank': team.get('theoretical_ranking', 0),  # Handicap rank
@@ -692,13 +695,28 @@ def process_tournaments_to_elo(
             p2_id = result.get('player2_id')
             p1_name = result.get('player1_name', '')
             p2_name = result.get('player2_name', '')
-            club_pct = float(result.get('percentage', 50.0) or 50.0)
+            # Classic data may only have `percentage` (which we treat as handicap score);
+            # `club_percentage` might be missing/unavailable.
+            club_pct_raw = result.get('club_percentage')
             handicap_pct_raw = result.get('handicap_percentage')
+            try:
+                club_pct = float(club_pct_raw) if club_pct_raw is not None else None
+            except (ValueError, TypeError):
+                club_pct = None
             try:
                 handicap_pct = float(handicap_pct_raw) if handicap_pct_raw is not None else None
             except (ValueError, TypeError):
                 handicap_pct = None
-            percentage = handicap_pct if use_handicap and handicap_pct is not None else club_pct
+
+            # Backward-compat fallback: if handicap % missing, use `percentage`
+            raw_pct = float(result.get('percentage', 50.0) or 50.0)
+            if handicap_pct is None:
+                handicap_pct = raw_pct
+            # If club % missing, fall back to handicap % (so Elo still computes)
+            if club_pct is None:
+                club_pct = handicap_pct
+
+            percentage = handicap_pct if use_handicap else club_pct
 
             rank_club = result.get('rank', 0)
             rank_handicap = result.get('theoretical_rank', 0)  # Handicap rank
@@ -738,7 +756,8 @@ def process_tournaments_to_elo(
                 'player2_name': str(p2_name),
                 'pair_name': str(pair_name),
                 'percentage': float(percentage),
-                'club_percentage': float(club_pct),
+                # Note: `club_percentage` might be a fallback; see detail table columns for truth.
+                'club_percentage': float(club_pct) if club_pct is not None else None,
                 'handicap_percentage': handicap_pct,
                 'rank': int(rank) if rank is not None else 0,
                 'rank_without_handicap': int(rank_club) if rank_club is not None else 0,
@@ -1144,7 +1163,7 @@ def main():
             return
 
     # Create a cache key based on current selection
-    cache_key = f"ffbridge_processed_{simultaneous_type}_{len(tournaments)}_handicap_{int(use_handicap)}"
+    cache_key = f"ffbridge_processed_v2_{simultaneous_type}_{len(tournaments)}_handicap_{int(use_handicap)}"
     
     # Check if we have cached results for this selection
     if (st.session_state.get('ffbridge_cache_key') == cache_key and 
@@ -1295,7 +1314,7 @@ def main():
                                     pl.col('tournament_name').alias('Tournament'),
                                     pl.col('pair_name').alias('Partner'),
                                     # Show both raw % values when available
-                                    (pl.col('club_percentage') if 'club_percentage' in player_results.columns else pl.col('percentage')).cast(pl.Float64, strict=False).round(2).alias('Club_Pct'),
+                                    (pl.col('club_percentage') if 'club_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Club_Pct'),
                                     (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_Pct'),
                                     pl.col('percentage').cast(pl.Float64, strict=False).round(2).alias('Pct_Used'),
                                     pl.col('rank').alias('Rank'),
@@ -1380,7 +1399,7 @@ def main():
                             cols_to_select = [
                                 pl.col('date').str.slice(0, 10).alias('Date'),
                                 pl.col('tournament_name').alias('Tournament'),
-                                (pl.col('club_percentage') if 'club_percentage' in pair_results.columns else pl.col('percentage')).cast(pl.Float64, strict=False).round(2).alias('Club_Pct'),
+                                (pl.col('club_percentage') if 'club_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Club_Pct'),
                                 (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_Pct'),
                                 pl.col('percentage').cast(pl.Float64, strict=False).round(2).alias('Pct_Used'),
                                 pl.col('rank').alias('Rank'),
