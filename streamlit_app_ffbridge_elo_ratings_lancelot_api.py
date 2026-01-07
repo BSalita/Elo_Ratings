@@ -314,11 +314,12 @@ def fetch_session_ranking(session_id: int, session_label: str = "", series_id: O
     date_match = re.search(r'(\d{4}-\d{2}-\d{2})', session_label)
     date_part = date_match.group(1) if date_match else ""
     friendly_name = f"ranking_{session_id}_{date_part}" if date_part else f"ranking_{session_id}"
+    old_name = f"ranking_{session_id}"
     
-    # Check disk cache first
+    # Check disk cache
     cached_data = load_from_disk_cache(friendly_name, max_age_hours=None, series_id=series_id)
     if cached_data:
-        return cached_data, True  # Return cached data and flag
+        return cached_data, True
     
     # Fetch from API (no pagination needed for ranking - returns full list)
     data = lancelot_get(f"/results/sessions/{session_id}/ranking")
@@ -389,6 +390,11 @@ def process_sessions_to_elo(
     if max_sessions:
         sorted_sessions = sorted_sessions[-max_sessions:]  # Take most recent
     
+    # Filter out future sessions
+    from datetime import datetime
+    today = datetime.now().strftime('%Y-%m-%d')
+    sorted_sessions = [s for s in sorted_sessions if s.get('date', '')[:10] <= today]
+    
     # Progress tracking for UI
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -399,14 +405,15 @@ def process_sessions_to_elo(
         s_id = session.get('id')
         s_label = session.get('label', f"Session {s_id}")
         s_date = session.get('date', '')
+        s_series_id = session.get('series_id', series_id)  # Use session's series_id for correct cache folder
         
         # Display progress with cache stats (white text for visibility)
         cache_info = f"[Cached: {cache_stats['cached']}, Fetched: {cache_stats['fetched']}]"
         status_text.markdown(f"<span style='color: white;'>Processing {i+1}/{total_s}: {s_label[:35]}... {cache_info}</span>", unsafe_allow_html=True)
         progress_bar.progress((i + 1) / total_s)
         
-        # Fetch ranking for this session (with session label for friendly filename)
-        ranking, was_cached = fetch_session_ranking(s_id, session_label=s_label, series_id=series_id)
+        # Fetch ranking for this session (use session's series_id for correct cache folder)
+        ranking, was_cached = fetch_session_ranking(s_id, session_label=s_label, series_id=s_series_id)
         
         # Track cache statistics
         if was_cached:

@@ -486,7 +486,7 @@ def fetch_tournament_results_with_session(session: Optional[requests.Session], t
     date_part = date_match.group(1) if date_match else ""
     friendly_name = f"results_{tournament_id}_{date_part}" if date_part else f"results_{tournament_id}"
     
-    # Check disk cache first (never expires as results are static)
+    # Check disk cache first with new friendly filename (never expires as results are static)
     cached_data = load_from_disk_cache(friendly_name, max_age_hours=None, series_id=series_id)
     if cached_data:
         return cached_data, True
@@ -614,6 +614,11 @@ def process_tournaments_to_elo(
     progress_bar = st.progress(0)
     status_text = st.empty()
     cache_stats = {"cached": 0, "fetched": 0}
+    
+    # Filter out future tournaments
+    from datetime import datetime
+    today = datetime.now().strftime('%Y-%m-%d')
+    sorted_tournaments = [t for t in sorted_tournaments if t.get('date', '')[:10] <= today]
     
     total_t = len(sorted_tournaments)
     for i, tournament in enumerate(sorted_tournaments):
@@ -1063,14 +1068,13 @@ def main():
     )
     
     # Update available clubs in session state for the filter dropdown
+    # Only update once per data load to avoid double-processing
     if not results_df.is_empty() and 'club_name' in results_df.columns:
         unique_clubs = sorted(set(results_df.select('club_name').to_series().to_list()))
         unique_clubs = [c for c in unique_clubs if c and c.strip()]  # Remove empty/whitespace strings
         new_clubs = ["All Clubs"] + unique_clubs
-        # If clubs changed, update and rerun to refresh the dropdown
-        if st.session_state.get('available_clubs') != new_clubs:
-            st.session_state.available_clubs = new_clubs
-            st.rerun()
+        # Update clubs list (no rerun needed - will be available on next interaction)
+        st.session_state.available_clubs = new_clubs
     
     # Apply club filter if selected
     if selected_club != "All Clubs" and not results_df.is_empty():
