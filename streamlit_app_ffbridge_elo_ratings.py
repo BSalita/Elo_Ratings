@@ -54,8 +54,8 @@ except (ImportError, AttributeError):
 
 # Available API backends
 API_BACKENDS = {
-    "FFBridge (Classic)": classic_api,
-    "FFBridge (Lancelot)": lancelot_api,
+    "FFBridge (Classic API)": classic_api,
+    "FFBridge (Lancelot API)": lancelot_api,
 }
 
 
@@ -483,6 +483,20 @@ def main():
             box-shadow: 0 4px 12px rgba(255,193,7,0.3);
         }
         
+        .stDownloadButton > button {
+            background-color: #00695c !important;
+            color: #ffc107 !important;
+            border: 2px solid #ffc107 !important;
+            border-radius: 5px;
+            font-weight: 700;
+        }
+        
+        .stDownloadButton > button:hover {
+            background-color: #00796b !important;
+            color: #ffca28 !important;
+            border-color: #ffca28 !important;
+        }
+        
         .stRadio > label { color: #ffc107 !important; font-weight: 600 !important; }
         .stRadio [data-testid="stMarkdownContainer"] p { color: #ffffff !important; font-size: 1rem !important; font-weight: 500 !important; }
         .stSelectbox > label { color: #ffc107 !important; font-weight: 600 !important; }
@@ -501,7 +515,7 @@ def main():
         
         # API Backend selection
         if "selected_api" not in st.session_state:
-            st.session_state.selected_api = "FFBridge (Classic)"
+            st.session_state.selected_api = "FFBridge (Classic API)"
         
         selected_api_name = st.selectbox(
             "Bridge API",
@@ -749,7 +763,7 @@ def main():
     with m4:
         if not players_df.is_empty():
             top_rating = players_df.select(pl.col('elo_rating').max()).item()
-            st.markdown(f'<div class="metric-card"><small>Highest Elo</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{int(top_rating)}</span></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><small>Highest Elo</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{round(top_rating)}</span></div>', unsafe_allow_html=True)
     
     st.markdown("<br>", unsafe_allow_html=True)
     
@@ -769,6 +783,7 @@ def main():
             if not top_players.is_empty():
                 display_df = top_players.to_pandas()
                 grid_response = build_selectable_aggrid(display_df, 'players_table_selectable')
+                st.caption("💡 Click a row to view player's tournament history")
                 
                 selected_rows = grid_response.get('selected_rows', None)
                 if selected_rows is not None and len(selected_rows) > 0:
@@ -777,32 +792,8 @@ def main():
                     player_name = selected_row.get('Player_Name', 'Unknown')
                     
                     if player_id and not results_df.is_empty():
-                        # Fetch member details if available
-                        member_info = api_module.fetch_member_details(str(player_id))
-                        
-                        st.markdown(f"### 👤 Player Profile: **{player_name}**")
-                        
-                        if member_info:
-                            iv_info = member_info.get('iv', {})
-                            iv_rating = iv_info.get('iv', 'N/A')
-                            iv_label = iv_info.get('label', '')
-                            licence_info = member_info.get('licence', {})
-                            home_club = licence_info.get('organization_name', 'Unknown')
-                            
-                            col1, col2, col3, col4 = st.columns(4)
-                            with col1:
-                                calc_elo = selected_row.get('Elo_Rating', 'N/A')
-                                st.metric("Calculated Elo", f"{calc_elo}")
-                            with col2:
-                                st.metric("Official IV", f"{iv_rating}", help=iv_label)
-                            with col3:
-                                games = selected_row.get('Games_Played', 0)
-                                st.metric("Games Played", f"{games}")
-                            with col4:
-                                st.metric("Home Club", home_club[:20] + "..." if len(home_club) > 20 else home_club)
-                        
                         # Show tournament history
-                        st.markdown("#### 📊 Tournament History")
+                        st.markdown(f"#### 📊 Tournament History: **{player_name}**")
                         player_results = results_df.filter(
                             (pl.col('player1_id') == str(player_id)) | 
                             (pl.col('player2_id') == str(player_id))
@@ -844,6 +835,7 @@ def main():
             if not top_pairs.is_empty():
                 display_df = top_pairs.to_pandas()
                 grid_response = build_selectable_aggrid(display_df, 'pairs_table_selectable')
+                st.caption("💡 Click a row to view pair's tournament history")
                 
                 selected_rows = grid_response.get('selected_rows', None)
                 if selected_rows is not None and len(selected_rows) > 0:
