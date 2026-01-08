@@ -54,8 +54,8 @@ except (ImportError, AttributeError):
 
 # Available API backends
 API_BACKENDS = {
-    "FFBridge (Classic API)": classic_api,
-    "FFBridge (Lancelot API)": lancelot_api,
+    "FFBridge Classic API": classic_api,
+    "FFBridge Lancelot API": lancelot_api,
 }
 
 
@@ -538,7 +538,7 @@ def main():
         
         # API Backend selection
         if "selected_api" not in st.session_state:
-            st.session_state.selected_api = "FFBridge (Classic API)"
+            st.session_state.selected_api = "FFBridge Classic API"
         
         selected_api_name = st.selectbox(
             "Bridge API",
@@ -649,7 +649,7 @@ def main():
                 Morty's Unofficial FFBridge Elo Ratings Playground
             </h1>
             <p style="color: #ffc107; font-size: 1.2rem; font-weight: 500; opacity: 0.9;">
-                 {selected_tournament_label} via {selected_api_name}
+                 {selected_tournament_label} using {selected_api_name}
             </p>
         </div>
     """, unsafe_allow_html=True)
@@ -659,7 +659,7 @@ def main():
     # -------------------------------
     
     # Cache key includes API name to separate caches
-    api_key = selected_api_name.replace(" ", "_").replace("(", "").replace(")", "")
+    api_key = selected_api_name.replace(" ", "_")
     
     # Fetch all tournaments
     with st.spinner("Loading tournament data..."):
@@ -934,7 +934,7 @@ def main():
     
     st.markdown(f"""
         <div style="text-align: center; padding: 2rem 0; color: #80cbc4; font-size: 0.9rem; opacity: 0.8;">
-            Data sourced from {selected_api_name} • {selected_tournament_label}<br>
+            Data sourced using {selected_api_name} • {selected_tournament_label}<br>
             System Current Date: {datetime.now().strftime('%Y-%m-%d')}
         </div>
     """, unsafe_allow_html=True)
