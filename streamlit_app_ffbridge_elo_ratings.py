@@ -813,8 +813,8 @@ def main():
             
             if not top_players.is_empty():
                 display_df = top_players.to_pandas()
-                grid_response = build_selectable_aggrid(display_df, 'players_table_selectable')
                 st.caption("💡 Click a row to view player's tournament history")
+                grid_response = build_selectable_aggrid(display_df, 'players_table_selectable')
                 
                 selected_rows = grid_response.get('selected_rows', None)
                 if selected_rows is not None and len(selected_rows) > 0:
@@ -865,8 +865,8 @@ def main():
             
             if not top_pairs.is_empty():
                 display_df = top_pairs.to_pandas()
-                grid_response = build_selectable_aggrid(display_df, 'pairs_table_selectable')
                 st.caption("💡 Click a row to view pair's tournament history")
+                grid_response = build_selectable_aggrid(display_df, 'pairs_table_selectable')
                 
                 selected_rows = grid_response.get('selected_rows', None)
                 if selected_rows is not None and len(selected_rows) > 0:
