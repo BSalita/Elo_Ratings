@@ -301,11 +301,19 @@ def build_club_name_mapping(unique_codes: List[str], sessions: List[Dict[str, An
         sessions_to_check = set()
         
         # If we have results_df, find sessions that contain missing clubs
-        if results_df is not None and not results_df.is_empty() and 'session_id' in results_df.columns:
+        # Check for both 'session_id' and 'tournament_id' column names
+        id_col = None
+        if results_df is not None and not results_df.is_empty():
+            if 'session_id' in results_df.columns:
+                id_col = 'session_id'
+            elif 'tournament_id' in results_df.columns:
+                id_col = 'tournament_id'
+        
+        if id_col:
             for code in list(missing_codes)[:100]:
                 matches = results_df.filter(pl.col('club_code') == code)
                 if not matches.is_empty():
-                    s_ids = matches.select('session_id').head(3).to_series().to_list()
+                    s_ids = matches.select(id_col).head(3).to_series().to_list()
                     for sid in s_ids:
                         sessions_to_check.add(str(sid))
         
