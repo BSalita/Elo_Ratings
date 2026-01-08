@@ -2,9 +2,10 @@
 
 **Base URL:** `https://api-lancelot.ffbridge.fr`  
 **Authentication:** Most endpoints are public. User-specific endpoints require separate auth (not the same token as api.ffbridge.fr).  
-**Version:** 2.0.8
+**Version:** 2.0.8  
+**Used by:** `elo_ffbridge_lancelot.py` adapter
 
-> **Note:** The Lancelot API appears to be an older/legacy system but contains more detailed historical data and board-level information including full deal records in PBN format.
+> **Note:** The Lancelot API appears to be an older/legacy system but contains more detailed historical data and board-level information including full deal records in PBN format. It provides 620+ sessions for Rondes de France alone vs ~100 in the Classic API.
 
 ---
 
@@ -131,8 +132,15 @@
 **Response (array):**
 | Field | Description |
 |-------|-------------|
-| `ffbCode` | Club code |
-| `label` | Club name |
+| `id` | Lancelot club ID (internal) |
+| `ffbCode` | FFBridge club code (**use this for mapping**) |
+| `label` | Club name (human-readable) |
+
+**Club Code Mapping Notes:**
+- The `simultaneousId` in ranking entries corresponds to `id` or `ffbCode` in this response
+- Strip leading zeros from codes for consistent matching: `"05802079"` → `"5802079"`
+- Build a mapping dict from multiple sessions for complete coverage
+- Club names are only available through this endpoint, not in ranking data
 
 ---
 
@@ -148,20 +156,27 @@
 **Response (array or paginated):**
 | Field | Description |
 |-------|-------------|
-| `rank` | Position in ranking |
-| `sessionScore` | Percentage score |
+| `rank` | Position in ranking (with handicap) |
+| `sessionScore` | Percentage score (**appears to be handicap-adjusted**) |
 | `totalScore` | Final score (may include carryover) |
 | `pe` | Performance points |
-| `peBonus` | Bonus points |
+| `peBonus` | Bonus points (numeric, e.g., 10.0) |
 | `orientation` | NS or EW |
 | `section` | Section (A, B, etc.) |
 | `tableNumber` | Table number |
-| `simultaneousId` | Club code |
+| `simultaneousId` | Club code (**maps to ffbCode via `/simultaneousIds` endpoint**) |
 | `handicapPercentage` | Handicap (if applicable) |
-| `rankWithoutHandicap` | Non-handicapped rank |
+| `rankWithoutHandicap` | Non-handicapped rank (club rank) |
 | `team.id` | Team ID |
 | `team.label` | Pair names |
 | `team.player1`, `team.player2` | Player details |
+
+**Score Calculation Notes:**
+- `sessionScore`/`totalScore` behaves like the handicap-adjusted score in practice
+- To derive club percentage: `club_pct = sessionScore - (peBonus / 10.0)`
+- `rank` is the handicapped national ranking
+- `rankWithoutHandicap` is the club-level ranking (without handicap)
+- Club codes in `simultaneousId` may have leading zeros that need stripping for consistent matching
 
 **Player fields:**
 | Field | Description |
@@ -409,3 +424,36 @@ urls = {
    GET /results/scores/board/7404537
    → Returns every result achieved on this board
    ```
+
+---
+
+## Usage in Elo Ratings App
+
+The Lancelot API is used through the `elo_ffbridge_lancelot.py` adapter module.
+
+**Key functions:**
+```python
+import elo_ffbridge_lancelot as api
+
+# No authentication required
+# Fetch all sessions (tournaments)
+sessions = api.fetch_tournament_list(series_id="all")
+
+# Fetch results for a specific session
+results, was_cached = api.fetch_tournament_results(
+    session_id="247653",
+    tournament_date="2026-01-06",
+    series_id=3
+)
+
+# Build club name mapping
+unique_codes = ["5000107", "5802079"]
+mapping = api.build_club_name_mapping(unique_codes, sessions)
+```
+
+**Cache Location:** `data/ffbridge/lancelot_cache/`
+
+**Benefits over Classic API:**
+- No authentication required (public access)
+- More historical data (620+ sessions for Rondes de France)
+- Full PBN deal data available for board-level analysis

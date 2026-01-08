@@ -1,31 +1,38 @@
-# Requirements for ACBL Elo Ratings Project
-# ==========================================
+# Requirements for FFBridge/ACBL Elo Ratings Project
+# ===================================================
 
 # Core Streamlit web interface
-streamlit>=1.28.0
-streamlit-aggrid>=0.3.0
-python-dotenv>=1.0.0
+streamlit
+streamlit-aggrid
+python-dotenv
+
+# HTTP requests for API calls
+requests
 
 # Data processing and analysis
-pandas>=2.0.0
-polars>=1.30.0
+pandas
+polars
+duckdb
 
 # Data visualization
-matplotlib>=3.7.0
+matplotlib
 
 # PDF generation for reports
-reportlab>=4.0.0
-markdown>=3.5.0
+reportlab
+markdown
 
 # Standard library extensions (if needed)
-typing-extensions>=4.8.0
+typing-extensions
 
 # Development and debugging
-IPython>=8.15.0
+IPython
+
+# Optional: Bridge analysis library
+# endplay
 
 # Optional ML dependencies (uncomment if using mlBridgeAiLib.py)
-# torch>=2.0.0
-# tqdm>=4.65.0
+# torch
+# tqdm
 
 # Note: The DDS library (dds.py) requires external DLL files
 # Make sure dds.dll is available in the specified path
