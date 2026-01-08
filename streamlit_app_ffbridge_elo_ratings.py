@@ -415,9 +415,12 @@ def initialize_session_state():
 # Main UI
 # -------------------------------
 def main():
+    # Logo URLs (must have raw=true for GitHub)
+    assistant_logo_url = 'https://github.com/BSalita/Elo_Ratings/blob/master/assets/logo_assistant.gif?raw=true'
+    
     st.set_page_config(
         page_title="Unofficial FFBridge Elo Ratings Playground",
-        page_icon="🃏",
+        page_icon=assistant_logo_url,
         layout="wide",
         initial_sidebar_state="expanded"
     )
@@ -436,6 +439,26 @@ def main():
         .stApp {
             background-color: #004d40;
             color: #f5f5f5;
+        }
+        
+        /* Hide/style the Streamlit header bar */
+        header[data-testid="stHeader"] {
+            background-color: #004d40 !important;
+        }
+        
+        /* Style header toolbar buttons consistently */
+        header[data-testid="stHeader"] button,
+        header[data-testid="stHeader"] [data-testid="stStatusWidget"],
+        header[data-testid="stHeader"] span,
+        header[data-testid="stHeader"] a {
+            color: #f5f5f5 !important;
+        }
+        
+        /* Style the running man icon white */
+        header[data-testid="stHeader"] svg,
+        header[data-testid="stHeader"] [data-testid="stStatusWidget"] svg {
+            fill: #f5f5f5 !important;
+            color: #f5f5f5 !important;
         }
         
         h1, h2, h3 {
@@ -611,11 +634,19 @@ def main():
         # PDF Export
         generate_pdf = st.button("Export Report to PDF File", use_container_width=True)
     
+        # Automated Postmortem Apps
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**Morty's Automated Postmortem Apps**")
+        st.sidebar.markdown("🔗 [ACBL Postmortem](https://acbl.postmortem.chat)")
+        st.sidebar.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
+        #st.sidebar.markdown("🔗 [BridgeWebs Postmortem](https://bridgewebs.postmortem.chat)")
+
     # Header
     st.markdown(f"""
         <div style="text-align: center; padding: 0 0 1rem 0; margin-top: -2rem;">
             <h1 style="font-size: 2.8rem; margin-bottom: 0.2rem;">
-                🃏 Unofficial FFBridge Elo Ratings Playground
+                <img src="{assistant_logo_url}" style="height: 2.5rem; vertical-align: middle; margin-right: 0.5rem;">
+                Morty's Unofficial FFBridge Elo Ratings Playground
             </h1>
             <p style="color: #ffc107; font-size: 1.2rem; font-weight: 500; opacity: 0.9;">
                  {selected_tournament_label} via {selected_api_name}
@@ -895,7 +926,7 @@ def main():
     # Footer
     st.markdown(f"""
         <div style="text-align: center; color: #80cbc4; font-size: 0.8rem; opacity: 0.7;">
-            Project lead is Robert Salita research@AiPolice.org. Code written in Python. UI written in streamlit. Data engine is polars. Repo:https://github.com/BSalita<br>
+            Project lead is Robert Salita research@AiPolice.org. Code written in Python. UI written in streamlit. Data engine is polars. Repo: <a href="https://github.com/BSalita/Elo_Ratings" target="_blank" style="color: #80cbc4;">github.com/BSalita/Elo_Ratings</a><br>
             Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}<br>
             Streamlit:{st.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pd.__version__} polars:{pl.__version__} duckdb:{duckdb.__version__} endplay:{ENDPLAY_VERSION}
         </div>
