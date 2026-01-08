@@ -145,7 +145,6 @@ def process_tournaments_to_elo(
             cache_stats["fetched"] += 1
         
         if not results:
-            cache_stats["empty"] = cache_stats.get("empty", 0) + 1
             continue
         
         # Calculate field average rating
@@ -294,10 +293,6 @@ def process_tournaments_to_elo(
     
     progress_bar.empty()
     status_text.empty()
-    
-    # Debug: Show processing stats
-    empty_count = cache_stats.get("empty", 0)
-    st.info(f"📊 Processing: {len(all_results)} results from {total_t} tournaments ({cache_stats['cached']} cached, {cache_stats['fetched']} fetched, {empty_count} empty), {len(player_ratings)} players")
     
     # Convert to DataFrames
     results_df = pl.DataFrame(all_results) if all_results else pl.DataFrame()
@@ -578,12 +573,6 @@ def main():
             key="elo_use_handicap",
             help="Uses handicap-adjusted percentage when available"
         )
-        
-        # Clear cache button for debugging
-        if st.button("🔄 Clear Session Cache", key="clear_cache_btn"):
-            if 'elo_full_cache' in st.session_state:
-                st.session_state.elo_full_cache = {}
-            st.rerun()
         
         # Number of results
         top_n = st.slider(
