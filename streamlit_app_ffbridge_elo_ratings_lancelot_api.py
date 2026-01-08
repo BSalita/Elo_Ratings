@@ -32,7 +32,7 @@ from streamlitlib.streamlitlib import (
     create_pdf,
     widen_scrollbars,
 )
-from st_aggrid import GridOptionsBuilder, AgGrid, ColumnsAutoSizeMode, AgGridTheme, JsCode
+from st_aggrid import GridOptionsBuilder, AgGrid, ColumnsAutoSizeMode, AgGridTheme
 
 # Import for version display only
 try:
@@ -100,10 +100,33 @@ AGGRID_MAX_DISPLAY_ROWS = 10
 # -------------------------------
 # Persistent Disk Cache Helpers
 # -------------------------------
+def _normalize_series_id(series_id: Optional[Any]) -> Optional[Any]:
+    """Normalize series_id so cache folders are stable (e.g. '3' and 3 map the same)."""
+    if series_id is None:
+        return None
+    if isinstance(series_id, str):
+        s = series_id.strip()
+        if s.isdigit():
+            try:
+                return int(s)
+            except Exception:
+                return series_id
+        return series_id
+    try:
+        if isinstance(series_id, bool):
+            return series_id
+        if isinstance(series_id, float) and series_id.is_integer():
+            return int(series_id)
+    except Exception:
+        pass
+    return series_id
+
+
 def get_cache_path(identifier: str, params: Optional[Dict] = None, series_id: Optional[Any] = None) -> pathlib.Path:
     """Generate a readable, unique filename in a series-specific subdirectory."""
     # Determine the subdirectory based on series_id (friendly name)
-    series_folder = SERIES_NAMES.get(series_id, "General")
+    norm_series_id = _normalize_series_id(series_id)
+    series_folder = SERIES_NAMES.get(norm_series_id, SERIES_NAMES.get(series_id, "General"))
     target_dir = CACHE_DIR / series_folder
     target_dir.mkdir(parents=True, exist_ok=True)
     
@@ -121,6 +144,7 @@ def get_cache_path(identifier: str, params: Optional[Dict] = None, series_id: Op
 def save_to_disk_cache(identifier: str, data: Any, params: Optional[Dict] = None, series_id: Optional[Any] = None):
     """Save response data to disk as JSON."""
     cache_path = get_cache_path(identifier, params, series_id)
+    # print(f"[CACHE] Saving to: {cache_path}")
     try:
         with open(cache_path, 'w', encoding='utf-8') as f:
             json.dump({
@@ -137,6 +161,21 @@ def save_to_disk_cache(identifier: str, data: Any, params: Optional[Dict] = None
 def load_from_disk_cache(identifier: str, params: Optional[Dict] = None, max_age_hours: Optional[int] = None, series_id: Optional[Any] = None) -> Optional[Any]:
     """Load data from disk if it exists and isn't too old."""
     cache_path = get_cache_path(identifier, params, series_id)
+    
+    # Fallback for older cache filename format (results_ID.json instead of results_ID_DATE.json)
+    if not cache_path.exists() and "ranking_" in identifier:
+        # Extract just the ID part: ranking_12345_2023-01-01 -> ranking_12345
+        id_match = re.search(r'(ranking_\d+)', identifier)
+        if id_match:
+            legacy_identifier = id_match.group(1)
+            legacy_path = get_cache_path(legacy_identifier, params, series_id)
+            if legacy_path.exists():
+                print(f"[CACHE] Found legacy file: {legacy_path}")
+                cache_path = legacy_path
+
+    # Log cache lookup for debugging (disabled - too verbose)
+    # print(f"[CACHE] Looking for: {cache_path} (exists: {cache_path.exists()})")
+    
     if not cache_path.exists():
         return None
     
@@ -189,20 +228,13 @@ def calculate_aggrid_height(row_count: int) -> int:
 
 def build_selectable_aggrid(df: pd.DataFrame, key: str) -> Dict[str, Any]:
     """
-    Build an AgGrid with double-click row selection.
+    Build an AgGrid with single-click row selection.
     Returns the grid response dictionary.
     """
     gb = GridOptionsBuilder.from_dataframe(df)
-    gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=True)
+    gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
     gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
     grid_options = gb.build()
-    
-    # Add double-click handler to select row
-    grid_options['onRowDoubleClicked'] = JsCode("""
-        function(event) {
-            event.node.setSelected(true, true);
-        }
-    """)
     
     return AgGrid(
         df,
@@ -338,6 +370,7 @@ def fetch_session_clubs(session_id: int) -> List[Dict[str, Any]]:
     # Fetch from API
     data = lancelot_get(f"/results/sessions/{session_id}/simultaneousIds")
     if isinstance(data, list):
+        # print(f"[DEBUG] fetch_session_clubs({session_id}) returned {len(data)} clubs")
         save_to_disk_cache(cache_name, data, series_id=None)
         return data
     return []
@@ -355,42 +388,66 @@ def build_club_name_mapping(unique_codes: List[str], sessions: List[Dict[str, An
     
     mapping = st.session_state.lancelot_club_mapping
     
+    # Helper to normalize codes to stripped strings (handle potential leading zeros)
+    def normalize_code(c: Any) -> str:
+        if c is None: return ""
+        s = str(c).strip()
+        if not s or s.lower() == 'none': return ""
+        # Remove leading zeros but keep at least one digit if it's all zeros
+        norm = s.lstrip('0')
+        return norm if norm else '0'
+    
     # Find which codes we still need to look up
-    missing_codes = set(unique_codes) - set(mapping.keys())
+    normalized_unique = [normalize_code(c) for c in unique_codes if c]
+    missing_codes = set(normalized_unique) - set(mapping.keys())
     
     if missing_codes:
+        # print(f"[DEBUG] Missing club names for normalized codes: {list(missing_codes)[:20]}...")
         # Build a set of session IDs to check - prioritize sessions that have missing clubs
         sessions_to_check = set()
         
         # If we have results_df, find sessions that contain missing clubs
         if results_df is not None and not results_df.is_empty() and 'session_id' in results_df.columns:
-            for code in list(missing_codes)[:100]:  # Limit to avoid too many lookups
-                # Find a session that has this club code
+            # Check sessions for EACH missing code (up to a limit)
+            for code in list(missing_codes)[:100]:
                 matches = results_df.filter(pl.col('club_code') == code)
                 if not matches.is_empty():
-                    session_id = matches.select('session_id').head(1).item()
-                    sessions_to_check.add(session_id)
+                    # Get up to 3 session IDs for this code to increase chances of finding it
+                    s_ids = matches.select('session_id').head(3).to_series().to_list()
+                    for sid in s_ids:
+                        sessions_to_check.add(str(sid))
         
         # Also add some recent sessions as fallback
-        sorted_sessions = sorted(sessions, key=lambda x: x.get('date', ''), reverse=True)
-        for s in sorted_sessions[:20]:
-            sessions_to_check.add(str(s.get('id', '')))
+        if len(sessions_to_check) < 20:
+            sorted_sessions = sorted(sessions, key=lambda x: x.get('date', ''), reverse=True)
+            for s in sorted_sessions[:40]:
+                sessions_to_check.add(str(s.get('id', '')))
         
         # Fetch clubs from identified sessions
+        # print(f"[DEBUG] Checking {len(sessions_to_check)} sessions for club names...")
+        found_count = 0
         for session_id in sessions_to_check:
             if not missing_codes:
                 break
             if session_id:
                 clubs = fetch_session_clubs(int(session_id) if session_id.isdigit() else session_id)
                 for club in clubs:
-                    code = str(club.get('ffbCode', ''))
+                    # Normalize all possible ID fields
+                    l_id = normalize_code(club.get('id'))
+                    ffb_code = normalize_code(club.get('ffbCode'))
                     name = club.get('label', '')
-                    if code and name and code not in mapping:
-                        mapping[code] = name
-                        missing_codes.discard(code)
+                    
+                    if name:
+                        if l_id and l_id in missing_codes:
+                            mapping[l_id] = name
+                            missing_codes.discard(l_id)
+                            found_count += 1
+                        if ffb_code and ffb_code in missing_codes:
+                            mapping[ffb_code] = name
+                            missing_codes.discard(ffb_code)
+                            found_count += 1
         
-        # Save updated mapping
-        st.session_state.lancelot_club_mapping = mapping
+        print(f"[DEBUG] Club mapping: found {found_count} new names, {len(missing_codes)} still missing")
     
     return mapping
 
@@ -460,7 +517,7 @@ def process_sessions_to_elo(
         s_id = session.get('id')
         s_label = session.get('label', f"Session {s_id}")
         s_date = session.get('date', '')
-        s_series_id = session.get('series_id', series_id)  # Use session's series_id for correct cache folder
+        s_series_id = _normalize_series_id(session.get('series_id', series_id))  # Use session's series_id for correct cache folder
         
         # Display progress with cache stats (white text for visibility)
         cache_info = f"[Cached: {cache_stats['cached']}, Fetched: {cache_stats['fetched']}]"
@@ -505,6 +562,7 @@ def process_sessions_to_elo(
             
             # Score/percentage from sessionScore or totalScore
             pct = float(entry.get('sessionScore') or entry.get('totalScore') or 0)
+            pe_bonus = float(entry.get('peBonus') or 0)
             
             results.append({
                 'team_id': str(team.get('id', '')),
@@ -513,11 +571,14 @@ def process_sessions_to_elo(
                 'player1_name': p1_name,
                 'player2_name': p2_name,
                 'percentage': pct,
+                # Lancelot `sessionScore/totalScore` behaves like the handicapped score in practice.
+                'handicap_percentage': pct,
+                # Derive "club score" by subtracting Team_PE_Bonus/10 from handicapped score
+                'club_percentage': pct - pe_bonus / 10.0,
                 'rank': entry.get('rank', 0),
                 'rank_without_handicap': entry.get('rankWithoutHandicap'),
                 'pe': entry.get('pe', 0),
-                'pe_bonus': entry.get('peBonus', 0),
-                'handicap_percentage': entry.get('handicapPercentage'),
+                'pe_bonus': pe_bonus,
                 'club_code': str(entry.get('simultaneousId', '')),
             })
         
@@ -542,13 +603,27 @@ def process_sessions_to_elo(
             p2_id = result.get('player2_id')
             p1_name = result.get('player1_name', '')
             p2_name = result.get('player2_name', '')
-            club_pct = float(result.get('percentage', 50.0) or 50.0)
+            club_pct_raw = result.get('club_percentage')
             handicap_pct_raw = result.get('handicap_percentage')
+            club_code = result.get('club_code', '')
+            
             try:
-                handicap_pct = float(handicap_pct_raw) if handicap_pct_raw is not None else None
+                handicap_pct = float(handicap_pct_raw) if handicap_pct_raw is not None else float(result.get('percentage', 50.0) or 50.0)
             except (ValueError, TypeError):
-                handicap_pct = None
-            percentage = handicap_pct if use_handicap and handicap_pct is not None else club_pct
+                handicap_pct = float(result.get('percentage', 50.0) or 50.0)
+
+            # Derive club % if missing
+            pe_bonus_raw = result.get('pe_bonus', 0)
+            try:
+                pe_bonus = float(pe_bonus_raw or 0)
+            except (ValueError, TypeError):
+                pe_bonus = 0.0
+            try:
+                club_pct = float(club_pct_raw) if club_pct_raw is not None else (handicap_pct - pe_bonus / 10.0)
+            except (ValueError, TypeError):
+                club_pct = handicap_pct - pe_bonus / 10.0
+
+            percentage = handicap_pct if use_handicap else club_pct
 
             rank_with_handicap = result.get('rank', 0)
             rank_without_handicap = result.get('rank_without_handicap')
@@ -568,10 +643,19 @@ def process_sessions_to_elo(
                 pair_name = f"{p1_name} - {p2_name}"
             
             # Store result with explicit type conversion
+            # Normalize club_code to string and strip leading zeros for consistent mapping
+            cc_raw = str(club_code).strip()
+            if not cc_raw or cc_raw.lower() == 'none':
+                cc_norm = "0"
+            else:
+                cc_norm = cc_raw.lstrip('0')
+                if not cc_norm: cc_norm = "0"
+            
             result_record = {
                 'session_id': str(s_id),
                 'session_name': str(s_label),
                 'date': str(s_date),
+                'series_id': int(s_series_id) if s_series_id else 0,
                 'team_id': str(result.get('team_id', '')),
                 'pair_id': str(pair_id),
                 'player1_id': str(p1_id),
@@ -580,13 +664,13 @@ def process_sessions_to_elo(
                 'player2_name': str(p2_name),
                 'pair_name': str(pair_name),
                 'percentage': float(percentage),
+                'handicap_percentage': float(handicap_pct),
                 'club_percentage': float(club_pct),
-                'handicap_percentage': handicap_pct,
                 'rank': int(rank) if rank is not None else 0,
                 'pe': float(result.get('pe', 0) or 0),
                 'pe_bonus': float(result.get('pe_bonus', 0) or 0),
                 'field_avg_rating': float(field_avg),
-                'club_code': str(result.get('club_code', '')),
+                'club_code': cc_norm,
             }
             
             # Update player 1 rating
@@ -768,7 +852,7 @@ def initialize_session_state():
 # -------------------------------
 def main():
     st.set_page_config(
-        page_title="Unofficial FFBridge Elo Ratings",
+        page_title="Unofficial FFBridge Elo Ratings Playground",
         page_icon="🃏",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -889,43 +973,77 @@ def main():
     with st.sidebar:
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
         
-        # Lancelot API badge
-        st.markdown('<div class="lancelot-badge">🌐 Lancelot API (Public)</div>', unsafe_allow_html=True)
-        
         # Organization selection
         organization = st.selectbox(
-            "Bridge Organization",
+            "Bridge API",
             options=["FFBridge (Lancelot)"],
             index=0,
             help="Using Lancelot API for extended historical data"
         )
         
         # Tournament selection - derive from SERIES_NAMES constant
-        tournament_options = {SERIES_NAMES[k]: k for k in ["all"] + VALID_SERIES_IDS}
+        tournament_options_list = ["all"] + VALID_SERIES_IDS
+        tournament_labels = [SERIES_NAMES[k] for k in tournament_options_list]
+        
+        # Debug: Track widget state before initialization
+        print(f"[DEBUG] Widget state BEFORE init: lancelot_tournament_selectbox = {st.session_state.get('lancelot_tournament_selectbox', 'NOT SET')}")
+        
+        # Initialize widget state if not present (ensures "All Tournaments" is default)
+        if "lancelot_tournament_selectbox" not in st.session_state:
+            st.session_state.lancelot_tournament_selectbox = tournament_labels[0]  # "All Tournaments"
+            print(f"[DEBUG] Initialized lancelot_tournament_selectbox to: {tournament_labels[0]}")
+        
+        # Validate the stored value is still valid
+        if st.session_state.lancelot_tournament_selectbox not in tournament_labels:
+            print(f"[DEBUG] Invalid stored value '{st.session_state.lancelot_tournament_selectbox}', resetting to: {tournament_labels[0]}")
+            st.session_state.lancelot_tournament_selectbox = tournament_labels[0]
+        
+        print(f"[DEBUG] Widget state AFTER init/validation: lancelot_tournament_selectbox = {st.session_state.lancelot_tournament_selectbox}")
         
         selected_tournament_label = st.selectbox(
             "Tournament Names",
-            options=list(tournament_options.keys()),
-            index=0,
+            options=tournament_labels,
+            key="lancelot_tournament_selectbox",
             help="Select which simultaneous tournaments to analyze"
         )
-        selected_series = tournament_options[selected_tournament_label]
+        
+        print(f"[DEBUG] Selectbox RETURNED: {selected_tournament_label}")
+        
+        # Determine selected series from the label
+        selected_series = tournament_options_list[tournament_labels.index(selected_tournament_label)]
+        print(f"[DEBUG] selected_series resolved to: {selected_series}")
         
         # Club filter - uses clubs from previous data load (stored in session state)
         club_options = st.session_state.get('lancelot_available_clubs', ["All Clubs"])
+        
+        # Debug: Track club widget state
+        print(f"[DEBUG] Widget state BEFORE init: lancelot_club_selectbox = {st.session_state.get('lancelot_club_selectbox', 'NOT SET')}")
+        
+        # Initialize widget state if not present
+        if "lancelot_club_selectbox" not in st.session_state:
+            st.session_state.lancelot_club_selectbox = "All Clubs"
+            print(f"[DEBUG] Initialized lancelot_club_selectbox to: All Clubs")
+        
+        # Validate the stored club is still in the options (list may have changed)
+        if st.session_state.lancelot_club_selectbox not in club_options:
+            print(f"[DEBUG] Invalid stored club '{st.session_state.lancelot_club_selectbox}', resetting to: All Clubs")
+            st.session_state.lancelot_club_selectbox = "All Clubs"
+        
         selected_club = st.selectbox(
             "Filter by Club",
             options=club_options,
-            index=0,
-            key="lancelot_selected_club",
+            key="lancelot_club_selectbox",
             help="Filter results to show only players/pairs from a specific club"
         )
+        
+        print(f"[DEBUG] Club selectbox RETURNED: {selected_club}")
         
         # Report type
         rating_type = st.radio(
             "Ranking Type",
             ["Players", "Pairs"],
             index=0,
+            key="lancelot_rating_type",
             horizontal=True,
             help="Switch between individual and partnership rankings"
         )
@@ -934,6 +1052,7 @@ def main():
         use_handicap = st.checkbox(
             "Use handicap score",
             value=True,
+            key="lancelot_use_handicap",
             help="If available in the API data, uses handicap-adjusted percentage (otherwise uses club percentage)."
         )
         
@@ -943,7 +1062,8 @@ def main():
             min_value=50,
             max_value=1000,
             value=250,
-            step=50
+            step=50,
+            key="lancelot_top_n"
         )
         
         # Minimum games
@@ -952,6 +1072,7 @@ def main():
             min_value=1,
             max_value=100,
             value=10,
+            key="lancelot_min_games",
             help="Minimum sessions played to appear in rankings"
         )
 
@@ -962,29 +1083,23 @@ def main():
     st.markdown(f"""
         <div style="text-align: center; padding: 0 0 1rem 0; margin-top: -2rem;">
             <h1 style="font-size: 2.5rem; margin-bottom: 0.2rem;">
-                🃏 Unofficial FFBridge Elo Ratings (Lancelot API) Proof of Concept
+                🃏 Unofficial FFBridge Elo Ratings Playground (Lancelot API) Proof of Concept
             </h1>
             <p style="color: #ffc107; font-size: 1.2rem; font-weight: 500; opacity: 0.9;">
-                Extended Historical Data • "{selected_tournament_label}"
+                Extended Historical Data • {selected_tournament_label}
             </p>
         </div>
     """, unsafe_allow_html=True)
 
     # -------------------------------
-    # Main Content
+    # Main Content - ALWAYS load ALL tournaments once, then filter
     # -------------------------------
     
-    # Determine which series to process
-    if selected_series == "all":
-        series_to_process = VALID_SERIES_IDS
-    else:
-        series_to_process = [selected_series]
-    
-    # Collect all sessions from all selected series
+    # Always fetch ALL sessions regardless of UI selection
     all_sessions = []
     
-    with st.spinner(f"Fetching sessions for {selected_tournament_label}..."):
-        for migration_id in series_to_process:
+    with st.spinner("Loading all tournament sessions..."):
+        for migration_id in VALID_SERIES_IDS:
             lancelot_id = MIGRATION_TO_LANCELOT.get(migration_id)
             if lancelot_id:
                 sessions = fetch_sessions_for_series(lancelot_id, max_pages=15)
@@ -1001,87 +1116,152 @@ def main():
     # Sort all sessions chronologically
     all_sessions.sort(key=lambda x: x.get('date', ''))
     
-    # Create a cache key based on current selection
-    cache_key = f"lancelot_processed_{selected_series}_{len(all_sessions)}_handicap_{int(use_handicap)}"
+    # Cache key is now ONLY based on handicap setting (we always load everything)
+    cache_key = f"lancelot_full_v1_{len(all_sessions)}_handicap_{int(use_handicap)}"
     
-    # Check if we have cached results for this selection
-    if (st.session_state.get('lancelot_cache_key') == cache_key and 
-        'lancelot_results_df' in st.session_state and
-        'lancelot_players_df' in st.session_state):
-        # Use cached results
-        results_df = st.session_state.lancelot_results_df
-        players_df = st.session_state.lancelot_players_df
-        current_ratings = st.session_state.get('lancelot_current_ratings', {})
+    # Use a single cache entry for the full dataset
+    if 'lancelot_full_cache' not in st.session_state:
+        st.session_state.lancelot_full_cache = {}
+    
+    full_cache = st.session_state.lancelot_full_cache
+    
+    # Check if we have cached results for ALL data
+    if cache_key in full_cache:
+        cached = full_cache[cache_key]
+        full_results_df = cached['results_df']
+        full_players_df = cached['players_df']
+        current_ratings = cached['current_ratings']
+        print(f"[DEBUG] Full dataset cache hit: {cache_key}")
     else:
-        # Process sessions and calculate Elo
-        results_df, players_df, current_ratings = process_sessions_to_elo(
+        # Check if this is an unexpected reload (fail fast)
+        if full_cache:
+            old_keys = list(full_cache.keys())
+            st.error(f"⚠️ Unexpected cache miss! Old keys: {old_keys}, New key: {cache_key}. Reload the page to fix.")
+            st.stop()
+        
+        print(f"[DEBUG] Full dataset cache miss (initial load): {cache_key}")
+        
+        # Process ALL sessions and calculate Elo (this is the one-time expensive operation)
+        full_results_df, full_players_df, current_ratings = process_sessions_to_elo(
             all_sessions,
-            series_id=selected_series if selected_series != "all" else 3,  # Default for 'all'
+            series_id=3,  # Default series for cache folder
             initial_players=None,
             use_handicap=use_handicap,
         )
-        # Cache results
-        st.session_state.lancelot_cache_key = cache_key
-        st.session_state.lancelot_results_df = results_df
-        st.session_state.lancelot_players_df = players_df
-        st.session_state.lancelot_current_ratings = current_ratings
+        
+        # Cache the full dataset
+        full_cache[cache_key] = {
+            'results_df': full_results_df,
+            'players_df': full_players_df,
+            'current_ratings': current_ratings,
+        }
     
-    # Populate club options with human-readable names
-    if not results_df.is_empty() and 'club_code' in results_df.columns:
-        unique_codes = sorted(set(results_df.select('club_code').to_series().to_list()))
+    # Now filter the cached data based on UI selections (instant operation)
+    print(f"[DEBUG] Filtering: series={selected_series}, club={selected_club}")
+    print(f"[DEBUG] Full results_df has {len(full_results_df)} rows")
+    
+    # Start with full data, then apply filters
+    results_df = full_results_df
+    
+    # Apply tournament filter if not "all"
+    if selected_series != "all":
+        if 'series_id' in results_df.columns:
+            results_df = results_df.filter(pl.col('series_id') == selected_series)
+            print(f"[DEBUG] After series filter: {len(results_df)} rows")
+        else:
+            st.warning("⚠️ Cached data is missing series_id column. Please reload the page.")
+    
+    # Apply club filter if not "All Clubs"
+    if selected_club != "All Clubs" and not results_df.is_empty():
+        if 'club_code' in results_df.columns:
+            code_mapping = st.session_state.get('lancelot_club_name_to_code', {})
+            filter_code = code_mapping.get(selected_club, selected_club)
+            print(f"[DEBUG] Club filter: '{selected_club}' -> code '{filter_code}'")
+            results_df = results_df.filter(pl.col('club_code') == filter_code)
+            print(f"[DEBUG] After club filter: {len(results_df)} rows")
+    
+    # Recalculate players_df from filtered results (so stats reflect the filter)
+    if not results_df.is_empty():
+        # Use DuckDB to aggregate player stats from the filtered results
+        players_df = duckdb.sql("""
+            WITH player_results AS (
+                -- Combine player1 and player2 into a single player view
+                SELECT 
+                    player1_id AS player_id,
+                    player1_name AS player_name,
+                    player1_elo_after AS elo_rating,
+                    percentage
+                FROM results_df
+                UNION ALL
+                SELECT 
+                    player2_id AS player_id,
+                    player2_name AS player_name,
+                    player2_elo_after AS elo_rating,
+                    percentage
+                FROM results_df
+            )
+            SELECT 
+                player_id,
+                LAST(player_name) AS player_name,
+                ROUND(LAST(elo_rating), 1) AS elo_rating,
+                COUNT(*) AS games_played,
+                ROUND(AVG(percentage), 2) AS avg_percentage,
+                ROUND(STDDEV_SAMP(percentage), 2) AS stdev_percentage
+            FROM player_results
+            GROUP BY player_id
+        """).pl()
+        print(f"[DEBUG] Recalculated players_df: {len(players_df)} rows")
+    else:
+        players_df = pl.DataFrame()
+        st.info(f"No results found for the selected filters.")
+    
+    print(f"[DEBUG] Final: results_df={len(results_df)} rows, players_df={len(players_df)} rows")
+
+    # Populate club options with human-readable names (using FULL results, not filtered)
+    if not full_results_df.is_empty() and 'club_code' in full_results_df.columns:
+        unique_codes = sorted(set(full_results_df.select('club_code').to_series().to_list()))
         unique_codes = [c for c in unique_codes if c and str(c).strip()]
         
         # Build club code -> name mapping (fetches from API as needed)
-        club_mapping = build_club_name_mapping(unique_codes, all_sessions, results_df)
+        club_mapping = build_club_name_mapping(unique_codes, all_sessions, full_results_df)
         
-        # Create list of club names (with code as fallback if name not found)
+        # Create list of club names (with normalized code as fallback if name not found)
         club_names = []
         code_to_name = {}
         for code in unique_codes:
-            name = club_mapping.get(code, code)  # Use code as fallback
+            name = club_mapping.get(code, f"Club {code}") 
             club_names.append(name)
             code_to_name[name] = code
         
-        # Sort by name and add "All Clubs" at the start
+        # Update available clubs in session state
         club_names = sorted(set(club_names))
-        new_clubs = ["All Clubs"] + club_names
+        current_selected = st.session_state.get("lancelot_club_selectbox", "All Clubs")
         
-        # Update session state and rerun to refresh the selectbox options.
-        # (Safe because we cache the heavy processing results above.)
         old_clubs = st.session_state.get('lancelot_available_clubs', ["All Clubs"])
-        if new_clubs != old_clubs:
+        merged_names = {c.strip() for c in old_clubs}
+        for n in club_names:
+            if n.strip():
+                merged_names.add(n.strip())
+        
+        if current_selected and current_selected != "All Clubs":
+            merged_names.add(current_selected.strip())
+        
+        merged_sorted = sorted([c for c in merged_names if c != "All Clubs"])
+        new_clubs = ["All Clubs"] + merged_sorted
+        
+        old_map = st.session_state.get('lancelot_club_name_to_code', {})
+        merged_map = dict(old_map)
+        merged_map.update(code_to_name)
+        
+        if len(new_clubs) > len(old_clubs) or merged_map != old_map:
+            print(f"[DEBUG] Updating available clubs: {len(old_clubs)} -> {len(new_clubs)}")
             st.session_state.lancelot_available_clubs = new_clubs
-            st.session_state.lancelot_club_name_to_code = code_to_name
-            # Ensure current selection is valid under new options
-            if st.session_state.get("lancelot_selected_club") not in new_clubs:
-                st.session_state["lancelot_selected_club"] = "All Clubs"
+            st.session_state.lancelot_club_name_to_code = merged_map
             st.rerun()
         else:
             st.session_state.lancelot_available_clubs = new_clubs
-            st.session_state.lancelot_club_name_to_code = code_to_name
-    
-    # Apply club filter if selected
-    if selected_club != "All Clubs" and not results_df.is_empty():
-        if 'club_code' not in results_df.columns:
-            st.warning("Club filtering requires club data in results.")
-        else:
-            # Get the club code for the selected name
-            code_mapping = st.session_state.get('lancelot_club_name_to_code', {})
-            filter_code = code_mapping.get(selected_club, selected_club)
-            
-            # Filter results to only include pairs from the selected club
-            results_df = results_df.filter(pl.col('club_code') == filter_code)
-            
-            # Recalculate players_df based on filtered results
-            if not results_df.is_empty():
-                filtered_player_ids = set(
-                    [str(pid) for pid in results_df.select('player1_id').to_series().to_list()] +
-                    [str(pid) for pid in results_df.select('player2_id').to_series().to_list()]
-                )
-                players_df = players_df.filter(pl.col('player_id').cast(pl.Utf8).is_in(list(filtered_player_ids)))
-            else:
-                st.info(f"No results found for club: {selected_club}")
-                players_df = pl.DataFrame()
+            st.session_state.lancelot_club_name_to_code = merged_map
+
     
     # Display top metrics in styled cards
     m1, m2, m3, m4 = st.columns(4)
@@ -1145,10 +1325,11 @@ def main():
                             # Select and format relevant columns
                             detail_df = player_results.select([
                                 pl.col('date').str.slice(0, 10).alias('Date'),
+                                pl.col('session_id').alias('Event_ID'),
                                 pl.col('session_name').alias('Session'),
                                 pl.col('pair_name').alias('Partner'),
-                                (pl.col('club_percentage') if 'club_percentage' in player_results.columns else pl.col('percentage')).cast(pl.Float64, strict=False).round(2).alias('Club_Pct'),
-                                (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_Pct'),
+                                (pl.col('club_percentage') if 'club_percentage' in player_results.columns else pl.col('percentage')).cast(pl.Float64, strict=False).round(2).alias('Club_Score'),
+                                (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_Score'),
                                 pl.col('percentage').cast(pl.Float64, strict=False).round(2).alias('Pct_Used'),
                                 pl.col('rank').alias('Rank'),
                                 pl.col('pe').alias('PE'),
@@ -1198,9 +1379,10 @@ def main():
                             # Select and format relevant columns
                             detail_df = pair_results.select([
                                 pl.col('date').str.slice(0, 10).alias('Date'),
+                                pl.col('session_id').alias('Event_ID'),
                                 pl.col('session_name').alias('Session'),
-                                (pl.col('club_percentage') if 'club_percentage' in pair_results.columns else pl.col('percentage')).cast(pl.Float64, strict=False).round(2).alias('Club_Pct'),
-                                (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_Pct'),
+                                (pl.col('club_percentage') if 'club_percentage' in pair_results.columns else pl.col('percentage')).cast(pl.Float64, strict=False).round(2).alias('Club_Score'),
+                                (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_Score'),
                                 pl.col('percentage').cast(pl.Float64, strict=False).round(2).alias('Pct_Used'),
                                 pl.col('rank').alias('Rank'),
                                 pl.col('pe').alias('PE'),

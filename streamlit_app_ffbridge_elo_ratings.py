@@ -33,7 +33,7 @@ from streamlitlib.streamlitlib import (
     create_pdf,
     widen_scrollbars,
 )
-from st_aggrid import GridOptionsBuilder, AgGrid, ColumnsAutoSizeMode, AgGridTheme, JsCode
+from st_aggrid import GridOptionsBuilder, AgGrid, ColumnsAutoSizeMode, AgGridTheme
 
 # Import for version display only
 try:
@@ -84,10 +84,37 @@ AGGRID_MAX_DISPLAY_ROWS = 10
 # -------------------------------
 # Persistent Disk Cache Helpers
 # -------------------------------
+def _normalize_series_id(series_id: Optional[Any]) -> Optional[Any]:
+    """Normalize series_id so cache folders are stable (e.g. '3' and 3 map the same)."""
+    if series_id is None:
+        return None
+    # Keep non-numeric strings (e.g. "all") as-is
+    if isinstance(series_id, str):
+        s = series_id.strip()
+        if s.isdigit():
+            try:
+                return int(s)
+            except Exception:
+                return series_id
+        return series_id
+    # Coerce simple numeric types
+    try:
+        # bool is a subclass of int; don't convert it
+        if isinstance(series_id, bool):
+            return series_id
+        # floats that are integral (e.g. 3.0)
+        if isinstance(series_id, float) and series_id.is_integer():
+            return int(series_id)
+    except Exception:
+        pass
+    return series_id
+
+
 def get_cache_path(identifier: str, params: Optional[Dict] = None, series_id: Optional[Any] = None) -> pathlib.Path:
     """Generate a readable, unique filename in a series-specific subdirectory."""
     # Determine the subdirectory based on series_id (friendly name)
-    series_folder = SERIES_NAMES.get(series_id, "General")
+    norm_series_id = _normalize_series_id(series_id)
+    series_folder = SERIES_NAMES.get(norm_series_id, SERIES_NAMES.get(series_id, "General"))
     target_dir = CACHE_DIR / series_folder
     target_dir.mkdir(parents=True, exist_ok=True)
     
@@ -122,6 +149,20 @@ def save_to_disk_cache(identifier: str, data: Any, params: Optional[Dict] = None
 def load_from_disk_cache(identifier: str, params: Optional[Dict] = None, max_age_hours: Optional[int] = 72, series_id: Optional[Any] = None) -> Optional[Any]:
     """Load data from disk if it exists and isn't too old."""
     cache_path = get_cache_path(identifier, params, series_id)
+    
+    # Fallback for older cache filename format (results_ID.json instead of results_ID_DATE.json)
+    if not cache_path.exists() and "results_" in identifier:
+        id_match = re.search(r'(results_\d+)', identifier)
+        if id_match:
+            legacy_identifier = id_match.group(1)
+            legacy_path = get_cache_path(legacy_identifier, params, series_id)
+            if legacy_path.exists():
+                print(f"[CACHE] Found legacy file: {legacy_path}")
+                cache_path = legacy_path
+
+    # Log cache lookup for debugging (disabled - too verbose)
+    # print(f"[CACHE] Looking for: {cache_path} (exists: {cache_path.exists()})")
+    
     if not cache_path.exists():
         return None
     
@@ -279,20 +320,13 @@ def calculate_aggrid_height(row_count: int) -> int:
 
 def build_selectable_aggrid(df: pd.DataFrame, key: str) -> Dict[str, Any]:
     """
-    Build an AgGrid with double-click row selection.
+    Build an AgGrid with single-click row selection.
     Returns the grid response dictionary.
     """
     gb = GridOptionsBuilder.from_dataframe(df)
-    gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=True)
+    gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
     gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
     grid_options = gb.build()
-    
-    # Add double-click handler to select row
-    grid_options['onRowDoubleClicked'] = JsCode("""
-        function(event) {
-            event.node.setSelected(true, true);
-        }
-    """)
     
     return AgGrid(
         df,
@@ -563,9 +597,11 @@ def fetch_tournament_results_with_session(session: Optional[requests.Session], t
                                 'player2_id': str(p2.get('id')),
                                 'player1_name': f"{p1.get('firstname', '')} {p1.get('lastname', '')}".strip(),
                                 'player2_name': f"{p2.get('firstname', '')} {p2.get('lastname', '')}".strip(),
+                                # FFBridge `percent` appears to already be the handicapped score.
                                 'percentage': pct,
-                                'club_percentage': club_pct,
                                 'handicap_percentage': handicap_pct,
+                                # Derive "club score" by subtracting Team_PE_Bonus/10 from handicapped score
+                                'club_percentage': (handicap_pct - (float(team.get('PE_bonus', 0) or 0) / 10.0)),
                                 'rank': team.get('ranking', 0),
                                 'theoretical_rank': team.get('theoretical_ranking', 0),  # Handicap rank
                                 'pe': team.get('PE', 0),  # Performance points
@@ -651,7 +687,7 @@ def process_tournaments_to_elo(
     total_t = len(sorted_tournaments)
     for i, tournament in enumerate(sorted_tournaments):
         t_id = str(tournament.get('id', ''))
-        t_series = tournament.get('series_id')
+        t_series = _normalize_series_id(tournament.get('series_id'))
         # New API uses moment_label, Demo uses name
         t_name = tournament.get('name') or tournament.get('moment_label') or f"Tournament {t_id}"
         t_date = tournament.get('date', '')
@@ -695,26 +731,26 @@ def process_tournaments_to_elo(
             p2_id = result.get('player2_id')
             p1_name = result.get('player1_name', '')
             p2_name = result.get('player2_name', '')
-            # Classic data may only have `percentage` (which we treat as handicap score);
-            # `club_percentage` might be missing/unavailable.
-            club_pct_raw = result.get('club_percentage')
+            # Treat stored `percentage` as handicapped score (backward compat).
+            raw_pct = float(result.get('percentage', 50.0) or 50.0)
             handicap_pct_raw = result.get('handicap_percentage')
             try:
-                club_pct = float(club_pct_raw) if club_pct_raw is not None else None
+                handicap_pct = float(handicap_pct_raw) if handicap_pct_raw is not None else raw_pct
             except (ValueError, TypeError):
-                club_pct = None
-            try:
-                handicap_pct = float(handicap_pct_raw) if handicap_pct_raw is not None else None
-            except (ValueError, TypeError):
-                handicap_pct = None
-
-            # Backward-compat fallback: if handicap % missing, use `percentage`
-            raw_pct = float(result.get('percentage', 50.0) or 50.0)
-            if handicap_pct is None:
                 handicap_pct = raw_pct
-            # If club % missing, fall back to handicap % (so Elo still computes)
-            if club_pct is None:
-                club_pct = handicap_pct
+
+            # Club score is derived from handicap score - PE_bonus/10 (PE_bonus may be string)
+            pe_bonus_raw = result.get('pe_bonus', 0)
+            try:
+                pe_bonus = float(pe_bonus_raw or 0)
+            except (ValueError, TypeError):
+                pe_bonus = 0.0
+
+            club_pct_raw = result.get('club_percentage')
+            try:
+                club_pct = float(club_pct_raw) if club_pct_raw is not None else (handicap_pct - pe_bonus / 10.0)
+            except (ValueError, TypeError):
+                club_pct = handicap_pct - pe_bonus / 10.0
 
             percentage = handicap_pct if use_handicap else club_pct
 
@@ -748,6 +784,7 @@ def process_tournaments_to_elo(
                 'tournament_id': str(t_id),
                 'tournament_name': str(t_name),
                 'date': str(t_date),
+                'series_id': int(t_series) if t_series else 0,
                 'team_id': str(team_id),
                 'pair_id': str(pair_id),
                 'player1_id': str(p1_id),
@@ -756,9 +793,8 @@ def process_tournaments_to_elo(
                 'player2_name': str(p2_name),
                 'pair_name': str(pair_name),
                 'percentage': float(percentage),
-                # Note: `club_percentage` might be a fallback; see detail table columns for truth.
-                'club_percentage': float(club_pct) if club_pct is not None else None,
-                'handicap_percentage': handicap_pct,
+                'handicap_percentage': float(handicap_pct),
+                'club_percentage': float(club_pct),
                 'rank': int(rank) if rank is not None else 0,
                 'rank_without_handicap': int(rank_club) if rank_club is not None else 0,
                 'theoretical_rank': int(theoretical_rank) if theoretical_rank is not None else 0,
@@ -1059,8 +1095,8 @@ def main():
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
         # Organization selection
         organization = st.selectbox(
-            "Bridge Organization",
-            options=["FFBridge"],
+            "Bridge API",
+            options=["FFBridge (New)"],
             index=0,
             help="Select the bridge organization"
         )
@@ -1077,24 +1113,42 @@ def main():
         
 
         # Tournament selection - derive from SERIES_NAMES constant
-        tournament_options = {SERIES_NAMES[k]: k for k in ["all"] + VALID_SERIES_IDS}
+        tournament_options_list = ["all"] + VALID_SERIES_IDS
+        tournament_labels = [SERIES_NAMES[k] for k in tournament_options_list]
+        
+        # Initialize widget state if not present (ensures "All Tournaments" is default)
+        if "ffbridge_tournament_selectbox" not in st.session_state:
+            st.session_state.ffbridge_tournament_selectbox = tournament_labels[0]  # "All Tournaments"
+        
+        # Validate the stored value is still valid
+        if st.session_state.ffbridge_tournament_selectbox not in tournament_labels:
+            st.session_state.ffbridge_tournament_selectbox = tournament_labels[0]
         
         selected_tournament_label = st.selectbox(
             "Tournament Names",
-            options=list(tournament_options.keys()),
-            index=0,
+            options=tournament_labels,
+            key="ffbridge_tournament_selectbox",
             help="Select which simultaneous tournaments to analyze"
         )
-        simultaneous_type = tournament_options[selected_tournament_label]
+        
+        # Determine selection from label
+        simultaneous_type = tournament_options_list[tournament_labels.index(selected_tournament_label)]
         
         # Club filter - uses clubs from previous data load (stored in session state)
-        # Will be populated after first data load
         club_options = st.session_state.get('available_clubs', ["All Clubs"])
+        
+        # Initialize widget state if not present
+        if "ffbridge_club_selectbox" not in st.session_state:
+            st.session_state.ffbridge_club_selectbox = "All Clubs"
+        
+        # Validate the stored club is still in the options (list may have changed)
+        if st.session_state.ffbridge_club_selectbox not in club_options:
+            st.session_state.ffbridge_club_selectbox = "All Clubs"
+        
         selected_club = st.selectbox(
             "Filter by Club",
             options=club_options,
-            index=0,
-            key="ffbridge_selected_club",
+            key="ffbridge_club_selectbox",
             help="Filter results to show only players/pairs from a specific club"
         )
         
@@ -1103,6 +1157,7 @@ def main():
             "Ranking Type",
             ["Players", "Pairs"],
             index=0,
+            key="ffbridge_rating_type",
             horizontal=True,
             help="Switch between individual and partnership rankings"
         )
@@ -1111,6 +1166,7 @@ def main():
         use_handicap = st.checkbox(
             "Use handicap score",
             value=True,
+            key="ffbridge_use_handicap",
             help="If available in the API data, uses handicap-adjusted percentage (otherwise uses club percentage)."
         )
         
@@ -1120,7 +1176,8 @@ def main():
             min_value=50,
             max_value=1000,
             value=250,
-            step=50
+            step=50,
+            key="ffbridge_top_n"
         )
         
         # Minimum games
@@ -1129,6 +1186,7 @@ def main():
             min_value=1,
             max_value=100,
             value=10,
+            key="ffbridge_min_games",
             help="Minimum tournaments played to appear in rankings"
         )
 
@@ -1142,89 +1200,153 @@ def main():
                 🃏 Unofficial FFBridge Elo Ratings Playground (Proof of Concept)
             </h1>
             <p style="color: #ffc107; font-size: 1.2rem; font-weight: 500; opacity: 0.9;">
-                 Elo Ratings for "{selected_tournament_label}"
+                 Elo Ratings for {selected_tournament_label}
             </p>
         </div>
     """, unsafe_allow_html=True)
 
     # -------------------------------
-    # Main Content
+    # Main Content - ALWAYS load ALL tournaments once, then filter
     # -------------------------------
     
     # Use session ID for cache invalidation
     session_id = hashlib.md5(st.session_state.get('ffbridge_user', 'env').encode()).hexdigest()[:8]
     
-    # Automatically fetch data
-    with st.spinner(f"Fetching {selected_tournament_label}..."):
-        tournaments = fetch_tournament_list(simultaneous_type=simultaneous_type, limit=None, _session_id=session_id)
+    # Always fetch ALL tournaments regardless of UI selection
+    with st.spinner("Loading all tournament data..."):
+        all_tournaments = fetch_tournament_list(simultaneous_type="all", limit=None, _session_id=session_id)
         
-        if not tournaments:
+        if not all_tournaments:
             st.error("Failed to retrieve tournament data from FFBridge. Please verify your token.")
             return
 
-    # Create a cache key based on current selection
-    cache_key = f"ffbridge_processed_v2_{simultaneous_type}_{len(tournaments)}_handicap_{int(use_handicap)}"
+    # Cache key is now ONLY based on handicap setting (we always load everything)
+    cache_key = f"ffbridge_full_v1_{len(all_tournaments)}_handicap_{int(use_handicap)}"
     
-    # Check if we have cached results for this selection
-    if (st.session_state.get('ffbridge_cache_key') == cache_key and 
-        'ffbridge_results_df' in st.session_state and
-        'ffbridge_players_df' in st.session_state):
-        # Use cached results
-        results_df = st.session_state.ffbridge_results_df
-        players_df = st.session_state.ffbridge_players_df
-        current_ratings = st.session_state.get('ffbridge_current_ratings', {})
+    # Use a single cache entry for the full dataset
+    if 'ffbridge_full_cache' not in st.session_state:
+        st.session_state.ffbridge_full_cache = {}
+    
+    full_cache = st.session_state.ffbridge_full_cache
+    
+    # Check if we have cached results for ALL data
+    if cache_key in full_cache:
+        cached = full_cache[cache_key]
+        full_results_df = cached['results_df']
+        full_players_df = cached['players_df']
+        current_ratings = cached['current_ratings']
+        print(f"[DEBUG] Full dataset cache hit: {cache_key}")
     else:
-        # Process tournaments and calculate Elo
-        # Note: process_tournaments_to_elo handles individual tournament fetching and disk caching
-        results_df, players_df, current_ratings = process_tournaments_to_elo(
-            tournaments, initial_players=None, use_handicap=use_handicap
+        # Check if this is an unexpected reload (fail fast)
+        if full_cache:
+            old_keys = list(full_cache.keys())
+            st.error(f"⚠️ Unexpected cache miss! Old keys: {old_keys}, New key: {cache_key}. Reload the page to fix.")
+            st.stop()
+        
+        print(f"[DEBUG] Full dataset cache miss (initial load): {cache_key}")
+        
+        # Process ALL tournaments and calculate Elo (this is the one-time expensive operation)
+        full_results_df, full_players_df, current_ratings = process_tournaments_to_elo(
+            all_tournaments, initial_players=None, use_handicap=use_handicap
         )
-        # Cache results
-        st.session_state.ffbridge_cache_key = cache_key
-        st.session_state.ffbridge_results_df = results_df
-        st.session_state.ffbridge_players_df = players_df
-        st.session_state.ffbridge_current_ratings = current_ratings
+        
+        # Cache the full dataset
+        full_cache[cache_key] = {
+            'results_df': full_results_df,
+            'players_df': full_players_df,
+            'current_ratings': current_ratings,
+        }
     
-    # Update available clubs in session state for the filter dropdown
-    if not results_df.is_empty() and 'club_name' in results_df.columns:
-        unique_clubs = sorted(set(results_df.select('club_name').to_series().to_list()))
-        unique_clubs = [c for c in unique_clubs if c and c.strip()]  # Remove empty/whitespace strings
-        new_clubs = ["All Clubs"] + unique_clubs
+    # Now filter the cached data based on UI selections (instant operation)
+    print(f"[DEBUG] Filtering: tournament={simultaneous_type}, club={selected_club}")
+    print(f"[DEBUG] Full results_df has {len(full_results_df)} rows")
+    
+    # Start with full data, then apply filters
+    results_df = full_results_df
+    
+    # Apply tournament filter if not "all"
+    if simultaneous_type != "all":
+        if 'series_id' in results_df.columns:
+            results_df = results_df.filter(pl.col('series_id') == simultaneous_type)
+            print(f"[DEBUG] After tournament filter: {len(results_df)} rows")
+        else:
+            st.warning("⚠️ Cached data is missing series_id column. Please reload the page.")
+    
+    # Apply club filter if not "All Clubs"
+    if selected_club != "All Clubs" and not results_df.is_empty():
+        if 'club_name' in results_df.columns:
+            print(f"[DEBUG] Club filter: '{selected_club}'")
+            results_df = results_df.filter(pl.col('club_name') == selected_club)
+            print(f"[DEBUG] After club filter: {len(results_df)} rows")
+    
+    # Recalculate players_df from filtered results (so stats reflect the filter)
+    if not results_df.is_empty():
+        # Use DuckDB to aggregate player stats from the filtered results
+        players_df = duckdb.sql("""
+            WITH player_results AS (
+                -- Combine player1 and player2 into a single player view
+                SELECT 
+                    player1_id AS player_id,
+                    player1_name AS player_name,
+                    player1_elo_after AS elo_rating,
+                    percentage
+                FROM results_df
+                UNION ALL
+                SELECT 
+                    player2_id AS player_id,
+                    player2_name AS player_name,
+                    player2_elo_after AS elo_rating,
+                    percentage
+                FROM results_df
+            )
+            SELECT 
+                player_id,
+                LAST(player_name) AS player_name,
+                ROUND(LAST(elo_rating), 1) AS elo_rating,
+                COUNT(*) AS games_played,
+                ROUND(AVG(percentage), 2) AS avg_percentage,
+                ROUND(STDDEV_SAMP(percentage), 2) AS stdev_percentage
+            FROM player_results
+            GROUP BY player_id
+        """).pl()
+        print(f"[DEBUG] Recalculated players_df: {len(players_df)} rows")
+    else:
+        players_df = pl.DataFrame()
+        st.info(f"No results found for the selected filters.")
+    
+    print(f"[DEBUG] Final: results_df={len(results_df)} rows, players_df={len(players_df)} rows")
+
+    # Populate club options with human-readable names (using FULL results, not filtered)
+    if not full_results_df.is_empty() and 'club_name' in full_results_df.columns:
+        unique_clubs = sorted(set(full_results_df.select('club_name').to_series().to_list()))
+        unique_clubs = [c for c in unique_clubs if c and c.strip()]
+
+        current_selected = st.session_state.get("ffbridge_club_selectbox", "All Clubs")
         old_clubs = st.session_state.get('available_clubs', ["All Clubs"])
-        if new_clubs != old_clubs:
+        
+        merged_names = {c.strip() for c in old_clubs}
+        for n in unique_clubs:
+            if n.strip():
+                merged_names.add(n.strip())
+        
+        if current_selected and current_selected != "All Clubs":
+            merged_names.add(current_selected.strip())
+
+        merged_sorted = sorted([c for c in merged_names if c != "All Clubs"])
+        new_clubs = ["All Clubs"] + merged_sorted
+
+        if len(new_clubs) > len(old_clubs):
+            print(f"[DEBUG] Updating available clubs: {len(old_clubs)} -> {len(new_clubs)}")
             st.session_state.available_clubs = new_clubs
-            if st.session_state.get("ffbridge_selected_club") not in new_clubs:
-                st.session_state["ffbridge_selected_club"] = "All Clubs"
             st.rerun()
         else:
             st.session_state.available_clubs = new_clubs
-    
-    # Apply club filter if selected
-    if selected_club != "All Clubs" and not results_df.is_empty():
-        # Check if club_name column exists (may not exist in old cached data)
-        if 'club_name' not in results_df.columns:
-            st.warning("Club filtering requires refreshing cached data. Please delete the cache folder and reload.")
-        else:
-            # Filter results to only include pairs from the selected club
-            results_df = results_df.filter(pl.col('club_name') == selected_club)
-            
-            # Recalculate players_df based on filtered results
-            if not results_df.is_empty():
-                # Get unique player IDs from filtered results (ensure string type)
-                filtered_player_ids = set(
-                    [str(pid) for pid in results_df.select('player1_id').to_series().to_list()] +
-                    [str(pid) for pid in results_df.select('player2_id').to_series().to_list()]
-                )
-                players_df = players_df.filter(pl.col('player_id').cast(pl.Utf8).is_in(list(filtered_player_ids)))
-            else:
-                st.info(f"No results found for club: {selected_club}")
-                players_df = pl.DataFrame()
-    
+
     # Display top metrics in styled cards
     m1, m2, m3, m4 = st.columns(4)
     
     with m1:
-        st.markdown(f'<div class="metric-card"><small>Tournaments</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{len(tournaments)}</span></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><small>Tournaments</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{len(all_tournaments)}</span></div>', unsafe_allow_html=True)
     
     with m2:
         st.markdown(f'<div class="metric-card"><small>Active Players</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{len(players_df)}</span></div>', unsafe_allow_html=True)
@@ -1311,11 +1433,12 @@ def main():
                             if not player_results.is_empty():
                                 cols_to_select = [
                                     pl.col('date').str.slice(0, 10).alias('Date'),
+                                    pl.col('tournament_id').alias('Event_ID'),
                                     pl.col('tournament_name').alias('Tournament'),
                                     pl.col('pair_name').alias('Partner'),
                                     # Show both raw % values when available
-                                    (pl.col('club_percentage') if 'club_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Club_Pct'),
-                                    (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_Pct'),
+                                    (pl.col('club_percentage') if 'club_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Club_Score'),
+                                    (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_Score'),
                                     pl.col('percentage').cast(pl.Float64, strict=False).round(2).alias('Pct_Used'),
                                     pl.col('rank').alias('Rank'),
                                 ]
@@ -1398,9 +1521,10 @@ def main():
                             # Select and format relevant columns including handicap rank
                             cols_to_select = [
                                 pl.col('date').str.slice(0, 10).alias('Date'),
+                                pl.col('tournament_id').alias('Event_ID'),
                                 pl.col('tournament_name').alias('Tournament'),
-                                (pl.col('club_percentage') if 'club_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Club_Pct'),
-                                (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_Pct'),
+                                (pl.col('club_percentage') if 'club_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Club_Score'),
+                                (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_Score'),
                                 pl.col('percentage').cast(pl.Float64, strict=False).round(2).alias('Pct_Used'),
                                 pl.col('rank').alias('Rank'),
                             ]
