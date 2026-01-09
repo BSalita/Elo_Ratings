@@ -68,9 +68,10 @@ def calculate_aggrid_height(row_count: int) -> int:
     return AGGRID_HEADER_HEIGHT + (AGGRID_ROW_HEIGHT * display_rows) + AGGRID_FOOTER_HEIGHT
 
 
-def build_selectable_aggrid(df: pd.DataFrame, key: str) -> Dict[str, Any]:
+def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
     """Build an AgGrid with single-click row selection."""
-    gb = GridOptionsBuilder.from_dataframe(df)
+    display_df = df.to_pandas()
+    gb = GridOptionsBuilder.from_dataframe(display_df)
     gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
     gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
     grid_options = gb.build()
@@ -80,7 +81,7 @@ def build_selectable_aggrid(df: pd.DataFrame, key: str) -> Dict[str, Any]:
         gridOptions=grid_options,
         columns_auto_size_mode=ColumnsAutoSizeMode.FIT_CONTENTS,
         theme=AgGridTheme.BALHAM,
-        height=calculate_aggrid_height(len(df)),
+        height=calculate_aggrid_height(len(display_df)),
         key=key,
         allow_unsafe_jscode=True
     )
@@ -812,9 +813,8 @@ def main():
                     st.code(sql_query, language="sql")
             
             if not top_players.is_empty():
-                display_df = top_players.to_pandas()
                 st.caption("💡 Click a row to view player's tournament history")
-                grid_response = build_selectable_aggrid(display_df, 'players_table_selectable')
+                grid_response = build_selectable_aggrid(top_players, 'players_table_selectable')
                 
                 selected_rows = grid_response.get('selected_rows', None)
                 if selected_rows is not None and len(selected_rows) > 0:
@@ -864,9 +864,8 @@ def main():
                     st.code(sql_query, language="sql")
             
             if not top_pairs.is_empty():
-                display_df = top_pairs.to_pandas()
                 st.caption("💡 Click a row to view pair's tournament history")
-                grid_response = build_selectable_aggrid(display_df, 'pairs_table_selectable')
+                grid_response = build_selectable_aggrid(top_pairs, 'pairs_table_selectable')
                 
                 selected_rows = grid_response.get('selected_rows', None)
                 if selected_rows is not None and len(selected_rows) > 0:
