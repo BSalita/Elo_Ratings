@@ -1,5 +1,5 @@
-# mlBridgeLib package
-from mlBridgeLib.mlBridgeLib import (
+# mlBridge package
+from mlBridge.mlBridge import (
     pd_options_display,
     Direction_to_NESW_d,
     brs_to_pbn,
@@ -48,7 +48,7 @@ from mlBridgeLib.mlBridgeLib import (
     CATEGORICAL_SCHEMAS,
 )
 
-from mlBridgeLib.mlBridgeAcblLib import (
+from mlBridge.mlBridgeAcblLib import (
     get_club_results_from_acbl_number,
     get_tournament_sessions_from_acbl_number,
     get_tournament_session_results,
@@ -58,7 +58,7 @@ from mlBridgeLib.mlBridgeAcblLib import (
     merge_clean_augment_tournament_dfs,
 )
 
-from mlBridgeLib.logging_config import (
+from mlBridge.logging_config import (
     setup_logger,
     get_logger,
     log_print,

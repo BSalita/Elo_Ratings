@@ -38,8 +38,8 @@ from endplay.types import Deal, Contract, Denom, Player, Penalty, Vul
 from endplay.dds import calc_dd_table, calc_all_tables, par
 from endplay.dealer import generate_deals
 
-import mlBridgeLib.mlBridgeLib as mlBridgeLib
-from mlBridgeLib.mlBridgeLib import (
+import mlBridge.mlBridge as mlBridge
+from mlBridge.mlBridge import (
     NESW, SHDC, NS_EW,
     PlayerDirectionToPairDirection,
     NextPosition,
@@ -52,8 +52,8 @@ from logging_config import setup_logger
 logger = setup_logger(__name__)
 
 
-# todo: use versions in mlBridgeLib
-VulToEndplayVul_d = { # convert mlBridgeLib Vul to endplay Vul
+# todo: use versions in mlBridge
+VulToEndplayVul_d = { # convert mlBridge Vul to endplay Vul
     'None':Vul.none,
     'Both':Vul.both,
     'N_S':Vul.ns,
@@ -61,7 +61,7 @@ VulToEndplayVul_d = { # convert mlBridgeLib Vul to endplay Vul
 }
 
 
-DealerToEndPlayDealer_d = { # convert mlBridgeLib dealer to endplay dealer
+DealerToEndPlayDealer_d = { # convert mlBridge dealer to endplay dealer
     'N':Player.north,
     'E':Player.east,
     'S':Player.south,
@@ -2357,7 +2357,7 @@ def compute_contract_result(df: pl.DataFrame) -> list[Optional[int]]:
     # convert Score_NS into Result (-13 to 13) and Tricks (0 to 13)
     result_col = 'Result' if 'Result' not in df.columns else 'Result2'
     scores_l_cache = {}
-    df = df.with_columns(pl.Series('scores_l',mlBridgeLib.ContractToScores(df,cache=scores_l_cache),dtype=pl.List(pl.Int16)))
+    df = df.with_columns(pl.Series('scores_l',mlBridge.ContractToScores(df,cache=scores_l_cache),dtype=pl.List(pl.Int16)))
     logger.info(len(scores_l_cache))
     logger.info(df[['Contract','BidLvl','BidSuit','Dbl','Vul','Declarer_Direction','Score_NS','scores_l']])
     # todo: can map_elements be eliminated?
@@ -3194,17 +3194,17 @@ def add_dd_scores_basic(df: pl.DataFrame, scores_d: Dict) -> pl.DataFrame:
         )
         .alias(f"DD_Score_{level}{strain}_{direction}")
         for level in range(1, 8)
-        for strain in mlBridgeLib.CDHSN
+        for strain in mlBridge.CDHSN
         for direction, pair_direction in [('N','NS'), ('E','EW'), ('S','NS'), ('W','EW')]
     ])
     df = df.with_columns([
         pl.max_horizontal(pl.col(f"^DD_Score_[1-7]{strain}_{direction}$")).alias(f"DD_Score_{strain}_{direction}_Max")
-        for strain in mlBridgeLib.CDHSN
+        for strain in mlBridge.CDHSN
         for direction in 'NESW'
     ])
     df = df.with_columns([
         pl.max_horizontal(pl.col(f"^DD_Score_{strain}_{pair_direction[0]}_Max$"),pl.col(f"^DD_Score_{strain}_{pair_direction[1]}_Max$")).alias(f"DD_Score_{strain}_{pair_direction}_Max")
-        for strain in mlBridgeLib.CDHSN
+        for strain in mlBridge.CDHSN
         for pair_direction in ['NS','EW']
     ])
     

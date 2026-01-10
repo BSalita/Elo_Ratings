@@ -1,7 +1,7 @@
 # takes 1h10m/35m to produce df of 48m rows by 2546 columns. File size 33GB. Uses 1.4TB of memory/pagefile.
 # Create training data by merging of hand records augmented and board results augmented.
 
-# todo: C:\sw\bridge\ML-Contract-Bridge\src\acbl\mlBridgeLib\mlBridgeAiLib.py:2574: CategoricalRemappingWarning:
+# todo: C:\sw\bridge\ML-Contract-Bridge\src\acbl\mlBridge\mlBridgeAiLib.py:2574: CategoricalRemappingWarning:
 #    Local categoricals have different encodings, expensive re-encoding is done to perform this merge operation.
 #    Consider using a StringCache or an Enum type if the categories are known in advance
 #    .replace_strict(mapping, default=unknown_idx, return_dtype=pl.Int64)
@@ -100,14 +100,14 @@ from tqdm import tqdm
 from IPython.display import display
 import numpy as np
 import logging
-from mlBridgeLib.logging_config import setup_logger
+from mlBridge.logging_config import setup_logger
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 import torch.nn.functional as F
 from typing import Any, Optional, Dict, List, Tuple, Iterable, Callable, Union
 import matplotlib.pyplot as plt
 import seaborn as sns
-import mlBridgeLib.mlBridgeLib as mlBridgeLib
+import mlBridge.mlBridge as mlBridge
 
 
 logger = setup_logger(__name__)
@@ -1234,7 +1234,7 @@ def validate_categorical_schemas(
         import sys
         import pathlib
         sys.path.append(str(pathlib.Path(__file__).parent))
-        from mlBridgeLib import CATEGORICAL_SCHEMAS
+        from mlBridge import CATEGORICAL_SCHEMAS
         
         for col in categorical_feature_cols:
             if col not in df.columns:
@@ -1565,9 +1565,9 @@ def generate_and_save_schema_core(
     for col in categorical_feature_cols:
         if col in schema_map:
             # Use predefined enum from CATEGORICAL_SCHEMAS if available
-            if hasattr(mlBridgeLib, 'CATEGORICAL_SCHEMAS') and col in mlBridgeLib.CATEGORICAL_SCHEMAS:
+            if hasattr(mlBridge, 'CATEGORICAL_SCHEMAS') and col in mlBridge.CATEGORICAL_SCHEMAS:
                 # Get all possible values from the enum
-                enum_def = mlBridgeLib.CATEGORICAL_SCHEMAS[col]
+                enum_def = mlBridge.CATEGORICAL_SCHEMAS[col]
                 if hasattr(enum_def, 'categories'):
                     values = list(enum_def.categories)
                     if verbose:

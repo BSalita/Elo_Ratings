@@ -77,7 +77,7 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
     grid_options = gb.build()
     
     return AgGrid(
-        df,
+        display_df,
         gridOptions=grid_options,
         columns_auto_size_mode=ColumnsAutoSizeMode.FIT_CONTENTS,
         theme=AgGridTheme.BALHAM,

@@ -74,7 +74,7 @@ contract_classes = ['PASS'] + [level+suit+dbl+decl for level in '1234567' for su
 contract_classes_dtype = pd.CategoricalDtype(contract_classes, ordered=False)
 declarer_direction_to_pair_direction = {'N':'NS','S':'NS','E':'EW','W':'EW'} # NULL if PASS?
 # creates a dict all possible opening bids in auction order. key is npasses and values are opening bids.
-auction_order = [level+suit for level in '1234567' for suit in 'CDHSN']+['x','xx','p'] # todo: put into mlBridgeLib
+auction_order = [level+suit for level in '1234567' for suit in 'CDHSN']+['x','xx','p'] # todo: put into mlBridge
 # want to make these python enums but the '' in Dbl_enum isn't allowed. So back to pl.Enum we go.
 BidSuit_enum = pl.Enum(['C', 'D', 'H', 'S', 'N']) # NULL if PASS?
 ContractType_enum = pl.Enum(['Pass', 'Partial', 'Game', 'SSlam', 'GSlam'])
@@ -685,7 +685,7 @@ def DDmakesToScores(ddmakes,vuls):
     for ddmakes,vul in zip(ddmakes,vuls):
         directionsl = []
         for direction in range(len(NESW)):
-            # todo: add to mlBridgeLib
+            # todo: add to mlBridge
             v =  DirectionToVul(vul,direction)
             strainl = []
             for strain, tricks in enumerate(ddmakes[direction]): # cycle through all strains
