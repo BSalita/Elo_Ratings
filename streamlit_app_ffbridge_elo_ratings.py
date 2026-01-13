@@ -740,19 +740,14 @@ def main():
         )
         
         # Choose which score type to use for Elo calculations
-        col_label, col_radio = st.columns([1, 2])
-        with col_label:
-            st.markdown("**Elo Based On**")
-        with col_radio:
-            score_type = st.radio(
-                "Elo Based On",
-                ["Scratch", "Handicapped"],
-                index=0,
-                key="elo_score_type",
-                horizontal=True,
-                label_visibility="collapsed",
-                help="Choose which percentage to use for Elo calculations (rankings always sorted by Elo)"
-            )
+        score_type = st.radio(
+            "Elo Based On",
+            ["Scratch", "Handicapped"],
+            index=0,
+            key="elo_score_type",
+            horizontal=True,
+            help="Choose which percentage to use for Elo calculations (rankings always sorted by Elo)"
+        )
         use_handicap = (score_type == "Handicapped")
         
         # IV fetching is always enabled (cached, refreshes monthly on 15th)
