@@ -177,9 +177,15 @@ def _fetch_sessions_for_series(lancelot_id: int, migration_id: int, limit: Optio
     return all_sessions[:limit] if limit else all_sessions
 
 
-def fetch_tournament_results(session_id: str, tournament_date: str = "", series_id: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], bool]:
+def fetch_tournament_results(session_id: str, tournament_date: str = "", series_id: Optional[Any] = None, fetch_iv: bool = False) -> Tuple[List[Dict[str, Any]], bool]:
     """
     Fetch results for a specific session from Lancelot.
+    
+    Args:
+        session_id: The session ID to fetch
+        tournament_date: Optional date string for cache naming
+        series_id: Optional series ID for cache organization
+        fetch_iv: Ignored for Lancelot API (requires auth not available)
     
     Returns:
         Tuple of (list of result dicts, was_cached bool)
@@ -228,7 +234,13 @@ def _normalize_ranking_results(ranking: List[Dict[str, Any]]) -> List[Dict[str, 
         p2_name = f"{p2.get('firstName', '')} {p2.get('lastName', '')}".strip()
         
         pct = float(entry.get('sessionScore') or entry.get('totalScore') or 0)
-        pe_bonus = float(entry.get('peBonus') or 0)
+        pe_bonus_raw = float(entry.get('peBonus') or 0)
+        
+        # Derive IV bonus (peBonus is in tenths of a percent)
+        iv_bonus = pe_bonus_raw / 10.0
+        
+        # Derive scratch (unhandicapped) score
+        scratch_pct = pct - iv_bonus
         
         # Normalize club code using shared utility
         club_code = normalize_club_code(entry.get('simultaneousId', ''))
@@ -242,13 +254,19 @@ def _normalize_ranking_results(ranking: List[Dict[str, Any]]) -> List[Dict[str, 
             'player2_name': p2_name,
             'percentage': pct,
             'handicap_percentage': pct,
-            'club_percentage': pct - pe_bonus / 10.0,
+            'scratch_percentage': scratch_pct,  # Derived unhandicapped score
+            'iv_bonus': iv_bonus,  # Derived IV bonus (percentage points)
+            'club_percentage': scratch_pct,  # Club % is same as scratch
             'rank': entry.get('rank', 0),
             'theoretical_rank': entry.get('rankWithoutHandicap'),
             'pe': entry.get('pe', 0),
-            'pe_bonus': str(pe_bonus),
+            'pe_bonus': str(pe_bonus_raw),
             'club_code': club_code,
             'club_name': '',  # Will be populated by build_club_name_mapping
+            # IV fields (not available from Lancelot API without auth)
+            'player1_iv': None,
+            'player2_iv': None,
+            'pair_iv': None,
         })
     
     return results

@@ -95,13 +95,21 @@ def process_tournaments_to_elo(
     api_module,
     initial_players: Optional[Dict[str, Dict]] = None,
     use_handicap: bool = False,
+    fetch_iv: bool = False,
 ) -> Tuple[pl.DataFrame, pl.DataFrame, Dict[str, float]]:
     """
     Process tournament list and calculate Elo ratings.
     Works with both Classic and Lancelot API data.
+    Computes BOTH scratch and handicap Elo in one pass for efficient caching.
+    
+    Args:
+        fetch_iv: If True, fetch current IV values for each player (slower)
+        use_handicap: Determines which Elo is returned as current_ratings (both are stored in DataFrame)
     """
     all_results = []
-    player_ratings: Dict[str, float] = {}
+    # Track ratings for BOTH scratch and handicap
+    scratch_ratings: Dict[str, float] = {}
+    handicap_ratings: Dict[str, float] = {}
     player_names: Dict[str, str] = {}
     player_games: Dict[str, int] = {}
     player_pct_n: Dict[str, int] = {}
@@ -110,7 +118,8 @@ def process_tournaments_to_elo(
     
     if initial_players:
         for pid, pinfo in initial_players.items():
-            player_ratings[pid] = pinfo.get('elo', DEFAULT_ELO)
+            scratch_ratings[pid] = pinfo.get('elo', DEFAULT_ELO)
+            handicap_ratings[pid] = pinfo.get('elo', DEFAULT_ELO)
             player_names[pid] = pinfo.get('name', pid)
             player_games[pid] = pinfo.get('games_played', 0)
     
@@ -138,7 +147,7 @@ def process_tournaments_to_elo(
         progress_bar.progress((i + 1) / total_t)
         
         # Fetch results using the appropriate API module
-        results, was_cached = api_module.fetch_tournament_results(t_id, tournament_date=t_date, series_id=t_series)
+        results, was_cached = api_module.fetch_tournament_results(t_id, tournament_date=t_date, series_id=t_series, fetch_iv=fetch_iv)
         
         if was_cached:
             cache_stats["cached"] += 1
@@ -148,17 +157,18 @@ def process_tournaments_to_elo(
         if not results:
             continue
         
-        # Calculate field average rating
-        field_ratings = []
+        # Calculate field average rating for both scratch and handicap
+        scratch_field_ratings = []
+        handicap_field_ratings = []
         for result in results:
             p1_id = result.get('player1_id')
             p2_id = result.get('player2_id')
             if p1_id and p2_id:
-                r1 = player_ratings.get(p1_id, DEFAULT_ELO)
-                r2 = player_ratings.get(p2_id, DEFAULT_ELO)
-                field_ratings.append((r1 + r2) / 2)
+                scratch_field_ratings.append((scratch_ratings.get(p1_id, DEFAULT_ELO) + scratch_ratings.get(p2_id, DEFAULT_ELO)) / 2)
+                handicap_field_ratings.append((handicap_ratings.get(p1_id, DEFAULT_ELO) + handicap_ratings.get(p2_id, DEFAULT_ELO)) / 2)
         
-        field_avg = sum(field_ratings) / len(field_ratings) if field_ratings else DEFAULT_ELO
+        scratch_field_avg = sum(scratch_field_ratings) / len(scratch_field_ratings) if scratch_field_ratings else DEFAULT_ELO
+        handicap_field_avg = sum(handicap_field_ratings) / len(handicap_field_ratings) if handicap_field_ratings else DEFAULT_ELO
         
         # Update ratings for each result
         for result in results:
@@ -187,7 +197,26 @@ def process_tournaments_to_elo(
             except (ValueError, TypeError):
                 club_pct = handicap_pct - pe_bonus / 10.0
             
-            percentage = handicap_pct if use_handicap else club_pct
+            # Get scratch (unhandicapped) percentage and IV bonus
+            scratch_pct_raw = result.get('scratch_percentage')
+            try:
+                scratch_pct = float(scratch_pct_raw) if scratch_pct_raw is not None else club_pct
+            except (ValueError, TypeError):
+                scratch_pct = club_pct
+            
+            iv_bonus_raw = result.get('iv_bonus')
+            try:
+                iv_bonus = float(iv_bonus_raw) if iv_bonus_raw is not None else (pe_bonus / 10.0)
+            except (ValueError, TypeError):
+                iv_bonus = pe_bonus / 10.0
+            
+            # Get individual IV values (if available from API)
+            player1_iv = result.get('player1_iv')
+            player2_iv = result.get('player2_iv')
+            pair_iv = result.get('pair_iv')
+            
+            # We'll compute both, but use_handicap determines which is used for 'percentage' column
+            percentage = handicap_pct if use_handicap else scratch_pct
             
             rank_club = result.get('rank', 0)
             rank_handicap = result.get('theoretical_rank', 0)
@@ -230,25 +259,44 @@ def process_tournaments_to_elo(
                 'pair_name': str(pair_name),
                 'percentage': float(percentage),
                 'handicap_percentage': float(handicap_pct),
+                'scratch_percentage': float(scratch_pct),
+                'iv_bonus': float(iv_bonus),
                 'club_percentage': float(club_pct),
                 'rank': int(rank) if rank is not None else 0,
                 'rank_without_handicap': int(rank_club) if rank_club is not None else 0,
                 'theoretical_rank': int(rank_handicap) if rank_handicap is not None else 0,
                 'pe': float(pe) if pe is not None else 0.0,
                 'pe_bonus': str(pe_bonus) if pe_bonus is not None else '',
-                'field_avg_rating': float(field_avg),
+                'scratch_field_avg': float(scratch_field_avg),
+                'handicap_field_avg': float(handicap_field_avg),
                 'club_id': str(club_id),
                 'club_name': str(club_name),
                 'club_code': str(club_code),
+                'player1_current_iv': float(player1_iv) if player1_iv is not None else None,
+                'player2_current_iv': float(player2_iv) if player2_iv is not None else None,
+                'pair_iv': float(pair_iv) if pair_iv is not None else None,  # Current pair IV (sum of current player IVs)
             }
             
-            # Update player 1 rating
+            # Update player 1 ratings (BOTH scratch and handicap)
             if p1_id:
-                current_r1 = player_ratings.get(p1_id, DEFAULT_ELO)
-                new_r1 = calculate_elo_from_percentage(current_r1, percentage, field_avg)
-                result_record['player1_elo_before'] = current_r1
-                result_record['player1_elo_after'] = new_r1
-                player_ratings[p1_id] = new_r1
+                # Scratch Elo
+                scratch_r1_before = scratch_ratings.get(p1_id, DEFAULT_ELO)
+                scratch_r1_after = calculate_elo_from_percentage(scratch_r1_before, scratch_pct, scratch_field_avg)
+                scratch_ratings[p1_id] = scratch_r1_after
+                
+                # Handicap Elo
+                handicap_r1_before = handicap_ratings.get(p1_id, DEFAULT_ELO)
+                handicap_r1_after = calculate_elo_from_percentage(handicap_r1_before, handicap_pct, handicap_field_avg)
+                handicap_ratings[p1_id] = handicap_r1_after
+                
+                result_record['player1_scratch_elo_before'] = scratch_r1_before
+                result_record['player1_scratch_elo_after'] = scratch_r1_after
+                result_record['player1_handicap_elo_before'] = handicap_r1_before
+                result_record['player1_handicap_elo_after'] = handicap_r1_after
+                # For backward compatibility, use selected type
+                result_record['player1_elo_before'] = handicap_r1_before if use_handicap else scratch_r1_before
+                result_record['player1_elo_after'] = handicap_r1_after if use_handicap else scratch_r1_after
+                
                 player_names[p1_id] = p1_name
                 player_games[p1_id] = player_games.get(p1_id, 0) + 1
                 
@@ -264,13 +312,26 @@ def process_tournaments_to_elo(
                 player_pct_mean[p1_id] = mean
                 player_pct_m2[p1_id] = m2
             
-            # Update player 2 rating
+            # Update player 2 ratings (BOTH scratch and handicap)
             if p2_id:
-                current_r2 = player_ratings.get(p2_id, DEFAULT_ELO)
-                new_r2 = calculate_elo_from_percentage(current_r2, percentage, field_avg)
-                result_record['player2_elo_before'] = current_r2
-                result_record['player2_elo_after'] = new_r2
-                player_ratings[p2_id] = new_r2
+                # Scratch Elo
+                scratch_r2_before = scratch_ratings.get(p2_id, DEFAULT_ELO)
+                scratch_r2_after = calculate_elo_from_percentage(scratch_r2_before, scratch_pct, scratch_field_avg)
+                scratch_ratings[p2_id] = scratch_r2_after
+                
+                # Handicap Elo
+                handicap_r2_before = handicap_ratings.get(p2_id, DEFAULT_ELO)
+                handicap_r2_after = calculate_elo_from_percentage(handicap_r2_before, handicap_pct, handicap_field_avg)
+                handicap_ratings[p2_id] = handicap_r2_after
+                
+                result_record['player2_scratch_elo_before'] = scratch_r2_before
+                result_record['player2_scratch_elo_after'] = scratch_r2_after
+                result_record['player2_handicap_elo_before'] = handicap_r2_before
+                result_record['player2_handicap_elo_after'] = handicap_r2_after
+                # For backward compatibility, use selected type
+                result_record['player2_elo_before'] = handicap_r2_before if use_handicap else scratch_r2_before
+                result_record['player2_elo_after'] = handicap_r2_after if use_handicap else scratch_r2_after
+                
                 player_names[p2_id] = p2_name
                 player_games[p2_id] = player_games.get(p2_id, 0) + 1
                 
@@ -286,27 +347,85 @@ def process_tournaments_to_elo(
                 player_pct_mean[p2_id] = mean
                 player_pct_m2[p2_id] = m2
             
-            # Calculate pair Elo
+            # Calculate pair Elo (both types)
             if p1_id and p2_id:
-                result_record['pair_elo'] = (player_ratings[p1_id] + player_ratings[p2_id]) / 2
+                result_record['scratch_pair_elo'] = (scratch_ratings[p1_id] + scratch_ratings[p2_id]) / 2
+                result_record['handicap_pair_elo'] = (handicap_ratings[p1_id] + handicap_ratings[p2_id]) / 2
+                result_record['pair_elo'] = result_record['handicap_pair_elo'] if use_handicap else result_record['scratch_pair_elo']
             
             all_results.append(result_record)
     
     progress_bar.empty()
     status_text.empty()
     
-    # Convert to DataFrames
-    results_df = pl.DataFrame(all_results) if all_results else pl.DataFrame()
+    # Convert to DataFrames with explicit schema to handle None values
+    if all_results:
+        results_schema = {
+            'tournament_id': pl.Utf8,
+            'tournament_name': pl.Utf8,
+            'date': pl.Utf8,
+            'series_id': pl.Int64,
+            'team_id': pl.Utf8,
+            'pair_id': pl.Utf8,
+            'player1_id': pl.Utf8,
+            'player2_id': pl.Utf8,
+            'player1_name': pl.Utf8,
+            'player2_name': pl.Utf8,
+            'pair_name': pl.Utf8,
+            'percentage': pl.Float64,
+            'handicap_percentage': pl.Float64,
+            'scratch_percentage': pl.Float64,
+            'iv_bonus': pl.Float64,
+            'club_percentage': pl.Float64,
+            'rank': pl.Int64,
+            'rank_without_handicap': pl.Int64,
+            'theoretical_rank': pl.Int64,
+            'pe': pl.Float64,
+            'pe_bonus': pl.Utf8,
+            'scratch_field_avg': pl.Float64,
+            'handicap_field_avg': pl.Float64,
+            'club_id': pl.Utf8,
+            'club_name': pl.Utf8,
+            'club_code': pl.Utf8,
+            'player1_current_iv': pl.Float64,
+            'player2_current_iv': pl.Float64,
+            'pair_iv': pl.Float64,
+            'player1_scratch_elo_before': pl.Float64,
+            'player1_scratch_elo_after': pl.Float64,
+            'player1_handicap_elo_before': pl.Float64,
+            'player1_handicap_elo_after': pl.Float64,
+            'player1_elo_before': pl.Float64,
+            'player1_elo_after': pl.Float64,
+            'player2_scratch_elo_before': pl.Float64,
+            'player2_scratch_elo_after': pl.Float64,
+            'player2_handicap_elo_before': pl.Float64,
+            'player2_handicap_elo_after': pl.Float64,
+            'player2_elo_before': pl.Float64,
+            'player2_elo_after': pl.Float64,
+            'scratch_pair_elo': pl.Float64,
+            'handicap_pair_elo': pl.Float64,
+            'pair_elo': pl.Float64,
+        }
+        results_df = pl.DataFrame(all_results, schema=results_schema)
+    else:
+        results_df = pl.DataFrame()
     
-    # Create player ratings summary
+    # Create player ratings summary with BOTH scratch and handicap Elo
     player_summary = []
-    for pid, rating in player_ratings.items():
+    for pid in set(scratch_ratings.keys()) | set(handicap_ratings.keys()):
+        scratch_elo = scratch_ratings.get(pid, DEFAULT_ELO)
+        handicap_elo = handicap_ratings.get(pid, DEFAULT_ELO)
+        # Use the selected type for the main 'elo_rating' column
+        rating = handicap_elo if use_handicap else scratch_elo
+        
         n = player_pct_n.get(pid, 0)
         avg_pct = float(player_pct_mean.get(pid, 0.0)) if n > 0 else None
         stdev_pct = float((player_pct_m2.get(pid, 0.0) / (n - 1)) ** 0.5) if n > 1 else None
         player_summary.append({
             'player_id': str(pid),
             'player_name': str(player_names.get(pid, pid)),
+            'scratch_elo': float(round(scratch_elo, 1)),
+            'handicap_elo': float(round(handicap_elo, 1)),
             'elo_rating': float(round(rating, 1)),
             'games_played': int(player_games.get(pid, 0)),
             'avg_percentage': avg_pct,
@@ -317,6 +436,8 @@ def process_tournaments_to_elo(
         players_df = pl.DataFrame(player_summary, schema={
             'player_id': pl.Utf8,
             'player_name': pl.Utf8,
+            'scratch_elo': pl.Float64,
+            'handicap_elo': pl.Float64,
             'elo_rating': pl.Float64,
             'games_played': pl.Int64,
             'avg_percentage': pl.Float64,
@@ -325,11 +446,13 @@ def process_tournaments_to_elo(
     else:
         players_df = pl.DataFrame()
     
-    return results_df, players_df, player_ratings
+    # Return selected type ratings dict for backward compatibility
+    current_ratings = handicap_ratings if use_handicap else scratch_ratings
+    return results_df, players_df, current_ratings
 
 
 def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5) -> Tuple[pl.DataFrame, str]:
-    """Get top players by Elo rating using SQL."""
+    """Get top players sorted by Elo rating using SQL."""
     if players_df.is_empty():
         return players_df, ""
     
@@ -344,7 +467,9 @@ def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5) -
             CAST(ROUND(elo_rating, 0) AS INTEGER) AS Elo_Rating,
             player_id AS Player_ID,
             player_name AS Player_Name,
-            ROUND(avg_percentage, 1) AS Avg_Pct,
+            ROUND(avg_scratch_pct, 1) AS Avg_Scratch,
+            ROUND(avg_handicap_pct, 1) AS Avg_Handicap,
+            ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,
             ROUND(stdev_percentage, 1) AS Pct_Stdev,
             games_played AS Games_Played
         FROM filtered
@@ -356,10 +481,13 @@ def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5) -
     return result, query
 
 
-def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5) -> Tuple[pl.DataFrame, str]:
-    """Get top pairs by average Elo rating using SQL."""
+def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5, use_handicap: bool = False) -> Tuple[pl.DataFrame, str]:
+    """Get top pairs sorted by Elo rating using SQL."""
     if results_df.is_empty():
         return results_df, ""
+    
+    # Select appropriate Elo column based on use_handicap
+    elo_col = "handicap_pair_elo" if use_handicap else "scratch_pair_elo"
     
     query = f"""
         WITH pair_stats AS (
@@ -368,7 +496,12 @@ def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5) -> 
                 ARG_MAX(pair_name, date) AS pair_name,
                 ARG_MAX(player1_id, date) AS player1_id,
                 ARG_MAX(player2_id, date) AS player2_id,
-                AVG(pair_elo) AS avg_pair_elo,
+                AVG(scratch_pair_elo) AS avg_scratch_elo,
+                AVG(handicap_pair_elo) AS avg_handicap_elo,
+                AVG({elo_col}) AS avg_pair_elo,
+                AVG(scratch_percentage) AS avg_scratch_pct,
+                AVG(handicap_percentage) AS avg_handicap_pct,
+                AVG(iv_bonus) AS avg_iv_bonus,
                 AVG(percentage) AS avg_percentage,
                 STDDEV_SAMP(percentage) AS stdev_percentage,
                 COUNT(*) AS games_played
@@ -381,11 +514,13 @@ def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5) -> 
             WHERE games_played >= {min_games}
         )
         SELECT 
-            ROW_NUMBER() OVER (ORDER BY avg_pair_elo DESC, avg_percentage DESC, games_played DESC, pair_name ASC, pair_id ASC) AS Rank,
+            ROW_NUMBER() OVER (ORDER BY avg_pair_elo DESC, games_played DESC, pair_name ASC, pair_id ASC) AS Rank,
             CAST(ROUND(avg_pair_elo, 0) AS INTEGER) AS Pair_Elo,
             pair_id AS Pair_ID,
             pair_name AS Pair_Name,
-            ROUND(avg_percentage, 1) AS Avg_Pct,
+            ROUND(avg_scratch_pct, 1) AS Avg_Scratch,
+            ROUND(avg_handicap_pct, 1) AS Avg_Handicap,
+            ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,
             ROUND(stdev_percentage, 1) AS Pct_Stdev,
             games_played AS Games
         FROM filtered
@@ -604,13 +739,19 @@ def main():
             help="Switch between individual and partnership rankings"
         )
         
-        # Handicap option
-        use_handicap = st.checkbox(
-            "Use handicap score",
-            value=True,
-            key="elo_use_handicap",
-            help="Uses handicap-adjusted percentage when available"
+        # Choose which score type to use for Elo calculations
+        score_type = st.radio(
+            "Elo Based On",
+            ["Scratch", "Handicapped"],
+            index=0,
+            key="elo_score_type",
+            horizontal=True,
+            help="Choose which percentage to use for Elo calculations (rankings always sorted by Elo)"
         )
+        use_handicap = (score_type == "Handicapped")
+        
+        # IV fetching is always enabled (cached, refreshes monthly on 15th)
+        fetch_iv = True
         
         # Number of results
         top_n = st.slider(
@@ -670,8 +811,9 @@ def main():
             st.error("Failed to retrieve tournament data. Please check your connection or authentication.")
             return
     
-    # Cache key for full dataset
-    cache_key = f"elo_full_v1_{api_key}_{len(all_tournaments)}_handicap_{int(use_handicap)}"
+    # Cache key for full dataset - only depends on API and fetch_iv
+    # Both scratch and handicap Elo are computed in one pass and stored in the DataFrame
+    cache_key = f"elo_full_v3_{api_key}_{len(all_tournaments)}_iv_{int(fetch_iv)}"
     
     if 'elo_full_cache' not in st.session_state:
         st.session_state.elo_full_cache = {}
@@ -679,19 +821,20 @@ def main():
     full_cache = st.session_state.elo_full_cache
     
     if cache_key in full_cache:
+        # Use cached data - both scratch and handicap Elo are already computed
         cached = full_cache[cache_key]
         full_results_df = cached['results_df']
         full_players_df = cached['players_df']
-        current_ratings = cached['current_ratings']
+        current_ratings = cached['scratch_ratings'] if not use_handicap else cached['handicap_ratings']
     else:
         # Clear old cache entries for different API
-        keys_to_remove = [k for k in full_cache.keys() if not k.startswith(f"elo_full_v1_{api_key}_")]
+        keys_to_remove = [k for k in full_cache.keys() if not k.startswith(f"elo_full_v3_{api_key}_")]
         for k in keys_to_remove:
             del full_cache[k]
         
-        # Process all tournaments
+        # Process all tournaments - computes BOTH scratch and handicap Elo in one pass
         full_results_df, full_players_df, current_ratings = process_tournaments_to_elo(
-            all_tournaments, api_module, initial_players=None, use_handicap=use_handicap
+            all_tournaments, api_module, initial_players=None, use_handicap=use_handicap, fetch_iv=fetch_iv
         )
         
         # Apply club name mapping for APIs that don't provide club names directly (e.g., Lancelot)
@@ -716,10 +859,20 @@ def main():
                             ).alias('club_name')
                         )
         
+        # Extract both scratch and handicap ratings from players_df for caching
+        scratch_ratings_dict = {}
+        handicap_ratings_dict = {}
+        if not full_players_df.is_empty():
+            for row in full_players_df.iter_rows(named=True):
+                pid = row['player_id']
+                scratch_ratings_dict[pid] = row['scratch_elo']
+                handicap_ratings_dict[pid] = row['handicap_elo']
+        
         full_cache[cache_key] = {
             'results_df': full_results_df,
             'players_df': full_players_df,
-            'current_ratings': current_ratings,
+            'scratch_ratings': scratch_ratings_dict,
+            'handicap_ratings': handicap_ratings_dict,
         }
     
     # Apply filters
@@ -733,21 +886,50 @@ def main():
         if 'club_name' in results_df.columns:
             results_df = results_df.filter(pl.col('club_name') == selected_club)
     
-    # Recalculate players_df from filtered results
+    # Recalculate players_df from filtered results with both scratch and handicap stats
     if not results_df.is_empty():
-        players_df = duckdb.sql("""
+        # Dynamic column selection based on use_handicap
+        elo_col_p1 = "player1_handicap_elo_after" if use_handicap else "player1_scratch_elo_after"
+        elo_col_p2 = "player2_handicap_elo_after" if use_handicap else "player2_scratch_elo_after"
+        
+        players_df = duckdb.sql(f"""
             WITH player_results AS (
-                SELECT player1_id AS player_id, player1_name AS player_name, player1_elo_after AS elo_rating, percentage, date
+                SELECT 
+                    player1_id AS player_id, 
+                    player1_name AS player_name, 
+                    player1_scratch_elo_after AS scratch_elo,
+                    player1_handicap_elo_after AS handicap_elo,
+                    {elo_col_p1} AS elo_rating, 
+                    percentage,
+                    scratch_percentage,
+                    handicap_percentage,
+                    iv_bonus,
+                    date
                 FROM results_df
                 UNION ALL
-                SELECT player2_id AS player_id, player2_name AS player_name, player2_elo_after AS elo_rating, percentage, date
+                SELECT 
+                    player2_id AS player_id, 
+                    player2_name AS player_name, 
+                    player2_scratch_elo_after AS scratch_elo,
+                    player2_handicap_elo_after AS handicap_elo,
+                    {elo_col_p2} AS elo_rating, 
+                    percentage,
+                    scratch_percentage,
+                    handicap_percentage,
+                    iv_bonus,
+                    date
                 FROM results_df
             )
             SELECT 
                 player_id,
                 ARG_MAX(player_name, date) AS player_name,
+                ROUND(ARG_MAX(scratch_elo, date), 1) AS scratch_elo,
+                ROUND(ARG_MAX(handicap_elo, date), 1) AS handicap_elo,
                 ROUND(ARG_MAX(elo_rating, date), 1) AS elo_rating,
                 COUNT(*) AS games_played,
+                ROUND(AVG(scratch_percentage), 2) AS avg_scratch_pct,
+                ROUND(AVG(handicap_percentage), 2) AS avg_handicap_pct,
+                ROUND(AVG(iv_bonus), 1) AS avg_iv_bonus,
                 ROUND(AVG(percentage), 2) AS avg_percentage,
                 ROUND(STDDEV_SAMP(percentage), 2) AS stdev_percentage
             FROM player_results
@@ -836,13 +1018,17 @@ def main():
                                 pl.col('tournament_id').alias('Event_ID'),
                                 pl.col('tournament_name').alias('Tournament'),
                                 pl.col('pair_name').alias('Partner'),
-                                (pl.col('club_percentage') if 'club_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Club_Score'),
-                                (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_Score'),
+                                (pl.col('scratch_percentage') if 'scratch_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Scratch_%'),
+                                (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_%'),
+                                (pl.col('iv_bonus') if 'iv_bonus' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(1).alias('IV_Bonus'),
                                 pl.col('percentage').cast(pl.Float64, strict=False).round(2).alias('Pct_Used'),
                                 pl.col('rank').alias('Rank'),
                             ]
                             if 'theoretical_rank' in player_results.columns and use_handicap:
                                 cols_to_select.append(pl.col('theoretical_rank').alias('Hcp_Rank'))
+                            # Add current IV (note: this is current IV, not IV at tournament time)
+                            if 'pair_iv' in player_results.columns:
+                                cols_to_select.append(pl.col('pair_iv').alias('Current_Pair_IV'))
                             cols_to_select.append(pl.col('player1_elo_after').round(0).alias('Elo_After'))
                             
                             detail_df = player_results.select(cols_to_select)
@@ -857,7 +1043,7 @@ def main():
     else:
         st.markdown(f"### 🏆 Top {top_n} Pairs (Min. {min_games} games)")
         if not results_df.is_empty():
-            top_pairs, sql_query = show_top_pairs(results_df, top_n, min_games)
+            top_pairs, sql_query = show_top_pairs(results_df, top_n, min_games, use_handicap)
             
             if sql_query:
                 with st.expander("📝 SQL Query", expanded=False):
@@ -885,13 +1071,17 @@ def main():
                                 pl.col('date').str.slice(0, 10).alias('Date'),
                                 pl.col('tournament_id').alias('Event_ID'),
                                 pl.col('tournament_name').alias('Tournament'),
-                                (pl.col('club_percentage') if 'club_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Club_Score'),
-                                (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_Score'),
+                                (pl.col('scratch_percentage') if 'scratch_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Scratch_%'),
+                                (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_%'),
+                                (pl.col('iv_bonus') if 'iv_bonus' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(1).alias('IV_Bonus'),
                                 pl.col('percentage').cast(pl.Float64, strict=False).round(2).alias('Pct_Used'),
                                 pl.col('rank').alias('Rank'),
                             ]
                             if 'theoretical_rank' in pair_results.columns and use_handicap:
                                 cols_to_select.append(pl.col('theoretical_rank').alias('Hcp_Rank'))
+                            # Add current IV (note: this is current IV, not IV at tournament time)
+                            if 'pair_iv' in pair_results.columns:
+                                cols_to_select.append(pl.col('pair_iv').alias('Current_Pair_IV'))
                             cols_to_select.append(pl.col('pair_elo').round(0).alias('Pair_Elo'))
                             
                             detail_df = pair_results.select(cols_to_select)

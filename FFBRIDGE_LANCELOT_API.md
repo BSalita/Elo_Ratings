@@ -178,6 +178,32 @@
 - `rankWithoutHandicap` is the club-level ranking (without handicap)
 - Club codes in `simultaneousId` may have leading zeros that need stripping for consistent matching
 
+**Handicap (IV) Formula:**
+
+Based on empirical analysis comparing scratch vs handicapped scores from bridgeinter.net:
+
+```
+Handicap% = Scratch% + Bonus(Pair_IV)
+```
+
+Where:
+- **Pair_IV** = sum of both players' IV (Indice de Valeur) ratings
+- **Bonus** = an integer from 0 to ~15% based on pair strength
+- **Strongest pairs** (IV sum ≥ 60): Bonus = 0%
+- **Weaker pairs** (lower IV): Bonus increases proportionally
+
+**Observed bonus values:** 0, 3, 4, 6, 7, 8, 9, 10, 11, 14 (percentage points)
+
+**Examples from Simultané Octopus (Jan 12, 2026):**
+| Players | Scratch | Handicap | Bonus | IV Level |
+|---------|---------|----------|-------|----------|
+| MARGAIL/TEISSIER | 66.10% | 66.10% | +0% | Very strong |
+| LAUMOND/DAS | 62.41% | 65.41% | +3% | Strong |
+| AMAR/SUISSA | 57.30% | 66.30% | +9% | Medium |
+| L'HIRONDEL/VAYSSE | 59.67% | 73.67% | +14% | Weaker |
+
+**Key insight:** Both scratch and handicapped percentages are calculated from the **same national field** (not local vs national). The only difference is the IV-based bonus applied to weaker pairs.
+
 **Player fields:**
 | Field | Description |
 |-------|-------------|

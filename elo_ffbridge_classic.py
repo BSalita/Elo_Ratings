@@ -47,6 +47,77 @@ REQUEST_DELAY = 0.1  # seconds between API requests
 # -------------------------------
 # Authentication
 # -------------------------------
+# Player IV cache (in-memory for session)
+_player_iv_cache: Dict[str, Dict] = {}
+
+
+def fetch_player_iv(person_id: str, session: Optional[requests.Session] = None) -> Optional[Dict]:
+    """
+    Fetch player IV data from the members endpoint.
+    
+    Returns dict with:
+        - iv: int (e.g., 28)
+        - label: str (e.g., "4ème série")
+        - code: str (e.g., "4S")
+    
+    Returns None if not found or error.
+    """
+    global _player_iv_cache
+    
+    # Check memory cache
+    if person_id in _player_iv_cache:
+        return _player_iv_cache[person_id]
+    
+    # Check disk cache - expires on 15th of each month when FFBridge updates IVs
+    cache_key = f"player_iv_{person_id}"
+    # Calculate hours until 15th of current/next month
+    from datetime import datetime
+    now = datetime.now()
+    if now.day < 15:
+        # Expires on 15th of current month
+        next_refresh = now.replace(day=15, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        # Expires on 15th of next month
+        if now.month == 12:
+            next_refresh = now.replace(year=now.year + 1, month=1, day=15, hour=0, minute=0, second=0, microsecond=0)
+        else:
+            next_refresh = now.replace(month=now.month + 1, day=15, hour=0, minute=0, second=0, microsecond=0)
+    hours_until_refresh = max(1, int((next_refresh - now).total_seconds() / 3600))
+    
+    cached = load_from_disk_cache(CACHE_DIR, cache_key, max_age_hours=hours_until_refresh)
+    if cached:
+        _player_iv_cache[person_id] = cached
+        return cached
+    
+    # Fetch from API
+    if session is None:
+        session = get_session()
+    if not session:
+        return None
+    
+    try:
+        time.sleep(0.05)  # Light rate limiting (50ms)
+        url = f"{API_BASE}/api/v1/members/{person_id}"
+        response = session.get(url, timeout=10)  # Shorter timeout for IV lookups
+        
+        if response.status_code == 200:
+            data = response.json()
+            iv_data = data.get('iv', {})
+            if iv_data:
+                result = {
+                    'iv': iv_data.get('iv', 0),
+                    'label': iv_data.get('label', ''),
+                    'code': iv_data.get('code', ''),
+                }
+                _player_iv_cache[person_id] = result
+                save_to_disk_cache(CACHE_DIR, cache_key, result)
+                return result
+    except Exception:
+        pass
+    
+    return None
+
+
 def get_session() -> Optional[requests.Session]:
     """
     Get an authenticated FFBridge session from environment variables.
@@ -142,14 +213,21 @@ def _fetch_tournament_list_single(session: requests.Session, series_id: int, lim
     return []
 
 
-def fetch_tournament_results(tournament_id: str, tournament_date: str = "", series_id: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], bool]:
+def fetch_tournament_results(tournament_id: str, tournament_date: str = "", series_id: Optional[Any] = None, fetch_iv: bool = False) -> Tuple[List[Dict[str, Any]], bool]:
     """
     Fetch results for a specific tournament.
     
+    Args:
+        tournament_id: The tournament ID to fetch
+        tournament_date: Optional date string for cache naming
+        series_id: Optional series ID for cache organization
+        fetch_iv: If True, also fetch IV data for each player (slower)
+    
     Returns:
         Tuple of (list of result dicts, was_cached bool)
-        Each result dict has normalized keys: player1_id, player2_id, player1_name, player2_name,
-        percentage, handicap_percentage, club_percentage, rank, club_name, etc.
+        Each result dict has normalized keys including:
+        - percentage, handicap_percentage, scratch_percentage, iv_bonus
+        - player1_iv, player2_iv, pair_iv (if fetch_iv=True)
     """
     session = get_session()
     if not session:
@@ -222,11 +300,18 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
                         except (ValueError, TypeError):
                             pe_bonus_val = 0.0
                         
-                        # Derive club_pct if not available
-                        if club_pct is None:
-                            club_pct = handicap_pct - (pe_bonus_val / 10.0)
+                        # Derive IV bonus (PE_bonus is in tenths of a percent)
+                        iv_bonus = pe_bonus_val / 10.0
                         
-                        results.append({
+                        # Derive scratch (unhandicapped) score
+                        scratch_pct = handicap_pct - iv_bonus
+                        
+                        # Derive club_pct if not available (same as scratch)
+                        if club_pct is None:
+                            club_pct = scratch_pct
+                        
+                        # Base result dict
+                        result_dict = {
                             'team_id': str(team.get('id')),
                             'pair_id': str(team.get('id')),
                             'player1_id': str(p1.get('id')),
@@ -235,6 +320,8 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
                             'player2_name': f"{p2.get('firstname', '')} {p2.get('lastname', '')}".strip(),
                             'percentage': pct,
                             'handicap_percentage': handicap_pct,
+                            'scratch_percentage': scratch_pct,  # Derived unhandicapped score
+                            'iv_bonus': iv_bonus,  # Derived IV bonus (percentage points)
                             'club_percentage': club_pct,
                             'rank': team.get('ranking', 0),
                             'theoretical_rank': team.get('theoretical_ranking', 0),
@@ -243,7 +330,25 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
                             'club_id': club_id,
                             'club_name': club_name,
                             'club_code': club_code,
-                        })
+                            # IV fields (populated if fetch_iv=True)
+                            'player1_iv': None,
+                            'player2_iv': None,
+                            'pair_iv': None,
+                        }
+                        
+                        # Optionally fetch IV for each player
+                        if fetch_iv:
+                            p1_iv_data = fetch_player_iv(str(p1.get('id')), session)
+                            p2_iv_data = fetch_player_iv(str(p2.get('id')), session)
+                            
+                            p1_iv = p1_iv_data.get('iv', 0) if p1_iv_data else 0
+                            p2_iv = p2_iv_data.get('iv', 0) if p2_iv_data else 0
+                            
+                            result_dict['player1_iv'] = p1_iv
+                            result_dict['player2_iv'] = p2_iv
+                            result_dict['pair_iv'] = p1_iv + p2_iv
+                        
+                        results.append(result_dict)
                 
                 processed_data = {'results': results}
                 save_to_disk_cache(CACHE_DIR, friendly_name, processed_data, series_id=series_id)
