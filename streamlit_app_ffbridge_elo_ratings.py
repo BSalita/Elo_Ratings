@@ -742,13 +742,13 @@ def main():
         # Choose which score type to use for Elo calculations
         score_type = st.radio(
             "Elo Based On",
-            ["Scratch", "Handicapped"],
+            ["Scratch", "Handicap"],
             index=0,
             key="elo_score_type",
             horizontal=True,
             help="Choose which percentage to use for Elo calculations (rankings always sorted by Elo)"
         )
-        use_handicap = (score_type == "Handicapped")
+        use_handicap = (score_type == "Handicap")
         
         # IV fetching is always enabled (cached, refreshes monthly on 15th)
         fetch_iv = True
