@@ -71,12 +71,15 @@ def calculate_aggrid_height(row_count: int) -> int:
 def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
     """Build an AgGrid with single-click row selection."""
     display_df = df.to_pandas()
+    # Ensure Rank column is numeric before passing to AgGrid
+    if 'Rank' in display_df.columns:
+        display_df['Rank'] = pd.to_numeric(display_df['Rank'], errors='coerce').astype(int)
     gb = GridOptionsBuilder.from_dataframe(display_df)
     gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
     gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
-    # Ensure Rank column sorts numerically
+    # Configure Rank column for numeric sorting
     if 'Rank' in display_df.columns:
-        gb.configure_column('Rank', type=['numericColumn', 'numberColumnFilter'])
+        gb.configure_column('Rank', type=['numericColumn', 'numberColumnFilter'], sort='asc')
     grid_options = gb.build()
     
     return AgGrid(
@@ -466,7 +469,7 @@ def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5) -
             WHERE games_played >= {min_games}
         )
         SELECT 
-            ROW_NUMBER() OVER (ORDER BY elo_rating DESC, games_played DESC, player_name ASC, player_id ASC) AS Rank,
+            CAST(ROW_NUMBER() OVER (ORDER BY elo_rating DESC, games_played DESC, player_name ASC, player_id ASC) AS INTEGER) AS Rank,
             CAST(ROUND(elo_rating, 0) AS INTEGER) AS Elo_Rating,
             player_id AS Player_ID,
             player_name AS Player_Name,
@@ -517,7 +520,7 @@ def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5, use
             WHERE games_played >= {min_games}
         )
         SELECT 
-            ROW_NUMBER() OVER (ORDER BY avg_pair_elo DESC, games_played DESC, pair_name ASC, pair_id ASC) AS Rank,
+            CAST(ROW_NUMBER() OVER (ORDER BY avg_pair_elo DESC, games_played DESC, pair_name ASC, pair_id ASC) AS INTEGER) AS Rank,
             CAST(ROUND(avg_pair_elo, 0) AS INTEGER) AS Pair_Elo,
             pair_id AS Pair_ID,
             pair_name AS Pair_Name,
