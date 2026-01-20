@@ -70,6 +70,8 @@ def calculate_aggrid_height(row_count: int) -> int:
 
 def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
     """Build an AgGrid with single-click row selection."""
+    from st_aggrid import JsCode
+    
     display_df = df.to_pandas()
     # Ensure Rank column is numeric before passing to AgGrid
     if 'Rank' in display_df.columns:
@@ -77,9 +79,18 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
     gb = GridOptionsBuilder.from_dataframe(display_df)
     gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
     gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
-    # Configure Rank column for numeric sorting
+    # Configure Rank column for numeric sorting with custom comparator
     if 'Rank' in display_df.columns:
-        gb.configure_column('Rank', type=['numericColumn', 'numberColumnFilter'], sort='asc')
+        gb.configure_column(
+            'Rank', 
+            type=['numericColumn', 'numberColumnFilter'],
+            sort='asc',
+            comparator=JsCode("""
+                function(valueA, valueB, nodeA, nodeB, isDescending) {
+                    return Number(valueA) - Number(valueB);
+                }
+            """)
+        )
     grid_options = gb.build()
     
     return AgGrid(
