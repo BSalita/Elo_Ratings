@@ -74,6 +74,9 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
     gb = GridOptionsBuilder.from_dataframe(display_df)
     gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
     gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
+    # Ensure Rank column sorts numerically
+    if 'Rank' in display_df.columns:
+        gb.configure_column('Rank', type=['numericColumn', 'numberColumnFilter'])
     grid_options = gb.build()
     
     return AgGrid(
