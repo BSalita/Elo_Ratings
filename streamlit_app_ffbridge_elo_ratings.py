@@ -977,24 +977,26 @@ def main():
         else:
             st.session_state.elo_available_clubs = new_clubs
     
-    # Display metrics
+    # Display metrics - use containers to ensure proper refresh on filter changes
     m1, m2, m3, m4 = st.columns(4)
     
+    # Calculate metric values first
+    num_tournaments = len(all_tournaments)
+    num_players = len(players_df) if not players_df.is_empty() else 0
+    avg_games = players_df.select(pl.col('games_played').mean()).item() if not players_df.is_empty() else 0.0
+    top_rating = players_df.select(pl.col('elo_rating').max()).item() if not players_df.is_empty() else 0
+    
     with m1:
-        st.markdown(f'<div class="metric-card"><small>Tournaments</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{len(all_tournaments)}</span></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><small>Tournaments</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{num_tournaments}</span></div>', unsafe_allow_html=True)
     
     with m2:
-        st.markdown(f'<div class="metric-card"><small>Active Players</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{len(players_df)}</span></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><small>Active Players</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{num_players}</span></div>', unsafe_allow_html=True)
     
     with m3:
-        if not players_df.is_empty():
-            avg_games = players_df.select(pl.col('games_played').mean()).item()
-            st.markdown(f'<div class="metric-card"><small>Avg Games</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{avg_games:.1f}</span></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><small>Avg Games</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{avg_games:.1f}</span></div>', unsafe_allow_html=True)
     
     with m4:
-        if not players_df.is_empty():
-            top_rating = players_df.select(pl.col('elo_rating').max()).item()
-            st.markdown(f'<div class="metric-card"><small>Highest Elo</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{round(top_rating)}</span></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><small>Highest Elo</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{round(top_rating)}</span></div>', unsafe_allow_html=True)
     
     st.markdown("<br>", unsafe_allow_html=True)
     
