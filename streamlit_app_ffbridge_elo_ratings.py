@@ -984,35 +984,42 @@ def main():
         st.markdown(f'<div class="metric-card"><small>Tournaments</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{len(all_tournaments)}</span></div>', unsafe_allow_html=True)
     
     # Calculate metrics based on Ranking Type (Players vs Pairs)
+    # Initialize defaults to avoid any potential value retention issues
+    active_count = 0
+    avg_games = 0.0
+    highest_elo = 0.0
+    
     if rating_type == "Players":
         active_label = "Active Players"
         avg_label = "Avg Games"
         highest_label = "Highest Elo"
         
-        if not players_df.is_empty():
-            active_count = len(players_df)
-            avg_games = players_df.select(pl.col('games_played').mean()).item()
-            highest_elo = players_df.select(pl.col('elo_rating').max()).item()
-        else:
-            active_count = avg_games = highest_elo = 0
+        # Filter by min_games to match the ranking table requirements
+        metric_players = players_df.filter(pl.col('games_played') >= min_games) if not players_df.is_empty() else players_df
+        
+        if not metric_players.is_empty():
+            active_count = len(metric_players)
+            avg_games = metric_players.select(pl.col('games_played').mean()).item()
+            highest_elo = metric_players.select(pl.col('elo_rating').max()).item()
     else:
         active_label = "Active Pairs"
         avg_label = "Avg Games/Pair"
         highest_label = "Highest Pair Elo"
         
         if not results_df.is_empty():
-            # Calculate pair stats for metrics
+            # Calculate pair stats for metrics with min_games filter to match ranking table logic (Average Elo)
             elo_col = "handicap_pair_elo" if use_handicap else "scratch_pair_elo"
             pair_stats = duckdb.sql(f"""
                 SELECT pair_id, COUNT(*) as games, AVG({elo_col}) as elo
                 FROM results_df
                 GROUP BY pair_id
+                HAVING games >= {min_games}
             """).pl()
-            active_count = len(pair_stats)
-            avg_games = pair_stats.select(pl.col('games').mean()).item()
-            highest_elo = pair_stats.select(pl.col('elo').max()).item()
-        else:
-            active_count = avg_games = highest_elo = 0
+            
+            if not pair_stats.is_empty():
+                active_count = len(pair_stats)
+                avg_games = pair_stats.select(pl.col('games').mean()).item()
+                highest_elo = pair_stats.select(pl.col('elo').max()).item()
 
     with m2:
         st.markdown(f'<div class="metric-card"><small>{active_label}</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{active_count}</span></div>', unsafe_allow_html=True)
