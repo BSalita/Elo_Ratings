@@ -638,6 +638,25 @@ def main():
             box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         }
         
+        /* Style native Streamlit metrics to match theme */
+        [data-testid="stMetric"] {
+            background: rgba(0, 105, 92, 0.4);
+            border: 1px solid #00796b;
+            border-radius: 8px;
+            padding: 0.5rem 1rem;
+            text-align: center;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        
+        [data-testid="stMetric"] label {
+            color: #e0e0e0 !important;
+        }
+        
+        [data-testid="stMetric"] [data-testid="stMetricValue"] {
+            color: #ffc107 !important;
+            font-weight: 700;
+        }
+        
         .stDataFrame {
             background-color: white;
             border-radius: 8px;
@@ -977,26 +996,28 @@ def main():
         else:
             st.session_state.elo_available_clubs = new_clubs
     
-    # Display metrics - use containers to ensure proper refresh on filter changes
-    m1, m2, m3, m4 = st.columns(4)
-    
-    # Calculate metric values first
+    # Display metrics - calculate values and use native st.metric for reliable refresh
     num_tournaments = len(all_tournaments)
     num_players = len(players_df) if not players_df.is_empty() else 0
     avg_games = players_df.select(pl.col('games_played').mean()).item() if not players_df.is_empty() else 0.0
     top_rating = players_df.select(pl.col('elo_rating').max()).item() if not players_df.is_empty() else 0
     
+    # Debug: show which elo type is being used
+    elo_type_label = "Handicap" if use_handicap else "Scratch"
+    
+    m1, m2, m3, m4 = st.columns(4)
+    
     with m1:
-        st.markdown(f'<div class="metric-card"><small>Tournaments</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{num_tournaments}</span></div>', unsafe_allow_html=True)
+        st.metric("Tournaments", num_tournaments)
     
     with m2:
-        st.markdown(f'<div class="metric-card"><small>Active Players</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{num_players}</span></div>', unsafe_allow_html=True)
+        st.metric("Active Players", num_players)
     
     with m3:
-        st.markdown(f'<div class="metric-card"><small>Avg Games</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{avg_games:.1f}</span></div>', unsafe_allow_html=True)
+        st.metric("Avg Games", f"{avg_games:.1f}")
     
     with m4:
-        st.markdown(f'<div class="metric-card"><small>Highest Elo</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{round(top_rating)}</span></div>', unsafe_allow_html=True)
+        st.metric(f"Highest Elo ({elo_type_label})", round(top_rating))
     
     st.markdown("<br>", unsafe_allow_html=True)
     
