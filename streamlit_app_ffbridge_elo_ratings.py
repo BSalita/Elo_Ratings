@@ -977,52 +977,51 @@ def main():
         else:
             st.session_state.elo_available_clubs = new_clubs
     
-    # Compute metrics based on rating_type BEFORE rendering
-    if rating_type == "Players":
-        metric2_label = "Active Players"
-        metric2_value = len(players_df)
-        metric3_label = "Avg Games"
-        metric3_value = players_df.select(pl.col('games_played').mean()).item() if not players_df.is_empty() else 0
-        metric4_label = "Highest Player Elo"
-        metric4_value = round(players_df.select(pl.col('elo_rating').max()).item()) if not players_df.is_empty() else 0
-    else:
-        # Pairs mode - compute pair statistics
-        pair_elo_col = "handicap_pair_elo" if use_handicap else "scratch_pair_elo"
-        if not results_df.is_empty() and pair_elo_col in results_df.columns:
-            pair_stats = duckdb.sql(f"""
-                SELECT 
-                    COUNT(DISTINCT pair_id) AS num_pairs,
-                    AVG(games) AS avg_games,
-                    MAX(avg_elo) AS highest_pair_elo
-                FROM (
-                    SELECT pair_id, COUNT(*) AS games, AVG({pair_elo_col}) AS avg_elo
-                    FROM results_df
-                    GROUP BY pair_id
-                )
-            """).pl()
-            metric2_value = pair_stats.select('num_pairs').item() if not pair_stats.is_empty() else 0
-            metric3_value = pair_stats.select('avg_games').item() if not pair_stats.is_empty() else 0
-            metric4_value = round(pair_stats.select('highest_pair_elo').item()) if not pair_stats.is_empty() else 0
-        else:
-            metric2_value, metric3_value, metric4_value = 0, 0.0, 0
-        metric2_label = "Active Pairs"
-        metric3_label = "Avg Games"
-        metric4_label = "Highest Pair Elo"
-    
-    # Display metrics - always render all 4 columns unconditionally
+    # Display metrics
     m1, m2, m3, m4 = st.columns(4)
     
     with m1:
         st.markdown(f'<div class="metric-card"><small>Tournaments</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{len(all_tournaments)}</span></div>', unsafe_allow_html=True)
     
+    # Calculate metrics based on Ranking Type (Players vs Pairs)
+    if rating_type == "Players":
+        active_label = "Active Players"
+        avg_label = "Avg Games"
+        highest_label = "Highest Elo"
+        
+        if not players_df.is_empty():
+            active_count = len(players_df)
+            avg_games = players_df.select(pl.col('games_played').mean()).item()
+            highest_elo = players_df.select(pl.col('elo_rating').max()).item()
+        else:
+            active_count = avg_games = highest_elo = 0
+    else:
+        active_label = "Active Pairs"
+        avg_label = "Avg Games/Pair"
+        highest_label = "Highest Pair Elo"
+        
+        if not results_df.is_empty():
+            # Calculate pair stats for metrics
+            elo_col = "handicap_pair_elo" if use_handicap else "scratch_pair_elo"
+            pair_stats = duckdb.sql(f"""
+                SELECT pair_id, COUNT(*) as games, AVG({elo_col}) as elo
+                FROM results_df
+                GROUP BY pair_id
+            """).pl()
+            active_count = len(pair_stats)
+            avg_games = pair_stats.select(pl.col('games').mean()).item()
+            highest_elo = pair_stats.select(pl.col('elo').max()).item()
+        else:
+            active_count = avg_games = highest_elo = 0
+
     with m2:
-        st.markdown(f'<div class="metric-card"><small>{metric2_label}</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{metric2_value}</span></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><small>{active_label}</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{active_count}</span></div>', unsafe_allow_html=True)
     
     with m3:
-        st.markdown(f'<div class="metric-card"><small>{metric3_label}</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{metric3_value:.1f}</span></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><small>{avg_label}</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{avg_games:.1f}</span></div>', unsafe_allow_html=True)
     
     with m4:
-        st.markdown(f'<div class="metric-card"><small>{metric4_label}</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{metric4_value}</span></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><small>{highest_label}</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{round(highest_elo)}</span></div>', unsafe_allow_html=True)
     
     st.markdown("<br>", unsafe_allow_html=True)
     
