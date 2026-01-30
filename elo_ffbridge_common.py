@@ -32,9 +32,18 @@ SERIES_NAMES = {
 VALID_SERIES_IDS = [3, 4, 5, 140, 384, 386, 604, 868]
 
 # Default Elo parameters
-DEFAULT_ELO = 1500.0
+DEFAULT_ELO = 1200.0  # Changed from 1500 to align with chess federation beginner level
 K_FACTOR = 32.0
 PERFORMANCE_SCALING = 400  # Standard Elo scaling factor
+
+# Chess federation scaling parameters
+# Target: Top players at ~2800 (Magnus Carlsen level), beginners at ~1200
+CHESS_SCALING_ENABLED = True
+CHESS_TARGET_MIN = 1200.0  # Beginner level
+CHESS_TARGET_MAX = 2800.0  # World champion level (Magnus Carlsen peak ~2882)
+# Current observed range (adjust based on actual data)
+CURRENT_OBSERVED_MIN = 1400.0
+CURRENT_OBSERVED_MAX = 1600.0
 
 # UI Constants
 AGGRID_ROW_HEIGHT = 42
@@ -193,6 +202,47 @@ def calculate_expected_score(rating_a: float, rating_b: float) -> float:
     E_A = 1 / (1 + 10^((R_B - R_A) / 400))
     """
     return 1.0 / (1.0 + 10 ** ((rating_b - rating_a) / PERFORMANCE_SCALING))
+
+
+def scale_to_chess_range(rating: float) -> float:
+    """
+    Scale Elo rating to chess federation range (1200-2800).
+    
+    Maps current observed range to chess federation range where top players
+    are at Magnus Carlsen level (~2800). Ratings above the observed max are
+    allowed to scale proportionally toward the target max.
+    
+    Args:
+        rating: Current Elo rating
+    
+    Returns:
+        Scaled Elo rating in chess federation range
+    """
+    if not CHESS_SCALING_ENABLED:
+        return rating
+    
+    # Calculate scale factor: map current range to chess range
+    current_range = CURRENT_OBSERVED_MAX - CURRENT_OBSERVED_MIN
+    chess_range = CHESS_TARGET_MAX - CHESS_TARGET_MIN
+    
+    if current_range == 0:
+        return CHESS_TARGET_MIN
+    
+    scale_factor = chess_range / current_range
+    
+    # For ratings below observed min, clamp to target min
+    if rating < CURRENT_OBSERVED_MIN:
+        return CHESS_TARGET_MIN
+    
+    # For ratings at or above observed max, scale proportionally
+    # This allows ratings to grow beyond the initial observed range
+    scaled = (rating - CURRENT_OBSERVED_MIN) * scale_factor + CHESS_TARGET_MIN
+    
+    # Ensure we don't exceed reasonable bounds (but allow up to 3000 for future growth)
+    scaled = min(scaled, 3000.0)
+    scaled = max(scaled, CHESS_TARGET_MIN)
+    
+    return round(scaled, 1)
 
 
 def calculate_elo_from_percentage(

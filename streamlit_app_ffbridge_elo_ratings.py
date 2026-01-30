@@ -41,6 +41,7 @@ from elo_ffbridge_common import (
     normalize_series_id,
     calculate_expected_score,
     calculate_elo_from_percentage,
+    scale_to_chess_range,
 )
 
 # Import API adapters
@@ -337,8 +338,9 @@ def process_tournaments_to_elo(
     
     if initial_players:
         for pid, pinfo in initial_players.items():
-            scratch_ratings[pid] = pinfo.get('elo', DEFAULT_ELO)
-            handicap_ratings[pid] = pinfo.get('elo', DEFAULT_ELO)
+            initial_elo = pinfo.get('elo', DEFAULT_ELO)
+            scratch_ratings[pid] = scale_to_chess_range(initial_elo)
+            handicap_ratings[pid] = scale_to_chess_range(initial_elo)
             player_names[pid] = pinfo.get('name', pid)
             player_games[pid] = pinfo.get('games_played', 0)
     
@@ -511,14 +513,16 @@ def process_tournaments_to_elo(
             if p1_id:
                 # Scratch Elo
                 scratch_r1_before = scratch_ratings.get(p1_id, DEFAULT_ELO)
-                scratch_r1_after = calculate_elo_from_percentage(scratch_r1_before, scratch_pct, scratch_field_avg)
+                scratch_r1_after_raw = calculate_elo_from_percentage(scratch_r1_before, scratch_pct, scratch_field_avg)
+                scratch_r1_after = scale_to_chess_range(scratch_r1_after_raw)
                 scratch_ratings[p1_id] = scratch_r1_after
                 
                 # Handicap Elo (use scratch if handicap not available)
                 handicap_r1_before = handicap_ratings.get(p1_id, DEFAULT_ELO)
                 h_pct_for_elo = handicap_pct if handicap_pct is not None else scratch_pct
                 h_field_for_elo = handicap_field_avg if handicap_pct is not None else scratch_field_avg
-                handicap_r1_after = calculate_elo_from_percentage(handicap_r1_before, h_pct_for_elo, h_field_for_elo)
+                handicap_r1_after_raw = calculate_elo_from_percentage(handicap_r1_before, h_pct_for_elo, h_field_for_elo)
+                handicap_r1_after = scale_to_chess_range(handicap_r1_after_raw)
                 handicap_ratings[p1_id] = handicap_r1_after
                 
                 result_record['player1_scratch_elo_before'] = scratch_r1_before
@@ -548,14 +552,16 @@ def process_tournaments_to_elo(
             if p2_id:
                 # Scratch Elo
                 scratch_r2_before = scratch_ratings.get(p2_id, DEFAULT_ELO)
-                scratch_r2_after = calculate_elo_from_percentage(scratch_r2_before, scratch_pct, scratch_field_avg)
+                scratch_r2_after_raw = calculate_elo_from_percentage(scratch_r2_before, scratch_pct, scratch_field_avg)
+                scratch_r2_after = scale_to_chess_range(scratch_r2_after_raw)
                 scratch_ratings[p2_id] = scratch_r2_after
                 
                 # Handicap Elo (use scratch if handicap not available)
                 handicap_r2_before = handicap_ratings.get(p2_id, DEFAULT_ELO)
                 h_pct_for_elo = handicap_pct if handicap_pct is not None else scratch_pct
                 h_field_for_elo = handicap_field_avg if handicap_pct is not None else scratch_field_avg
-                handicap_r2_after = calculate_elo_from_percentage(handicap_r2_before, h_pct_for_elo, h_field_for_elo)
+                handicap_r2_after_raw = calculate_elo_from_percentage(handicap_r2_before, h_pct_for_elo, h_field_for_elo)
+                handicap_r2_after = scale_to_chess_range(handicap_r2_after_raw)
                 handicap_ratings[p2_id] = handicap_r2_after
                 
                 result_record['player2_scratch_elo_before'] = scratch_r2_before
