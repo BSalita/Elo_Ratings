@@ -897,6 +897,7 @@ def main():
         .stRadio > label { color: #ffc107 !important; font-weight: 600 !important; }
         .stRadio [data-testid="stMarkdownContainer"] p { color: #ffffff !important; font-size: 1rem !important; font-weight: 500 !important; }
         .stSelectbox > label { color: #ffc107 !important; font-weight: 600 !important; }
+        .stTextInput > label { color: #ffc107 !important; font-weight: 600 !important; }
         .stSlider > label { color: #ffc107 !important; font-weight: 600 !important; }
         .stCheckbox label span, .stCheckbox label p, .stCheckbox [data-testid="stMarkdownContainer"] p { color: #ffffff !important; font-weight: 500 !important; }
         </style>
@@ -1034,8 +1035,6 @@ def main():
         
         # PDF Export
         generate_pdf = st.button("Export Report to PDF File", use_container_width=True)
-        # Automated Postmortem Apps
-        st.sidebar.markdown("---")
         st.sidebar.markdown("**Morty's Automated Postmortem Apps**")
         st.sidebar.markdown("🔗 [ACBL Postmortem](https://acbl.postmortem.chat)")
         st.sidebar.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
