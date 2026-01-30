@@ -894,11 +894,11 @@ def main():
             border-color: #ffca28 !important;
         }
         
-        .stRadio > label { color: #ffc107 !important; font-weight: 600 !important; }
+        .stSidebar .stRadio > label { color: #ffc107 !important; font-weight: 600 !important; }
         .stRadio [data-testid="stMarkdownContainer"] p { color: #ffffff !important; font-size: 1rem !important; font-weight: 500 !important; }
-        .stSelectbox > label { color: #ffc107 !important; font-weight: 600 !important; }
-        .stTextInput > label { color: #ffc107 !important; font-weight: 600 !important; }
-        .stSlider > label { color: #ffc107 !important; font-weight: 600 !important; }
+        .stSidebar .stSelectbox > label { color: #ffc107 !important; font-weight: 600 !important; }
+        .stSidebar .stTextInput > label { color: #ffc107 !important; font-weight: 600 !important; }
+        .stSidebar .stSlider > label { color: #ffc107 !important; font-weight: 600 !important; }
         .stCheckbox label span, .stCheckbox label p, .stCheckbox [data-testid="stMarkdownContainer"] p { color: #ffffff !important; font-weight: 500 !important; }
         </style>
     """, unsafe_allow_html=True)
