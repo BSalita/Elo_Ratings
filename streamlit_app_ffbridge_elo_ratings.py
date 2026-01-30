@@ -909,6 +909,7 @@ def main():
     # -------------------------------
     with st.sidebar:
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
+        st.sidebar.markdown("🔗 [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
         
         # API Backend selection
         if "selected_api" not in st.session_state:
@@ -933,13 +934,21 @@ def main():
         # Tournament selection
         series_names = api_module.SERIES_NAMES
         valid_series_ids = api_module.VALID_SERIES_IDS
-        tournament_options_list = ["all"] + valid_series_ids
         # Handicap tournament IDs that should have ' (H)' appended
         handicap_tournament_ids = {3, 4, 5, 384, 386}
-        tournament_labels = [
-            series_names[k] + (' (H)' if k in handicap_tournament_ids else '')
-            for k in tournament_options_list
-        ]
+        # Create list of (label, id) tuples for sorting
+        tournament_items = [("all", "all")]
+        tournament_items.extend([
+            (series_names[k] + (' (H)' if k in handicap_tournament_ids else ''), k)
+            for k in valid_series_ids
+        ])
+        # Sort by label alphabetically, keeping "all" first
+        all_item = tournament_items[0]
+        other_items = sorted(tournament_items[1:], key=lambda x: x[0])
+        tournament_items = [all_item] + other_items
+        # Extract sorted lists
+        tournament_labels = [item[0] for item in tournament_items]
+        tournament_options_list = [item[1] for item in tournament_items]
         
         if "elo_tournament_selectbox" not in st.session_state:
             st.session_state.elo_tournament_selectbox = tournament_labels[0]
@@ -1024,14 +1033,6 @@ def main():
             help="Minimum tournaments played to appear in rankings"
         )
         
-        # Tournament sort order
-        sort_tournaments_ascending = st.checkbox(
-            "Sort Tournaments Ascending",
-            value=True,
-            key="elo_sort_tournaments_ascending",
-            help="Sort tournaments by date in ascending order (oldest first)"
-        )
-        
         # PDF Export
         generate_pdf = st.button("Export Report to PDF File", use_container_width=True)
     
@@ -1041,9 +1042,6 @@ def main():
         st.sidebar.markdown("🔗 [ACBL Postmortem](https://acbl.postmortem.chat)")
         st.sidebar.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
         #st.sidebar.markdown("🔗 [BridgeWebs Postmortem](https://bridgewebs.postmortem.chat)")
-        
-        st.sidebar.markdown("---")
-        st.sidebar.markdown("🔗 [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
 
     # Header
     st.markdown(f"""
@@ -1076,9 +1074,10 @@ def main():
             st.error("Failed to retrieve tournament data. Please check your connection or authentication.")
             return
     
-    # Cache key for full dataset - includes API, fetch_iv, and sort order
+    # Cache key for full dataset - only depends on API and fetch_iv
     # Both scratch and handicap Elo are computed in one pass and stored in the DataFrame
-    cache_key = f"elo_full_v3_{api_key}_{len(all_tournaments)}_iv_{int(fetch_iv)}_sort_{int(sort_tournaments_ascending)}"
+    # Tournaments are always sorted ascending (oldest first) for Elo calculations
+    cache_key = f"elo_full_v3_{api_key}_{len(all_tournaments)}_iv_{int(fetch_iv)}"
     
     if 'elo_full_cache' not in st.session_state:
         st.session_state.elo_full_cache = {}
@@ -1099,8 +1098,9 @@ def main():
             del full_cache[k]
         
         # Process all tournaments - computes BOTH scratch and handicap Elo in one pass
+        # Always sort ascending (oldest first) for proper Elo calculation chronology
         full_results_df, full_players_df, current_ratings, processing_stats = process_tournaments_to_elo(
-            all_tournaments, api_module, initial_players=None, use_handicap=use_handicap, fetch_iv=fetch_iv, sort_ascending=sort_tournaments_ascending
+            all_tournaments, api_module, initial_players=None, use_handicap=use_handicap, fetch_iv=fetch_iv, sort_ascending=True
         )
         
         # Apply club name mapping for APIs that don't provide club names directly (e.g., Lancelot)
@@ -1323,7 +1323,7 @@ def main():
                         
                         if player_id and not results_df.is_empty():
                             # Show tournament history
-                            st.markdown(f"#### 📊 Tournament History: **{player_name}**")
+                            st.markdown(f"#### 📊 Tournament History Details: **{player_name}**")
                             player_results = results_df.filter(
                                 (pl.col('player1_id') == str(player_id)) | 
                                 (pl.col('player2_id') == str(player_id))
