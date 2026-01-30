@@ -937,7 +937,7 @@ def main():
         # Handicap tournament IDs that should have ' (H)' appended
         handicap_tournament_ids = {3, 4, 5, 384, 386}
         # Create list of (label, id) tuples for sorting
-        tournament_items = [("all", "all")]
+        tournament_items = [("All Tournaments", "all")]
         tournament_items.extend([
             (series_names[k] + (' (H)' if k in handicap_tournament_ids else ''), k)
             for k in valid_series_ids
@@ -957,7 +957,7 @@ def main():
             st.session_state.elo_tournament_selectbox = tournament_labels[0]
         
         selected_tournament_label = st.selectbox(
-            "Tournament Names",
+            "Filter by Tournament",
             options=tournament_labels,
             key="elo_tournament_selectbox",
             help="Select which simultaneous tournaments to analyze"
@@ -984,7 +984,6 @@ def main():
         # Name filter
         name_filter = st.text_input(
             "Filter by Name",
-            value="",
             key="elo_name_filter",
             help="Filter results by player or pair name (case-insensitive)"
         )
@@ -1035,7 +1034,6 @@ def main():
         
         # PDF Export
         generate_pdf = st.button("Export Report to PDF File", use_container_width=True)
-    
         # Automated Postmortem Apps
         st.sidebar.markdown("---")
         st.sidebar.markdown("**Morty's Automated Postmortem Apps**")
@@ -1333,7 +1331,6 @@ def main():
                                 cols_to_select = [
                                     pl.col('date').str.slice(0, 10).alias('Date'),
                                     pl.col('tournament_id').alias('Event_ID'),
-                                    pl.col('tournament_name').alias('Tournament'),
                                     pl.col('pair_name').alias('Partner'),
                                     (pl.col('scratch_percentage') if 'scratch_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Scratch_%'),
                                     (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_%'),
@@ -1437,7 +1434,6 @@ def main():
                                 cols_to_select = [
                                     pl.col('date').str.slice(0, 10).alias('Date'),
                                     pl.col('tournament_id').alias('Event_ID'),
-                                    pl.col('tournament_name').alias('Tournament'),
                                     (pl.col('scratch_percentage') if 'scratch_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Scratch_%'),
                                     (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_%'),
                                     (pl.col('iv_bonus') if 'iv_bonus' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(1).alias('IV_Bonus'),
