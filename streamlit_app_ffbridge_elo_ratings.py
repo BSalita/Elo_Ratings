@@ -10,6 +10,7 @@ Supports both:
 - Lancelot API (api-lancelot.ffbridge.fr) - public access
 """
 
+import math
 import os
 import pathlib
 import re
@@ -288,6 +289,9 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
                 }
             """)
         )
+    # Configure Games column width to fit column name + icon size
+    if 'Games' in display_df.columns:
+        gb.configure_column('Games', width=100)  # Width accommodates "Games" text + sort icon
     grid_options = gb.build()
     
     return AgGrid(
@@ -339,8 +343,9 @@ def process_tournaments_to_elo(
     if initial_players:
         for pid, pinfo in initial_players.items():
             initial_elo = pinfo.get('elo', DEFAULT_ELO)
-            scratch_ratings[pid] = scale_to_chess_range(initial_elo)
-            handicap_ratings[pid] = scale_to_chess_range(initial_elo)
+            # Don't scale during calculation - scale only for display
+            scratch_ratings[pid] = initial_elo
+            handicap_ratings[pid] = initial_elo
             player_names[pid] = pinfo.get('name', pid)
             player_games[pid] = pinfo.get('games_played', 0)
     
@@ -511,27 +516,26 @@ def process_tournaments_to_elo(
             
             # Update player 1 ratings (BOTH scratch and handicap)
             if p1_id:
-                # Scratch Elo
+                # Scratch Elo - calculate in original range, don't scale during calculation
                 scratch_r1_before = scratch_ratings.get(p1_id, DEFAULT_ELO)
-                scratch_r1_after_raw = calculate_elo_from_percentage(scratch_r1_before, scratch_pct, scratch_field_avg)
-                scratch_r1_after = scale_to_chess_range(scratch_r1_after_raw)
+                scratch_r1_after = calculate_elo_from_percentage(scratch_r1_before, scratch_pct, scratch_field_avg)
                 scratch_ratings[p1_id] = scratch_r1_after
                 
                 # Handicap Elo (use scratch if handicap not available)
                 handicap_r1_before = handicap_ratings.get(p1_id, DEFAULT_ELO)
                 h_pct_for_elo = handicap_pct if handicap_pct is not None else scratch_pct
                 h_field_for_elo = handicap_field_avg if handicap_pct is not None else scratch_field_avg
-                handicap_r1_after_raw = calculate_elo_from_percentage(handicap_r1_before, h_pct_for_elo, h_field_for_elo)
-                handicap_r1_after = scale_to_chess_range(handicap_r1_after_raw)
+                handicap_r1_after = calculate_elo_from_percentage(handicap_r1_before, h_pct_for_elo, h_field_for_elo)
                 handicap_ratings[p1_id] = handicap_r1_after
                 
-                result_record['player1_scratch_elo_before'] = scratch_r1_before
-                result_record['player1_scratch_elo_after'] = scratch_r1_after
-                result_record['player1_handicap_elo_before'] = handicap_r1_before
-                result_record['player1_handicap_elo_after'] = handicap_r1_after
+                # Scale Elo values for display (calculations done in original range)
+                result_record['player1_scratch_elo_before'] = scale_to_chess_range(scratch_r1_before)
+                result_record['player1_scratch_elo_after'] = scale_to_chess_range(scratch_r1_after)
+                result_record['player1_handicap_elo_before'] = scale_to_chess_range(handicap_r1_before)
+                result_record['player1_handicap_elo_after'] = scale_to_chess_range(handicap_r1_after)
                 # For backward compatibility, use selected type
-                result_record['player1_elo_before'] = handicap_r1_before if use_handicap else scratch_r1_before
-                result_record['player1_elo_after'] = handicap_r1_after if use_handicap else scratch_r1_after
+                result_record['player1_elo_before'] = scale_to_chess_range(handicap_r1_before if use_handicap else scratch_r1_before)
+                result_record['player1_elo_after'] = scale_to_chess_range(handicap_r1_after if use_handicap else scratch_r1_after)
                 
                 player_names[p1_id] = p1_name
                 player_games[p1_id] = player_games.get(p1_id, 0) + 1
@@ -550,27 +554,26 @@ def process_tournaments_to_elo(
             
             # Update player 2 ratings (BOTH scratch and handicap)
             if p2_id:
-                # Scratch Elo
+                # Scratch Elo - calculate in original range, don't scale during calculation
                 scratch_r2_before = scratch_ratings.get(p2_id, DEFAULT_ELO)
-                scratch_r2_after_raw = calculate_elo_from_percentage(scratch_r2_before, scratch_pct, scratch_field_avg)
-                scratch_r2_after = scale_to_chess_range(scratch_r2_after_raw)
+                scratch_r2_after = calculate_elo_from_percentage(scratch_r2_before, scratch_pct, scratch_field_avg)
                 scratch_ratings[p2_id] = scratch_r2_after
                 
                 # Handicap Elo (use scratch if handicap not available)
                 handicap_r2_before = handicap_ratings.get(p2_id, DEFAULT_ELO)
                 h_pct_for_elo = handicap_pct if handicap_pct is not None else scratch_pct
                 h_field_for_elo = handicap_field_avg if handicap_pct is not None else scratch_field_avg
-                handicap_r2_after_raw = calculate_elo_from_percentage(handicap_r2_before, h_pct_for_elo, h_field_for_elo)
-                handicap_r2_after = scale_to_chess_range(handicap_r2_after_raw)
+                handicap_r2_after = calculate_elo_from_percentage(handicap_r2_before, h_pct_for_elo, h_field_for_elo)
                 handicap_ratings[p2_id] = handicap_r2_after
                 
-                result_record['player2_scratch_elo_before'] = scratch_r2_before
-                result_record['player2_scratch_elo_after'] = scratch_r2_after
-                result_record['player2_handicap_elo_before'] = handicap_r2_before
-                result_record['player2_handicap_elo_after'] = handicap_r2_after
-                # For backward compatibility, use selected type
-                result_record['player2_elo_before'] = handicap_r2_before if use_handicap else scratch_r2_before
-                result_record['player2_elo_after'] = handicap_r2_after if use_handicap else scratch_r2_after
+                # Scale Elo values for display (calculations done in original range)
+                result_record['player2_scratch_elo_before'] = scale_to_chess_range(scratch_r2_before)
+                result_record['player2_scratch_elo_after'] = scale_to_chess_range(scratch_r2_after)
+                result_record['player2_handicap_elo_before'] = scale_to_chess_range(handicap_r2_before)
+                result_record['player2_handicap_elo_after'] = scale_to_chess_range(handicap_r2_after)
+                # For backward compatibility, use selected type (scaled for display)
+                result_record['player2_elo_before'] = scale_to_chess_range(handicap_r2_before if use_handicap else scratch_r2_before)
+                result_record['player2_elo_after'] = scale_to_chess_range(handicap_r2_after if use_handicap else scratch_r2_after)
                 
                 player_names[p2_id] = p2_name
                 player_games[p2_id] = player_games.get(p2_id, 0) + 1
@@ -589,8 +592,11 @@ def process_tournaments_to_elo(
             
             # Calculate pair Elo (both types)
             if p1_id and p2_id:
-                result_record['scratch_pair_elo'] = (scratch_ratings[p1_id] + scratch_ratings[p2_id]) / 2
-                result_record['handicap_pair_elo'] = (handicap_ratings[p1_id] + handicap_ratings[p2_id]) / 2
+                # Calculate pair Elo from unscaled player ratings, then scale for display
+                scratch_pair_elo_raw = (scratch_ratings[p1_id] + scratch_ratings[p2_id]) / 2
+                handicap_pair_elo_raw = (handicap_ratings[p1_id] + handicap_ratings[p2_id]) / 2
+                result_record['scratch_pair_elo'] = scale_to_chess_range(scratch_pair_elo_raw)
+                result_record['handicap_pair_elo'] = scale_to_chess_range(handicap_pair_elo_raw)
                 result_record['pair_elo'] = result_record['handicap_pair_elo'] if use_handicap else result_record['scratch_pair_elo']
             
             all_results.append(result_record)
@@ -653,10 +659,14 @@ def process_tournaments_to_elo(
         results_df = pl.DataFrame()
     
     # Create player ratings summary with BOTH scratch and handicap Elo
+    # Scale ratings for display (calculations done in original range)
     player_summary = []
     for pid in set(scratch_ratings.keys()) | set(handicap_ratings.keys()):
-        scratch_elo = scratch_ratings.get(pid, DEFAULT_ELO)
-        handicap_elo = handicap_ratings.get(pid, DEFAULT_ELO)
+        scratch_elo_raw = scratch_ratings.get(pid, DEFAULT_ELO)
+        handicap_elo_raw = handicap_ratings.get(pid, DEFAULT_ELO)
+        # Scale for display
+        scratch_elo = scale_to_chess_range(scratch_elo_raw)
+        handicap_elo = scale_to_chess_range(handicap_elo_raw)
         # Use the selected type for the main 'elo_rating' column
         rating = handicap_elo if use_handicap else scratch_elo
         
@@ -737,22 +747,24 @@ def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5, u
         return players_df, ""
     
     # Build SELECT clause - conditionally include Title column
-    title_col = ""
-    if not use_handicap:
-        # Add Title column after Elo_Rating when using scratch
-        title_col = """,
+    # Title is always based on scratch Elo, regardless of use_handicap setting
+    # Determine column names based on handicap setting
+    elo_col_name = "HC_Player_Elo" if use_handicap else "Player_Elo"
+    title_col_name = "Scratch_Title" if use_handicap else "Title"
+    
+    title_col = f""",
             CASE 
-                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 2600 THEN 'SGM'
-                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 2500 THEN 'GM'
-                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 2400 THEN 'IM'
-                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 2300 THEN 'FM'
-                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 2200 THEN 'CM'
-                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 2000 THEN 'Expert'
-                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 1800 THEN 'Advanced'
-                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 1600 THEN 'Intermediate'
-                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 1400 THEN 'Novice'
+                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 2600 THEN 'SGM'
+                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 2500 THEN 'GM'
+                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 2400 THEN 'IM'
+                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 2300 THEN 'FM'
+                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 2200 THEN 'CM'
+                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 2000 THEN 'Expert'
+                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 1800 THEN 'Advanced'
+                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 1600 THEN 'Intermediate'
+                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 1400 THEN 'Novice'
                 ELSE 'Beginner'
-            END AS Title"""
+            END AS {title_col_name}"""
     
     query = f"""
         WITH filtered AS (
@@ -762,14 +774,14 @@ def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5, u
         )
         SELECT 
             CAST(ROW_NUMBER() OVER (ORDER BY elo_rating DESC, games_played DESC, player_name ASC, player_id ASC) AS INTEGER) AS Rank,
-            CAST(ROUND(elo_rating, 0) AS INTEGER) AS Elo_Rating{title_col},
+            CAST(ROUND(LEAST(GREATEST(elo_rating, 0), 3500), 0) AS INTEGER) AS {elo_col_name}{title_col},
             player_id AS Player_ID,
             player_name AS Player_Name,
             ROUND(avg_scratch_pct, 1) AS Avg_Scratch,
             ROUND(avg_handicap_pct, 1) AS Avg_Handicap,
             ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,
             ROUND(stdev_percentage, 1) AS Pct_Stdev,
-            games_played AS Games_Played
+            CAST(games_played AS INTEGER) AS Games
         FROM filtered
         ORDER BY Rank ASC
         LIMIT {top_n}
@@ -779,7 +791,7 @@ def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5, u
     return result, query
 
 
-def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5, use_handicap: bool = False) -> Tuple[pl.DataFrame, str]:
+def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5, use_handicap: bool = False, players_df: Optional[pl.DataFrame] = None) -> Tuple[pl.DataFrame, str]:
     """Get top pairs sorted by Elo rating using SQL."""
     if results_df.is_empty():
         return results_df, ""
@@ -789,23 +801,72 @@ def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5, use
     # Use COALESCE for handicap to fall back to scratch when handicap is null
     pct_col = "COALESCE(handicap_percentage, scratch_percentage)" if use_handicap else "scratch_percentage"
     
-    # Build SELECT clause - conditionally include Title column
-    title_col = ""
-    if not use_handicap:
-        # Add Title column after Pair_Elo when using scratch
+    # Determine column names based on handicap setting
+    pair_elo_col_name = "HC_Pair_Elo" if use_handicap else "Pair_Elo"
+    title_col_name = "Scratch_Title" if use_handicap else "Title"
+    
+    # Build Title column - use lower title of the two players based on their scratch Elo
+    if players_df is not None and not players_df.is_empty():
+        # Join with players_df to get individual player scratch Elo and calculate lower title
         title_col = """,
             CASE 
-                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 2600 THEN 'SGM'
-                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 2500 THEN 'GM'
-                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 2400 THEN 'IM'
-                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 2300 THEN 'FM'
-                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 2200 THEN 'CM'
-                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 2000 THEN 'Expert'
-                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 1800 THEN 'Advanced'
-                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 1600 THEN 'Intermediate'
-                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 1400 THEN 'Novice'
+                -- Calculate title rank for player1 (1=SGM, 10=Beginner)
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2600 THEN 1
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2500 THEN 2
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2400 THEN 3
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2300 THEN 4
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2200 THEN 5
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2000 THEN 6
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 1800 THEN 7
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 1600 THEN 8
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 1400 THEN 9
+                ELSE 10
+            END AS p1_title_rank,
+            CASE 
+                -- Calculate title rank for player2 (1=SGM, 10=Beginner)
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2600 THEN 1
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2500 THEN 2
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2400 THEN 3
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2300 THEN 4
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2200 THEN 5
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2000 THEN 6
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 1800 THEN 7
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 1600 THEN 8
+                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 1400 THEN 9
+                ELSE 10
+            END AS p2_title_rank"""
+        
+        title_select = f""",
+            CASE 
+                -- Use GREATEST to get the higher rank number, which corresponds to the lower title
+                -- (Higher rank number = lower title: 1=SGM, 2=GM, ..., 10=Beginner)
+                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 1 THEN 'SGM'
+                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 2 THEN 'GM'
+                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 3 THEN 'IM'
+                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 4 THEN 'FM'
+                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 5 THEN 'CM'
+                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 6 THEN 'Expert'
+                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 7 THEN 'Advanced'
+                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 8 THEN 'Intermediate'
+                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 9 THEN 'Novice'
                 ELSE 'Beginner'
-            END AS Title"""
+            END AS {title_col_name}"""
+    else:
+        # Fallback: use pair scratch Elo if players_df not available
+        title_col = f""",
+            CASE 
+                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2600 THEN 'SGM'
+                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2500 THEN 'GM'
+                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2400 THEN 'IM'
+                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2300 THEN 'FM'
+                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2200 THEN 'CM'
+                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2000 THEN 'Expert'
+                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 1800 THEN 'Advanced'
+                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 1600 THEN 'Intermediate'
+                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 1400 THEN 'Novice'
+                ELSE 'Beginner'
+            END AS {title_col_name}"""
+        title_select = ""
     
     query = f"""
         WITH pair_stats AS (
@@ -830,17 +891,43 @@ def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5, use
             SELECT *
             FROM pair_stats
             WHERE games_played >= {min_games}
+        )"""
+    
+    if players_df is not None and not players_df.is_empty():
+        query += f""",
+        with_player_titles AS (
+            SELECT 
+                f.*{title_col}
+            FROM filtered f
+            LEFT JOIN players_df p1 ON f.player1_id = p1.player_id
+            LEFT JOIN players_df p2 ON f.player2_id = p2.player_id
         )
         SELECT 
             CAST(ROW_NUMBER() OVER (ORDER BY avg_pair_elo DESC, games_played DESC, pair_name ASC, pair_id ASC) AS INTEGER) AS Rank,
-            CAST(ROUND(avg_pair_elo, 0) AS INTEGER) AS Pair_Elo{title_col},
+            CAST(ROUND(LEAST(GREATEST(avg_pair_elo, 0), 3500), 0) AS INTEGER) AS {pair_elo_col_name}{title_select},
             pair_id AS Pair_ID,
             pair_name AS Pair_Name,
             ROUND(avg_scratch_pct, 1) AS Avg_Scratch,
             ROUND(avg_handicap_pct, 1) AS Avg_Handicap,
             ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,
             ROUND(stdev_percentage, 1) AS Pct_Stdev,
-            games_played AS Games
+            CAST(games_played AS INTEGER) AS Games
+        FROM with_player_titles
+        ORDER BY Rank ASC
+        LIMIT {top_n}
+    """
+    else:
+        query += f"""
+        SELECT 
+            CAST(ROW_NUMBER() OVER (ORDER BY avg_pair_elo DESC, games_played DESC, pair_name ASC, pair_id ASC) AS INTEGER) AS Rank,
+            CAST(ROUND(LEAST(GREATEST(avg_pair_elo, 0), 3500), 0) AS INTEGER) AS {pair_elo_col_name}{title_col},
+            pair_id AS Pair_ID,
+            pair_name AS Pair_Name,
+            ROUND(avg_scratch_pct, 1) AS Avg_Scratch,
+            ROUND(avg_handicap_pct, 1) AS Avg_Handicap,
+            ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,
+            ROUND(stdev_percentage, 1) AS Pct_Stdev,
+            CAST(games_played AS INTEGER) AS Games
         FROM filtered
         ORDER BY Rank ASC
         LIMIT {top_n}
@@ -1141,7 +1228,7 @@ def main():
         
         # PDF Export
         generate_pdf = st.button("Export Report to PDF File", use_container_width=True)
-        st.sidebar.markdown("**Morty's Automated Postmortem Apps**")
+        st.sidebar.markdown('<p style="color: #ffc107; font-weight: 600;">Morty\'s Automated Postmortem Apps</p>', unsafe_allow_html=True)
         st.sidebar.markdown("🔗 [ACBL Postmortem](https://acbl.postmortem.chat)")
         st.sidebar.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
         #st.sidebar.markdown("🔗 [BridgeWebs Postmortem](https://bridgewebs.postmortem.chat)")
@@ -1387,7 +1474,12 @@ def main():
         st.markdown(f'<div class="metric-card"><small>{avg_label}</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{avg_games:.1f}</span></div>', unsafe_allow_html=True)
     
     with m4:
-        st.markdown(f'<div class="metric-card"><small>{highest_label}</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{round(highest_elo)}</span></div>', unsafe_allow_html=True)
+        # Handle infinity/NaN values safely
+        if highest_elo is None or not math.isfinite(highest_elo):
+            highest_elo_display = 0
+        else:
+            highest_elo_display = round(highest_elo)
+        st.markdown(f'<div class="metric-card"><small>{highest_label}</small><br><span style="font-size:1.4rem; color:#ffc107; font-weight:700;">{highest_elo_display}</span></div>', unsafe_allow_html=True)
     
     st.markdown("<br>", unsafe_allow_html=True)
     
@@ -1502,7 +1594,7 @@ def main():
     else:
         st.markdown(f"### 🏆 Top {top_n} Pairs (Min. {min_games} games)")
         if not results_df.is_empty():
-            top_pairs, sql_query = show_top_pairs(results_df, top_n, min_games, use_handicap)
+            top_pairs, sql_query = show_top_pairs(results_df, top_n, min_games, use_handicap, players_df)
             
             if sql_query:
                 with st.expander("📝 SQL Query", expanded=False):
@@ -1568,10 +1660,11 @@ def main():
                                     cols_to_select.append(pl.col('pair_iv').alias('Current_Pair_IV'))
                                 # Dynamically select Pair Elo based on current use_handicap setting
                                 pair_elo_col = 'pair_handicap_elo' if use_handicap else 'pair_scratch_elo'
+                                pair_elo_alias = 'HC_Pair_Elo' if use_handicap else 'Pair_Elo'
                                 if pair_elo_col in pair_results.columns:
-                                    cols_to_select.append(pl.col(pair_elo_col).round(0).alias('Pair_Elo'))
+                                    cols_to_select.append(pl.col(pair_elo_col).round(0).alias(pair_elo_alias))
                                 elif 'pair_elo' in pair_results.columns:
-                                    cols_to_select.append(pl.col('pair_elo').round(0).alias('Pair_Elo'))
+                                    cols_to_select.append(pl.col('pair_elo').round(0).alias(pair_elo_alias))
                                 
                                 detail_df = pair_results.select(cols_to_select)
                                 # Optional reconciliation: for Octopus, prefer BridgeInterNet scratch/handicap when matchable.

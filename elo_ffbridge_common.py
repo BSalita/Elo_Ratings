@@ -203,37 +203,65 @@ def calculate_expected_score(rating_a: float, rating_b: float) -> float:
     
     Uses the standard Elo formula:
     E_A = 1 / (1 + 10^((R_B - R_A) / 400))
+    
+    Includes overflow protection for extreme rating differences.
     """
-    return 1.0 / (1.0 + 10 ** ((rating_b - rating_a) / PERFORMANCE_SCALING))
+    rating_diff = (rating_b - rating_a) / PERFORMANCE_SCALING
+    
+    # Prevent overflow: clamp exponent to reasonable range
+    # 10^10 ≈ 10 billion (way beyond practical), 10^-10 ≈ 0.0000000001
+    # For Elo: max practical diff is ~800 points (10^2 = 100), so ±10 is safe
+    max_exponent = 10.0
+    min_exponent = -10.0
+    rating_diff = max(min_exponent, min(max_exponent, rating_diff))
+    
+    try:
+        return 1.0 / (1.0 + 10 ** rating_diff)
+    except OverflowError:
+        # Fallback: if still overflow, use extreme values
+        if rating_diff > 0:
+            return 0.0  # Player A is much weaker
+        else:
+            return 1.0  # Player A is much stronger
 
 
 def scale_to_chess_range(rating: float) -> float:
     """
     Scale Elo rating to chess federation range.
     
-    Maps ratings so that top players (1600 in old system) reach Magnus Carlsen level (2800).
-    Uses a simple linear scaling: rating * 1.75 to map 1600 -> 2800.
+    Maps ratings so that top players reach Magnus Carlsen level and beyond.
+    Uses a simple linear scaling: rating * 2.0 (e.g., 1200 -> 2400, 1600 -> 3200).
     
-    No clamping is applied - following standard Elo system precedent (FIDE, USCF) where
-    ratings are allowed to naturally distribute without bounds. FIDE only publishes ratings
-    >= 1000 but doesn't clamp the underlying calculations.
+    Includes bounds checking to prevent extreme values that could cause overflow errors.
+    While standard Elo systems don't clamp ratings, we need to prevent technical issues
+    from corrupting the calculation.
     
     Args:
         rating: Current Elo rating
     
     Returns:
-        Scaled Elo rating (no bounds enforced)
+        Scaled Elo rating (bounded to reasonable range to prevent overflow)
     """
     if not CHESS_SCALING_ENABLED:
         return rating
     
-    # Simple scaling: multiply by factor to get 1600 -> 2800
-    # Factor = 2800 / 1600 = 1.75
-    # This means: 1200 -> 2100, 1400 -> 2450, 1600 -> 2800
-    # Ratings can go below 1200 or above 2800 naturally
-    scale_factor = CHESS_TARGET_MAX / CURRENT_REFERENCE_MAX  # 2800 / 1600 = 1.75
+    # Clamp input rating to reasonable range before scaling to prevent extreme values
+    # This prevents overflow errors while still allowing natural distribution
+    max_input_rating = 10000.0  # Reasonable upper bound for unscaled ratings
+    min_input_rating = -1000.0  # Allow negative ratings (though unlikely)
+    rating = max(min_input_rating, min(max_input_rating, rating))
+    
+    # Simple scaling: multiply by factor of 2.0
+    # This means: 1200 -> 2400, 1400 -> 2800, 1600 -> 3200
+    scale_factor = 2.0
     
     scaled = rating * scale_factor
+    
+    # Clamp output to prevent overflow in downstream calculations
+    # Max reasonable Elo: 3500 (allows growth beyond Magnus Carlsen's peak)
+    max_output_rating = 3500.0
+    min_output_rating = 0.0
+    scaled = max(min_output_rating, min(max_output_rating, scaled))
     
     return round(scaled, 1)
 
