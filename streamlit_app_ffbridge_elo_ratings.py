@@ -12,12 +12,14 @@ Supports both:
 
 import os
 import pathlib
+import re
 import sys
 from datetime import datetime, timezone
 from typing import Optional, Tuple, List, Dict, Any
 
 import pandas as pd
 import polars as pl
+import requests
 import streamlit as st
 import duckdb
 
@@ -62,6 +64,200 @@ API_BACKENDS = {
 # -------------------------------
 # Helper Functions
 # -------------------------------
+@st.cache_data(ttl=86400, show_spinner=False)
+def _bridgeinter_fetch_text(url: str) -> str:
+    """
+    Fetch a BridgeInterNet page and return a whitespace-normalized text version.
+    Cached because this is used only for small, occasional reconciliations.
+    """
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    html = resp.text
+    # Strip scripts/styles then tags; keep numbers/%/names.
+    html = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.IGNORECASE)
+    html = re.sub(r"<style[\s\S]*?</style>", " ", html, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", html)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _bridgeinter_octopus_url(date_yyyy_mm_dd: str, classement_type: str) -> Optional[str]:
+    """
+    Build BridgeInterNet Octopus URL for a given date.
+    Thursday sessions use octopus_j + code joYYMMDD.
+    Monday sessions use octopus_l + code loYYMMDD.
+    """
+    try:
+        d = datetime.strptime(date_yyyy_mm_dd, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+    yymmdd = d.strftime("%y%m%d")
+    # Monday=0, Thursday=3
+    if d.weekday() == 3:
+        base_path = "octopus_j/resseance_j.php"
+        session_code = f"jo{yymmdd}"
+    elif d.weekday() == 0:
+        base_path = "octopus_l/resseance_l.php"
+        session_code = f"lo{yymmdd}"
+    else:
+        return None
+
+    classement_type = str(classement_type).lower().strip()
+    if classement_type not in {"s", "h"}:
+        return None
+
+    return f"http://www.bridgeinter.net/{base_path}?v_codeseance={session_code}&v_type_classement={classement_type}"
+
+
+def _bridgeinter_find_pair_pct(page_text: str, surname1: str, surname2: str) -> Optional[float]:
+    """
+    Heuristic: find the percentage whose nearby context contains both surnames.
+    BridgeInterNet format: "RANK LINE EO/NS SURNAME1 First1 SURNAME2 First2 XX.XX% ..."
+    Names appear BEFORE the percentage, so we search primarily in the preceding text.
+    """
+    t = (page_text or "").upper()
+    s1 = (surname1 or "").strip().upper()
+    s2 = (surname2 or "").strip().upper()
+    if not t or not s1 or not s2:
+        return None
+
+    best_match = None
+    best_distance = float('inf')
+    
+    for m in re.finditer(r"(\d{1,2}\.\d{2})%", t):
+        # Look primarily BEFORE the percentage (names come before %)
+        # Use smaller window: 100 chars before, 20 after
+        start = max(0, m.start() - 100)
+        end = min(len(t), m.end() + 20)
+        ctx = t[start:end]
+        
+        if s1 in ctx and s2 in ctx:
+            # Find how close the surnames are to the percentage
+            s1_pos = ctx.rfind(s1)  # Last occurrence before %
+            s2_pos = ctx.rfind(s2)
+            if s1_pos >= 0 and s2_pos >= 0:
+                # Distance from surnames to the percentage
+                pct_pos_in_ctx = m.start() - start
+                distance = max(pct_pos_in_ctx - s1_pos, pct_pos_in_ctx - s2_pos)
+                if distance < best_distance:
+                    best_distance = distance
+                    try:
+                        best_match = float(m.group(1))
+                    except Exception:
+                        pass
+
+    return best_match
+
+
+def _pair_surnames(pair_name: str) -> Tuple[str, str]:
+    """
+    Extract rough surnames from "First LAST - First LAST".
+    Falls back gracefully if format is unexpected.
+    """
+    if not pair_name:
+        return "", ""
+
+    left, right = "", ""
+    if " - " in pair_name:
+        left, right = pair_name.split(" - ", 1)
+    elif "-" in pair_name:
+        left, right = pair_name.split("-", 1)
+    else:
+        parts = pair_name.split()
+        if len(parts) >= 2:
+            return parts[-1], parts[-1]
+        return "", ""
+
+    l = left.strip().split()
+    r = right.strip().split()
+    return (l[-1] if l else ""), (r[-1] if r else "")
+
+
+def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, use_handicap: bool = True) -> pl.DataFrame:
+    """
+    For Octopus sessions, try to override Scratch_% / Handicap_% with BridgeInterNet values.
+    Adds a 'Source' column with a clickable link to verify the data source.
+    
+    Args:
+        detail_df: DataFrame with tournament results
+        pair_name: Pair name or player name. If "Partner" column exists, uses that for each row.
+        use_handicap: Whether to use handicap percentage for Pct_Used (else scratch)
+    """
+    if detail_df.is_empty():
+        return detail_df
+
+    # Get default surnames from passed pair_name
+    default_s1, default_s2 = _pair_surnames(pair_name)
+    
+    rows = []
+    for r in detail_df.to_dicts():
+        src_url = ""
+        date_str = str(r.get("Date", "") or "")[:10]
+        tournament_label = str(r.get("Tournament", "") or "")
+        event_id = str(r.get("Event_ID", "") or "")
+        
+        # Use Partner column if available (contains full pair name), otherwise use default
+        partner_col = r.get("Partner", "")
+        if partner_col:
+            s1, s2 = _pair_surnames(str(partner_col))
+            print(f"[BI Reconcile] Partner='{partner_col}' -> s1='{s1}', s2='{s2}'", flush=True)
+        else:
+            s1, s2 = default_s1, default_s2
+            print(f"[BI Reconcile] No Partner col, using default s1='{s1}', s2='{s2}'", flush=True)
+
+        scratch = r.get("Scratch_%")
+        handicap = r.get("Handicap_%")
+
+        # Attempt BridgeInterNet reconciliation for Octopus days (Monday/Thursday)
+        # Check both by name and by date (Mon=0, Thu=3 are Octopus days)
+        is_octopus_name = "octopus" in tournament_label.lower()
+        is_octopus_day = False
+        try:
+            from datetime import datetime as dt
+            d = dt.strptime(date_str, "%Y-%m-%d").date()
+            is_octopus_day = d.weekday() in (0, 3)  # Monday or Thursday
+        except Exception:
+            pass
+        
+        if (is_octopus_name or is_octopus_day) and s1 and s2:
+            url_s = _bridgeinter_octopus_url(date_str, "s")
+            url_h = _bridgeinter_octopus_url(date_str, "h")
+            print(f"[BI Reconcile] date={date_str}, s1={s1}, s2={s2}, url_s={url_s}", flush=True)
+            if url_s and url_h:
+                try:
+                    txt_s = _bridgeinter_fetch_text(url_s)
+                    txt_h = _bridgeinter_fetch_text(url_h)
+                    s_pct = _bridgeinter_find_pair_pct(txt_s, s1, s2)
+                    h_pct = _bridgeinter_find_pair_pct(txt_h, s1, s2)
+                    print(f"[BI Reconcile] Found: scratch={s_pct}, handicap={h_pct}", flush=True)
+                    if s_pct is not None and h_pct is not None:
+                        scratch = round(float(s_pct), 2)
+                        handicap = round(float(h_pct), 2)
+                        src_url = url_s  # Link to scratch results page
+                except Exception as e:
+                    # Fail fast-ish: just don't override if BridgeInterNet fetch/parsing fails.
+                    print(f"[BI Reconcile] Error: {e}", flush=True)
+        
+        # If no BridgeInterNet URL, provide FFBridge API URL for verification
+        if not src_url and event_id:
+            src_url = f"https://api.ffbridge.fr/api/v1/simultaneous-tournaments/{event_id}"
+
+        r["Scratch_%"] = scratch
+        r["Handicap_%"] = handicap
+        # Update Pct_Used to match the updated values
+        # Use handicap if requested AND available, otherwise use scratch
+        if use_handicap and handicap is not None:
+            r["Pct_Used"] = handicap
+        else:
+            r["Pct_Used"] = scratch
+        # Store raw URL - LinkColumn will make it clickable
+        r["Source"] = src_url if src_url else None
+        rows.append(r)
+
+    return pl.DataFrame(rows)
+
+
 def calculate_aggrid_height(row_count: int) -> int:
     """Calculate AgGrid height based on row count."""
     display_rows = min(AGGRID_MAX_DISPLAY_ROWS, row_count)
@@ -113,7 +309,7 @@ def process_tournaments_to_elo(
     initial_players: Optional[Dict[str, Dict]] = None,
     use_handicap: bool = False,
     fetch_iv: bool = False,
-) -> Tuple[pl.DataFrame, pl.DataFrame, Dict[str, float]]:
+) -> Tuple[pl.DataFrame, pl.DataFrame, Dict[str, float], Dict[str, int]]:
     """
     Process tournament list and calculate Elo ratings.
     Works with both Classic and Lancelot API data.
@@ -122,6 +318,10 @@ def process_tournaments_to_elo(
     Args:
         fetch_iv: If True, fetch current IV values for each player (slower)
         use_handicap: Determines which Elo is returned as current_ratings (both are stored in DataFrame)
+    
+    Returns:
+        Tuple of (results_df, players_df, current_ratings, cache_stats)
+        cache_stats contains: {"cached": int, "fetched": int, "missing": int}
     """
     all_results = []
     # Track ratings for BOTH scratch and handicap
@@ -150,7 +350,7 @@ def process_tournaments_to_elo(
     # Progress tracking
     progress_bar = st.progress(0)
     status_text = st.empty()
-    cache_stats = {"cached": 0, "fetched": 0}
+    cache_stats = {"cached": 0, "fetched": 0, "missing_ids": []}
     
     total_t = len(sorted_tournaments)
     for i, tournament in enumerate(sorted_tournaments):
@@ -159,12 +359,17 @@ def process_tournaments_to_elo(
         t_name = tournament.get('name') or tournament.get('label') or tournament.get('moment_label') or f"Tournament {t_id}"
         t_date = tournament.get('date', '')
         
-        cache_info = f"[Cached: {cache_stats['cached']}, Fetched: {cache_stats['fetched']}]"
-        status_text.markdown(f"<span style='color: white;'>Processing {i+1}/{total_t}: {t_name[:35]}... {cache_info}</span>", unsafe_allow_html=True)
+        missing_count = len(cache_stats['missing_ids'])
+        cache_info = f"[Cached: {cache_stats['cached']}, Fetched: {cache_stats['fetched']}, Missing results: {missing_count}]"
+        status_text.markdown(f"<span style='color: white;'>Processing {i+1}/{total_t}: {t_name[:35]} (ID:{t_id})... {cache_info}</span>", unsafe_allow_html=True)
         progress_bar.progress((i + 1) / total_t)
+        
+        # Log to console for debugging hung requests
+        print(f"[Processing] {i+1}/{total_t}: ID={t_id}, date={t_date[:10] if t_date else 'N/A'}, name={t_name[:40]}", flush=True)
         
         # Fetch results using the appropriate API module
         results, was_cached = api_module.fetch_tournament_results(t_id, tournament_date=t_date, series_id=t_series, fetch_iv=fetch_iv)
+        print(f"[Processing] {i+1}/{total_t}: ID={t_id} - fetch returned, cached={was_cached}, count={len(results) if results else 0}", flush=True)
         
         if was_cached:
             cache_stats["cached"] += 1
@@ -172,7 +377,11 @@ def process_tournaments_to_elo(
             cache_stats["fetched"] += 1
         
         if not results:
+            cache_stats["missing_ids"].append(t_id)
+            print(f"[Processing] {i+1}/{total_t}: ID={t_id} - no results, skipping (missing: {len(cache_stats['missing_ids'])})", flush=True)
             continue
+        
+        print(f"[Processing] {i+1}/{total_t}: ID={t_id} - processing {len(results)} results...", flush=True)
         
         # Calculate field average rating for both scratch and handicap
         scratch_field_ratings = []
@@ -197,10 +406,11 @@ def process_tournaments_to_elo(
             # Get percentages
             raw_pct = float(result.get('percentage', 50.0) or 50.0)
             handicap_pct_raw = result.get('handicap_percentage')
+            # handicap_pct_raw may be None for scratch-only events
             try:
-                handicap_pct = float(handicap_pct_raw) if handicap_pct_raw is not None else raw_pct
+                handicap_pct = float(handicap_pct_raw) if handicap_pct_raw is not None else None
             except (ValueError, TypeError):
-                handicap_pct = raw_pct
+                handicap_pct = None
             
             pe_bonus_raw = result.get('pe_bonus', 0)
             try:
@@ -210,9 +420,9 @@ def process_tournaments_to_elo(
             
             club_pct_raw = result.get('club_percentage')
             try:
-                club_pct = float(club_pct_raw) if club_pct_raw is not None else (handicap_pct - pe_bonus / 10.0)
+                club_pct = float(club_pct_raw) if club_pct_raw is not None else (raw_pct - pe_bonus / 10.0)
             except (ValueError, TypeError):
-                club_pct = handicap_pct - pe_bonus / 10.0
+                club_pct = raw_pct - pe_bonus / 10.0
             
             # Get scratch (unhandicapped) percentage and IV bonus
             scratch_pct_raw = result.get('scratch_percentage')
@@ -233,7 +443,8 @@ def process_tournaments_to_elo(
             pair_iv = result.get('pair_iv')
             
             # We'll compute both, but use_handicap determines which is used for 'percentage' column
-            percentage = handicap_pct if use_handicap else scratch_pct
+            # For scratch-only events (handicap_pct is None), always use scratch
+            percentage = handicap_pct if (use_handicap and handicap_pct is not None) else scratch_pct
             
             rank_club = result.get('rank', 0)
             rank_handicap = result.get('theoretical_rank', 0)
@@ -275,7 +486,7 @@ def process_tournaments_to_elo(
                 'player2_name': str(p2_name),
                 'pair_name': str(pair_name),
                 'percentage': float(percentage),
-                'handicap_percentage': float(handicap_pct),
+                'handicap_percentage': float(handicap_pct) if handicap_pct is not None else None,
                 'scratch_percentage': float(scratch_pct),
                 'iv_bonus': float(iv_bonus),
                 'club_percentage': float(club_pct),
@@ -301,9 +512,11 @@ def process_tournaments_to_elo(
                 scratch_r1_after = calculate_elo_from_percentage(scratch_r1_before, scratch_pct, scratch_field_avg)
                 scratch_ratings[p1_id] = scratch_r1_after
                 
-                # Handicap Elo
+                # Handicap Elo (use scratch if handicap not available)
                 handicap_r1_before = handicap_ratings.get(p1_id, DEFAULT_ELO)
-                handicap_r1_after = calculate_elo_from_percentage(handicap_r1_before, handicap_pct, handicap_field_avg)
+                h_pct_for_elo = handicap_pct if handicap_pct is not None else scratch_pct
+                h_field_for_elo = handicap_field_avg if handicap_pct is not None else scratch_field_avg
+                handicap_r1_after = calculate_elo_from_percentage(handicap_r1_before, h_pct_for_elo, h_field_for_elo)
                 handicap_ratings[p1_id] = handicap_r1_after
                 
                 result_record['player1_scratch_elo_before'] = scratch_r1_before
@@ -336,9 +549,11 @@ def process_tournaments_to_elo(
                 scratch_r2_after = calculate_elo_from_percentage(scratch_r2_before, scratch_pct, scratch_field_avg)
                 scratch_ratings[p2_id] = scratch_r2_after
                 
-                # Handicap Elo
+                # Handicap Elo (use scratch if handicap not available)
                 handicap_r2_before = handicap_ratings.get(p2_id, DEFAULT_ELO)
-                handicap_r2_after = calculate_elo_from_percentage(handicap_r2_before, handicap_pct, handicap_field_avg)
+                h_pct_for_elo = handicap_pct if handicap_pct is not None else scratch_pct
+                h_field_for_elo = handicap_field_avg if handicap_pct is not None else scratch_field_avg
+                handicap_r2_after = calculate_elo_from_percentage(handicap_r2_before, h_pct_for_elo, h_field_for_elo)
                 handicap_ratings[p2_id] = handicap_r2_after
                 
                 result_record['player2_scratch_elo_before'] = scratch_r2_before
@@ -371,6 +586,8 @@ def process_tournaments_to_elo(
                 result_record['pair_elo'] = result_record['handicap_pair_elo'] if use_handicap else result_record['scratch_pair_elo']
             
             all_results.append(result_record)
+        
+        print(f"[Processing] {i+1}/{total_t}: ID={t_id} - done", flush=True)
     
     progress_bar.empty()
     status_text.empty()
@@ -465,7 +682,7 @@ def process_tournaments_to_elo(
     
     # Return selected type ratings dict for backward compatibility
     current_ratings = handicap_ratings if use_handicap else scratch_ratings
-    return results_df, players_df, current_ratings
+    return results_df, players_df, current_ratings, cache_stats
 
 
 def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5) -> Tuple[pl.DataFrame, str]:
@@ -503,8 +720,10 @@ def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5, use
     if results_df.is_empty():
         return results_df, ""
     
-    # Select appropriate Elo column based on use_handicap
+    # Select appropriate Elo and percentage columns based on use_handicap
     elo_col = "handicap_pair_elo" if use_handicap else "scratch_pair_elo"
+    # Use COALESCE for handicap to fall back to scratch when handicap is null
+    pct_col = "COALESCE(handicap_percentage, scratch_percentage)" if use_handicap else "scratch_percentage"
     
     query = f"""
         WITH pair_stats AS (
@@ -514,13 +733,13 @@ def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5, use
                 ARG_MAX(player1_id, date) AS player1_id,
                 ARG_MAX(player2_id, date) AS player2_id,
                 AVG(scratch_pair_elo) AS avg_scratch_elo,
-                AVG(handicap_pair_elo) AS avg_handicap_elo,
+                AVG(COALESCE(handicap_pair_elo, scratch_pair_elo)) AS avg_handicap_elo,
                 AVG({elo_col}) AS avg_pair_elo,
                 AVG(scratch_percentage) AS avg_scratch_pct,
-                AVG(handicap_percentage) AS avg_handicap_pct,
+                AVG(COALESCE(handicap_percentage, scratch_percentage)) AS avg_handicap_pct,
                 AVG(iv_bonus) AS avg_iv_bonus,
-                AVG(percentage) AS avg_percentage,
-                STDDEV_SAMP(percentage) AS stdev_percentage,
+                AVG({pct_col}) AS avg_percentage,
+                STDDEV_SAMP({pct_col}) AS stdev_percentage,
                 COUNT(*) AS games_played
             FROM results_df
             GROUP BY pair_id
@@ -813,6 +1032,9 @@ def main():
         </div>
     """, unsafe_allow_html=True)
     
+    # Placeholder for processing stats (created once, updated later)
+    stats_placeholder = st.empty()
+    
     # -------------------------------
     # Main Content
     # -------------------------------
@@ -843,6 +1065,7 @@ def main():
         full_results_df = cached['results_df']
         full_players_df = cached['players_df']
         current_ratings = cached['scratch_ratings'] if not use_handicap else cached['handicap_ratings']
+        processing_stats = cached.get('processing_stats', {"cached": 0, "fetched": 0, "missing_ids": []})
     else:
         # Clear old cache entries for different API
         keys_to_remove = [k for k in full_cache.keys() if not k.startswith(f"elo_full_v3_{api_key}_")]
@@ -850,7 +1073,7 @@ def main():
             del full_cache[k]
         
         # Process all tournaments - computes BOTH scratch and handicap Elo in one pass
-        full_results_df, full_players_df, current_ratings = process_tournaments_to_elo(
+        full_results_df, full_players_df, current_ratings, processing_stats = process_tournaments_to_elo(
             all_tournaments, api_module, initial_players=None, use_handicap=use_handicap, fetch_iv=fetch_iv
         )
         
@@ -890,7 +1113,14 @@ def main():
             'players_df': full_players_df,
             'scratch_ratings': scratch_ratings_dict,
             'handicap_ratings': handicap_ratings_dict,
+            'processing_stats': processing_stats,
         }
+    
+    # Display processing stats using the placeholder (avoids duplicates)
+    missing_ids = processing_stats.get('missing_ids', [])
+    missing_str = str(missing_ids) if missing_ids else "none"
+    stats_msg = f"Cached: {processing_stats['cached']}, Fetched: {processing_stats['fetched']}, Missing results: {missing_str}"
+    stats_placeholder.caption(stats_msg)
     
     # Apply filters
     results_df = full_results_df
@@ -908,6 +1138,8 @@ def main():
         # Dynamic column selection based on use_handicap
         elo_col_p1 = "player1_handicap_elo_after" if use_handicap else "player1_scratch_elo_after"
         elo_col_p2 = "player2_handicap_elo_after" if use_handicap else "player2_scratch_elo_after"
+        # Use COALESCE for handicap to fall back to scratch when handicap is null
+        pct_expr = "COALESCE(handicap_percentage, scratch_percentage)" if use_handicap else "scratch_percentage"
         
         players_df = duckdb.sql(f"""
             WITH player_results AS (
@@ -917,7 +1149,6 @@ def main():
                     player1_scratch_elo_after AS scratch_elo,
                     player1_handicap_elo_after AS handicap_elo,
                     {elo_col_p1} AS elo_rating, 
-                    percentage,
                     scratch_percentage,
                     handicap_percentage,
                     iv_bonus,
@@ -930,7 +1161,6 @@ def main():
                     player2_scratch_elo_after AS scratch_elo,
                     player2_handicap_elo_after AS handicap_elo,
                     {elo_col_p2} AS elo_rating, 
-                    percentage,
                     scratch_percentage,
                     handicap_percentage,
                     iv_bonus,
@@ -941,14 +1171,14 @@ def main():
                 player_id,
                 ARG_MAX(player_name, date) AS player_name,
                 ROUND(ARG_MAX(scratch_elo, date), 1) AS scratch_elo,
-                ROUND(ARG_MAX(handicap_elo, date), 1) AS handicap_elo,
+                ROUND(ARG_MAX(COALESCE(handicap_elo, scratch_elo), date), 1) AS handicap_elo,
                 ROUND(ARG_MAX(elo_rating, date), 1) AS elo_rating,
                 COUNT(*) AS games_played,
                 ROUND(AVG(scratch_percentage), 2) AS avg_scratch_pct,
-                ROUND(AVG(handicap_percentage), 2) AS avg_handicap_pct,
+                ROUND(AVG(COALESCE(handicap_percentage, scratch_percentage)), 2) AS avg_handicap_pct,
                 ROUND(AVG(iv_bonus), 1) AS avg_iv_bonus,
-                ROUND(AVG(percentage), 2) AS avg_percentage,
-                ROUND(STDDEV_SAMP(percentage), 2) AS stdev_percentage
+                ROUND(AVG({pct_expr}), 2) AS avg_percentage,
+                ROUND(STDDEV_SAMP({pct_expr}), 2) AS stdev_percentage
             FROM player_results
             GROUP BY player_id
         """).pl()
@@ -1072,18 +1302,53 @@ def main():
                                 (pl.col('scratch_percentage') if 'scratch_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Scratch_%'),
                                 (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_%'),
                                 (pl.col('iv_bonus') if 'iv_bonus' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(1).alias('IV_Bonus'),
-                                pl.col('percentage').cast(pl.Float64, strict=False).round(2).alias('Pct_Used'),
-                                pl.col('rank').alias('Rank'),
                             ]
-                            if 'theoretical_rank' in player_results.columns and use_handicap:
-                                cols_to_select.append(pl.col('theoretical_rank').alias('Hcp_Rank'))
+                            # Pct_Used: use handicap if requested AND not null, otherwise scratch
+                            if use_handicap and 'handicap_percentage' in player_results.columns:
+                                # Use handicap when available, fall back to scratch when null
+                                cols_to_select.append(
+                                    pl.when(pl.col('handicap_percentage').is_not_null())
+                                      .then(pl.col('handicap_percentage').cast(pl.Float64, strict=False).round(2))
+                                      .otherwise(pl.col('scratch_percentage').cast(pl.Float64, strict=False).round(2))
+                                      .alias('Pct_Used')
+                                )
+                            else:
+                                # Use scratch
+                                cols_to_select.append(
+                                    (pl.col('scratch_percentage') if 'scratch_percentage' in player_results.columns else pl.col('percentage'))
+                                      .cast(pl.Float64, strict=False).round(2).alias('Pct_Used')
+                                )
+                            # Dynamically select Rank based on current use_handicap setting
+                            if use_handicap and 'theoretical_rank' in player_results.columns:
+                                cols_to_select.append(pl.col('theoretical_rank').alias('Rank'))
+                            else:
+                                cols_to_select.append(pl.col('rank').alias('Rank'))
                             # Add current IV (note: this is current IV, not IV at tournament time)
                             if 'pair_iv' in player_results.columns:
                                 cols_to_select.append(pl.col('pair_iv').alias('Current_Pair_IV'))
-                            cols_to_select.append(pl.col('player1_elo_after').round(0).alias('Elo_After'))
+                            # Dynamically select Elo based on current use_handicap setting
+                            elo_col = 'player1_handicap_elo_after' if use_handicap else 'player1_scratch_elo_after'
+                            if elo_col in player_results.columns:
+                                cols_to_select.append(pl.col(elo_col).round(0).alias('Elo_After'))
+                            elif 'player1_elo_after' in player_results.columns:
+                                cols_to_select.append(pl.col('player1_elo_after').round(0).alias('Elo_After'))
                             
                             detail_df = player_results.select(cols_to_select)
-                            ShowDataFrameTable(detail_df, key='player_detail_table', height_rows=10)
+                            # Optional reconciliation: for Octopus, prefer BridgeInterNet scratch/handicap when matchable.
+                            detail_df = _maybe_override_octopus_pct_rows(detail_df, pair_name=player_name, use_handicap=use_handicap)
+                            # Display with clickable Source link
+                            st.dataframe(
+                                detail_df.to_pandas(),
+                                column_config={
+                                    "Source": st.column_config.LinkColumn(
+                                        "Source",
+                                        help="Click to verify data (BI=BridgeInterNet, API=FFBridge)",
+                                        display_text="🔗",  # Short clickable icon
+                                    )
+                                },
+                                hide_index=True,
+                                width='stretch',
+                            )
                         else:
                             st.info("No results in selected tournaments.")
                 
@@ -1125,18 +1390,53 @@ def main():
                                 (pl.col('scratch_percentage') if 'scratch_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Scratch_%'),
                                 (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_%'),
                                 (pl.col('iv_bonus') if 'iv_bonus' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(1).alias('IV_Bonus'),
-                                pl.col('percentage').cast(pl.Float64, strict=False).round(2).alias('Pct_Used'),
-                                pl.col('rank').alias('Rank'),
                             ]
-                            if 'theoretical_rank' in pair_results.columns and use_handicap:
-                                cols_to_select.append(pl.col('theoretical_rank').alias('Hcp_Rank'))
+                            # Pct_Used: use handicap if requested AND not null, otherwise scratch
+                            if use_handicap and 'handicap_percentage' in pair_results.columns:
+                                # Use handicap when available, fall back to scratch when null
+                                cols_to_select.append(
+                                    pl.when(pl.col('handicap_percentage').is_not_null())
+                                      .then(pl.col('handicap_percentage').cast(pl.Float64, strict=False).round(2))
+                                      .otherwise(pl.col('scratch_percentage').cast(pl.Float64, strict=False).round(2))
+                                      .alias('Pct_Used')
+                                )
+                            else:
+                                # Use scratch
+                                cols_to_select.append(
+                                    (pl.col('scratch_percentage') if 'scratch_percentage' in pair_results.columns else pl.col('percentage'))
+                                      .cast(pl.Float64, strict=False).round(2).alias('Pct_Used')
+                                )
+                            # Dynamically select Rank based on current use_handicap setting
+                            if use_handicap and 'theoretical_rank' in pair_results.columns:
+                                cols_to_select.append(pl.col('theoretical_rank').alias('Rank'))
+                            else:
+                                cols_to_select.append(pl.col('rank').alias('Rank'))
                             # Add current IV (note: this is current IV, not IV at tournament time)
                             if 'pair_iv' in pair_results.columns:
                                 cols_to_select.append(pl.col('pair_iv').alias('Current_Pair_IV'))
-                            cols_to_select.append(pl.col('pair_elo').round(0).alias('Pair_Elo'))
+                            # Dynamically select Pair Elo based on current use_handicap setting
+                            pair_elo_col = 'pair_handicap_elo' if use_handicap else 'pair_scratch_elo'
+                            if pair_elo_col in pair_results.columns:
+                                cols_to_select.append(pl.col(pair_elo_col).round(0).alias('Pair_Elo'))
+                            elif 'pair_elo' in pair_results.columns:
+                                cols_to_select.append(pl.col('pair_elo').round(0).alias('Pair_Elo'))
                             
                             detail_df = pair_results.select(cols_to_select)
-                            ShowDataFrameTable(detail_df, key='pair_detail_table', height_rows=10)
+                            # Optional reconciliation: for Octopus, prefer BridgeInterNet scratch/handicap when matchable.
+                            detail_df = _maybe_override_octopus_pct_rows(detail_df, pair_name=pair_name, use_handicap=use_handicap)
+                            # Display with clickable Source link
+                            st.dataframe(
+                                detail_df.to_pandas(),
+                                column_config={
+                                    "Source": st.column_config.LinkColumn(
+                                        "Source",
+                                        help="Click to verify data (BI=BridgeInterNet, API=FFBridge)",
+                                        display_text="🔗",  # Short clickable icon
+                                    )
+                                },
+                                hide_index=True,
+                                width='stretch',
+                            )
                         else:
                             st.info("No detailed results found for this pair.")
                 

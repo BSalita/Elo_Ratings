@@ -40,7 +40,10 @@ DATA_ROOT = pathlib.Path('data') / 'ffbridge'
 CACHE_DIR = DATA_ROOT / 'cache'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-REQUEST_TIMEOUT = 15  # seconds
+# Cache version - increment to invalidate old cached calculations
+CACHE_VERSION = "v3"  # v3: Set handicap_percentage=None for scratch-only events
+
+REQUEST_TIMEOUT = 10  # seconds (reduced from 15 to fail faster on hung requests)
 REQUEST_DELAY = 0.1  # seconds between API requests
 
 
@@ -213,6 +216,23 @@ def _fetch_tournament_list_single(session: requests.Session, series_id: int, lim
     return []
 
 
+def _is_recent_tournament(tournament_date: str, days: int = 30) -> bool:
+    """Check if tournament date is within the last N days."""
+    if not tournament_date:
+        return False
+    try:
+        from datetime import datetime, timedelta
+        # Parse date (format: 2026-01-22T00:00:00+01:00 or 2026-01-22)
+        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', tournament_date)
+        if not date_match:
+            return False
+        t_date = datetime.strptime(date_match.group(1), '%Y-%m-%d')
+        cutoff = datetime.now() - timedelta(days=days)
+        return t_date >= cutoff
+    except Exception:
+        return False
+
+
 def fetch_tournament_results(tournament_id: str, tournament_date: str = "", series_id: Optional[Any] = None, fetch_iv: bool = False) -> Tuple[List[Dict[str, Any]], bool]:
     """
     Fetch results for a specific tournament.
@@ -221,22 +241,26 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
         tournament_id: The tournament ID to fetch
         tournament_date: Optional date string for cache naming
         series_id: Optional series ID for cache organization
-        fetch_iv: If True, also fetch IV data for each player (slower)
+        fetch_iv: If True, also fetch IV data for each player (slower).
+                  Note: IV is only fetched for tournaments within the last 30 days.
     
     Returns:
         Tuple of (list of result dicts, was_cached bool)
         Each result dict has normalized keys including:
         - percentage, handicap_percentage, scratch_percentage, iv_bonus
-        - player1_iv, player2_iv, pair_iv (if fetch_iv=True)
+        - player1_iv, player2_iv, pair_iv (if fetch_iv=True and tournament is recent)
     """
     session = get_session()
     if not session:
         return [], False
     
-    # Create friendly filename
+    # Only fetch IV for recent tournaments (within last 30 days)
+    should_fetch_iv = fetch_iv and _is_recent_tournament(tournament_date, days=30)
+    
+    # Create friendly filename with cache version
     date_match = re.search(r'(\d{4}-\d{2}-\d{2})', tournament_date)
     date_part = date_match.group(1) if date_match else ""
-    friendly_name = f"results_{tournament_id}_{date_part}" if date_part else f"results_{tournament_id}"
+    friendly_name = f"results_{CACHE_VERSION}_{tournament_id}_{date_part}" if date_part else f"results_{CACHE_VERSION}_{tournament_id}"
     
     # Check disk cache
     cached_data = load_from_disk_cache(CACHE_DIR, friendly_name, max_age_hours=None, series_id=series_id)
@@ -247,22 +271,36 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
     time.sleep(REQUEST_DELAY)
     
     url = f"{API_BASE}/api/v1/simultaneous-tournaments/{tournament_id}"
+    print(f"[Classic] Fetching: {url}", flush=True)
     
     try:
         response = session.get(url, timeout=REQUEST_TIMEOUT)
         
         if response.status_code == 429:
+            print(f"[Classic] Rate limited: {url}", flush=True)
             st.warning("Rate limited by FFBridge API. Waiting 5 seconds...")
             time.sleep(5)
             return fetch_tournament_results(tournament_id, tournament_date, series_id)
         
         if response.status_code == 200:
+            print(f"[Classic] OK: {url}", flush=True)
             data = response.json()
+            print(f"[Classic] Parsed JSON for {tournament_id}", flush=True)
             if data:
                 teams = data.get('teams', [])
+                iv_status = "with IV" if should_fetch_iv else "no IV (old tournament)"
+                print(f"[Classic] Processing {len(teams)} teams for {tournament_id} ({iv_status})", flush=True)
                 results = []
                 
-                for team in teams:
+                # Show IV progress bar for recent tournaments
+                iv_progress_bar = None
+                iv_status_text = None
+                if should_fetch_iv and len(teams) > 0:
+                    iv_status_text = st.empty()
+                    iv_progress_bar = st.progress(0)
+                    iv_status_text.markdown(f"<span style='color: #ffc107;'>Fetching IV for {len(teams)} teams...</span>", unsafe_allow_html=True)
+                
+                for idx, team in enumerate(teams):
                     players = team.get('players', [])
                     if len(players) >= 2:
                         p1 = players[0]
@@ -278,21 +316,13 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
                         except (ValueError, TypeError):
                             pct = 0.0
                         
-                        # The API's percent is typically the handicap-adjusted score
-                        handicap_pct = pct
-                        
-                        # Try to find explicit club percentage
-                        club_pct_raw = None
+                        # Try to find explicit scratch percentage (percentWithoutHandicap)
+                        scratch_pct_raw = None
                         for k in ("percentWithoutHandicap", "clubPercent", "club_percent"):
                             v = team.get(k)
                             if v is not None and v != "":
-                                club_pct_raw = v
+                                scratch_pct_raw = v
                                 break
-                        
-                        try:
-                            club_pct = float(club_pct_raw) if club_pct_raw is not None else None
-                        except (ValueError, TypeError):
-                            club_pct = None
                         
                         pe_bonus = team.get('PE_bonus', 0)
                         try:
@@ -303,12 +333,42 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
                         # Derive IV bonus (PE_bonus is in tenths of a percent)
                         iv_bonus = pe_bonus_val / 10.0
                         
-                        # Derive scratch (unhandicapped) score
-                        scratch_pct = handicap_pct - iv_bonus
+                        # Check if this is an Octopus tournament (series_id 386)
+                        is_octopus = series_id == 386
                         
-                        # Derive club_pct if not available (same as scratch)
-                        if club_pct is None:
-                            club_pct = scratch_pct
+                        # Determine scratch and handicap percentages
+                        # Only treat as handicapped if:
+                        # 1. Explicit scratch_pct_raw is provided (percent is handicap), OR
+                        # 2. It's Octopus tournament (has verified handicap scoring), OR
+                        # 3. iv_bonus > 0 (actual bonus being applied)
+                        # Otherwise, tournament only has scratch scores (handicap = scratch)
+                        
+                        if scratch_pct_raw is not None:
+                            # Explicit scratch available - percent is handicap
+                            try:
+                                scratch_pct = float(scratch_pct_raw)
+                            except (ValueError, TypeError):
+                                scratch_pct = pct
+                            handicap_pct = pct
+                        elif is_octopus:
+                            # Octopus: API's 'percent' is the SCRATCH score
+                            # Handicap score = scratch + iv_bonus
+                            scratch_pct = pct
+                            handicap_pct = pct + iv_bonus
+                        else:
+                            # No explicit scratch and not Octopus
+                            # If iv_bonus > 0, assume percent is handicap; otherwise scratch-only
+                            if iv_bonus > 0:
+                                # Assume percent is handicap, derive scratch
+                                handicap_pct = pct
+                                scratch_pct = pct - iv_bonus
+                            else:
+                                # No handicap scoring - only scratch scores
+                                # Set handicap to None to indicate scratch-only event
+                                scratch_pct = pct
+                                handicap_pct = None
+                        
+                        club_pct = scratch_pct
                         
                         # Base result dict
                         result_dict = {
@@ -336,8 +396,8 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
                             'pair_iv': None,
                         }
                         
-                        # Optionally fetch IV for each player
-                        if fetch_iv:
+                        # Optionally fetch IV for each player (only for recent tournaments)
+                        if should_fetch_iv:
                             p1_iv_data = fetch_player_iv(str(p1.get('id')), session)
                             p2_iv_data = fetch_player_iv(str(p2.get('id')), session)
                             
@@ -345,16 +405,34 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
                             p2_iv = p2_iv_data.get('iv', 0) if p2_iv_data else 0
                             
                             result_dict['player1_iv'] = p1_iv
+                            
+                            # Update IV progress bar
+                            if iv_progress_bar is not None:
+                                iv_progress_bar.progress((idx + 1) / len(teams))
                             result_dict['player2_iv'] = p2_iv
                             result_dict['pair_iv'] = p1_iv + p2_iv
                         
                         results.append(result_dict)
                 
+                # Clean up IV progress bar
+                if iv_progress_bar is not None:
+                    iv_progress_bar.empty()
+                if iv_status_text is not None:
+                    iv_status_text.empty()
+                
+                print(f"[Classic] Built {len(results)} results for {tournament_id}", flush=True)
                 processed_data = {'results': results}
                 save_to_disk_cache(CACHE_DIR, friendly_name, processed_data, series_id=series_id)
+                print(f"[Classic] Saved to cache for {tournament_id}", flush=True)
                 return results, False
+        else:
+            print(f"[Classic] HTTP {response.status_code}: {url}", flush=True)
                 
+    except requests.exceptions.Timeout:
+        print(f"[Classic] TIMEOUT after {REQUEST_TIMEOUT}s: {url}", flush=True)
+        st.warning(f"Timeout fetching tournament {tournament_id} after {REQUEST_TIMEOUT}s - skipping")
     except Exception as e:
+        print(f"[Classic] ERROR: {e} for {url}", flush=True)
         st.warning(f"Error fetching tournament results: {e}")
     
     return [], False

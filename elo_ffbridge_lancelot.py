@@ -37,7 +37,7 @@ DATA_ROOT = pathlib.Path('data') / 'ffbridge'
 CACHE_DIR = DATA_ROOT / 'lancelot_cache'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-REQUEST_TIMEOUT = 30  # seconds (Lancelot can be slower)
+REQUEST_TIMEOUT = 10  # seconds (reduced from 30 to fail faster on hung requests)
 REQUEST_DELAY = 0.1  # seconds between API requests
 
 # Lancelot ID to Migration ID (FFBridge series ID) mapping
@@ -83,10 +83,14 @@ def get_auth_error_message() -> str:
 # -------------------------------
 # API Helpers
 # -------------------------------
-def lancelot_get(endpoint: str, params: Optional[Dict] = None, add_delay: bool = True) -> Optional[Any]:
+def lancelot_get(endpoint: str, params: Optional[Dict] = None, add_delay: bool = True, verbose: bool = True) -> Optional[Any]:
     """Make a GET request to Lancelot API with rate limiting."""
+    import sys
     session = get_session()
     url = f"{API_BASE}{endpoint}"
+    
+    if verbose:
+        print(f"[Lancelot] Fetching: {url}", flush=True)
     
     if add_delay:
         time.sleep(REQUEST_DELAY)
@@ -94,12 +98,21 @@ def lancelot_get(endpoint: str, params: Optional[Dict] = None, add_delay: bool =
     try:
         response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
         if response.status_code == 200:
+            if verbose:
+                print(f"[Lancelot] OK: {url}", flush=True)
             return response.json()
         elif response.status_code == 429:
             st.warning("Rate limited by Lancelot API. Waiting 5 seconds...")
             time.sleep(5)
-            return lancelot_get(endpoint, params, add_delay=False)
+            return lancelot_get(endpoint, params, add_delay=False, verbose=verbose)
+        else:
+            if verbose:
+                print(f"[Lancelot] HTTP {response.status_code}: {url}", flush=True)
+    except requests.exceptions.Timeout:
+        print(f"[Lancelot] TIMEOUT after {REQUEST_TIMEOUT}s: {url}", flush=True)
+        st.warning(f"Timeout fetching {endpoint} after {REQUEST_TIMEOUT}s - skipping")
     except Exception as e:
+        print(f"[Lancelot] ERROR: {e} for {url}", flush=True)
         st.warning(f"Lancelot API error: {e}")
     return None
 
@@ -198,21 +211,24 @@ def fetch_tournament_results(session_id: str, tournament_date: str = "", series_
     # Check disk cache
     cached_data = load_from_disk_cache(CACHE_DIR, friendly_name, max_age_hours=None, series_id=series_id)
     if cached_data:
-        return _normalize_ranking_results(cached_data), True
+        return _normalize_ranking_results(cached_data, series_id=series_id), True
     
     # Fetch from API
     data = lancelot_get(f"/results/sessions/{session_id}/ranking")
     
     if data and isinstance(data, list):
         save_to_disk_cache(CACHE_DIR, friendly_name, data, series_id=series_id)
-        return _normalize_ranking_results(data), False
+        return _normalize_ranking_results(data, series_id=series_id), False
     
     return [], False
 
 
-def _normalize_ranking_results(ranking: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _normalize_ranking_results(ranking: List[Dict[str, Any]], series_id: Optional[Any] = None) -> List[Dict[str, Any]]:
     """Normalize Lancelot ranking data to common result format."""
     results = []
+    
+    # Check if this is an Octopus tournament (series_id 386)
+    is_octopus = series_id == 386
     
     for entry in ranking:
         if not isinstance(entry, dict):
@@ -239,8 +255,22 @@ def _normalize_ranking_results(ranking: List[Dict[str, Any]]) -> List[Dict[str, 
         # Derive IV bonus (peBonus is in tenths of a percent)
         iv_bonus = pe_bonus_raw / 10.0
         
-        # Derive scratch (unhandicapped) score
-        scratch_pct = pct - iv_bonus
+        # Determine scratch and handicap percentages
+        # Only treat as handicapped if:
+        # 1. It's Octopus tournament (has verified handicap scoring), OR
+        # 2. iv_bonus > 0 (actual bonus being applied)
+        # Otherwise, tournament only has scratch scores (handicap = scratch)
+        has_handicap_scoring = is_octopus or iv_bonus > 0
+        
+        if has_handicap_scoring:
+            # Assume pct is handicap-adjusted, derive scratch
+            scratch_pct = pct - iv_bonus
+            handicap_pct = pct
+        else:
+            # No handicap scoring - only scratch scores
+            # Set handicap to None to indicate scratch-only event
+            scratch_pct = pct
+            handicap_pct = None
         
         # Normalize club code using shared utility
         club_code = normalize_club_code(entry.get('simultaneousId', ''))
@@ -253,7 +283,7 @@ def _normalize_ranking_results(ranking: List[Dict[str, Any]]) -> List[Dict[str, 
             'player1_name': p1_name,
             'player2_name': p2_name,
             'percentage': pct,
-            'handicap_percentage': pct,
+            'handicap_percentage': handicap_pct,
             'scratch_percentage': scratch_pct,  # Derived unhandicapped score
             'iv_bonus': iv_bonus,  # Derived IV bonus (percentage points)
             'club_percentage': scratch_pct,  # Club % is same as scratch
