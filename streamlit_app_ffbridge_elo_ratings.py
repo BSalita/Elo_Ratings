@@ -693,10 +693,66 @@ def process_tournaments_to_elo(
     return results_df, players_df, current_ratings, cache_stats
 
 
-def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5) -> Tuple[pl.DataFrame, str]:
+def get_elo_title(rating: float) -> str:
+    """
+    Get chess-style title based on Elo rating.
+    
+    Based on FIDE/chess federation standards:
+    - Super Grandmaster (SGM): 2600+
+    - Grandmaster (GM): 2500+
+    - International Master (IM): 2400-2499
+    - FIDE Master (FM): 2300-2399
+    - Candidate Master (CM): 2200-2299
+    - Expert: 2000-2199
+    - Advanced: 1800-1999
+    - Intermediate: 1600-1799
+    - Novice: 1400-1599
+    - Beginner: Below 1400
+    """
+    if rating >= 2600:
+        return "SGM"
+    elif rating >= 2500:
+        return "GM"
+    elif rating >= 2400:
+        return "IM"
+    elif rating >= 2300:
+        return "FM"
+    elif rating >= 2200:
+        return "CM"
+    elif rating >= 2000:
+        return "Expert"
+    elif rating >= 1800:
+        return "Advanced"
+    elif rating >= 1600:
+        return "Intermediate"
+    elif rating >= 1400:
+        return "Novice"
+    else:
+        return "Beginner"
+
+
+def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5, use_handicap: bool = False) -> Tuple[pl.DataFrame, str]:
     """Get top players sorted by Elo rating using SQL."""
     if players_df.is_empty():
         return players_df, ""
+    
+    # Build SELECT clause - conditionally include Title column
+    title_col = ""
+    if not use_handicap:
+        # Add Title column after Elo_Rating when using scratch
+        title_col = """,
+            CASE 
+                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 2600 THEN 'SGM'
+                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 2500 THEN 'GM'
+                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 2400 THEN 'IM'
+                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 2300 THEN 'FM'
+                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 2200 THEN 'CM'
+                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 2000 THEN 'Expert'
+                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 1800 THEN 'Advanced'
+                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 1600 THEN 'Intermediate'
+                WHEN CAST(ROUND(elo_rating, 0) AS INTEGER) >= 1400 THEN 'Novice'
+                ELSE 'Beginner'
+            END AS Title"""
     
     query = f"""
         WITH filtered AS (
@@ -706,7 +762,7 @@ def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5) -
         )
         SELECT 
             CAST(ROW_NUMBER() OVER (ORDER BY elo_rating DESC, games_played DESC, player_name ASC, player_id ASC) AS INTEGER) AS Rank,
-            CAST(ROUND(elo_rating, 0) AS INTEGER) AS Elo_Rating,
+            CAST(ROUND(elo_rating, 0) AS INTEGER) AS Elo_Rating{title_col},
             player_id AS Player_ID,
             player_name AS Player_Name,
             ROUND(avg_scratch_pct, 1) AS Avg_Scratch,
@@ -732,6 +788,24 @@ def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5, use
     elo_col = "handicap_pair_elo" if use_handicap else "scratch_pair_elo"
     # Use COALESCE for handicap to fall back to scratch when handicap is null
     pct_col = "COALESCE(handicap_percentage, scratch_percentage)" if use_handicap else "scratch_percentage"
+    
+    # Build SELECT clause - conditionally include Title column
+    title_col = ""
+    if not use_handicap:
+        # Add Title column after Pair_Elo when using scratch
+        title_col = """,
+            CASE 
+                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 2600 THEN 'SGM'
+                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 2500 THEN 'GM'
+                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 2400 THEN 'IM'
+                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 2300 THEN 'FM'
+                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 2200 THEN 'CM'
+                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 2000 THEN 'Expert'
+                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 1800 THEN 'Advanced'
+                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 1600 THEN 'Intermediate'
+                WHEN CAST(ROUND(avg_pair_elo, 0) AS INTEGER) >= 1400 THEN 'Novice'
+                ELSE 'Beginner'
+            END AS Title"""
     
     query = f"""
         WITH pair_stats AS (
@@ -759,7 +833,7 @@ def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5, use
         )
         SELECT 
             CAST(ROW_NUMBER() OVER (ORDER BY avg_pair_elo DESC, games_played DESC, pair_name ASC, pair_id ASC) AS INTEGER) AS Rank,
-            CAST(ROUND(avg_pair_elo, 0) AS INTEGER) AS Pair_Elo,
+            CAST(ROUND(avg_pair_elo, 0) AS INTEGER) AS Pair_Elo{title_col},
             pair_id AS Pair_ID,
             pair_name AS Pair_Name,
             ROUND(avg_scratch_pct, 1) AS Avg_Scratch,
@@ -852,7 +926,8 @@ def main():
             border-right: 1px solid #00695c;
         }
         
-        .stSidebar .stMarkdown, .stSidebar label {
+        .stSidebar .stMarkdown, 
+        .stSidebar label:not(.stRadio label):not(.stSelectbox label):not(.stTextInput label):not(.stSlider label) {
             color: #e0e0e0 !important;
         }
         
@@ -900,11 +975,36 @@ def main():
             border-color: #ffca28 !important;
         }
         
-        .stSidebar .stRadio > label { color: #ffc107 !important; font-weight: 600 !important; }
-        .stRadio [data-testid="stMarkdownContainer"] p { color: #ffffff !important; font-size: 1rem !important; font-weight: 500 !important; }
-        .stSidebar .stSelectbox > label { color: #ffc107 !important; font-weight: 600 !important; }
-        .stSidebar .stTextInput > label { color: #ffc107 !important; font-weight: 600 !important; }
-        .stSidebar .stSlider > label { color: #ffc107 !important; font-weight: 600 !important; }
+        /* Override sidebar label color for specific widget types - must come after general rule */
+        .stSidebar .stRadio label,
+        .stSidebar .stRadio > label,
+        .stSidebar div[data-testid="stRadio"] > label,
+        .stSidebar .stRadio label p,
+        .stSidebar .stRadio label span { 
+            color: #ffc107 !important; 
+            font-weight: 600 !important; 
+        }
+        /* Radio button option text (Players/Pairs, Scratch/Handicap) */
+        .stRadio [data-testid="stMarkdownContainer"] p { 
+            color: #ffffff !important; 
+            font-size: 1rem !important; 
+            font-weight: 500 !important; 
+        }
+        .stSidebar .stSelectbox label,
+        .stSidebar .stSelectbox > label { 
+            color: #ffc107 !important; 
+            font-weight: 600 !important; 
+        }
+        .stSidebar .stTextInput label,
+        .stSidebar .stTextInput > label { 
+            color: #ffc107 !important; 
+            font-weight: 600 !important; 
+        }
+        .stSidebar .stSlider label,
+        .stSidebar .stSlider > label { 
+            color: #ffc107 !important; 
+            font-weight: 600 !important; 
+        }
         .stCheckbox label span, .stCheckbox label p, .stCheckbox [data-testid="stMarkdownContainer"] p { color: #ffffff !important; font-weight: 500 !important; }
         </style>
     """, unsafe_allow_html=True)
@@ -1298,7 +1398,7 @@ def main():
     if rating_type == "Players":
         st.markdown(f"### 🏆 Top {top_n} Players (Min. {min_games} games)")
         if not players_df.is_empty():
-            top_players, sql_query = show_top_players(players_df, top_n, min_games)
+            top_players, sql_query = show_top_players(players_df, top_n, min_games, use_handicap)
             
             if sql_query:
                 with st.expander("📝 SQL Query", expanded=False):

@@ -41,9 +41,12 @@ PERFORMANCE_SCALING = 400  # Standard Elo scaling factor
 CHESS_SCALING_ENABLED = True
 CHESS_TARGET_MIN = 1200.0  # Beginner level
 CHESS_TARGET_MAX = 2800.0  # World champion level (Magnus Carlsen peak ~2882)
-# Current observed range (adjust based on actual data)
-CURRENT_OBSERVED_MIN = 1400.0
-CURRENT_OBSERVED_MAX = 1600.0
+# Reference range for scaling: map old range to new range
+# Old system: players typically ranged from ~1400-1600 (centered around 1500)
+# New system: players start at 1200 and should reach up to 2800
+# We'll scale proportionally: old 1600 (top) -> new 2800, old 1400 -> new ~1200
+CURRENT_REFERENCE_MIN = 1200.0  # New system minimum (matches DEFAULT_ELO)
+CURRENT_REFERENCE_MAX = 1600.0  # Old system maximum (top players to scale to 2800)
 
 # UI Constants
 AGGRID_ROW_HEIGHT = 42
@@ -206,41 +209,31 @@ def calculate_expected_score(rating_a: float, rating_b: float) -> float:
 
 def scale_to_chess_range(rating: float) -> float:
     """
-    Scale Elo rating to chess federation range (1200-2800).
+    Scale Elo rating to chess federation range.
     
-    Maps current observed range to chess federation range where top players
-    are at Magnus Carlsen level (~2800). Ratings above the observed max are
-    allowed to scale proportionally toward the target max.
+    Maps ratings so that top players (1600 in old system) reach Magnus Carlsen level (2800).
+    Uses a simple linear scaling: rating * 1.75 to map 1600 -> 2800.
+    
+    No clamping is applied - following standard Elo system precedent (FIDE, USCF) where
+    ratings are allowed to naturally distribute without bounds. FIDE only publishes ratings
+    >= 1000 but doesn't clamp the underlying calculations.
     
     Args:
         rating: Current Elo rating
     
     Returns:
-        Scaled Elo rating in chess federation range
+        Scaled Elo rating (no bounds enforced)
     """
     if not CHESS_SCALING_ENABLED:
         return rating
     
-    # Calculate scale factor: map current range to chess range
-    current_range = CURRENT_OBSERVED_MAX - CURRENT_OBSERVED_MIN
-    chess_range = CHESS_TARGET_MAX - CHESS_TARGET_MIN
+    # Simple scaling: multiply by factor to get 1600 -> 2800
+    # Factor = 2800 / 1600 = 1.75
+    # This means: 1200 -> 2100, 1400 -> 2450, 1600 -> 2800
+    # Ratings can go below 1200 or above 2800 naturally
+    scale_factor = CHESS_TARGET_MAX / CURRENT_REFERENCE_MAX  # 2800 / 1600 = 1.75
     
-    if current_range == 0:
-        return CHESS_TARGET_MIN
-    
-    scale_factor = chess_range / current_range
-    
-    # For ratings below observed min, clamp to target min
-    if rating < CURRENT_OBSERVED_MIN:
-        return CHESS_TARGET_MIN
-    
-    # For ratings at or above observed max, scale proportionally
-    # This allows ratings to grow beyond the initial observed range
-    scaled = (rating - CURRENT_OBSERVED_MIN) * scale_factor + CHESS_TARGET_MIN
-    
-    # Ensure we don't exceed reasonable bounds (but allow up to 3000 for future growth)
-    scaled = min(scaled, 3000.0)
-    scaled = max(scaled, CHESS_TARGET_MIN)
+    scaled = rating * scale_factor
     
     return round(scaled, 1)
 
