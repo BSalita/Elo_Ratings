@@ -401,8 +401,8 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
                             p1_iv_data = fetch_player_iv(str(p1.get('id')), session)
                             p2_iv_data = fetch_player_iv(str(p2.get('id')), session)
                             
-                            p1_iv = p1_iv_data.get('iv', 0) if p1_iv_data else 0
-                            p2_iv = p2_iv_data.get('iv', 0) if p2_iv_data else 0
+                            p1_iv = (p1_iv_data.get('iv') or 0) if p1_iv_data else 0
+                            p2_iv = (p2_iv_data.get('iv') or 0) if p2_iv_data else 0
                             
                             result_dict['player1_iv'] = p1_iv
                             

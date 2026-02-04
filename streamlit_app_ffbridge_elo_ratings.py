@@ -455,12 +455,12 @@ def process_tournaments_to_elo(
             # For scratch-only events (handicap_pct is None), always use scratch
             percentage = handicap_pct if (use_handicap and handicap_pct is not None) else scratch_pct
             
-            rank_club = result.get('rank', 0)
-            rank_handicap = result.get('theoretical_rank', 0)
+            rank_club = result.get('rank') or 0
+            rank_handicap = result.get('theoretical_rank') or 0
             rank = rank_handicap if use_handicap and rank_handicap is not None else rank_club
             
-            team_id = result.get('team_id', '')
-            pe = result.get('pe', 0)
+            team_id = result.get('team_id') or ''
+            pe = result.get('pe') or 0
             club_id = result.get('club_id', '')
             club_name = result.get('club_name', '')
             club_code = result.get('club_code', '')
@@ -486,7 +486,7 @@ def process_tournaments_to_elo(
                 'tournament_id': event_id,
                 'tournament_name': str(t_name),
                 'date': str(t_date),
-                'series_id': int(t_series) if t_series else 0,
+                'series_id': int(t_series) if t_series is not None else 0,
                 'team_id': str(team_id),
                 'pair_id': str(pair_id),
                 'player1_id': str(p1_id),
