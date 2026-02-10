@@ -503,25 +503,64 @@ def _show_opponent_history(results_df: pl.DataFrame, entity_tournaments: pl.Data
 
 
 def _show_opponent_summary(results_df: pl.DataFrame, entity_tournaments: pl.DataFrame, exclude_id: str, exclude_mode: str = 'pair', key_suffix: str = '') -> None:
-    """Show aggregation of opponents across all tournaments (Opponent Summary)."""
+    """Show aggregation of opponents across all tournaments (Opponent Summary).
+
+    Includes both the selected entity's averages and the opponent's averages
+    for each metric, so the user can compare side by side.
+    """
     opp_detail = _build_opponent_data(results_df, entity_tournaments, exclude_id, exclude_mode)
     if opp_detail.is_empty():
         return
+
+    # Build entity's per-tournament stats for joining
+    entity_cols = [pl.col('tournament_id').alias('Event_ID')]
+    has_rank = 'rank' in entity_tournaments.columns
+    has_scratch = 'scratch_percentage' in entity_tournaments.columns
+    has_handicap = 'handicap_percentage' in entity_tournaments.columns
+    has_elo = 'pair_elo' in entity_tournaments.columns
+    if has_rank:
+        entity_cols.append(pl.col('rank').cast(pl.Float64, strict=False).alias('My_Rank'))
+    if has_scratch:
+        entity_cols.append(pl.col('scratch_percentage').cast(pl.Float64, strict=False).alias('My_Scratch_%'))
+    if has_handicap:
+        entity_cols.append(pl.col('handicap_percentage').cast(pl.Float64, strict=False).alias('My_Handicap_%'))
+    if has_elo:
+        entity_cols.append(pl.col('pair_elo').cast(pl.Float64, strict=False).alias('My_Pair_Elo'))
+
+    entity_per_tourney = entity_tournaments.select(entity_cols)
+    # A player may appear multiple times per tournament (different partners);
+    # take the first result per tournament for a simple join
+    entity_per_tourney = entity_per_tourney.group_by('Event_ID').first()
+
+    # Join entity's stats onto each opponent row by Event_ID
+    opp_joined = opp_detail.join(entity_per_tourney, on='Event_ID', how='left')
+
     st.markdown("#### Opponent Summary — All Tournaments")
-    agg_cols = [
-        pl.len().alias('Events'),
-    ]
-    if 'Rank' in opp_detail.columns:
-        agg_cols.append(pl.col('Rank').cast(pl.Float64, strict=False).mean().round(1).alias('Avg_Rank'))
-    if 'Scratch_%' in opp_detail.columns:
-        agg_cols.append(pl.col('Scratch_%').mean().round(2).alias('Avg_Scratch_%'))
-    if 'Handicap_%' in opp_detail.columns:
-        agg_cols.append(pl.col('Handicap_%').mean().round(2).alias('Avg_Handicap_%'))
-    if 'Pair_Elo' in opp_detail.columns:
-        agg_cols.append(pl.col('Pair_Elo').mean().round(0).cast(pl.Int32, strict=False).alias('Avg_Pair_Elo'))
+
+    agg_cols = [pl.len().alias('Events')]
+
+    # Opponent averages
+    if 'Rank' in opp_joined.columns:
+        agg_cols.append(pl.col('Rank').mean().round(1).alias('Opp_Avg_Rank'))
+    if 'Scratch_%' in opp_joined.columns:
+        agg_cols.append(pl.col('Scratch_%').mean().round(2).alias('Opp_Avg_Scratch_%'))
+    if 'Handicap_%' in opp_joined.columns:
+        agg_cols.append(pl.col('Handicap_%').mean().round(2).alias('Opp_Avg_Handicap_%'))
+    if 'Pair_Elo' in opp_joined.columns:
+        agg_cols.append(pl.col('Pair_Elo').mean().round(0).cast(pl.Int32, strict=False).alias('Opp_Avg_Pair_Elo'))
+
+    # Entity's averages (in the same tournaments as this opponent)
+    if 'My_Rank' in opp_joined.columns:
+        agg_cols.append(pl.col('My_Rank').mean().round(1).alias('My_Avg_Rank'))
+    if 'My_Scratch_%' in opp_joined.columns:
+        agg_cols.append(pl.col('My_Scratch_%').mean().round(2).alias('My_Avg_Scratch_%'))
+    if 'My_Handicap_%' in opp_joined.columns:
+        agg_cols.append(pl.col('My_Handicap_%').mean().round(2).alias('My_Avg_Handicap_%'))
+    if 'My_Pair_Elo' in opp_joined.columns:
+        agg_cols.append(pl.col('My_Pair_Elo').mean().round(0).cast(pl.Int32, strict=False).alias('My_Avg_Pair_Elo'))
 
     opp_agg = (
-        opp_detail
+        opp_joined
         .group_by('Opponent')
         .agg(agg_cols)
         .sort('Events', descending=True)
