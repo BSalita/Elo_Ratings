@@ -328,6 +328,127 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
     )
 
 
+def _render_detail_aggrid_ff(detail_df: pl.DataFrame, key: str, selectable: bool = False):
+    """Render a detail DataFrame as a selectable AgGrid. Returns grid response if selectable."""
+    display_df = detail_df.to_pandas()
+    gb = GridOptionsBuilder.from_dataframe(display_df)
+    if selectable:
+        gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
+    gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
+    for col in display_df.columns:
+        if pd.api.types.is_numeric_dtype(display_df[col]):
+            gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
+    grid_options = gb.build()
+    grid_options['rowHeight'] = 28
+    grid_options['domLayout'] = 'normal'
+    header_height = 50
+    row_height = grid_options['rowHeight']
+    max_visible = 25
+    n_rows = len(display_df)
+    visible = max(1, min(n_rows, max_visible))
+    if n_rows <= max_visible:
+        grid_options['alwaysShowVerticalScroll'] = False
+        height = header_height + visible * row_height + 20
+    else:
+        grid_options['alwaysShowVerticalScroll'] = True
+        height = header_height + max_visible * row_height + 20
+    response = AgGrid(
+        display_df,
+        gridOptions=grid_options,
+        height=height,
+        theme=AgGridTheme.BALHAM,
+        key=key,
+    )
+    return response if selectable else None
+
+
+def _show_tournament_opponents(results_df: pl.DataFrame, tournament_id: str, exclude_pair_id: str = None) -> None:
+    """3rd df: Show all pairs who played in a given tournament (the 'opponents')."""
+    if results_df.is_empty():
+        return
+    tourney_results = results_df.filter(pl.col('tournament_id') == tournament_id)
+    if exclude_pair_id:
+        tourney_results = tourney_results.filter(pl.col('pair_id') != exclude_pair_id)
+    if tourney_results.is_empty():
+        st.info("No other pairs found in this tournament.")
+        return
+
+    cols = [pl.col('pair_name').alias('Pair')]
+    if 'rank' in tourney_results.columns:
+        cols.append(pl.col('rank').cast(pl.Int32, strict=False).alias('Rank'))
+    if 'scratch_percentage' in tourney_results.columns:
+        cols.append(pl.col('scratch_percentage').cast(pl.Float64, strict=False).round(2).alias('Scratch_%'))
+    if 'handicap_percentage' in tourney_results.columns:
+        cols.append(pl.col('handicap_percentage').cast(pl.Float64, strict=False).round(2).alias('Handicap_%'))
+    if 'pair_elo' in tourney_results.columns:
+        cols.append(pl.col('pair_elo').cast(pl.Float64, strict=False).round(0).cast(pl.Int32, strict=False).alias('Pair_Elo'))
+
+    opp_df = tourney_results.select(cols)
+    if 'Rank' in opp_df.columns:
+        opp_df = opp_df.sort('Rank')
+
+    t_name = tourney_results.select('tournament_name').row(0)[0] if 'tournament_name' in tourney_results.columns else tournament_id
+    t_date = tourney_results.select(pl.col('date').str.slice(0, 10)).row(0)[0] if 'date' in tourney_results.columns else ''
+    st.markdown(f"#### Tournament Opponents — {t_name} ({t_date})")
+    st.caption(f"{len(opp_df)} pairs in this tournament")
+    _render_detail_aggrid_ff(opp_df, key=f"ff_topp_{tournament_id}")
+
+
+def _show_partner_aggregation(detail_df: pl.DataFrame, key_suffix: str) -> None:
+    """4th df for Players: Aggregate tournament results by Partner across all tournaments."""
+    if detail_df.is_empty() or 'Partner' not in detail_df.columns:
+        return
+    st.markdown("#### Partner Summary — All Tournaments")
+    agg_cols = [
+        pl.len().alias('Tournaments'),
+    ]
+    if 'Pct_Used' in detail_df.columns:
+        agg_cols.append(pl.col('Pct_Used').mean().cast(pl.Float64).round(2).alias('Avg_Pct'))
+    if 'Rank' in detail_df.columns:
+        agg_cols.append(pl.col('Rank').cast(pl.Float64, strict=False).mean().round(1).alias('Avg_Rank'))
+    if 'Elo_After' in detail_df.columns:
+        agg_cols.append(pl.col('Elo_After').last().round(0).cast(pl.Int32, strict=False).alias('Last_Elo'))
+
+    partner_agg = (
+        detail_df
+        .group_by('Partner')
+        .agg(agg_cols)
+        .sort('Tournaments', descending=True)
+    )
+    st.caption(f"{len(partner_agg)} unique partners")
+    _render_detail_aggrid_ff(partner_agg, key=f"ff_partner_{key_suffix}")
+
+
+def _show_club_aggregation(detail_df: pl.DataFrame, results_df: pl.DataFrame, pair_id: str, key_suffix: str) -> None:
+    """4th df for Pairs: Aggregate tournament results by Club across all tournaments."""
+    if results_df.is_empty():
+        return
+    # Get pair's results with club info
+    pair_data = results_df.filter(pl.col('pair_id') == pair_id)
+    if pair_data.is_empty() or 'club_name' not in pair_data.columns:
+        return
+    st.markdown("#### Club Summary — All Tournaments")
+    agg_cols = [
+        pl.len().alias('Tournaments'),
+    ]
+    if 'scratch_percentage' in pair_data.columns:
+        agg_cols.append(pl.col('scratch_percentage').cast(pl.Float64, strict=False).mean().round(2).alias('Avg_Scratch_%'))
+    if 'handicap_percentage' in pair_data.columns:
+        agg_cols.append(pl.col('handicap_percentage').cast(pl.Float64, strict=False).mean().round(2).alias('Avg_Handicap_%'))
+    if 'rank' in pair_data.columns:
+        agg_cols.append(pl.col('rank').cast(pl.Float64, strict=False).mean().round(1).alias('Avg_Rank'))
+
+    club_agg = (
+        pair_data
+        .group_by('club_name')
+        .agg(agg_cols)
+        .sort('Tournaments', descending=True)
+        .rename({'club_name': 'Club'})
+    )
+    st.caption(f"{len(club_agg)} clubs")
+    _render_detail_aggrid_ff(club_agg, key=f"ff_club_{key_suffix}")
+
+
 # -------------------------------
 # Data Processing (common for both APIs)
 # -------------------------------
@@ -1419,22 +1540,35 @@ def main():
                                 elif 'player1_elo_after' in player_results.columns:
                                     cols_to_select.append(pl.col('player1_elo_after').round(0).alias('Elo_After'))
                                 
-                                detail_df = player_results.select(cols_to_select)
+                                # Also keep pair_id for tournament opponent lookup
+                                detail_df = player_results.select(cols_to_select + [pl.col('pair_id').alias('_pair_id')])
                                 # Optional reconciliation: for Octopus, prefer BridgeInterNet scratch/handicap when matchable.
                                 detail_df = _maybe_override_octopus_pct_rows(detail_df, pair_name=player_name, use_handicap=use_handicap)
-                                # Display with clickable Source link
-                                st.dataframe(
-                                    detail_df.to_pandas(),
-                                    column_config={
-                                        "Source": st.column_config.LinkColumn(
-                                            "Source",
-                                            help="Click to verify data (BI=BridgeInterNet, API=FFBridge)",
-                                            display_text="🔗",  # Short clickable icon
-                                        )
-                                    },
-                                    hide_index=True,
-                                    width='stretch',
-                                )
+                                
+                                # Display as selectable AgGrid (click row to see tournament opponents)
+                                st.caption("Click a row to see tournament opponents")
+                                # Hide _pair_id from display
+                                display_detail = detail_df.drop('_pair_id')
+                                detail_key = f"detail_player_{player_id}_{rating_type}_{use_handicap}"
+                                detail_resp = _render_detail_aggrid_ff(display_detail, key=detail_key, selectable=True)
+                                
+                                # 3rd df: tournament opponents for clicked row
+                                if detail_resp is not None:
+                                    d_sel = detail_resp.get('selected_rows', None)
+                                    if d_sel is not None and len(d_sel) > 0:
+                                        d_row = d_sel.iloc[0] if hasattr(d_sel, 'iloc') else d_sel[0]
+                                        event_id = str(d_row.get('Event_ID', ''))
+                                        # Find pair_id for this row
+                                        row_pair_id = None
+                                        if event_id and '_pair_id' in detail_df.columns:
+                                            match = detail_df.filter(pl.col('Event_ID') == event_id)
+                                            if not match.is_empty():
+                                                row_pair_id = str(match.select('_pair_id').row(0)[0])
+                                        if event_id:
+                                            _show_tournament_opponents(results_df, event_id, exclude_pair_id=row_pair_id)
+                                
+                                # 4th df: partner aggregation across all tournaments
+                                _show_partner_aggregation(display_detail, key_suffix=f"player_{player_id}")
                             else:
                                 st.info("No results in selected tournaments.")
                     
@@ -1525,19 +1659,23 @@ def main():
                                 detail_df = pair_results.select(cols_to_select)
                                 # Optional reconciliation: for Octopus, prefer BridgeInterNet scratch/handicap when matchable.
                                 detail_df = _maybe_override_octopus_pct_rows(detail_df, pair_name=pair_name, use_handicap=use_handicap)
-                                # Display with clickable Source link
-                                st.dataframe(
-                                    detail_df.to_pandas(),
-                                    column_config={
-                                        "Source": st.column_config.LinkColumn(
-                                            "Source",
-                                            help="Click to verify data (BI=BridgeInterNet, API=FFBridge)",
-                                            display_text="🔗",  # Short clickable icon
-                                        )
-                                    },
-                                    hide_index=True,
-                                    width='stretch',
-                                )
+                                
+                                # Display as selectable AgGrid (click row to see tournament opponents)
+                                st.caption("Click a row to see tournament opponents")
+                                detail_key = f"detail_pair_{pair_id}_{rating_type}_{use_handicap}"
+                                detail_resp = _render_detail_aggrid_ff(detail_df, key=detail_key, selectable=True)
+                                
+                                # 3rd df: tournament opponents for clicked row
+                                if detail_resp is not None:
+                                    d_sel = detail_resp.get('selected_rows', None)
+                                    if d_sel is not None and len(d_sel) > 0:
+                                        d_row = d_sel.iloc[0] if hasattr(d_sel, 'iloc') else d_sel[0]
+                                        event_id = str(d_row.get('Event_ID', ''))
+                                        if event_id:
+                                            _show_tournament_opponents(results_df, event_id, exclude_pair_id=str(pair_id))
+                                
+                                # 4th df: club aggregation across all tournaments
+                                _show_club_aggregation(detail_df, results_df, str(pair_id), key_suffix=f"pair_{pair_id}")
                             else:
                                 st.info("No detailed results found for this pair.")
                     

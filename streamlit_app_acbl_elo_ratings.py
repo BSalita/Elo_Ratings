@@ -1690,6 +1690,33 @@ def _show_opponent_aggregation(detail: pl.DataFrame, selected_row) -> None:
     _render_detail_aggrid(opp_agg, key=f"opp_agg_{session_id}")
 
 
+def _show_all_opponents_aggregation(detail: pl.DataFrame, key_suffix: str) -> None:
+    """Show per-opponent aggregation across ALL sessions in the detail data."""
+    if detail.is_empty() or "Opponents" not in detail.columns:
+        return
+
+    st.markdown("#### Opponent Summary — All Sessions")
+
+    agg_cols = [
+        pl.len().alias("Boards"),
+        pl.col("Session").n_unique().alias("Sessions"),
+    ]
+    if "Pct" in detail.columns:
+        agg_cols.append(pl.col("Pct").mean().cast(pl.Float64).round(1).alias("Avg_Pct"))
+    if "Elo_Delta" in detail.columns:
+        agg_cols.append(pl.col("Elo_Delta").mean().cast(pl.Float64).round(1).alias("Avg_Elo_Delta"))
+
+    opp_all = (
+        detail
+        .group_by("Opponents")
+        .agg(agg_cols)
+        .sort("Boards", descending=True)
+    )
+
+    st.caption(f"{len(opp_all)} unique opponent pairs")
+    _render_detail_aggrid(opp_all, key=f"opp_all_{key_suffix}")
+
+
 def _show_detail_for_selected_row(
     selected_row,
     raw_df: pl.DataFrame,
@@ -1795,6 +1822,9 @@ def _show_detail_for_selected_row(
                 sel_row = sel.iloc[0] if hasattr(sel, 'iloc') else sel[0]
                 _show_opponent_aggregation(detail, sel_row)
 
+        # --- All-sessions opponent summary ---
+        _show_all_opponents_aggregation(detail, key_suffix=f"player_{player_id}")
+
     elif rating_type == "Pairs":
         pair_ids = str(selected_row.get('Pair_IDs', ''))
         pair_names = selected_row.get('Pair_Names', 'Unknown')
@@ -1892,6 +1922,9 @@ def _show_detail_for_selected_row(
             if sel is not None and len(sel) > 0:
                 sel_row = sel.iloc[0] if hasattr(sel, 'iloc') else sel[0]
                 _show_opponent_aggregation(detail, sel_row)
+
+        # --- All-sessions opponent summary ---
+        _show_all_opponents_aggregation(detail, key_suffix=f"pair_{pair_ids}")
 
 
 def main():
