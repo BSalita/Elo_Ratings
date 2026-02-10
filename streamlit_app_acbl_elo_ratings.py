@@ -1599,14 +1599,19 @@ def app_info() -> None:
     return
 
 
-def _render_detail_aggrid(detail_df: pl.DataFrame, key: str) -> None:
-    """Render a session-history detail DataFrame as an AgGrid table."""
+def _render_detail_aggrid(detail_df: pl.DataFrame, key: str, selectable: bool = False):
+    """Render a detail DataFrame as an AgGrid table.
+
+    Returns the grid response dict when *selectable* is True, else None.
+    """
     import pandas as pd
     from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme
 
     pdf = detail_df.to_pandas()
 
     gb = GridOptionsBuilder.from_dataframe(pdf)
+    if selectable:
+        gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
     gb.configure_default_column(
         cellStyle={'color': 'black', 'font-size': '12px'},
         suppressMenu=True,
@@ -1635,13 +1640,54 @@ def _render_detail_aggrid(detail_df: pl.DataFrame, key: str) -> None:
         grid_options['alwaysShowVerticalScroll'] = True
         height = header_height + max_visible * row_height + 20
 
-    AgGrid(
+    response = AgGrid(
         pdf,
         gridOptions=grid_options,
         height=height,
         theme=AgGridTheme.BALHAM,
         key=key,
     )
+    return response if selectable else None
+
+
+def _show_opponent_aggregation(detail: pl.DataFrame, selected_row) -> None:
+    """Given the full board-level detail and a clicked row, show per-opponent aggregation for that session."""
+    session_id = selected_row.get('Session')
+    if session_id is None:
+        return
+
+    session_boards = detail.filter(pl.col("Session") == session_id)
+    if session_boards.is_empty():
+        return
+
+    date_val = session_boards.select("Date").row(0)[0]
+    st.markdown(f"#### Opponent Breakdown — Session {session_id} ({str(date_val)[:10]})")
+
+    agg_cols = [
+        pl.col("Opponents").first().alias("Opponents"),
+        pl.len().alias("Boards"),
+    ]
+    if "Pct" in session_boards.columns:
+        agg_cols.append(pl.col("Pct").mean().cast(pl.Float64).round(1).alias("Avg_Pct"))
+    if "Elo_Before" in session_boards.columns:
+        agg_cols.append(pl.col("Elo_Before").first().cast(pl.Int32, strict=False).alias("Elo_Start"))
+    if "Elo_After" in session_boards.columns:
+        agg_cols.append(pl.col("Elo_After").last().cast(pl.Int32, strict=False).alias("Elo_End"))
+
+    opp_agg = (
+        session_boards
+        .sort("Round" if "Round" in session_boards.columns else "Board")
+        .group_by("Opponents", maintain_order=True)
+        .agg(agg_cols[1:])  # skip the first Opponents alias — it's the group key
+    )
+
+    if "Elo_Start" in opp_agg.columns and "Elo_End" in opp_agg.columns:
+        opp_agg = opp_agg.with_columns(
+            (pl.col("Elo_End") - pl.col("Elo_Start")).alias("Elo_Delta")
+        )
+
+    st.caption(f"{len(opp_agg)} opponent pairs, {len(session_boards)} boards")
+    _render_detail_aggrid(opp_agg, key=f"opp_agg_{session_id}")
 
 
 def _show_detail_for_selected_row(
@@ -1739,8 +1785,15 @@ def _show_detail_for_selected_row(
                 )
 
         n_sessions = detail.select("Session").n_unique()
-        st.caption(f"{len(detail)} boards across {n_sessions} sessions")
-        _render_detail_aggrid(detail, key=f"detail_player_{player_id}")
+        st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
+        grid_resp = _render_detail_aggrid(detail, key=f"detail_player_{player_id}", selectable=True)
+
+        # --- Opponent aggregation for selected session ---
+        if grid_resp is not None:
+            sel = grid_resp.get('selected_rows', None)
+            if sel is not None and len(sel) > 0:
+                sel_row = sel.iloc[0] if hasattr(sel, 'iloc') else sel[0]
+                _show_opponent_aggregation(detail, sel_row)
 
     elif rating_type == "Pairs":
         pair_ids = str(selected_row.get('Pair_IDs', ''))
@@ -1830,8 +1883,15 @@ def _show_detail_for_selected_row(
                 )
 
         n_sessions = detail.select("Session").n_unique()
-        st.caption(f"{len(detail)} boards across {n_sessions} sessions")
-        _render_detail_aggrid(detail, key=f"detail_pair_{pair_ids}")
+        st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
+        grid_resp = _render_detail_aggrid(detail, key=f"detail_pair_{pair_ids}", selectable=True)
+
+        # --- Opponent aggregation for selected session ---
+        if grid_resp is not None:
+            sel = grid_resp.get('selected_rows', None)
+            if sel is not None and len(sel) > 0:
+                sel_row = sel.iloc[0] if hasattr(sel, 'iloc') else sel[0]
+                _show_opponent_aggregation(detail, sel_row)
 
 
 def main():
