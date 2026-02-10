@@ -1290,10 +1290,10 @@ def run_comprehensive_comparison(all_data: dict, top_n: int = 100, min_sessions:
                         online_filter = st.session_state.get('online_filter', 'All')
                         if online_filter == "Local Only":
                             if "is_virtual_game" in df_use.columns:
-                                df_use = df_use.filter(pl.col("is_virtual_game") != 1)
+                                df_use = df_use.filter(pl.col("is_virtual_game") == False)
                         elif online_filter == "Online Only":
                             if "is_virtual_game" in df_use.columns:
-                                df_use = df_use.filter(pl.col("is_virtual_game") == 1)
+                                df_use = df_use.filter(pl.col("is_virtual_game").is_null())
                         
                         # Run Polars implementation with timing
                         polars_start = time.time()
@@ -1599,6 +1599,241 @@ def app_info() -> None:
     return
 
 
+def _render_detail_aggrid(detail_df: pl.DataFrame, key: str) -> None:
+    """Render a session-history detail DataFrame as an AgGrid table."""
+    import pandas as pd
+    from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme
+
+    pdf = detail_df.to_pandas()
+
+    gb = GridOptionsBuilder.from_dataframe(pdf)
+    gb.configure_default_column(
+        cellStyle={'color': 'black', 'font-size': '12px'},
+        suppressMenu=True,
+        wrapHeaderText=True,
+        autoHeaderHeight=True,
+    )
+    # Configure numeric columns for proper sorting
+    for col in pdf.columns:
+        if pd.api.types.is_numeric_dtype(pdf[col]):
+            gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
+
+    grid_options = gb.build()
+    grid_options['rowHeight'] = 28
+    grid_options['domLayout'] = 'normal'
+
+    # Dynamic height: up to 25 rows visible
+    header_height = 50
+    row_height = grid_options['rowHeight']
+    max_visible = 25
+    n_rows = len(pdf)
+    visible = max(1, min(n_rows, max_visible))
+    if n_rows <= max_visible:
+        grid_options['alwaysShowVerticalScroll'] = False
+        height = header_height + visible * row_height + 20
+    else:
+        grid_options['alwaysShowVerticalScroll'] = True
+        height = header_height + max_visible * row_height + 20
+
+    AgGrid(
+        pdf,
+        gridOptions=grid_options,
+        height=height,
+        theme=AgGridTheme.BALHAM,
+        key=key,
+    )
+
+
+def _show_detail_for_selected_row(
+    selected_row,
+    raw_df: pl.DataFrame,
+    rating_type: str,
+    elo_rating_type: str,
+) -> None:
+    """Show session-level detail table for the clicked row in the summary grid.
+
+    For *Players* we filter by Player_ID across all four seat positions (N/E/S/W).
+    For *Pairs* we filter by the canonical Pair_IDs string (min-max of two player IDs).
+    """
+    elo_columns = get_elo_column_names(elo_rating_type)
+
+    if rating_type == "Players":
+        player_id = str(selected_row.get('Player_ID', ''))
+        player_name = selected_row.get('Player_Name', 'Unknown')
+        if not player_id:
+            return
+
+        st.markdown(f"#### Session History: **{player_name}** ({player_id})")
+
+        with st.spinner("Loading session history..."):
+            # Collect rows where this player sat in any seat
+            frames: list[pl.DataFrame] = []
+            for pos in "NESW":
+                elo_col = elo_columns["player_pattern"].format(pos=pos) if elo_columns["player_pattern"] else None
+                if elo_col is None or elo_col not in raw_df.columns:
+                    continue
+
+                # Determine the partner position
+                partner_pos_map = {"N": "S", "S": "N", "E": "W", "W": "E"}
+                partner = partner_pos_map[pos]
+                opp1, opp2 = (("E", "W") if pos in ("N", "S") else ("N", "S"))
+
+                cols_to_select = [
+                    pl.col("Date"),
+                    pl.col("session_id").alias("Session"),
+                ]
+                if "Round" in raw_df.columns:
+                    cols_to_select.append(pl.col("Round"))
+                if "Board" in raw_df.columns:
+                    cols_to_select.append(pl.col("Board"))
+                # Pct from this player's perspective (EW = 100 - Pct_NS)
+                is_ns = pos in ("N", "S")
+                if "Pct_NS" in raw_df.columns:
+                    pct_expr = (pl.col("Pct_NS").cast(pl.Float64) * 100).round(1) if is_ns else ((1 - pl.col("Pct_NS").cast(pl.Float64)) * 100).round(1)
+                else:
+                    pct_expr = pl.lit(None, dtype=pl.Float64)
+
+                # Add Elo_Before if available (only for current/start-of-session types)
+                before_col = f"Elo_R_{pos}_Before" if elo_rating_type in (
+                    "Current Rating (End of Session)", "Rating at Start of Session"
+                ) else None
+
+                cols_to_select += [
+                    pl.lit(pos).alias("Seat"),
+                    pl.col(f"Player_Name_{partner}").alias("Partner"),
+                    (pl.col(f"Player_Name_{opp1}") + " - " + pl.col(f"Player_Name_{opp2}")).alias("Opponents"),
+                    pct_expr.alias("Pct"),
+                ]
+                # Elo_Before first, then Elo_After
+                if before_col and before_col in raw_df.columns:
+                    cols_to_select.append(pl.col(before_col).cast(pl.Float64).round(0).cast(pl.Int32, strict=False).alias("Elo_Before"))
+                cols_to_select.append(pl.col(elo_col).cast(pl.Float64).round(0).cast(pl.Int32, strict=False).alias("Elo_After"))
+
+                seat_df = (
+                    raw_df
+                    .filter(pl.col(f"Player_ID_{pos}") == player_id)
+                    .select(cols_to_select)
+                )
+                frames.append(seat_df)
+
+            if not frames:
+                st.info("No session data found for this player.")
+                return
+
+            detail = pl.concat(frames, how="diagonal")
+
+            # Sort by Date desc, then Session, Round, Board for logical ordering
+            sort_cols = ["Date", "Session"]
+            sort_desc = [True, True]
+            if "Round" in detail.columns:
+                sort_cols.append("Round")
+                sort_desc.append(False)
+            if "Board" in detail.columns:
+                sort_cols.append("Board")
+                sort_desc.append(False)
+            detail = detail.sort(sort_cols, descending=sort_desc)
+
+            if "Elo_Before" in detail.columns and "Elo_After" in detail.columns:
+                detail = detail.with_columns(
+                    (pl.col("Elo_After") - pl.col("Elo_Before")).alias("Elo_Delta")
+                )
+
+        n_sessions = detail.select("Session").n_unique()
+        st.caption(f"{len(detail)} boards across {n_sessions} sessions")
+        _render_detail_aggrid(detail, key=f"detail_player_{player_id}")
+
+    elif rating_type == "Pairs":
+        pair_ids = str(selected_row.get('Pair_IDs', ''))
+        pair_names = selected_row.get('Pair_Names', 'Unknown')
+        if not pair_ids or '-' not in pair_ids:
+            return
+
+        st.markdown(f"#### Session History: **{pair_names}**")
+
+        player_a, player_b = pair_ids.split('-', 1)
+
+        with st.spinner("Loading session history..."):
+            # Collect rows where this pair sat NS or EW
+            frames: list[pl.DataFrame] = []
+            for side, id1_col, id2_col in [
+                ("NS", "Player_ID_N", "Player_ID_S"),
+                ("EW", "Player_ID_E", "Player_ID_W"),
+            ]:
+                pair_elo_col = elo_columns[f"pair_{side.lower()}"]
+                if pair_elo_col not in raw_df.columns:
+                    continue
+
+                # Canonical pair match: min(id1,id2)==player_a and max(id1,id2)==player_b
+                side_df = raw_df.filter(
+                    (pl.min_horizontal(pl.col(id1_col), pl.col(id2_col)) == player_a)
+                    & (pl.max_horizontal(pl.col(id1_col), pl.col(id2_col)) == player_b)
+                )
+
+                if side_df.is_empty():
+                    continue
+
+                opp_side = "EW" if side == "NS" else "NS"
+                opp1, opp2 = (("E", "W") if opp_side == "EW" else ("N", "S"))
+
+                cols_to_select = [
+                    pl.col("Date"),
+                    pl.col("session_id").alias("Session"),
+                ]
+                if "Round" in raw_df.columns:
+                    cols_to_select.append(pl.col("Round"))
+                if "Board" in raw_df.columns:
+                    cols_to_select.append(pl.col("Board"))
+                # Pct from this pair's perspective (EW = 100 - Pct_NS)
+                is_ns = (side == "NS")
+                if "Pct_NS" in raw_df.columns:
+                    pct_expr = (pl.col("Pct_NS").cast(pl.Float64) * 100).round(1) if is_ns else ((1 - pl.col("Pct_NS").cast(pl.Float64)) * 100).round(1)
+                else:
+                    pct_expr = pl.lit(None, dtype=pl.Float64)
+
+                # Add Elo_Before if available (only for current/start-of-session types)
+                before_col = f"Elo_R_{side}_Before" if elo_rating_type in (
+                    "Current Rating (End of Session)", "Rating at Start of Session"
+                ) else None
+
+                cols_to_select += [
+                    pl.lit(side).alias("Side"),
+                    (pl.col(f"Player_Name_{opp1}") + " - " + pl.col(f"Player_Name_{opp2}")).alias("Opponents"),
+                    pct_expr.alias("Pct"),
+                ]
+                # Elo_Before first, then Elo_After
+                if before_col and before_col in raw_df.columns:
+                    cols_to_select.append(pl.col(before_col).cast(pl.Float64).round(0).cast(pl.Int32, strict=False).alias("Elo_Before"))
+                cols_to_select.append(pl.col(pair_elo_col).cast(pl.Float64).round(0).cast(pl.Int32, strict=False).alias("Elo_After"))
+
+                frames.append(side_df.select(cols_to_select))
+
+            if not frames:
+                st.info("No session data found for this pair.")
+                return
+
+            detail = pl.concat(frames, how="diagonal")
+
+            # Sort by Date desc, then Session, Round, Board for logical ordering
+            sort_cols = ["Date", "Session"]
+            sort_desc = [True, True]
+            if "Round" in detail.columns:
+                sort_cols.append("Round")
+                sort_desc.append(False)
+            if "Board" in detail.columns:
+                sort_cols.append("Board")
+                sort_desc.append(False)
+            detail = detail.sort(sort_cols, descending=sort_desc)
+
+            if "Elo_Before" in detail.columns and "Elo_After" in detail.columns:
+                detail = detail.with_columns(
+                    (pl.col("Elo_After") - pl.col("Elo_Before")).alias("Elo_Delta")
+                )
+
+        n_sessions = detail.select("Session").n_unique()
+        st.caption(f"{len(detail)} boards across {n_sessions} sessions")
+        _render_detail_aggrid(detail, key=f"detail_pair_{pair_ids}")
+
+
 def main():
     """Main application function."""
     # UI Configuration - must be first Streamlit command
@@ -1742,32 +1977,13 @@ def main():
             index=0,
         )
         
-        # Is Online filter - only show if data is loaded and has any online games
-        online_filter = "All"  # Default value
-        if 'all_data' in st.session_state:
-            dataset_type = club_or_tournament.lower()
-            if dataset_type in st.session_state.all_data:
-                try:
-                    dataset_df = st.session_state.all_data[dataset_type]
-                    if hasattr(dataset_df, 'select') and 'is_virtual_game' in dataset_df.schema:
-                        # Show selectbox only if there exists at least one online game (is_virtual_game == 1/True)
-                        try:
-                            max_df = dataset_df.select(
-                                pl.col("is_virtual_game").cast(pl.Int8).max().alias("m")
-                            )
-                            has_online = bool(max_df["m"][0] or 0)
-                        except Exception:
-                            has_online = False
-                        if has_online:
-                            online_filter = st.selectbox(
-                                "Game Type",
-                                options=["All", "Local Only", "Online Only"],
-                                index=0,
-                                help="Filter by game type: Local (in-person), Online (virtual), or All games"
-                            )
-                except (RuntimeError, AttributeError, KeyError):
-                    # If any error occurs, just use default "All"
-                    pass
+        # Game type filter (Local / Online / All)
+        online_filter = st.selectbox(
+            "Game type",
+            options=["All", "Local Only", "Online Only"],
+            index=0,
+            help="Filter by game type: Local (in-person), Online (virtual), or All games"
+        )
         
         # Masterpoints range filter (Players only)
         masterpoints_filter = "All"
@@ -2018,13 +2234,13 @@ def main():
         
         # Apply online filter if specified
         if online_filter == "Local Only":
-            # Local games: exclude rows where is_virtual_game = 1
+            # Local games: rows explicitly marked as not virtual (False)
             if "is_virtual_game" in df.columns:
-                df = df.filter(pl.col("is_virtual_game") != 1)
+                df = df.filter(pl.col("is_virtual_game") == False)
         elif online_filter == "Online Only":
-            # Online games: include only rows where is_virtual_game = 1
+            # Online games: rows where is_virtual_game is null (virtual/online)
             if "is_virtual_game" in df.columns:
-                df = df.filter(pl.col("is_virtual_game") == 1)
+                df = df.filter(pl.col("is_virtual_game").is_null())
         # For "All", no filtering is applied
         
         # Store online filter in session state for comprehensive comparison
@@ -2217,14 +2433,25 @@ def main():
                     }
                 }
                 
-                AgGrid(
+                st.caption("Click a row to view session history details")
+                
+                # Create dynamic key that resets selection when data/filters change
+                dynamic_key = f"table-{rating_type}-{club_or_tournament}-{top_n}-{min_sessions}-{rating_method}-{elo_rating_type}-{date_range}-{online_filter}-{st.session_state.get('masterpoints_filter','All')}-{st.session_state.get('player_name_filter','')}"
+                
+                grid_response = AgGrid(
                     display_df,
                     gridOptions=gridOptions,
                     height=exact_height,
                     theme=AgGridTheme.BALHAM,
                     custom_css=custom_css,
-                    key=f"table-{rating_type}"
+                    key=dynamic_key
                 )
+                
+                # --- Row-click detail view ---
+                selected_rows = grid_response.get('selected_rows', None)
+                if selected_rows is not None and len(selected_rows) > 0:
+                    selected_row = selected_rows.iloc[0] if hasattr(selected_rows, 'iloc') else selected_rows[0]
+                    _show_detail_for_selected_row(selected_row, df, rating_type, elo_rating_type)
                 
                 # Store table_df in session state for cleanup on next run
                 st.session_state.previous_table_df = table_df

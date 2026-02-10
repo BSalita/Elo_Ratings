@@ -1083,7 +1083,7 @@ def main():
         )
         
         # PDF Export
-        generate_pdf = st.button("Export Report to PDF File", use_container_width=True)
+        generate_pdf = st.button("Export Report to PDF File", width='stretch')
         st.sidebar.markdown('<p style="color: #ffc107; font-weight: 600;">Morty\'s Automated Postmortem Apps</p>', unsafe_allow_html=True)
         st.sidebar.markdown("🔗 [ACBL Postmortem](https://acbl.postmortem.chat)")
         st.sidebar.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
