@@ -449,6 +449,87 @@ def _show_club_aggregation(detail_df: pl.DataFrame, results_df: pl.DataFrame, pa
     _render_detail_aggrid_ff(club_agg, key=f"ff_club_{key_suffix}")
 
 
+def _build_opponent_data(results_df: pl.DataFrame, entity_tournaments: pl.DataFrame, exclude_id: str, exclude_mode: str = 'pair') -> pl.DataFrame:
+    """Build a DataFrame of all opponents faced across tournaments.
+    
+    entity_tournaments: the tournaments the selected player/pair played in (with tournament_id).
+    exclude_id: the ID value to exclude from the opponents list.
+    exclude_mode: 'pair' excludes by pair_id, 'player' excludes rows where player appears as player1 or player2.
+    """
+    if entity_tournaments.is_empty() or results_df.is_empty():
+        return pl.DataFrame()
+
+    # Get all tournament IDs this entity played in
+    tourney_ids = entity_tournaments.select('tournament_id').unique().to_series().to_list()
+
+    # Get all results from those tournaments, excluding the entity's own rows
+    tourney_filter = pl.col('tournament_id').is_in(tourney_ids)
+    if exclude_mode == 'player':
+        # Exclude any row where the player appears as either player1 or player2
+        exclude_filter = (pl.col('player1_id') != exclude_id) & (pl.col('player2_id') != exclude_id)
+    else:
+        # Exclude by pair_id
+        exclude_filter = pl.col('pair_id') != exclude_id
+    all_opp = results_df.filter(tourney_filter & exclude_filter)
+    if all_opp.is_empty():
+        return pl.DataFrame()
+
+    cols = [
+        pl.col('tournament_id').alias('Event_ID'),
+        pl.col('date').str.slice(0, 10).alias('Date'),
+        pl.col('pair_name').alias('Opponent'),
+    ]
+    if 'rank' in all_opp.columns:
+        cols.append(pl.col('rank').cast(pl.Int32, strict=False).alias('Rank'))
+    if 'scratch_percentage' in all_opp.columns:
+        cols.append(pl.col('scratch_percentage').cast(pl.Float64, strict=False).round(2).alias('Scratch_%'))
+    if 'handicap_percentage' in all_opp.columns:
+        cols.append(pl.col('handicap_percentage').cast(pl.Float64, strict=False).round(2).alias('Handicap_%'))
+    if 'pair_elo' in all_opp.columns:
+        cols.append(pl.col('pair_elo').cast(pl.Float64, strict=False).round(0).cast(pl.Int32, strict=False).alias('Pair_Elo'))
+
+    return all_opp.select(cols).sort(['Date', 'Event_ID', 'Rank'], descending=[True, False, False])
+
+
+def _show_opponent_history(results_df: pl.DataFrame, entity_tournaments: pl.DataFrame, exclude_id: str, exclude_mode: str = 'pair', key_suffix: str = '') -> None:
+    """Show all opponents faced across all tournaments (Opponent History Details)."""
+    opp_detail = _build_opponent_data(results_df, entity_tournaments, exclude_id, exclude_mode)
+    if opp_detail.is_empty():
+        return
+    n_events = opp_detail.select('Event_ID').n_unique()
+    st.markdown("#### Opponent History Details — All Tournaments")
+    st.caption(f"{len(opp_detail)} opponent results across {n_events} tournaments")
+    _render_detail_aggrid_ff(opp_detail, key=f"ff_opp_hist_{key_suffix}")
+
+
+def _show_opponent_summary(results_df: pl.DataFrame, entity_tournaments: pl.DataFrame, exclude_id: str, exclude_mode: str = 'pair', key_suffix: str = '') -> None:
+    """Show aggregation of opponents across all tournaments (Opponent Summary)."""
+    opp_detail = _build_opponent_data(results_df, entity_tournaments, exclude_id, exclude_mode)
+    if opp_detail.is_empty():
+        return
+    st.markdown("#### Opponent Summary — All Tournaments")
+    agg_cols = [
+        pl.len().alias('Events'),
+    ]
+    if 'Rank' in opp_detail.columns:
+        agg_cols.append(pl.col('Rank').cast(pl.Float64, strict=False).mean().round(1).alias('Avg_Rank'))
+    if 'Scratch_%' in opp_detail.columns:
+        agg_cols.append(pl.col('Scratch_%').mean().round(2).alias('Avg_Scratch_%'))
+    if 'Handicap_%' in opp_detail.columns:
+        agg_cols.append(pl.col('Handicap_%').mean().round(2).alias('Avg_Handicap_%'))
+    if 'Pair_Elo' in opp_detail.columns:
+        agg_cols.append(pl.col('Pair_Elo').mean().round(0).cast(pl.Int32, strict=False).alias('Avg_Pair_Elo'))
+
+    opp_agg = (
+        opp_detail
+        .group_by('Opponent')
+        .agg(agg_cols)
+        .sort('Events', descending=True)
+    )
+    st.caption(f"{len(opp_agg)} unique opponents")
+    _render_detail_aggrid_ff(opp_agg, key=f"ff_opp_summ_{key_suffix}")
+
+
 # -------------------------------
 # Data Processing (common for both APIs)
 # -------------------------------
@@ -1569,6 +1650,10 @@ def main():
                                 
                                 # 4th df: partner aggregation across all tournaments
                                 _show_partner_aggregation(display_detail, key_suffix=f"player_{player_id}")
+                                
+                                # Opponent History Details + Opponent Summary
+                                _show_opponent_history(results_df, player_results, exclude_id=str(player_id), exclude_mode='player', key_suffix=f"player_{player_id}")
+                                _show_opponent_summary(results_df, player_results, exclude_id=str(player_id), exclude_mode='player', key_suffix=f"player_{player_id}")
                             else:
                                 st.info("No results in selected tournaments.")
                     
@@ -1676,6 +1761,10 @@ def main():
                                 
                                 # 4th df: club aggregation across all tournaments
                                 _show_club_aggregation(detail_df, results_df, str(pair_id), key_suffix=f"pair_{pair_id}")
+                                
+                                # Opponent History Details + Opponent Summary
+                                _show_opponent_history(results_df, pair_results, exclude_id=str(pair_id), exclude_mode='pair', key_suffix=f"pair_{pair_id}")
+                                _show_opponent_summary(results_df, pair_results, exclude_id=str(pair_id), exclude_mode='pair', key_suffix=f"pair_{pair_id}")
                             else:
                                 st.info("No detailed results found for this pair.")
                     

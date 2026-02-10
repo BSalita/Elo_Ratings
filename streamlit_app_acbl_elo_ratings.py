@@ -1813,6 +1813,10 @@ def _show_detail_for_selected_row(
 
         n_sessions = detail.select("Session").n_unique()
         st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
+
+        # --- All-sessions opponent summary (shown first for visibility) ---
+        _show_all_opponents_aggregation(detail, key_suffix=f"player_{player_id}")
+
         grid_resp = _render_detail_aggrid(detail, key=f"detail_player_{player_id}", selectable=True)
 
         # --- Opponent aggregation for selected session ---
@@ -1821,9 +1825,6 @@ def _show_detail_for_selected_row(
             if sel is not None and len(sel) > 0:
                 sel_row = sel.iloc[0] if hasattr(sel, 'iloc') else sel[0]
                 _show_opponent_aggregation(detail, sel_row)
-
-        # --- All-sessions opponent summary ---
-        _show_all_opponents_aggregation(detail, key_suffix=f"player_{player_id}")
 
     elif rating_type == "Pairs":
         pair_ids = str(selected_row.get('Pair_IDs', ''))
@@ -1914,6 +1915,10 @@ def _show_detail_for_selected_row(
 
         n_sessions = detail.select("Session").n_unique()
         st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
+
+        # --- All-sessions opponent summary (shown first for visibility) ---
+        _show_all_opponents_aggregation(detail, key_suffix=f"pair_{pair_ids}")
+
         grid_resp = _render_detail_aggrid(detail, key=f"detail_pair_{pair_ids}", selectable=True)
 
         # --- Opponent aggregation for selected session ---
@@ -1922,9 +1927,6 @@ def _show_detail_for_selected_row(
             if sel is not None and len(sel) > 0:
                 sel_row = sel.iloc[0] if hasattr(sel, 'iloc') else sel[0]
                 _show_opponent_aggregation(detail, sel_row)
-
-        # --- All-sessions opponent summary ---
-        _show_all_opponents_aggregation(detail, key_suffix=f"pair_{pair_ids}")
 
 
 def main():
