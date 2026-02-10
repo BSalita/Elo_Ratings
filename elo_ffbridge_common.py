@@ -2,8 +2,9 @@
 """
 FFBridge Elo Ratings - Shared Utilities
 
-This module contains shared constants, cache helpers, and Elo calculation functions
-used by both the Classic and Lancelot API adapters.
+This module contains FFBridge-specific constants, cache helpers, and re-exports
+common Elo functions from elo_common.py.
+Used by both the Classic and Lancelot API adapters.
 """
 
 import json
@@ -12,8 +13,28 @@ import pathlib
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
+# Re-export common Elo constants and functions so existing imports keep working.
+from elo_common import (  # noqa: F401
+    DEFAULT_ELO,
+    K_FACTOR,
+    PERFORMANCE_SCALING,
+    CHESS_SCALING_ENABLED,
+    CHESS_TARGET_MIN,
+    CHESS_TARGET_MAX,
+    CURRENT_REFERENCE_MIN,
+    CURRENT_REFERENCE_MAX,
+    AGGRID_ROW_HEIGHT,
+    AGGRID_HEADER_HEIGHT,
+    AGGRID_FOOTER_HEIGHT,
+    AGGRID_MAX_DISPLAY_ROWS,
+    calculate_expected_score,
+    calculate_elo_from_percentage,
+    scale_to_chess_range,
+    get_elo_title,
+)
+
 # -------------------------------
-# Constants
+# FFBridge-Specific Constants
 # -------------------------------
 # Unified tournament series names (used for cache folders and UI)
 SERIES_NAMES = {
@@ -30,29 +51,6 @@ SERIES_NAMES = {
 
 # List of all valid tournament series IDs
 VALID_SERIES_IDS = [3, 4, 5, 140, 384, 386, 604, 868]
-
-# Default Elo parameters
-DEFAULT_ELO = 1200.0  # Changed from 1500 to align with chess federation beginner level
-K_FACTOR = 32.0
-PERFORMANCE_SCALING = 400  # Standard Elo scaling factor
-
-# Chess federation scaling parameters
-# Target: Top players at ~2800 (Magnus Carlsen level), beginners at ~1200
-CHESS_SCALING_ENABLED = True
-CHESS_TARGET_MIN = 1200.0  # Beginner level
-CHESS_TARGET_MAX = 2800.0  # World champion level (Magnus Carlsen peak ~2882)
-# Reference range for scaling: map old range to new range
-# Old system: players typically ranged from ~1400-1600 (centered around 1500)
-# New system: players start at 1200 and should reach up to 2800
-# We'll scale proportionally: old 1600 (top) -> new 2800, old 1400 -> new ~1200
-CURRENT_REFERENCE_MIN = 1200.0  # New system minimum (matches DEFAULT_ELO)
-CURRENT_REFERENCE_MAX = 1600.0  # Old system maximum (top players to scale to 2800)
-
-# UI Constants
-AGGRID_ROW_HEIGHT = 42
-AGGRID_HEADER_HEIGHT = 50
-AGGRID_FOOTER_HEIGHT = 20
-AGGRID_MAX_DISPLAY_ROWS = 10
 
 
 # -------------------------------
@@ -192,111 +190,6 @@ def load_from_disk_cache(
         return cache_data['data']
     except Exception:
         return None
-
-
-# -------------------------------
-# Elo Rating Calculation
-# -------------------------------
-def calculate_expected_score(rating_a: float, rating_b: float) -> float:
-    """
-    Calculate expected score for player A against player B.
-    
-    Uses the standard Elo formula:
-    E_A = 1 / (1 + 10^((R_B - R_A) / 400))
-    
-    Includes overflow protection for extreme rating differences.
-    """
-    rating_diff = (rating_b - rating_a) / PERFORMANCE_SCALING
-    
-    # Prevent overflow: clamp exponent to reasonable range
-    # 10^10 ≈ 10 billion (way beyond practical), 10^-10 ≈ 0.0000000001
-    # For Elo: max practical diff is ~800 points (10^2 = 100), so ±10 is safe
-    max_exponent = 10.0
-    min_exponent = -10.0
-    rating_diff = max(min_exponent, min(max_exponent, rating_diff))
-    
-    try:
-        return 1.0 / (1.0 + 10 ** rating_diff)
-    except OverflowError:
-        # Fallback: if still overflow, use extreme values
-        if rating_diff > 0:
-            return 0.0  # Player A is much weaker
-        else:
-            return 1.0  # Player A is much stronger
-
-
-def scale_to_chess_range(rating: float) -> float:
-    """
-    Scale Elo rating to chess federation range.
-    
-    Maps ratings so that top players reach Magnus Carlsen level and beyond.
-    Uses a simple linear scaling: rating * 2.0 (e.g., 1200 -> 2400, 1600 -> 3200).
-    
-    Includes bounds checking to prevent extreme values that could cause overflow errors.
-    While standard Elo systems don't clamp ratings, we need to prevent technical issues
-    from corrupting the calculation.
-    
-    Args:
-        rating: Current Elo rating
-    
-    Returns:
-        Scaled Elo rating (bounded to reasonable range to prevent overflow)
-    """
-    if not CHESS_SCALING_ENABLED:
-        return rating
-    
-    # Clamp input rating to reasonable range before scaling to prevent extreme values
-    # This prevents overflow errors while still allowing natural distribution
-    max_input_rating = 10000.0  # Reasonable upper bound for unscaled ratings
-    min_input_rating = -1000.0  # Allow negative ratings (though unlikely)
-    rating = max(min_input_rating, min(max_input_rating, rating))
-    
-    # Simple scaling: multiply by factor of 2.0
-    # This means: 1200 -> 2400, 1400 -> 2800, 1600 -> 3200
-    scale_factor = 2.0
-    
-    scaled = rating * scale_factor
-    
-    # Clamp output to prevent overflow in downstream calculations
-    # Max reasonable Elo: 3500 (allows growth beyond Magnus Carlsen's peak)
-    max_output_rating = 3500.0
-    min_output_rating = 0.0
-    scaled = max(min_output_rating, min(max_output_rating, scaled))
-    
-    return round(scaled, 1)
-
-
-def calculate_elo_from_percentage(
-    current_rating: float,
-    percentage: float,
-    field_average_rating: float,
-    k_factor: float = K_FACTOR
-) -> float:
-    """
-    Calculate new Elo rating based on percentage score.
-    
-    Uses percentage as the actual performance and compares to expected
-    performance based on rating difference from field average.
-    
-    Args:
-        current_rating: Player's current Elo rating
-        percentage: Percentage score achieved (0-100)
-        field_average_rating: Average rating of the field
-        k_factor: K-factor for rating adjustment
-    
-    Returns:
-        New Elo rating
-    """
-    # Convert percentage to score (0-1)
-    actual_score = percentage / 100.0
-    
-    # Expected score based on rating difference from field average
-    expected_score = calculate_expected_score(current_rating, field_average_rating)
-    
-    # Calculate rating change
-    rating_change = k_factor * (actual_score - expected_score)
-    
-    return current_rating + rating_change
 
 
 # -------------------------------

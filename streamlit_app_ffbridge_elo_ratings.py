@@ -12,11 +12,34 @@ Supports both:
 
 import math
 import os
+
+# Prevent Intel Fortran runtime (libifcoremd.dll / MKL) from installing its own
+# Ctrl+C handler that crashes with "forrtl: error (200)".
+# Must be set before any numpy/scipy/MKL imports.
+os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
+
 import pathlib
 import re
 import sys
 from datetime import datetime, timezone
 from typing import Optional, Tuple, List, Dict, Any
+
+# On Windows, install a process-level console control handler via ctypes
+# for immediate clean exit on Ctrl+C. Works from any thread (unlike signal.signal).
+if sys.platform == "win32":
+    try:
+        import ctypes
+        _kernel32 = ctypes.windll.kernel32
+        _CTRL_C_EVENT = 0
+        _CTRL_BREAK_EVENT = 1
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+        def _console_ctrl_handler(event):
+            if event in (_CTRL_C_EVENT, _CTRL_BREAK_EVENT):
+                os._exit(0)
+            return False
+        _kernel32.SetConsoleCtrlHandler(_console_ctrl_handler, True)
+    except Exception:
+        pass
 
 import pandas as pd
 import polars as pl
@@ -31,19 +54,25 @@ from streamlitlib.streamlitlib import (
 )
 from st_aggrid import GridOptionsBuilder, AgGrid, ColumnsAutoSizeMode, AgGridTheme
 
-# Import shared utilities
-from elo_ffbridge_common import (
+# Import common Elo utilities (shared with ACBL app)
+from elo_common import (
     DEFAULT_ELO,
     K_FACTOR,
     AGGRID_ROW_HEIGHT,
     AGGRID_HEADER_HEIGHT,
     AGGRID_FOOTER_HEIGHT,
     AGGRID_MAX_DISPLAY_ROWS,
-    normalize_series_id,
+    ASSISTANT_LOGO_URL,
     calculate_expected_score,
     calculate_elo_from_percentage,
     scale_to_chess_range,
+    get_elo_title,
+    apply_app_theme,
+    calculate_aggrid_height,
 )
+
+# Import FFBridge-specific utilities
+from elo_ffbridge_common import normalize_series_id
 
 # Import API adapters
 import elo_ffbridge_classic as classic_api
@@ -258,12 +287,6 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
         rows.append(r)
 
     return pl.DataFrame(rows)
-
-
-def calculate_aggrid_height(row_count: int) -> int:
-    """Calculate AgGrid height based on row count."""
-    display_rows = min(AGGRID_MAX_DISPLAY_ROWS, row_count)
-    return AGGRID_HEADER_HEIGHT + (AGGRID_ROW_HEIGHT * display_rows) + AGGRID_FOOTER_HEIGHT
 
 
 def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
@@ -703,44 +726,6 @@ def process_tournaments_to_elo(
     return results_df, players_df, current_ratings, cache_stats
 
 
-def get_elo_title(rating: float) -> str:
-    """
-    Get chess-style title based on Elo rating.
-    
-    Based on FIDE/chess federation standards:
-    - Super Grandmaster (SGM): 2600+
-    - Grandmaster (GM): 2500+
-    - International Master (IM): 2400-2499
-    - FIDE Master (FM): 2300-2399
-    - Candidate Master (CM): 2200-2299
-    - Expert: 2000-2199
-    - Advanced: 1800-1999
-    - Intermediate: 1600-1799
-    - Novice: 1400-1599
-    - Beginner: Below 1400
-    """
-    if rating >= 2600:
-        return "SGM"
-    elif rating >= 2500:
-        return "GM"
-    elif rating >= 2400:
-        return "IM"
-    elif rating >= 2300:
-        return "FM"
-    elif rating >= 2200:
-        return "CM"
-    elif rating >= 2000:
-        return "Expert"
-    elif rating >= 1800:
-        return "Advanced"
-    elif rating >= 1600:
-        return "Intermediate"
-    elif rating >= 1400:
-        return "Novice"
-    else:
-        return "Beginner"
-
-
 def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5, use_handicap: bool = False) -> Tuple[pl.DataFrame, str]:
     """Get top players sorted by Elo rating using SQL."""
     if players_df.is_empty():
@@ -956,146 +941,17 @@ def initialize_session_state():
 # Main UI
 # -------------------------------
 def main():
-    # Logo URLs (must have raw=true for GitHub)
-    assistant_logo_url = 'https://github.com/BSalita/Elo_Ratings/blob/master/assets/logo_assistant.gif?raw=true'
-    
     st.set_page_config(
         page_title="Unofficial FFBridge Elo Ratings Playground",
-        page_icon=assistant_logo_url,
+        page_icon=ASSISTANT_LOGO_URL,
         layout="wide",
         initial_sidebar_state="expanded"
     )
     
     initialize_session_state()
     
-    # Apply styling
-    st.markdown("""
-        <style>
-        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap');
-        
-        html, body, [class*="css"] {
-            font-family: 'Outfit', sans-serif;
-        }
-        
-        .stApp {
-            background-color: #004d40;
-            color: #f5f5f5;
-        }
-        
-        /* Hide/style the Streamlit header bar */
-        header[data-testid="stHeader"] {
-            background-color: #004d40 !important;
-        }
-        
-        /* Style header toolbar buttons consistently */
-        header[data-testid="stHeader"] button,
-        header[data-testid="stHeader"] [data-testid="stStatusWidget"],
-        header[data-testid="stHeader"] span,
-        header[data-testid="stHeader"] a {
-            color: #f5f5f5 !important;
-        }
-        
-        /* Style the running man icon white */
-        header[data-testid="stHeader"] svg,
-        header[data-testid="stHeader"] [data-testid="stStatusWidget"] svg {
-            fill: #f5f5f5 !important;
-            color: #f5f5f5 !important;
-        }
-        
-        h1, h2, h3 {
-            color: #ffc107 !important;
-            font-weight: 700;
-            letter-spacing: 1px;
-        }
-        
-        .stSidebar {
-            background-color: #00332e !important;
-            border-right: 1px solid #00695c;
-        }
-        
-        .stSidebar .stMarkdown, 
-        .stSidebar label:not(.stRadio label):not(.stSelectbox label):not(.stTextInput label):not(.stSlider label) {
-            color: #e0e0e0 !important;
-        }
-        
-        .metric-card {
-            background: rgba(0, 105, 92, 0.4);
-            border: 1px solid #00796b;
-            border-radius: 8px;
-            padding: 0.5rem 1rem;
-            text-align: center;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        
-        .stDataFrame {
-            background-color: white;
-            border-radius: 8px;
-        }
-        
-        .stButton > button {
-            background-color: #ffc107;
-            color: #004d40;
-            border: none;
-            border-radius: 5px;
-            font-weight: 700;
-            padding: 0.5rem 1rem;
-            transition: all 0.2s ease;
-        }
-        
-        .stButton > button:hover {
-            background-color: #ffca28;
-            transform: scale(1.02);
-            box-shadow: 0 4px 12px rgba(255,193,7,0.3);
-        }
-        
-        .stDownloadButton > button {
-            background-color: #00695c !important;
-            color: #ffc107 !important;
-            border: 2px solid #ffc107 !important;
-            border-radius: 5px;
-            font-weight: 700;
-        }
-        
-        .stDownloadButton > button:hover {
-            background-color: #00796b !important;
-            color: #ffca28 !important;
-            border-color: #ffca28 !important;
-        }
-        
-        /* Override sidebar label color for specific widget types - must come after general rule */
-        .stSidebar .stRadio label,
-        .stSidebar .stRadio > label,
-        .stSidebar div[data-testid="stRadio"] > label,
-        .stSidebar .stRadio label p,
-        .stSidebar .stRadio label span { 
-            color: #ffc107 !important; 
-            font-weight: 600 !important; 
-        }
-        /* Radio button option text (Players/Pairs, Scratch/Handicap) */
-        .stRadio [data-testid="stMarkdownContainer"] p { 
-            color: #ffffff !important; 
-            font-size: 1rem !important; 
-            font-weight: 500 !important; 
-        }
-        .stSidebar .stSelectbox label,
-        .stSidebar .stSelectbox > label { 
-            color: #ffc107 !important; 
-            font-weight: 600 !important; 
-        }
-        .stSidebar .stTextInput label,
-        .stSidebar .stTextInput > label { 
-            color: #ffc107 !important; 
-            font-weight: 600 !important; 
-        }
-        .stSidebar .stSlider label,
-        .stSidebar .stSlider > label { 
-            color: #ffc107 !important; 
-            font-weight: 600 !important; 
-        }
-        .stCheckbox label span, .stCheckbox label p, .stCheckbox [data-testid="stMarkdownContainer"] p { color: #ffffff !important; font-weight: 500 !important; }
-        </style>
-    """, unsafe_allow_html=True)
-    
+    # Apply common theme
+    apply_app_theme(st)
     widen_scrollbars()
     
     # -------------------------------
@@ -1237,7 +1093,7 @@ def main():
     st.markdown(f"""
         <div style="text-align: center; padding: 0 0 1rem 0; margin-top: -2rem;">
             <h1 style="font-size: 2.8rem; margin-bottom: 0.2rem;">
-                <img src="{assistant_logo_url}" style="height: 2.5rem; vertical-align: middle; margin-right: 0.5rem;">
+                <img src="{ASSISTANT_LOGO_URL}" style="height: 2.5rem; vertical-align: middle; margin-right: 0.5rem;">
                 Morty's Unofficial FFBridge Elo Ratings Playground
             </h1>
             <p style="color: #ffc107; font-size: 1.2rem; font-weight: 500; opacity: 0.9;">

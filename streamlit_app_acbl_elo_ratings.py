@@ -4,10 +4,33 @@
 # acbl/acbl_elo_ratings_create.py
 
 import os
+
+# Prevent Intel Fortran runtime (libifcoremd.dll / MKL) from installing its own
+# Ctrl+C handler that crashes with "forrtl: error (200)".
+# Must be set before any numpy/scipy/MKL imports.
+os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
+
 import pathlib
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+
+# On Windows, install a process-level console control handler via ctypes
+# for immediate clean exit on Ctrl+C. Works from any thread (unlike signal.signal).
+if sys.platform == "win32":
+    try:
+        import ctypes
+        _kernel32 = ctypes.windll.kernel32
+        _CTRL_C_EVENT = 0
+        _CTRL_BREAK_EVENT = 1
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+        def _console_ctrl_handler(event):
+            if event in (_CTRL_C_EVENT, _CTRL_BREAK_EVENT):
+                os._exit(0)
+            return False
+        _kernel32.SetConsoleCtrlHandler(_console_ctrl_handler, True)
+    except Exception:
+        pass
 
 import pandas as pd
 import polars as pl
@@ -21,6 +44,13 @@ from streamlitlib.streamlitlib import (
     create_pdf,
     stick_it_good,
     widen_scrollbars,
+)
+
+# Import common Elo utilities (shared with FFBridge app)
+from elo_common import (
+    ASSISTANT_LOGO_URL,
+    apply_app_theme,
+    post_process_elo_table,
 )
 
 # -------------------------------
@@ -1550,6 +1580,9 @@ def initialize_session_state():
             st.session_state.sql_queries = []
         if 'use_sql_engine' not in st.session_state:
             st.session_state.use_sql_engine = True  # Default to SQL (faster)
+        # Auto-display table on first page load
+        st.session_state.show_main_content = True
+        st.session_state.content_mode = 'table'
     else:
         st.session_state.first_time = False
 
@@ -1568,49 +1601,35 @@ def app_info() -> None:
 
 def main():
     """Main application function."""
+    # UI Configuration - must be first Streamlit command
+    st.set_page_config(
+        page_title="Unofficial ACBL Elo Ratings Playground",
+        page_icon=ASSISTANT_LOGO_URL,
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    
     # Initialize session state
     initialize_session_state()
     
-    # UI Configuration
-    st.set_page_config(page_title="Unofficial ACBL Elo Ratings", layout="wide")
-    
-    # -------------------------------
-    # Main App
-    # -------------------------------
+    # Apply common dark green/gold theme (shared with FFBridge app)
+    apply_app_theme(st)
     widen_scrollbars()
-    st.title("Unofficial ACBL Elo Ratings Playground")
-    st.caption("An interactive playground for fiddling with Unofficial ACBL Elo ratings")
-    app_info()
+    
+    # Styled header
+    st.markdown(f"""
+        <div style="text-align: center; padding: 0 0 1rem 0; margin-top: -2rem;">
+            <h1 style="font-size: 2.8rem; margin-bottom: 0.2rem;">
+                <img src="{ASSISTANT_LOGO_URL}" style="height: 2.5rem; vertical-align: middle; margin-right: 0.5rem;">
+                Morty's Unofficial ACBL Elo Ratings Playground
+            </h1>
+            <p style="color: #ffc107; font-size: 1.2rem; font-weight: 500; opacity: 0.9;">
+                An interactive playground for ACBL Elo ratings
+            </p>
+        </div>
+    """, unsafe_allow_html=True)
     
     stick_it_good()
-
-    st.markdown(
-    """
-    <style>
-      .stButton > button {
-        background-color: #2E7D32 !important; /* green */
-        color: white !important;
-        border-color: #2E7D32 !important;
-      }
-      .stButton > button:hover {
-        background-color: #1B5E20 !important; /* darker green */
-        border-color: #1B5E20 !important;
-        color: white !important;
-      }
-      .stDownloadButton > button {
-        background-color: #2E7D32 !important; /* green */
-        color: white !important;
-        border-color: #2E7D32 !important;
-      }
-      .stDownloadButton > button:hover {
-        background-color: #1B5E20 !important; /* darker green */
-        border-color: #1B5E20 !important;
-        color: white !important;
-      }
-    </style>
-    """,
-    unsafe_allow_html=True,
-    )
 
     # Sidebar will be created after data loading is complete
     # Set default values for data loading
@@ -1669,8 +1688,9 @@ def main():
 
     with st.sidebar:
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
-        club_or_tournament = st.selectbox("Event type", options=["Club", "Tournament"], index=0)
-        rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=False)
+        st.sidebar.markdown("🔗 [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
+        club_or_tournament = st.radio("Event type", options=["Club", "Tournament"], index=0, horizontal=True)
+        rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=True)
         top_n = st.number_input("Top N players or pairs", min_value=50, max_value=5000, value=1000, step=50)
         min_sessions = st.number_input("Minimum sessions played", min_value=1, max_value=200, value=30, step=1)
         rating_method = st.selectbox("Elo Rating statistic", options=["Avg", "Max", "Latest"], index=0)
@@ -1702,7 +1722,7 @@ def main():
         
         # Player name filter (use a stable session key to avoid rerun inconsistencies)
         def _on_player_name_enter():
-            # Mimic clicking "Display Table" when ENTER is pressed in the name box
+            # Ensure table is shown when ENTER is pressed in the name box
             st.session_state.show_main_content = True
             st.session_state.content_mode = 'table'
 
@@ -1760,15 +1780,14 @@ def main():
             )
         st.session_state.masterpoints_filter = masterpoints_filter
         
-        display_table = st.button("Display Table", type="primary")
         generate_pdf = st.button("Generate PDF", type="primary")
         
         
         # Automated Postmortem Apps
-        st.markdown("**Automated Postmortem Apps**")
-        st.markdown("🔗 [ACBL Postmortem](https://acbl.postmortem.chat)")
-        st.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
-        #st.markdown("🔗 [BridgeWebs Postmortem](https://bridgewebs.postmortem.chat)")
+        st.sidebar.markdown('<p style="color: #ffc107; font-weight: 600;">Morty\'s Automated Postmortem Apps</p>', unsafe_allow_html=True)
+        st.sidebar.markdown("🔗 [ACBL Postmortem](https://acbl.postmortem.chat)")
+        st.sidebar.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
+        #st.sidebar.markdown("🔗 [BridgeWebs Postmortem](https://bridgewebs.postmortem.chat)")
         
         # Developer Options
         with st.expander("🔧 **Developer Options**"):
@@ -1950,24 +1969,21 @@ def main():
         return
     
     # Persist the display state in session_state
-    if display_table:
-        st.session_state.show_main_content = True
-        st.session_state.content_mode = 'table'
-    elif generate_pdf:
+    if generate_pdf:
         st.session_state.show_main_content = True
         st.session_state.content_mode = 'pdf'
     
-    # Check if settings have changed - if so, reset display state
-    if 'previous_settings' in st.session_state:
-        if st.session_state.previous_settings != current_settings:
-            st.session_state.show_main_content = False
+    # Any control change keeps content visible (auto-refresh); just ensure mode is set
+    if st.session_state.get('show_main_content') and not st.session_state.get('content_mode'):
+        st.session_state.content_mode = 'table'
+    
     st.session_state.previous_settings = current_settings.copy()
     
-    # Only show main content when display state is active
+    # Always show main content (auto-started on first load)
     show_main_content = st.session_state.get('show_main_content', False)
     
     if not show_main_content:
-        st.info("Select left sidebar options then click 'Display Table' or 'Generate PDF' button.")
+        st.info("Select left sidebar options or click 'Generate PDF' button.")
     else:
         # Memory cleanup - clear previous results and force garbage collection
         import gc
@@ -1995,6 +2011,10 @@ def main():
         # Get data
         dataset_type = club_or_tournament.lower()
         df = all_data[dataset_type]
+        
+        # Apply date range filter
+        if date_from is not None and 'Date' in df.columns:
+            df = df.filter(pl.col('Date') >= pl.lit(date_from))
         
         # Apply online filter if specified
         if online_filter == "Local Only":
@@ -2084,6 +2104,11 @@ def main():
                                 table_df = show_top_players(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
                             elif rating_type == "Pairs":
                                 table_df = show_top_pairs(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
+                        
+                        # Post-process: scale Elo to chess range (~2800 top) and add Title column
+                        # ACBL uses 1.6x scaling (FFBridge uses 2.0x)
+                        elo_col = 'Player_Elo_Score' if rating_type == "Players" else 'Pair_Elo_Score'
+                        table_df = post_process_elo_table(table_df, elo_col, scale_factor=1.6)
                         
                         # Cache the result
                         st.session_state[cache_key] = table_df
@@ -2340,6 +2365,11 @@ def main():
                             elif rating_type == "Pairs":
                                 table_df = show_top_pairs(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
                         
+                        # Post-process: scale Elo to chess range (~2800 top) and add Title column
+                        # ACBL uses 1.6x scaling (FFBridge uses 2.0x)
+                        elo_col = 'Player_Elo_Score' if rating_type == "Players" else 'Pair_Elo_Score'
+                        table_df = post_process_elo_table(table_df, elo_col, scale_factor=1.6)
+                        
                         # Cache the result
                         st.session_state[cache_key] = table_df
                         st.info(f"✅ Using {engine_name} engine for PDF generation")
@@ -2378,6 +2408,21 @@ def main():
                 file_name=pdf_filename,
                 mime="application/pdf",
             )
+
+    # Styled footer (matches FFBridge app)
+    st.markdown(f"""
+        <div style="text-align: center; color: #80cbc4; font-size: 0.8rem; opacity: 0.7;">
+            Project lead is Robert Salita research@AiPolice.org. Code written in Python by Cursor AI. UI written in streamlit. Data engine is polars. Repo: <a href="https://github.com/BSalita/Elo_Ratings" target="_blank" style="color: #80cbc4;">github.com/BSalita/Elo_Ratings</a><br>
+            Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}<br>
+            Streamlit:{st.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pd.__version__} polars:{pl.__version__} duckdb:{duckdb.__version__} endplay:{endplay.__version__}
+        </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown(f"""
+        <div style="text-align: center; padding: 2rem 0; color: #80cbc4; font-size: 0.9rem; opacity: 0.8;">
+            System Current Date: {datetime.now().strftime('%Y-%m-%d')}
+        </div>
+    """, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
