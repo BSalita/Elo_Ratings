@@ -569,6 +569,23 @@ def _show_opponent_summary(results_df: pl.DataFrame, entity_tournaments: pl.Data
     _render_detail_aggrid_ff(opp_agg, key=f"ff_opp_summ_{key_suffix}")
 
 
+def _filter_valid_percentages_ffbridge(df: pl.DataFrame) -> pl.DataFrame:
+    """Drop rows with invalid percentage values (<0 or >100)."""
+    if df.is_empty():
+        return df
+
+    pct_cols = [c for c in ("percentage", "scratch_percentage", "handicap_percentage", "club_percentage") if c in df.columns]
+    if not pct_cols:
+        return df
+
+    valid_expr = pl.lit(True)
+    for col_name in pct_cols:
+        col = pl.col(col_name).cast(pl.Float64, strict=False)
+        valid_expr = valid_expr & (col.is_null() | ((col >= 0.0) & (col <= 100.0)))
+
+    return df.filter(valid_expr)
+
+
 # -------------------------------
 # Data Processing (common for both APIs)
 # -------------------------------
@@ -1435,6 +1452,9 @@ def main():
     stats_msg = f"Cached: {processing_stats['cached']}, Fetched: {processing_stats['fetched']}, Missing results: {missing_str}"
     stats_placeholder.caption(stats_msg)
     
+    # Exclude invalid percentage rows before any downstream filtering/aggregation
+    full_results_df = _filter_valid_percentages_ffbridge(full_results_df)
+
     # Apply filters
     results_df = full_results_df
     

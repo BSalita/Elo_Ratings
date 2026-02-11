@@ -1929,6 +1929,16 @@ def _show_detail_for_selected_row(
                 _show_opponent_aggregation(detail, sel_row)
 
 
+def _filter_valid_percentages_acbl(df: pl.DataFrame) -> pl.DataFrame:
+    """Drop rows with invalid percentage values (<0 or >100 equivalent)."""
+    if df.is_empty() or "Pct_NS" not in df.columns:
+        return df
+
+    pct_ns = pl.col("Pct_NS").cast(pl.Float64, strict=False)
+    # Pct_NS is stored as a fraction (0..1), which corresponds to 0..100%.
+    return df.filter(pct_ns.is_null() | ((pct_ns >= 0.0) & (pct_ns <= 1.0)))
+
+
 def main():
     """Main application function."""
     # UI Configuration - must be first Streamlit command
@@ -1979,6 +1989,10 @@ def main():
         # Load both datasets
         club_df = load_elo_ratings("club", columns=None, date_from=date_from)
         tournament_df = load_elo_ratings("tournament", columns=None, date_from=date_from)
+
+        # Exclude invalid percentage rows before any downstream aggregation/display
+        club_df = _filter_valid_percentages_acbl(club_df)
+        tournament_df = _filter_valid_percentages_acbl(tournament_df)
         
         return {
             "club": club_df,
