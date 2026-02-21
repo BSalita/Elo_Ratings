@@ -2181,44 +2181,47 @@ def main():
     )
     if must_reload:
         try:
-            # Explicitly drop old data and force GC before loading new dataset
-            # to avoid both datasets coexisting in memory during the transition.
+            import gc
+
+            # Hard reset of switch-sensitive state to prevent retained references.
+            _clear_table_cache()
+            if 'sql_query_history' in st.session_state:
+                st.session_state.sql_query_history = []
+
+            # Drop all loaded dataframes immediately.
             if 'all_data' in st.session_state:
                 st.session_state.all_data = {}
-            # Drop DuckDB's reference to the old frame so it doesn't pin memory.
+
+            # Recreate DuckDB connection on dataset switch.
+            # This guarantees no registered/relation state can pin prior frames.
             if 'db_connection' in st.session_state:
                 try:
-                    st.session_state.db_connection.unregister('self')
+                    st.session_state.db_connection.close()
                 except Exception:
                     pass
-            import gc
+                del st.session_state.db_connection
+
+            # Keep metadata only for the active dataset.
+            st.session_state.loaded_columns = {}
+
             gc.collect()
-            # Ask the Arrow/Polars mimalloc allocator to release free pages back
-            # to the OS. Without this, RSS stays elevated even after frames are freed.
-            try:
-                import pyarrow as pa
-                pa.default_memory_pool().release_unused()
-            except Exception:
-                pass
-            try:
-                import ctypes
-                ctypes.cdll.LoadLibrary("libc.so.6").malloc_trim(0)
-            except Exception:
-                pass
             with st.spinner(f"Loading {selected_event_for_load} dataset..."):
-                all_data = {selected_event_for_load: load_dataset(selected_event_for_load, date_from_str, columns=required_columns)}
+                all_data = {
+                    selected_event_for_load: load_dataset(
+                        selected_event_for_load, date_from_str, columns=required_columns
+                    )
+                }
+
             st.success("Datasets loaded successfully")
-            
+
             # Store data and column set in session state for reuse
             st.session_state.all_data = all_data
             st.session_state.data_date_from = date_from_str
             st.session_state.loaded_dataset = selected_event_for_load
-            if 'loaded_columns' not in st.session_state:
-                st.session_state.loaded_columns = {}
             st.session_state.loaded_columns[selected_event_for_load] = required_cols_set
-            
+
         except Exception as e:
-            st.error(f"❌ Failed to load datasets: {e}")
+            st.error(f"Failed to load datasets: {e}")
             st.stop()
     else:
         # Use already loaded data
