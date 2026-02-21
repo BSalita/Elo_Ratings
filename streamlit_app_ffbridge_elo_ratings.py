@@ -1865,11 +1865,27 @@ def main():
                 )
     
     # Footer
+    try:
+        import psutil
+
+        def _gb(v: int) -> float:
+            return v / (1024 ** 3)
+
+        vm = psutil.virtual_memory()
+        sm = psutil.swap_memory()
+        memory_line = (
+            f"Memory: RAM {_gb(vm.used):.2f}/{_gb(vm.total):.2f} GB ({vm.percent:.1f}%) • "
+            f"Virtual/Pagefile {_gb(sm.used):.2f}/{_gb(sm.total):.2f} GB ({sm.percent:.1f}%)"
+        )
+    except Exception:
+        memory_line = "Memory: RAM/Virtual usage unavailable"
+
     st.markdown(f"""
         <div style="text-align: center; color: #80cbc4; font-size: 0.8rem; opacity: 0.7;">
             Project lead is Robert Salita research@AiPolice.org. Code written in Python by Cursor AI. UI written in streamlit. Data engine is polars. Repo: <a href="https://github.com/BSalita/Elo_Ratings" target="_blank" style="color: #80cbc4;">github.com/BSalita/Elo_Ratings</a><br>
             Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}<br>
-            Streamlit:{st.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pd.__version__} polars:{pl.__version__} duckdb:{duckdb.__version__} endplay:{ENDPLAY_VERSION}
+            Streamlit:{st.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pd.__version__} polars:{pl.__version__} duckdb:{duckdb.__version__} endplay:{ENDPLAY_VERSION}<br>
+            {memory_line}
         </div>
     """, unsafe_allow_html=True)
     

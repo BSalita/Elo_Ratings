@@ -1635,6 +1635,20 @@ def app_info() -> None:
     st.caption(f"Project lead is Robert Salita research@AiPolice.org. Code written in Python. UI written in streamlit. Data engine is polars. Query engine is duckdb. Bridge lib is endplay. Self hosted using Cloudflare Tunnel. Repo:https://github.com/BSalita")
     st.caption(f"App:{st.session_state.app_datetime} Streamlit:{st.__version__} Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}")
     st.caption(f"Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pd.__version__} polars:{pl.__version__} endplay:{ENDPLAY_VERSION}")
+    try:
+        import psutil
+
+        def _gb(v: int) -> float:
+            return v / (1024 ** 3)
+
+        vm = psutil.virtual_memory()
+        sm = psutil.swap_memory()
+        st.caption(
+            f"Memory: RAM {_gb(vm.used):.2f}/{_gb(vm.total):.2f} GB ({vm.percent:.1f}%) | "
+            f"Virtual/Pagefile {_gb(sm.used):.2f}/{_gb(sm.total):.2f} GB ({sm.percent:.1f}%)"
+        )
+    except Exception:
+        st.caption("Memory: RAM/Virtual usage unavailable")
     return
 
 
