@@ -40,6 +40,12 @@ REQUIRES_AUTH = True
 DATA_ROOT = pathlib.Path(os.getenv("FFBRIDGE_CACHE_DIR", "data/ffbridge"))
 CACHE_DIR = DATA_ROOT / 'cache'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+print(
+    f"[classic] FFBRIDGE_CACHE_DIR={os.getenv('FFBRIDGE_CACHE_DIR', '(not set)')!r} "
+    f"→ CACHE_DIR={CACHE_DIR.resolve()} exists={CACHE_DIR.exists()} "
+    f"writable={os.access(CACHE_DIR, os.W_OK)}",
+    flush=True,
+)
 
 # Cache version - increment to invalidate old cached calculations
 CACHE_VERSION = "v3"  # v3: Set handicap_percentage=None for scratch-only events

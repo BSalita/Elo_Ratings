@@ -38,6 +38,12 @@ REQUIRES_AUTH = False
 DATA_ROOT = pathlib.Path(os.getenv("FFBRIDGE_CACHE_DIR", "data/ffbridge"))
 CACHE_DIR = DATA_ROOT / 'lancelot_cache'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+print(
+    f"[lancelot] FFBRIDGE_CACHE_DIR={os.getenv('FFBRIDGE_CACHE_DIR', '(not set)')!r} "
+    f"→ CACHE_DIR={CACHE_DIR.resolve()} exists={CACHE_DIR.exists()} "
+    f"writable={os.access(CACHE_DIR, os.W_OK)}",
+    flush=True,
+)
 
 REQUEST_TIMEOUT = 10  # seconds (reduced from 30 to fail faster on hung requests)
 REQUEST_DELAY = 0.1  # seconds between API requests
