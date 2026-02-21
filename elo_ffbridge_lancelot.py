@@ -6,6 +6,7 @@ This module provides the API adapter for the public FFBridge Lancelot API (api-l
 No authentication required - public access.
 """
 
+import os
 import re
 import time
 import pathlib
@@ -33,7 +34,8 @@ API_NAME = "FFBridge (Lancelot)"
 API_BASE = "https://api-lancelot.ffbridge.fr"
 REQUIRES_AUTH = False
 
-DATA_ROOT = pathlib.Path('data') / 'ffbridge'
+# Cache root can be redirected to a persistent Railway Volume, e.g. /data/ffbridge
+DATA_ROOT = pathlib.Path(os.getenv("FFBRIDGE_CACHE_DIR", "data/ffbridge"))
 CACHE_DIR = DATA_ROOT / 'lancelot_cache'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 

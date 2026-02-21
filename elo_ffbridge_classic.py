@@ -36,7 +36,8 @@ API_NAME = "FFBridge (Classic)"
 API_BASE = "https://api.ffbridge.fr"
 REQUIRES_AUTH = True
 
-DATA_ROOT = pathlib.Path('data') / 'ffbridge'
+# Cache root can be redirected to a persistent Railway Volume, e.g. /data/ffbridge
+DATA_ROOT = pathlib.Path(os.getenv("FFBRIDGE_CACHE_DIR", "data/ffbridge"))
 CACHE_DIR = DATA_ROOT / 'cache'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
