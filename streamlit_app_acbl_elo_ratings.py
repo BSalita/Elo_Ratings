@@ -2155,12 +2155,16 @@ def main():
     selected_rating_for_load = st.session_state.get("rating_type", "Players")
     selected_elo_type_for_load = st.session_state.get("elo_rating_type", "Current Rating (End of Session)")
     required_columns = _required_columns_for_mode(selected_rating_for_load, selected_elo_type_for_load)
+    required_cols_set = set(required_columns)
+    stored_cols_set = set(st.session_state.get('loaded_columns', {}).get(selected_event_for_load, []))
     must_reload = (
         'all_data' not in st.session_state
         or 'data_date_from' not in st.session_state
         or st.session_state.data_date_from != date_from_str
         or st.session_state.get('loaded_dataset') != selected_event_for_load
         or selected_event_for_load not in st.session_state.get('all_data', {})
+        or not required_cols_set.issubset(stored_cols_set)  # missing columns
+        or stored_cols_set - required_cols_set  # excess columns — trim to save memory
     )
     if must_reload:
         try:
@@ -2168,10 +2172,13 @@ def main():
                 all_data = {selected_event_for_load: load_dataset(selected_event_for_load, date_from_str, columns=required_columns)}
             st.success("Datasets loaded successfully")
             
-            # Store data in session state for reuse
+            # Store data and column set in session state for reuse
             st.session_state.all_data = all_data
             st.session_state.data_date_from = date_from_str
             st.session_state.loaded_dataset = selected_event_for_load
+            if 'loaded_columns' not in st.session_state:
+                st.session_state.loaded_columns = {}
+            st.session_state.loaded_columns[selected_event_for_load] = required_cols_set
             
         except Exception as e:
             st.error(f"❌ Failed to load datasets: {e}")
@@ -2181,7 +2188,7 @@ def main():
         all_data = st.session_state.all_data
 
     def ensure_dataset_loaded(dataset_name: str, columns: list[str] | None = None):
-        """Load missing dataset on-demand; reload if required columns are missing."""
+        """Load missing dataset on-demand; reload only if required columns are missing."""
         nonlocal all_data
         if dataset_name in all_data:
             if columns is None:
@@ -2190,10 +2197,12 @@ def main():
             needed_cols = set(columns)
             if needed_cols.issubset(existing_cols):
                 return
-            # Reload with union of existing + required columns when switching modes
-            columns = sorted(existing_cols | needed_cols)
+            # Only load the needed columns (not a union) to avoid memory accumulation
         with st.spinner(f"Loading {dataset_name} dataset..."):
             all_data[dataset_name] = load_dataset(dataset_name, date_from_str, columns=columns)
+        if 'loaded_columns' not in st.session_state:
+            st.session_state.loaded_columns = {}
+        st.session_state.loaded_columns[dataset_name] = set(columns) if columns else None
         st.session_state.all_data = all_data
     
     # Initialize SQL query settings
