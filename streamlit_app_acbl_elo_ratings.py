@@ -218,6 +218,19 @@ def get_db_connection():
     return st.session_state.db_connection
 
 
+def _db_register(con, name: str, df) -> None:
+    """Unregister any existing view then register the new frame.
+
+    DuckDB holds a reference to the registered Arrow/Polars buffer, so
+    re-registering without unregistering first leaks the old frame.
+    """
+    try:
+        con.unregister(name)
+    except Exception:
+        pass
+    con.register(name, df)
+
+
 def _get_or_build_report_table_df(
     df: pl.DataFrame,
     generated_sql: str,
@@ -237,7 +250,7 @@ def _get_or_build_report_table_df(
 
     if use_sql_engine:
         con = get_db_connection()
-        con.register('self', df)
+        _db_register(con, 'self', df)
         table_df = con.execute(generated_sql).pl()
     else:
         if rating_type == "Players":
@@ -295,7 +308,7 @@ def sql_input_callback():
             df = st.session_state.all_data[dataset_type]
             # Register the dataframe with DuckDB
             con = get_db_connection()
-            con.register('self', df)
+            _db_register(con, 'self', df)
             # Execute the query
             execute_sql_query(df, query, f'sql_query_result_{len(st.session_state.get("sql_queries", []))}')
             # Store query in history
@@ -1299,7 +1312,7 @@ def debug_single_comparison(df: pl.DataFrame, top_n: int = 10, min_sessions: int
     
     # Run SQL implementation
     con = get_db_connection()
-    con.register('self', df)
+    _db_register(con, 'self', df)
     sql_query = generate_top_players_sql(top_n, min_sessions, rating_method, 10, elo_rating_type, set(df.columns))
     sql_df = con.execute(sql_query).pl()
     
@@ -1450,7 +1463,7 @@ def run_comprehensive_comparison(all_data: dict, top_n: int = 100, min_sessions:
                         # Run SQL implementation with timing
                         sql_start = time.time()
                         con = get_db_connection()
-                        con.register('self', df_use)
+                        _db_register(con, 'self', df_use)
                         # Ensure PRAGMAs are applied for potentially large club queries
                         try:
                             con.execute("PRAGMA preserve_insertion_order=false;")
@@ -2172,7 +2185,13 @@ def main():
             # to avoid both datasets coexisting in memory during the transition.
             if 'all_data' in st.session_state:
                 st.session_state.all_data = {}
-                import gc; gc.collect()
+            # Drop DuckDB's reference to the old frame so it doesn't pin memory.
+            if 'db_connection' in st.session_state:
+                try:
+                    st.session_state.db_connection.unregister('self')
+                except Exception:
+                    pass
+            import gc; gc.collect()
             with st.spinner(f"Loading {selected_event_for_load} dataset..."):
                 all_data = {selected_event_for_load: load_dataset(selected_event_for_load, date_from_str, columns=required_columns)}
             st.success("Datasets loaded successfully")
@@ -2466,7 +2485,7 @@ def main():
             # Run SQL implementation
             st.write("Running SQL implementation...")
             con = get_db_connection()
-            con.register('self', df)
+            _db_register(con, 'self', df)
             sql_query = generate_top_players_sql(10, 5, rating_method, 10, elo_rating_type, set(df.columns))
             st.code(sql_query, language='sql')
             
@@ -2828,14 +2847,7 @@ def main():
                             
                             # Execute query on the query results table, not the raw dataset
                             con = get_db_connection()
-                            
-                            # Unregister 'self' if it exists, then register fresh
-                            try:
-                                con.unregister('self')
-                            except:
-                                pass  # Ignore if 'self' wasn't registered
-                            
-                            con.register('self', table_df)  # Register the query results dataframe
+                            _db_register(con, 'self', table_df)
                             result_df = con.execute(processed_query).pl()
                             
                             # Store in history
