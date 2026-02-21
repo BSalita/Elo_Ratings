@@ -106,7 +106,50 @@ def apply_masterpoints_filter_polars(df: pl.DataFrame, range_label: str) -> pl.D
 # -------------------------------
 # Config / Paths
 # -------------------------------
-DATA_ROOT = pathlib.Path('data')
+DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
+
+
+def _r2_enabled() -> bool:
+    return bool(os.getenv("R2_BUCKET", "").strip())
+
+
+def _r2_storage_options() -> dict:
+    """Build Polars S3 storage options for Cloudflare R2."""
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    endpoint = os.getenv("R2_ENDPOINT", "").strip()
+    access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
+    secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+    region = os.getenv("R2_REGION", "auto").strip() or "auto"
+
+    if not bucket:
+        raise ValueError("R2_BUCKET is required when using R2 data source.")
+    if not endpoint:
+        raise ValueError("R2_ENDPOINT is required when using R2 data source.")
+    if not access_key:
+        raise ValueError("R2_ACCESS_KEY_ID is required when using R2 data source.")
+    if not secret_key:
+        raise ValueError("R2_SECRET_ACCESS_KEY is required when using R2 data source.")
+
+    return {
+        "aws_region": region,
+        "aws_access_key_id": access_key,
+        "aws_secret_access_key": secret_key,
+        "aws_endpoint_url": endpoint,
+    }
+
+
+def _parquet_source_for(club_or_tournament: str) -> tuple[str, dict | None]:
+    filename = f"acbl_{club_or_tournament.lower()}_elo_ratings.parquet"
+    if _r2_enabled():
+        bucket = os.getenv("R2_BUCKET", "").strip()
+        prefix = os.getenv("R2_PREFIX", "data").strip().strip("/")
+        key = f"{prefix}/{filename}" if prefix else filename
+        return f"s3://{bucket}/{key}", _r2_storage_options()
+
+    file_path = DATA_ROOT.joinpath(filename)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Missing file: {file_path}")
+    return str(file_path), None
 
 # -------------------------------
 # SQL Query Support
@@ -188,20 +231,14 @@ def sql_input_callback():
 # Data Loading
 # -------------------------------
 def load_elo_ratings_schema(club_or_tournament: str) -> list[str]:
-    filename = f'acbl_{club_or_tournament.lower()}_elo_ratings.parquet'
-    file_path = DATA_ROOT.joinpath(filename)
-    if not file_path.exists():
-        raise FileNotFoundError(f"Missing file: {file_path}")
-    df0 = pl.read_parquet(file_path, n_rows=0)
+    source_path, storage_options = _parquet_source_for(club_or_tournament)
+    df0 = pl.read_parquet(source_path, n_rows=0, storage_options=storage_options)
     return df0.columns
 
 
 def load_elo_ratings_schema_map(club_or_tournament: str) -> dict:
-    filename = f'acbl_{club_or_tournament.lower()}_elo_ratings.parquet'
-    file_path = DATA_ROOT.joinpath(filename)
-    if not file_path.exists():
-        raise FileNotFoundError(f"Missing file: {file_path}")
-    df0 = pl.read_parquet(file_path, n_rows=0)
+    source_path, storage_options = _parquet_source_for(club_or_tournament)
+    df0 = pl.read_parquet(source_path, n_rows=0, storage_options=storage_options)
     return df0.schema  # dict[str, pl.DataType]
 
 
@@ -210,16 +247,13 @@ def load_elo_ratings(
     columns: list[str] | None = None,
     date_from: datetime | None = None,
 ) -> pl.DataFrame:
-    filename = f'acbl_{club_or_tournament.lower()}_elo_ratings.parquet'
-    file_path = DATA_ROOT.joinpath(filename)
-    if not file_path.exists():
-        raise FileNotFoundError(f"Missing file: {file_path}")
+    source_path, storage_options = _parquet_source_for(club_or_tournament)
 
     # Inspect schema once
     schema_map = load_elo_ratings_schema_map(club_or_tournament)
 
     # Lazy scan for performance
-    lf = pl.scan_parquet(file_path)
+    lf = pl.scan_parquet(source_path, storage_options=storage_options)
 
     # Reduce columns early if given
     if columns:
