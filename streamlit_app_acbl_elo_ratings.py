@@ -2168,6 +2168,11 @@ def main():
     )
     if must_reload:
         try:
+            # Explicitly drop old data and force GC before loading new dataset
+            # to avoid both datasets coexisting in memory during the transition.
+            if 'all_data' in st.session_state:
+                st.session_state.all_data = {}
+                import gc; gc.collect()
             with st.spinner(f"Loading {selected_event_for_load} dataset..."):
                 all_data = {selected_event_for_load: load_dataset(selected_event_for_load, date_from_str, columns=required_columns)}
             st.success("Datasets loaded successfully")
@@ -2197,7 +2202,10 @@ def main():
             needed_cols = set(columns)
             if needed_cols.issubset(existing_cols):
                 return
-            # Only load the needed columns (not a union) to avoid memory accumulation
+            # Drop old frame before reloading to free memory promptly
+            import gc
+            all_data[dataset_name] = None
+            gc.collect()
         with st.spinner(f"Loading {dataset_name} dataset..."):
             all_data[dataset_name] = load_dataset(dataset_name, date_from_str, columns=columns)
         if 'loaded_columns' not in st.session_state:
