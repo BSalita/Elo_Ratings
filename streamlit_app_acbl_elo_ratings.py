@@ -36,8 +36,13 @@ import pandas as pd
 import polars as pl
 import streamlit as st
 import duckdb
-import endplay
 from streamlit_extras.bottom_container import bottom
+
+try:
+    import endplay
+    ENDPLAY_VERSION = endplay.__version__
+except (ImportError, AttributeError):
+    ENDPLAY_VERSION = "N/A"
 
 from streamlitlib.streamlitlib import (
     ShowDataFrameTable,
@@ -1629,7 +1634,7 @@ def app_info() -> None:
     """Display app information"""
     st.caption(f"Project lead is Robert Salita research@AiPolice.org. Code written in Python. UI written in streamlit. Data engine is polars. Query engine is duckdb. Bridge lib is endplay. Self hosted using Cloudflare Tunnel. Repo:https://github.com/BSalita")
     st.caption(f"App:{st.session_state.app_datetime} Streamlit:{st.__version__} Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}")
-    st.caption(f"Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pd.__version__} polars:{pl.__version__} endplay:{endplay.__version__}")
+    st.caption(f"Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pd.__version__} polars:{pl.__version__} endplay:{ENDPLAY_VERSION}")
     return
 
 
@@ -2784,7 +2789,7 @@ def main():
         <div style="text-align: center; color: #80cbc4; font-size: 0.8rem; opacity: 0.7;">
             Project lead is Robert Salita research@AiPolice.org. Code written in Python by Cursor AI. UI written in streamlit. Data engine is polars. Repo: <a href="https://github.com/BSalita/Elo_Ratings" target="_blank" style="color: #80cbc4;">github.com/BSalita/Elo_Ratings</a><br>
             Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}<br>
-            Streamlit:{st.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pd.__version__} polars:{pl.__version__} duckdb:{duckdb.__version__} endplay:{endplay.__version__}
+            Streamlit:{st.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pd.__version__} polars:{pl.__version__} duckdb:{duckdb.__version__} endplay:{ENDPLAY_VERSION}
         </div>
     """, unsafe_allow_html=True)
 
