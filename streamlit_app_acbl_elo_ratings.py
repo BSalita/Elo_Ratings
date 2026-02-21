@@ -2191,7 +2191,20 @@ def main():
                     st.session_state.db_connection.unregister('self')
                 except Exception:
                     pass
-            import gc; gc.collect()
+            import gc
+            gc.collect()
+            # Ask the Arrow/Polars mimalloc allocator to release free pages back
+            # to the OS. Without this, RSS stays elevated even after frames are freed.
+            try:
+                import pyarrow as pa
+                pa.default_memory_pool().release_unused()
+            except Exception:
+                pass
+            try:
+                import ctypes
+                ctypes.cdll.LoadLibrary("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
             with st.spinner(f"Loading {selected_event_for_load} dataset..."):
                 all_data = {selected_event_for_load: load_dataset(selected_event_for_load, date_from_str, columns=required_columns)}
             st.success("Datasets loaded successfully")
