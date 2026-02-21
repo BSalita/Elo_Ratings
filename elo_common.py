@@ -12,7 +12,9 @@ Contains:
 """
 
 import os
+import pathlib
 import sys
+import threading
 from datetime import datetime
 import polars as pl
 
@@ -451,12 +453,39 @@ def get_memory_usage_line() -> str:
         else:
             swap_text = "Virtual/Pagefile N/A (swap disabled)"
 
+        cpu_count = os.cpu_count() or 0
+        thread_count = threading.active_count()
         return (
             f"Memory: RAM {_gb(ram_used):.2f}/{_gb(ram_total):.2f} GB ({ram_pct:.1f}%) • "
-            f"{swap_text}"
+            f"{swap_text} • CPU/Threads {cpu_count}/{thread_count}"
         )
     except Exception:
         return "Memory: RAM/Virtual usage unavailable"
+
+
+def get_cache_diagnostic_line(cache_dir_env_var: str = "FFBRIDGE_CACHE_DIR") -> str:
+    """Return cache diagnostics: resolved dir, exists/writable, and file count."""
+    cache_dir_raw = os.getenv(cache_dir_env_var, "").strip()
+    if not cache_dir_raw:
+        return f"Cache ({cache_dir_env_var}): dir=not set • exists=False • writable=False • files=0"
+
+    cache_dir = pathlib.Path(cache_dir_raw).expanduser()
+    cache_dir_resolved = cache_dir.resolve(strict=False)
+    exists = cache_dir_resolved.exists() and cache_dir_resolved.is_dir()
+    writable = os.access(cache_dir_resolved, os.W_OK) if exists else False
+    file_count = 0
+    if exists:
+        try:
+            for _root, _dirs, files in os.walk(cache_dir_resolved):
+                file_count += len(files)
+        except OSError:
+            file_count = -1
+
+    file_count_text = str(file_count) if file_count >= 0 else "unavailable"
+    return (
+        f"Cache ({cache_dir_env_var}): dir={cache_dir_resolved} • "
+        f"exists={exists} • writable={writable} • files={file_count_text}"
+    )
 
 
 def render_app_footer(
@@ -471,6 +500,7 @@ def render_app_footer(
     polars_version = dependency_versions.get("polars", pl.__version__)
     duckdb_version = dependency_versions.get("duckdb", "N/A")
     memory_line = get_memory_usage_line()
+    cache_diagnostic_line = get_cache_diagnostic_line()
     st_module.markdown(
         f"""
         <div style="text-align: center; color: #80cbc4; font-size: 0.8rem; opacity: 0.7;">
@@ -478,6 +508,7 @@ def render_app_footer(
             Query Params:{st_module.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}<br>
             Streamlit:{st_module.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pandas_version} polars:{polars_version} duckdb:{duckdb_version} endplay:{endplay_version}<br>
             {memory_line}<br>
+            {cache_diagnostic_line}<br>
             System Current Date: {datetime.now().strftime('%Y-%m-%d')}
         </div>
     """,
