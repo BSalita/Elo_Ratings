@@ -1878,7 +1878,37 @@ def main():
             f"Virtual/Pagefile {_gb(sm.used):.2f}/{_gb(sm.total):.2f} GB ({sm.percent:.1f}%)"
         )
     except Exception:
-        memory_line = "Memory: RAM/Virtual usage unavailable"
+        # Fallback for Linux containers without psutil.
+        try:
+            meminfo = {}
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.split(":", 1)
+                    if len(parts) != 2:
+                        continue
+                    key = parts[0].strip()
+                    val = parts[1].strip().split()[0]
+                    meminfo[key] = int(val) * 1024  # kB -> bytes
+
+            def _gb(v: int) -> float:
+                return v / (1024 ** 3)
+
+            ram_total = meminfo.get("MemTotal", 0)
+            ram_avail = meminfo.get("MemAvailable", 0)
+            ram_used = max(0, ram_total - ram_avail)
+            ram_pct = (ram_used / ram_total * 100.0) if ram_total else 0.0
+
+            swap_total = meminfo.get("SwapTotal", 0)
+            swap_free = meminfo.get("SwapFree", 0)
+            swap_used = max(0, swap_total - swap_free)
+            swap_pct = (swap_used / swap_total * 100.0) if swap_total else 0.0
+
+            memory_line = (
+                f"Memory: RAM {_gb(ram_used):.2f}/{_gb(ram_total):.2f} GB ({ram_pct:.1f}%) • "
+                f"Virtual/Pagefile {_gb(swap_used):.2f}/{_gb(swap_total):.2f} GB ({swap_pct:.1f}%)"
+            )
+        except Exception:
+            memory_line = "Memory: RAM/Virtual usage unavailable"
 
     st.markdown(f"""
         <div style="text-align: center; color: #80cbc4; font-size: 0.8rem; opacity: 0.7;">
