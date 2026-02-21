@@ -30,7 +30,7 @@ typing-extensions
 IPython
 
 # Optional: Bridge analysis library
-# endplay
+endplay
 
 # Optional ML dependencies (uncomment if using mlBridgeAiLib.py)
 # torch
