@@ -41,12 +41,14 @@ REQUIRES_AUTH = True
 
 # Cache root can be redirected to a persistent Railway Volume, e.g. /data/ffbridge
 DATA_ROOT = pathlib.Path(os.getenv("FFBRIDGE_CACHE_DIR", "data/ffbridge")).resolve()
-CACHE_DIR = DATA_ROOT / 'classic_cache'
+CACHE_DIR = DATA_ROOT / 'cache'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+_cache_file_count = sum(len(files) for _, _, files in os.walk(CACHE_DIR))
 print(
     f"[classic] FFBRIDGE_CACHE_DIR={os.getenv('FFBRIDGE_CACHE_DIR', '(not set)')!r} "
     f"→ DATA_ROOT={DATA_ROOT} CACHE_DIR={CACHE_DIR} "
-    f"exists={CACHE_DIR.exists()} writable={os.access(CACHE_DIR, os.W_OK)}",
+    f"exists={CACHE_DIR.exists()} writable={os.access(CACHE_DIR, os.W_OK)} "
+    f"cached_files={_cache_file_count}",
     flush=True,
 )
 

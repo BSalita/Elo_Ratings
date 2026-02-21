@@ -38,10 +38,12 @@ REQUIRES_AUTH = False
 DATA_ROOT = pathlib.Path(os.getenv("FFBRIDGE_CACHE_DIR", "data/ffbridge")).resolve()
 CACHE_DIR = DATA_ROOT / 'lancelot_cache'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+_cache_file_count = sum(len(files) for _, _, files in os.walk(CACHE_DIR))
 print(
     f"[lancelot] FFBRIDGE_CACHE_DIR={os.getenv('FFBRIDGE_CACHE_DIR', '(not set)')!r} "
     f"→ DATA_ROOT={DATA_ROOT} CACHE_DIR={CACHE_DIR} "
-    f"exists={CACHE_DIR.exists()} writable={os.access(CACHE_DIR, os.W_OK)}",
+    f"exists={CACHE_DIR.exists()} writable={os.access(CACHE_DIR, os.W_OK)} "
+    f"cached_files={_cache_file_count}",
     flush=True,
 )
 
