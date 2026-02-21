@@ -8,10 +8,13 @@ Used by both the Classic and Lancelot API adapters.
 """
 
 import json
+import logging
 import re
 import pathlib
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
+
+logger = logging.getLogger(__name__)
 
 # Re-export common Elo constants and functions so existing imports keep working.
 from elo_common import (  # noqa: F401
@@ -148,8 +151,10 @@ def save_to_disk_cache(
                 'series_id': series_id,
                 'data': data
             }, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass  # Silently fail on cache save errors
+        logger.debug("Cache written: %s", cache_path)
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning("Cache write failed for %s → %s: %s", identifier, cache_path, exc)
+        print(f"[cache] WRITE FAILED {cache_path}: {exc}", flush=True)
 
 
 def load_from_disk_cache(
@@ -180,15 +185,16 @@ def load_from_disk_cache(
     try:
         with open(cache_path, 'r', encoding='utf-8') as f:
             cache_data = json.load(f)
-            
+
         # Check expiration if max_age_hours is provided
         if max_age_hours is not None:
             cached_time = datetime.fromisoformat(cache_data['timestamp'])
             if datetime.now() - cached_time > timedelta(hours=max_age_hours):
                 return None
-            
+
         return cache_data['data']
-    except Exception:
+    except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+        logger.warning("Cache read failed for %s → %s: %s", identifier, cache_path, exc)
         return None
 
 

@@ -6,11 +6,14 @@ This module provides the API adapter for the authenticated FFBridge API (api.ffb
 Requires a Bearer token for authentication.
 """
 
+import logging
 import os
 import re
 import time
 import pathlib
 from typing import Optional, Tuple, List, Dict, Any
+
+logger = logging.getLogger(__name__)
 
 import requests
 import streamlit as st
@@ -37,13 +40,13 @@ API_BASE = "https://api.ffbridge.fr"
 REQUIRES_AUTH = True
 
 # Cache root can be redirected to a persistent Railway Volume, e.g. /data/ffbridge
-DATA_ROOT = pathlib.Path(os.getenv("FFBRIDGE_CACHE_DIR", "data/ffbridge"))
-CACHE_DIR = DATA_ROOT / 'cache'
+DATA_ROOT = pathlib.Path(os.getenv("FFBRIDGE_CACHE_DIR", "data/ffbridge")).resolve()
+CACHE_DIR = DATA_ROOT / 'classic_cache'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 print(
     f"[classic] FFBRIDGE_CACHE_DIR={os.getenv('FFBRIDGE_CACHE_DIR', '(not set)')!r} "
-    f"→ CACHE_DIR={CACHE_DIR.resolve()} exists={CACHE_DIR.exists()} "
-    f"writable={os.access(CACHE_DIR, os.W_OK)}",
+    f"→ DATA_ROOT={DATA_ROOT} CACHE_DIR={CACHE_DIR} "
+    f"exists={CACHE_DIR.exists()} writable={os.access(CACHE_DIR, os.W_OK)}",
     flush=True,
 )
 
@@ -122,8 +125,8 @@ def fetch_player_iv(person_id: str, session: Optional[requests.Session] = None) 
                 _player_iv_cache[person_id] = result
                 save_to_disk_cache(CACHE_DIR, cache_key, result)
                 return result
-    except Exception:
-        pass
+    except (requests.exceptions.RequestException, ValueError, KeyError) as exc:
+        logger.warning("fetch_player_iv failed for person_id=%s: %s", person_id, exc)
     
     return None
 

@@ -35,13 +35,13 @@ API_BASE = "https://api-lancelot.ffbridge.fr"
 REQUIRES_AUTH = False
 
 # Cache root can be redirected to a persistent Railway Volume, e.g. /data/ffbridge
-DATA_ROOT = pathlib.Path(os.getenv("FFBRIDGE_CACHE_DIR", "data/ffbridge"))
+DATA_ROOT = pathlib.Path(os.getenv("FFBRIDGE_CACHE_DIR", "data/ffbridge")).resolve()
 CACHE_DIR = DATA_ROOT / 'lancelot_cache'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 print(
     f"[lancelot] FFBRIDGE_CACHE_DIR={os.getenv('FFBRIDGE_CACHE_DIR', '(not set)')!r} "
-    f"→ CACHE_DIR={CACHE_DIR.resolve()} exists={CACHE_DIR.exists()} "
-    f"writable={os.access(CACHE_DIR, os.W_OK)}",
+    f"→ DATA_ROOT={DATA_ROOT} CACHE_DIR={CACHE_DIR} "
+    f"exists={CACHE_DIR.exists()} writable={os.access(CACHE_DIR, os.W_OK)}",
     flush=True,
 )
 
