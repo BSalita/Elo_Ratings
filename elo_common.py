@@ -477,7 +477,8 @@ def render_app_footer(
             Project lead is Robert Salita research@AiPolice.org. Code written in Python by Cursor AI. UI written in streamlit. Data engine is polars. Repo: <a href="https://github.com/BSalita/Elo_Ratings" target="_blank" style="color: #80cbc4;">github.com/BSalita/Elo_Ratings</a><br>
             Query Params:{st_module.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}<br>
             Streamlit:{st_module.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pandas_version} polars:{polars_version} duckdb:{duckdb_version} endplay:{endplay_version}<br>
-            {memory_line}
+            {memory_line}<br>
+            System Current Date: {datetime.now().strftime('%Y-%m-%d')}
         </div>
     """,
         unsafe_allow_html=True,
@@ -485,4 +486,3 @@ def render_app_footer(
 
     if source_line:
         st_module.caption(source_line)
-    st_module.caption(f"System Current Date: {datetime.now().strftime('%Y-%m-%d')}")
