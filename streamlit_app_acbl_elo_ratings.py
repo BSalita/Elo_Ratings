@@ -156,6 +156,32 @@ def _parquet_source_for(club_or_tournament: str) -> tuple[str, dict | None]:
         raise FileNotFoundError(f"Missing file: {file_path}")
     return str(file_path), None
 
+
+def _table_cache_keys() -> list[str]:
+    return [k for k in st.session_state.keys() if isinstance(k, str) and k.startswith("cached_table_")]
+
+
+def _clear_table_cache() -> None:
+    for k in _table_cache_keys():
+        del st.session_state[k]
+
+
+def _prune_table_cache(current_key: str, max_entries: int = 2) -> None:
+    """Keep at most max_entries cached table DataFrames in session_state."""
+    keys = _table_cache_keys()
+    # Keep current key and the newest keys by insertion order (dict order is insertion-ordered).
+    keep = [k for k in keys if k == current_key]
+    for k in reversed(keys):
+        if k == current_key:
+            continue
+        if len(keep) >= max_entries:
+            break
+        keep.append(k)
+    keep_set = set(keep)
+    for k in keys:
+        if k not in keep_set:
+            del st.session_state[k]
+
 # -------------------------------
 # SQL Query Support
 # -------------------------------
@@ -342,6 +368,39 @@ def get_elo_column_names(elo_rating_type: str) -> dict:
             "pair_ns": "Elo_R_NS",
             "pair_ew": "Elo_R_EW"
         }
+
+
+def _required_columns_for_mode(rating_type: str, elo_rating_type: str) -> list[str]:
+    """Return minimal parquet columns required for the selected report mode."""
+    cols = {
+        "Date", "session_id", "is_virtual_game", "Pct_NS", "Round", "Board",
+        "DD_Tricks_Diff", "Is_Par_Suit", "Is_Par_Contract", "Is_Sacrifice",
+        "Pair_Number_NS", "Pair_Number_EW",
+    }
+    for p in "NESW":
+        cols.update({f"Player_ID_{p}", f"Player_Name_{p}", f"MasterPoints_{p}"})
+
+    elo_cols = get_elo_column_names(elo_rating_type)
+    if rating_type == "Players":
+        player_pat = elo_cols.get("player_pattern")
+        if player_pat:
+            for p in "NESW":
+                cols.add(player_pat.format(pos=p))
+                cols.add(f"Elo_R_{p}_Before")  # used by detail view for before/after
+    else:  # Pairs
+        pair_ns = elo_cols.get("pair_ns")
+        pair_ew = elo_cols.get("pair_ew")
+        if pair_ns:
+            cols.add(pair_ns)
+        if pair_ew:
+            cols.add(pair_ew)
+        player_pat = elo_cols.get("player_pattern")
+        if player_pat:
+            for p in "NESW":
+                cols.add(player_pat.format(pos=p))
+        cols.update({"Elo_R_NS_Before", "Elo_R_EW_Before"})  # detail before/after
+
+    return sorted(cols)
 
 
 # -------------------------------
@@ -2035,10 +2094,10 @@ def main():
     # Data Loading
     # -------------------------------
 
-    def load_dataset(dataset_name: str, date_from_str: str):
+    def load_dataset(dataset_name: str, date_from_str: str, columns: list[str] | None = None):
         """Load one dataset lazily to reduce memory pressure."""
         date_from = None if date_from_str == "None" else datetime.fromisoformat(date_from_str)
-        df = load_elo_ratings(dataset_name, columns=None, date_from=date_from)
+        df = load_elo_ratings(dataset_name, columns=columns, date_from=date_from)
         return _filter_valid_percentages_acbl(df)
 
     # Convert date_from to string for caching key
@@ -2047,6 +2106,9 @@ def main():
     # Load only the currently selected event dataset (lazy loading).
     selected_event_for_load = st.session_state.get("event_type", "Club").lower()
     selected_event_for_load = "club" if selected_event_for_load not in ("club", "tournament") else selected_event_for_load
+    selected_rating_for_load = st.session_state.get("rating_type", "Players")
+    selected_elo_type_for_load = st.session_state.get("elo_rating_type", "Current Rating (End of Session)")
+    required_columns = _required_columns_for_mode(selected_rating_for_load, selected_elo_type_for_load)
     must_reload = (
         'all_data' not in st.session_state
         or 'data_date_from' not in st.session_state
@@ -2057,7 +2119,7 @@ def main():
     if must_reload:
         try:
             with st.spinner(f"Loading {selected_event_for_load} dataset..."):
-                all_data = {selected_event_for_load: load_dataset(selected_event_for_load, date_from_str)}
+                all_data = {selected_event_for_load: load_dataset(selected_event_for_load, date_from_str, columns=required_columns)}
             st.success("Datasets loaded successfully")
             
             # Store data in session state for reuse
@@ -2072,13 +2134,13 @@ def main():
         # Use already loaded data
         all_data = st.session_state.all_data
 
-    def ensure_dataset_loaded(dataset_name: str):
+    def ensure_dataset_loaded(dataset_name: str, columns: list[str] | None = None):
         """Load missing dataset on-demand (used by debug/comparison paths)."""
         nonlocal all_data
         if dataset_name in all_data:
             return
         with st.spinner(f"Loading {dataset_name} dataset..."):
-            all_data[dataset_name] = load_dataset(dataset_name, date_from_str)
+            all_data[dataset_name] = load_dataset(dataset_name, date_from_str, columns=columns)
         st.session_state.all_data = all_data
     
     # Initialize SQL query settings
@@ -2095,7 +2157,7 @@ def main():
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
         st.sidebar.markdown("🔗 [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
         club_or_tournament = st.radio("Event type", options=["Club", "Tournament"], index=0, horizontal=True, key="event_type")
-        rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=True)
+        rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=True, key="rating_type")
         top_n = st.number_input("Top N players or pairs", min_value=50, max_value=5000, value=1000, step=50)
         min_sessions = st.number_input("Minimum sessions played", min_value=1, max_value=200, value=30, step=1)
         rating_method = st.selectbox("Elo Rating statistic", options=["Avg", "Max", "Latest"], index=0)
@@ -2122,8 +2184,13 @@ def main():
                 "Expected Rating"
             ]
         
-        elo_rating_type = st.selectbox("Elo rating moment", options=elo_options, index=0, 
-                                     help="Choose timing of Elo analysis")
+        elo_rating_type = st.selectbox(
+            "Elo rating moment",
+            options=elo_options,
+            index=0,
+            key="elo_rating_type",
+            help="Choose timing of Elo analysis"
+        )
         
         # Player name filter (use a stable session key to avoid rerun inconsistencies)
         def _on_player_name_enter():
@@ -2261,12 +2328,7 @@ def main():
         
         # Clear previous results immediately when settings change
         import gc
-        if 'previous_table_df' in st.session_state:
-            del st.session_state.previous_table_df
-        if 'cached_table_df' in st.session_state:
-            del st.session_state.cached_table_df
-        if 'cached_table_settings' in st.session_state:
-            del st.session_state.cached_table_settings
+        _clear_table_cache()
         if 'sql_query_history' in st.session_state:
             st.session_state.sql_query_history = []
         gc.collect()
@@ -2275,8 +2337,8 @@ def main():
     if st.session_state.get('run_comprehensive_comparison', False):
         st.markdown("## 🔍 **Comprehensive Implementation Comparison**")
         st.markdown("Testing all combinations of datasets, rating types, methods, and Elo rating types...")
-        ensure_dataset_loaded("club")
-        ensure_dataset_loaded("tournament")
+        ensure_dataset_loaded("club", columns=None)
+        ensure_dataset_loaded("tournament", columns=None)
         
         # Run comprehensive comparison
         comprehensive_results = run_comprehensive_comparison(all_data, top_n=50, min_sessions=5)
@@ -2294,7 +2356,7 @@ def main():
     if st.session_state.get('run_comprehensive_comparison_club', False):
         st.markdown("## 🔍 **Club-only Polars vs SQL Comparison**")
         st.markdown("Testing all variations on the club dataset only...")
-        ensure_dataset_loaded("club")
+        ensure_dataset_loaded("club", columns=None)
         comprehensive_results = run_comprehensive_comparison(all_data, top_n=50, min_sessions=5, datasets_filter=['club'])
         display_comprehensive_results(comprehensive_results)
         st.session_state.run_comprehensive_comparison_club = False
@@ -2304,7 +2366,7 @@ def main():
     if st.session_state.get('run_comprehensive_comparison_tournament', False):
         st.markdown("## 🔍 **Tournament-only Polars vs SQL Comparison**")
         st.markdown("Testing all variations on the tournament dataset only...")
-        ensure_dataset_loaded("tournament")
+        ensure_dataset_loaded("tournament", columns=None)
         comprehensive_results = run_comprehensive_comparison(all_data, top_n=50, min_sessions=5, datasets_filter=['tournament'])
         display_comprehensive_results(comprehensive_results)
         st.session_state.run_comprehensive_comparison_tournament = False
@@ -2316,7 +2378,7 @@ def main():
         
         # Run a single test to debug
         try:
-            ensure_dataset_loaded("club")
+            ensure_dataset_loaded("club", columns=None)
             df = all_data['club']
             rating_type = "Players"
             rating_method = "Avg"
@@ -2379,9 +2441,8 @@ def main():
         # Memory cleanup - clear previous results and force garbage collection
         import gc
         
-        # Clear any previous table data from session state (but preserve cached table if settings haven't changed)
-        if 'previous_table_df' in st.session_state:
-            del st.session_state.previous_table_df
+        # Keep only bounded cached tables; avoid duplicate heavy references
+        _prune_table_cache(current_key="")
         if 'sql_query_history' in st.session_state:
             # Keep only the last 5 queries to prevent memory buildup
             st.session_state.sql_query_history = st.session_state.sql_query_history[-5:]
@@ -2401,7 +2462,7 @@ def main():
 
         # Get data
         dataset_type = club_or_tournament.lower()
-        ensure_dataset_loaded(dataset_type)
+        ensure_dataset_loaded(dataset_type, columns=_required_columns_for_mode(rating_type, elo_rating_type))
         df = all_data[dataset_type]
         
         # Apply date range filter
@@ -2504,6 +2565,7 @@ def main():
                         
                         # Cache the result
                         st.session_state[cache_key] = table_df
+                        _prune_table_cache(current_key=cache_key, max_entries=2)
                         st.success(f"✅ Report generated successfully using {engine_name} engine. Returned {len(table_df)} rows.")
                     except Exception as e:
                         st.error(f"❌ Report generation failed with {engine_name} engine: {e}")
@@ -2629,12 +2691,7 @@ def main():
                     selected_row = selected_rows.iloc[0] if hasattr(selected_rows, 'iloc') else selected_rows[0]
                     _show_detail_for_selected_row(selected_row, df, rating_type, elo_rating_type)
                 
-                # Store table_df in session state for cleanup on next run
-                st.session_state.previous_table_df = table_df
-                
-                # Cache table_df and settings for reuse in PDF generation
-                st.session_state.cached_table_df = table_df
-                st.session_state.cached_table_settings = current_settings.copy()
+                # Mark that table is displayed (lightweight state only)
                 st.session_state.table_displayed = True
             
             # 3. SQL Query Interface for additional queries (only if enabled)
@@ -2775,6 +2832,7 @@ def main():
                         
                         # Cache the result
                         st.session_state[cache_key] = table_df
+                        _prune_table_cache(current_key=cache_key, max_entries=2)
                         st.info(f"✅ Using {engine_name} engine for PDF generation")
                     except Exception as e:
                         st.error(f"❌ PDF Generation Failed with {engine_name} engine: {e}")
@@ -2813,11 +2871,27 @@ def main():
             )
 
     # Styled footer (matches FFBridge app)
+    try:
+        import psutil
+
+        def _gb(v: int) -> float:
+            return v / (1024 ** 3)
+
+        vm = psutil.virtual_memory()
+        sm = psutil.swap_memory()
+        memory_line = (
+            f"Memory: RAM {_gb(vm.used):.2f}/{_gb(vm.total):.2f} GB ({vm.percent:.1f}%) • "
+            f"Virtual/Pagefile {_gb(sm.used):.2f}/{_gb(sm.total):.2f} GB ({sm.percent:.1f}%)"
+        )
+    except Exception:
+        memory_line = "Memory: RAM/Virtual usage unavailable"
+
     st.markdown(f"""
         <div style="text-align: center; color: #80cbc4; font-size: 0.8rem; opacity: 0.7;">
             Project lead is Robert Salita research@AiPolice.org. Code written in Python by Cursor AI. UI written in streamlit. Data engine is polars. Repo: <a href="https://github.com/BSalita/Elo_Ratings" target="_blank" style="color: #80cbc4;">github.com/BSalita/Elo_Ratings</a><br>
             Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}<br>
-            Streamlit:{st.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pd.__version__} polars:{pl.__version__} duckdb:{duckdb.__version__} endplay:{ENDPLAY_VERSION}
+            Streamlit:{st.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pd.__version__} polars:{pl.__version__} duckdb:{duckdb.__version__} endplay:{ENDPLAY_VERSION}<br>
+            {memory_line}
         </div>
     """, unsafe_allow_html=True)
 

@@ -26,6 +26,7 @@ beautifulsoup4
 
 # Standard library extensions (if needed)
 typing-extensions
+psutil
 
 # Development and debugging
 IPython
