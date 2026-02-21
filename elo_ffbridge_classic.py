@@ -131,6 +131,12 @@ def get_session() -> Optional[requests.Session]:
         return session
     
     env_token = os.getenv('FFBRIDGE_BEARER_TOKEN')
+    # Be tolerant of misconfigured env var values like:
+    # "FFBRIDGE_BEARER_TOKEN=eyJ..."
+    if env_token:
+        env_token = env_token.strip().strip('"').strip("'")
+        if env_token.startswith("FFBRIDGE_BEARER_TOKEN="):
+            env_token = env_token.split("=", 1)[1].strip()
     if env_token:
         session = requests.Session()
         headers = {
@@ -210,8 +216,9 @@ def _fetch_tournament_list_single(session: requests.Session, series_id: int, lim
                 
                 save_to_disk_cache(CACHE_DIR, "tournament_list", tournaments, {"limit": limit}, series_id=series_id)
                 return tournaments
-    except Exception as e:
-        st.warning(f"Error fetching tournament list: {e}")
+    except Exception:
+        # Avoid echoing raw exception text (may include sensitive header values)
+        st.warning("Error fetching tournament list.")
     
     return []
 
@@ -433,7 +440,8 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
         st.warning(f"Timeout fetching tournament {tournament_id} after {REQUEST_TIMEOUT}s - skipping")
     except Exception as e:
         print(f"[Classic] ERROR: {e} for {url}", flush=True)
-        st.warning(f"Error fetching tournament results: {e}")
+        # Avoid echoing raw exception text (may include sensitive header values)
+        st.warning("Error fetching tournament results.")
     
     return [], False
 
