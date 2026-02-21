@@ -16,10 +16,12 @@ duckdb
 
 # Data visualization
 matplotlib
+seaborn
 
 # PDF generation for reports
 reportlab
 markdown
+beautifulsoup4
 
 # Standard library extensions (if needed)
 typing-extensions
