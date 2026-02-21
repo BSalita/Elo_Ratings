@@ -501,6 +501,7 @@ def render_app_footer(
     duckdb_version = dependency_versions.get("duckdb", "N/A")
     memory_line = get_memory_usage_line()
     cache_diagnostic_line = get_cache_diagnostic_line()
+    source_line_html = f"{source_line}<br>" if source_line else ""
     st_module.markdown(
         f"""
         <div style="text-align: center; color: #80cbc4; font-size: 0.8rem; opacity: 0.7;">
@@ -509,11 +510,9 @@ def render_app_footer(
             Streamlit:{st_module.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pandas_version} polars:{polars_version} duckdb:{duckdb_version} endplay:{endplay_version}<br>
             {memory_line}<br>
             {cache_diagnostic_line}<br>
+            {source_line_html}
             System Current Date: {datetime.now().strftime('%Y-%m-%d')}
         </div>
     """,
         unsafe_allow_html=True,
     )
-
-    if source_line:
-        st_module.caption(source_line)
