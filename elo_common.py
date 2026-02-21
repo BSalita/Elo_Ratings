@@ -501,22 +501,19 @@ def render_app_footer(
     polars_version = dependency_versions.get("polars", pl.__version__)
     duckdb_version = dependency_versions.get("duckdb", "N/A")
     memory_line = get_memory_usage_line()
-    cache_diagnostic_line = get_cache_diagnostic_line()
-    source_line_html = f"{html.escape(source_line)}<br>" if source_line else ""
-    memory_line_html = html.escape(memory_line)
-    cache_diagnostic_line_html = html.escape(cache_diagnostic_line)
-    date_line_html = html.escape(f"System Current Date: {datetime.now().strftime('%Y-%m-%d')}")
+    date_str = datetime.now().strftime('%Y-%m-%d')
+
+    # Build the centred info block: project credit + versions + memory + date all in one div.
+    source_html = f"{html.escape(source_line)}<br>" if source_line else ""
     st_module.markdown(
         f"""
         <div style="text-align: center; color: #80cbc4; font-size: 0.8rem; opacity: 0.7;">
             Project lead is Robert Salita research@AiPolice.org. Code written in Python by Cursor AI. UI written in streamlit. Data engine is polars. Repo: <a href="https://github.com/BSalita/Elo_Ratings" target="_blank" style="color: #80cbc4;">github.com/BSalita/Elo_Ratings</a><br>
             Query Params:{st_module.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}<br>
             Streamlit:{st_module.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pandas_version} polars:{polars_version} duckdb:{duckdb_version} endplay:{endplay_version}<br>
-            {memory_line_html}<br>
-            {cache_diagnostic_line_html}<br>
-            {source_line_html}
-            <span style="display: inline-block; text-align: center; color: #80cbc4;">{date_line_html}</span>
+            {source_html}{html.escape(memory_line)}<br>
+            System Current Date: {html.escape(date_str)}
         </div>
-    """,
+        """,
         unsafe_allow_html=True,
     )
