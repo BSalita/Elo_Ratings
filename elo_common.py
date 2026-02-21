@@ -483,13 +483,6 @@ def render_app_footer(
         unsafe_allow_html=True,
     )
 
-    source_line_html = f"{source_line}<br>" if source_line else ""
-    st_module.markdown(
-        f"""
-        <div style="text-align: center; padding: 2rem 0; color: #80cbc4; font-size: 0.9rem; opacity: 0.8;">
-            {source_line_html}
-            System Current Date: {datetime.now().strftime('%Y-%m-%d')}
-        </div>
-    """,
-        unsafe_allow_html=True,
-    )
+    if source_line:
+        st_module.caption(source_line)
+    st_module.caption(f"System Current Date: {datetime.now().strftime('%Y-%m-%d')}")
