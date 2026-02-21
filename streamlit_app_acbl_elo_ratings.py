@@ -2021,36 +2021,35 @@ def main():
     # Data Loading
     # -------------------------------
 
-    def load_and_enrich_datasets(date_from_str: str):
-        """Load datasets (benefits from RAM disk if mounted)."""
+    def load_dataset(dataset_name: str, date_from_str: str):
+        """Load one dataset lazily to reduce memory pressure."""
         date_from = None if date_from_str == "None" else datetime.fromisoformat(date_from_str)
-        
-        # Load both datasets
-        club_df = load_elo_ratings("club", columns=None, date_from=date_from)
-        tournament_df = load_elo_ratings("tournament", columns=None, date_from=date_from)
-
-        # Exclude invalid percentage rows before any downstream aggregation/display
-        club_df = _filter_valid_percentages_acbl(club_df)
-        tournament_df = _filter_valid_percentages_acbl(tournament_df)
-        
-        return {
-            "club": club_df,
-            "tournament": tournament_df
-        }
+        df = load_elo_ratings(dataset_name, columns=None, date_from=date_from)
+        return _filter_valid_percentages_acbl(df)
 
     # Convert date_from to string for caching key
     date_from_str = "None" if date_from is None else date_from.isoformat()
 
-    # Load datasets once at startup
-    if 'all_data' not in st.session_state or 'data_date_from' not in st.session_state or st.session_state.data_date_from != date_from_str:
+    # Load only the currently selected event dataset (lazy loading).
+    selected_event_for_load = st.session_state.get("event_type", "Club").lower()
+    selected_event_for_load = "club" if selected_event_for_load not in ("club", "tournament") else selected_event_for_load
+    must_reload = (
+        'all_data' not in st.session_state
+        or 'data_date_from' not in st.session_state
+        or st.session_state.data_date_from != date_from_str
+        or st.session_state.get('loaded_dataset') != selected_event_for_load
+        or selected_event_for_load not in st.session_state.get('all_data', {})
+    )
+    if must_reload:
         try:
-            with st.spinner("Loading club and tournament datasets..."):
-                all_data = load_and_enrich_datasets(date_from_str)
+            with st.spinner(f"Loading {selected_event_for_load} dataset..."):
+                all_data = {selected_event_for_load: load_dataset(selected_event_for_load, date_from_str)}
             st.success("Datasets loaded successfully")
             
             # Store data in session state for reuse
             st.session_state.all_data = all_data
             st.session_state.data_date_from = date_from_str
+            st.session_state.loaded_dataset = selected_event_for_load
             
         except Exception as e:
             st.error(f"❌ Failed to load datasets: {e}")
@@ -2058,6 +2057,15 @@ def main():
     else:
         # Use already loaded data
         all_data = st.session_state.all_data
+
+    def ensure_dataset_loaded(dataset_name: str):
+        """Load missing dataset on-demand (used by debug/comparison paths)."""
+        nonlocal all_data
+        if dataset_name in all_data:
+            return
+        with st.spinner(f"Loading {dataset_name} dataset..."):
+            all_data[dataset_name] = load_dataset(dataset_name, date_from_str)
+        st.session_state.all_data = all_data
     
     # Initialize SQL query settings
     if 'show_sql_query' not in st.session_state:
@@ -2072,7 +2080,7 @@ def main():
     with st.sidebar:
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
         st.sidebar.markdown("🔗 [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
-        club_or_tournament = st.radio("Event type", options=["Club", "Tournament"], index=0, horizontal=True)
+        club_or_tournament = st.radio("Event type", options=["Club", "Tournament"], index=0, horizontal=True, key="event_type")
         rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=True)
         top_n = st.number_input("Top N players or pairs", min_value=50, max_value=5000, value=1000, step=50)
         min_sessions = st.number_input("Minimum sessions played", min_value=1, max_value=200, value=30, step=1)
@@ -2253,6 +2261,8 @@ def main():
     if st.session_state.get('run_comprehensive_comparison', False):
         st.markdown("## 🔍 **Comprehensive Implementation Comparison**")
         st.markdown("Testing all combinations of datasets, rating types, methods, and Elo rating types...")
+        ensure_dataset_loaded("club")
+        ensure_dataset_loaded("tournament")
         
         # Run comprehensive comparison
         comprehensive_results = run_comprehensive_comparison(all_data, top_n=50, min_sessions=5)
@@ -2270,6 +2280,7 @@ def main():
     if st.session_state.get('run_comprehensive_comparison_club', False):
         st.markdown("## 🔍 **Club-only Polars vs SQL Comparison**")
         st.markdown("Testing all variations on the club dataset only...")
+        ensure_dataset_loaded("club")
         comprehensive_results = run_comprehensive_comparison(all_data, top_n=50, min_sessions=5, datasets_filter=['club'])
         display_comprehensive_results(comprehensive_results)
         st.session_state.run_comprehensive_comparison_club = False
@@ -2279,6 +2290,7 @@ def main():
     if st.session_state.get('run_comprehensive_comparison_tournament', False):
         st.markdown("## 🔍 **Tournament-only Polars vs SQL Comparison**")
         st.markdown("Testing all variations on the tournament dataset only...")
+        ensure_dataset_loaded("tournament")
         comprehensive_results = run_comprehensive_comparison(all_data, top_n=50, min_sessions=5, datasets_filter=['tournament'])
         display_comprehensive_results(comprehensive_results)
         st.session_state.run_comprehensive_comparison_tournament = False
@@ -2290,6 +2302,7 @@ def main():
         
         # Run a single test to debug
         try:
+            ensure_dataset_loaded("club")
             df = all_data['club']
             rating_type = "Players"
             rating_method = "Avg"
@@ -2374,6 +2387,7 @@ def main():
 
         # Get data
         dataset_type = club_or_tournament.lower()
+        ensure_dataset_loaded(dataset_type)
         df = all_data[dataset_type]
         
         # Apply date range filter
