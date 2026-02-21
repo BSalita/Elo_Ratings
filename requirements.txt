@@ -4,6 +4,7 @@
 # Core Streamlit web interface
 streamlit
 streamlit-aggrid==1.1.8.post1
+streamlit-extras
 python-dotenv
 
 # HTTP requests for API calls
