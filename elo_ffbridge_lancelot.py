@@ -25,6 +25,7 @@ from elo_ffbridge_common import (
     get_cache_path,
     save_to_disk_cache,
     load_from_disk_cache,
+    get_or_fetch_with_disk_cache,
 )
 
 # -------------------------------
@@ -210,18 +211,22 @@ def fetch_tournament_results(session_id: str, tournament_date: str = "", series_
     date_part = date_match.group(1) if date_match else ""
     friendly_name = f"ranking_{session_id}_{date_part}" if date_part else f"ranking_{session_id}"
     
-    # Check disk cache
-    cached_data = load_from_disk_cache(CACHE_DIR, friendly_name, max_age_hours=None, series_id=series_id)
-    if cached_data:
-        return _normalize_ranking_results(cached_data, series_id=series_id), True
-    
-    # Fetch from API
-    data = lancelot_get(f"/results/sessions/{session_id}/ranking")
-    
-    if data and isinstance(data, list):
-        save_to_disk_cache(CACHE_DIR, friendly_name, data, series_id=series_id)
-        return _normalize_ranking_results(data, series_id=series_id), False
-    
+    def _fetch_ranking():
+        data = lancelot_get(f"/results/sessions/{session_id}/ranking")
+        if data and isinstance(data, list):
+            return data
+        return None
+
+    cached_or_fetched, was_cached = get_or_fetch_with_disk_cache(
+        CACHE_DIR,
+        friendly_name,
+        fetch_fn=_fetch_ranking,
+        params=None,
+        max_age_hours=None,
+        series_id=series_id,
+    )
+    if cached_or_fetched:
+        return _normalize_ranking_results(cached_or_fetched, series_id=series_id), was_cached
     return [], False
 
 

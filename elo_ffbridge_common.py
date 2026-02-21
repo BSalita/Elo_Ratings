@@ -8,8 +8,10 @@ Used by both the Classic and Lancelot API adapters.
 """
 
 import json
+import os
 import re
 import pathlib
+import time
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
@@ -122,6 +124,100 @@ def get_cache_path(
     return target_dir / f"{safe_name}.json"
 
 
+def _get_lock_path(cache_path: pathlib.Path) -> pathlib.Path:
+    return cache_path.with_suffix(cache_path.suffix + ".lock")
+
+
+def _wait_for_unlock(cache_path: pathlib.Path, max_wait_seconds: float = 3.0, poll_seconds: float = 0.1) -> None:
+    """Wait briefly if another process is currently writing this cache key."""
+    lock_path = _get_lock_path(cache_path)
+    deadline = time.time() + max_wait_seconds
+    while lock_path.exists() and time.time() < deadline:
+        time.sleep(poll_seconds)
+
+
+class _CacheFileLock:
+    """File lock based on atomic lock-file creation."""
+
+    def __init__(
+        self,
+        cache_path: pathlib.Path,
+        timeout_seconds: float = 30.0,
+        stale_after_seconds: float = 300.0,
+        poll_seconds: float = 0.1,
+    ) -> None:
+        self.cache_path = cache_path
+        self.lock_path = _get_lock_path(cache_path)
+        self.timeout_seconds = timeout_seconds
+        self.stale_after_seconds = stale_after_seconds
+        self.poll_seconds = poll_seconds
+        self._locked = False
+
+    def __enter__(self):
+        deadline = time.time() + self.timeout_seconds
+        while True:
+            try:
+                fd = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                try:
+                    os.write(fd, f"{os.getpid()} {time.time()}".encode("utf-8"))
+                finally:
+                    os.close(fd)
+                self._locked = True
+                return self
+            except FileExistsError:
+                # Best-effort stale lock cleanup.
+                try:
+                    mtime = self.lock_path.stat().st_mtime
+                    if time.time() - mtime > self.stale_after_seconds:
+                        self.lock_path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+
+                if time.time() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for cache lock: {self.lock_path}")
+                time.sleep(self.poll_seconds)
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._locked:
+            try:
+                self.lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
+
+
+def _write_cache_file(
+    cache_path: pathlib.Path,
+    identifier: str,
+    data: Any,
+    series_id: Optional[Any] = None,
+) -> None:
+    """Write cache payload atomically (temp file + os.replace)."""
+    tmp_path = cache_path.with_suffix(cache_path.suffix + f".tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "timestamp": datetime.now().isoformat(),
+                    "identifier": identifier,
+                    "series_id": series_id,
+                    "data": data,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, cache_path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def save_to_disk_cache(
     cache_dir: pathlib.Path,
     identifier: str,
@@ -141,13 +237,8 @@ def save_to_disk_cache(
     """
     cache_path = get_cache_path(cache_dir, identifier, params, series_id)
     try:
-        with open(cache_path, 'w', encoding='utf-8') as f:
-            json.dump({
-                'timestamp': datetime.now().isoformat(),
-                'identifier': identifier,
-                'series_id': series_id,
-                'data': data
-            }, f, ensure_ascii=False, indent=2)
+        with _CacheFileLock(cache_path):
+            _write_cache_file(cache_path, identifier, data, series_id=series_id)
     except Exception:
         pass  # Silently fail on cache save errors
 
@@ -175,7 +266,10 @@ def load_from_disk_cache(
     cache_path = get_cache_path(cache_dir, identifier, params, series_id)
     
     if not cache_path.exists():
-        return None
+        # Another session may currently be writing this cache key.
+        _wait_for_unlock(cache_path)
+        if not cache_path.exists():
+            return None
     
     try:
         with open(cache_path, 'r', encoding='utf-8') as f:
@@ -190,6 +284,38 @@ def load_from_disk_cache(
         return cache_data['data']
     except Exception:
         return None
+
+
+def get_or_fetch_with_disk_cache(
+    cache_dir: pathlib.Path,
+    identifier: str,
+    fetch_fn,
+    params: Optional[Dict] = None,
+    max_age_hours: Optional[int] = None,
+    series_id: Optional[Any] = None,
+) -> tuple[Optional[Any], bool]:
+    """
+    Single-flight cache helper:
+    - First tries cache.
+    - If missing, acquires per-key lock, rechecks cache, then fetches and saves.
+    Returns (data, was_cached).
+    """
+    cached = load_from_disk_cache(cache_dir, identifier, params=params, max_age_hours=max_age_hours, series_id=series_id)
+    if cached is not None:
+        return cached, True
+
+    cache_path = get_cache_path(cache_dir, identifier, params, series_id)
+    with _CacheFileLock(cache_path):
+        cached = load_from_disk_cache(cache_dir, identifier, params=params, max_age_hours=max_age_hours, series_id=series_id)
+        if cached is not None:
+            return cached, True
+
+        data = fetch_fn()
+        if data is None:
+            return None, False
+
+        _write_cache_file(cache_path, identifier, data, series_id=series_id)
+        return data, False
 
 
 # -------------------------------
