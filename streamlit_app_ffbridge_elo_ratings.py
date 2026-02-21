@@ -1220,8 +1220,10 @@ def main():
         st.sidebar.markdown("🔗 [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
         
         # API Backend selection
+        # Railway-friendly default: use Classic only when token is present, otherwise Lancelot.
         if "selected_api" not in st.session_state:
-            st.session_state.selected_api = "FFBridge Classic API"
+            has_classic_token = bool(os.getenv("FFBRIDGE_BEARER_TOKEN", "").strip())
+            st.session_state.selected_api = "FFBridge Classic API" if has_classic_token else "FFBridge Lancelot API"
         
         selected_api_name = st.selectbox(
             "Bridge API",
@@ -1233,11 +1235,18 @@ def main():
         # Get the appropriate API module
         api_module = API_BACKENDS[selected_api_name]
         
-        # Check authentication if required
+        # Check authentication if required; auto-fallback to Lancelot for easier deployment.
         if api_module.REQUIRES_AUTH and not api_module.is_authenticated():
-            st.error("❌ **Authentication Error**")
-            st.markdown(api_module.get_auth_error_message())
-            return
+            fallback_api = "FFBridge Lancelot API"
+            if fallback_api in API_BACKENDS:
+                st.warning("Classic API auth missing. Automatically using Lancelot API.")
+                st.session_state.selected_api = fallback_api
+                selected_api_name = fallback_api
+                api_module = API_BACKENDS[selected_api_name]
+            else:
+                st.error("❌ **Authentication Error**")
+                st.markdown(api_module.get_auth_error_message())
+                return
         
         # Tournament selection
         series_names = api_module.SERIES_NAMES

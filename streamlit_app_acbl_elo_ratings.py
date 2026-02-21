@@ -2090,7 +2090,7 @@ def main():
         online_filter = st.selectbox(
             "Game type",
             options=["All", "Local Only", "Online Only"],
-            index=0,
+            index=1,
             help="Filter by game type: Local (in-person), Online (virtual), or All games"
         )
         
