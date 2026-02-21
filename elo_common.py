@@ -11,6 +11,9 @@ Contains:
 - Common UI helpers (AgGrid sizing, header/footer)
 """
 
+import os
+import sys
+from datetime import datetime
 import polars as pl
 
 
@@ -396,3 +399,97 @@ h1, h2, h3 {
 def apply_app_theme(st_module) -> None:
     """Apply the common dark green/gold theme CSS to a Streamlit app."""
     st_module.markdown(APP_THEME_CSS, unsafe_allow_html=True)
+
+
+def get_memory_usage_line() -> str:
+    """
+    Return a formatted memory usage line for footer display.
+
+    Prefers Linux cgroup limits/usage (useful in containers like Railway),
+    then falls back to psutil host metrics when cgroup values are unavailable.
+    """
+    try:
+        import psutil
+
+        def _gb(v: int) -> float:
+            return v / (1024 ** 3)
+
+        ram_used = ram_total = None
+        swap_used = swap_total = None
+
+        # Linux cgroup v2 paths (container-aware)
+        try:
+            if os.path.exists("/sys/fs/cgroup/memory.current") and os.path.exists("/sys/fs/cgroup/memory.max"):
+                with open("/sys/fs/cgroup/memory.current", "r", encoding="utf-8") as f:
+                    ram_used = int(f.read().strip())
+                with open("/sys/fs/cgroup/memory.max", "r", encoding="utf-8") as f:
+                    max_raw = f.read().strip()
+                ram_total = None if max_raw == "max" else int(max_raw)
+
+                if os.path.exists("/sys/fs/cgroup/memory.swap.current"):
+                    with open("/sys/fs/cgroup/memory.swap.current", "r", encoding="utf-8") as f:
+                        swap_used = int(f.read().strip())
+                if os.path.exists("/sys/fs/cgroup/memory.swap.max"):
+                    with open("/sys/fs/cgroup/memory.swap.max", "r", encoding="utf-8") as f:
+                        smax_raw = f.read().strip()
+                    swap_total = None if smax_raw == "max" else int(smax_raw)
+        except Exception:
+            ram_used = ram_total = swap_used = swap_total = None
+
+        if ram_used is None or ram_total is None or ram_total <= 0:
+            vm = psutil.virtual_memory()
+            ram_used, ram_total = vm.used, vm.total
+        ram_pct = (ram_used / ram_total * 100.0) if ram_total else 0.0
+
+        if swap_used is None or swap_total is None:
+            sm = psutil.swap_memory()
+            swap_used, swap_total = sm.used, sm.total
+
+        if swap_total and swap_total > 0:
+            swap_pct = (swap_used / swap_total * 100.0)
+            swap_text = f"Virtual/Pagefile {_gb(swap_used):.2f}/{_gb(swap_total):.2f} GB ({swap_pct:.1f}%)"
+        else:
+            swap_text = "Virtual/Pagefile N/A (swap disabled)"
+
+        return (
+            f"Memory: RAM {_gb(ram_used):.2f}/{_gb(ram_total):.2f} GB ({ram_pct:.1f}%) • "
+            f"{swap_text}"
+        )
+    except Exception:
+        return "Memory: RAM/Virtual usage unavailable"
+
+
+def render_app_footer(
+    st_module,
+    endplay_version: str,
+    source_line: str | None = None,
+    dependency_versions: dict[str, str] | None = None,
+) -> None:
+    """Render the common footer used by both Streamlit apps."""
+    dependency_versions = dependency_versions or {}
+    pandas_version = dependency_versions.get("pandas", "N/A")
+    polars_version = dependency_versions.get("polars", pl.__version__)
+    duckdb_version = dependency_versions.get("duckdb", "N/A")
+    memory_line = get_memory_usage_line()
+    st_module.markdown(
+        f"""
+        <div style="text-align: center; color: #80cbc4; font-size: 0.8rem; opacity: 0.7;">
+            Project lead is Robert Salita research@AiPolice.org. Code written in Python by Cursor AI. UI written in streamlit. Data engine is polars. Repo: <a href="https://github.com/BSalita/Elo_Ratings" target="_blank" style="color: #80cbc4;">github.com/BSalita/Elo_Ratings</a><br>
+            Query Params:{st_module.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}<br>
+            Streamlit:{st_module.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pandas_version} polars:{polars_version} duckdb:{duckdb_version} endplay:{endplay_version}<br>
+            {memory_line}
+        </div>
+    """,
+        unsafe_allow_html=True,
+    )
+
+    source_line_html = f"{source_line}<br>" if source_line else ""
+    st_module.markdown(
+        f"""
+        <div style="text-align: center; padding: 2rem 0; color: #80cbc4; font-size: 0.9rem; opacity: 0.8;">
+            {source_line_html}
+            System Current Date: {datetime.now().strftime('%Y-%m-%d')}
+        </div>
+    """,
+        unsafe_allow_html=True,
+    )

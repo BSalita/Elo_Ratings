@@ -38,8 +38,8 @@ if sys.platform == "win32":
                 os._exit(0)
             return False
         _kernel32.SetConsoleCtrlHandler(_console_ctrl_handler, True)
-    except Exception:
-        pass
+    except (AttributeError, OSError) as exc:
+        sys.stderr.write(f"[ffbridge] console ctrl handler setup skipped: {exc}\n")
 
 import pandas as pd
 import polars as pl
@@ -69,6 +69,7 @@ from elo_common import (
     get_elo_title,
     apply_app_theme,
     calculate_aggrid_height,
+    render_app_footer,
 )
 
 # Import FFBridge-specific utilities
@@ -175,7 +176,7 @@ def _bridgeinter_find_pair_pct(page_text: str, surname1: str, surname2: str) -> 
                     best_distance = distance
                     try:
                         best_match = float(m.group(1))
-                    except Exception:
+                    except (TypeError, ValueError):
                         pass
 
     return best_match
@@ -248,7 +249,7 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
             from datetime import datetime as dt
             d = dt.strptime(date_str, "%Y-%m-%d").date()
             is_octopus_day = d.weekday() in (0, 3)  # Monday or Thursday
-        except Exception:
+        except (TypeError, ValueError):
             pass
         
         if (is_octopus_name or is_octopus_day) and s1 and s2:
@@ -1864,67 +1865,16 @@ def main():
                     mime="application/pdf"
                 )
     
-    # Footer
-    try:
-        import psutil
-
-        def _gb(v: int) -> float:
-            return v / (1024 ** 3)
-
-        vm = psutil.virtual_memory()
-        sm = psutil.swap_memory()
-        memory_line = (
-            f"Memory: RAM {_gb(vm.used):.2f}/{_gb(vm.total):.2f} GB ({vm.percent:.1f}%) • "
-            f"Virtual/Pagefile {_gb(sm.used):.2f}/{_gb(sm.total):.2f} GB ({sm.percent:.1f}%)"
-        )
-    except Exception:
-        # Fallback for Linux containers without psutil.
-        try:
-            meminfo = {}
-            with open("/proc/meminfo", "r", encoding="utf-8") as f:
-                for line in f:
-                    parts = line.split(":", 1)
-                    if len(parts) != 2:
-                        continue
-                    key = parts[0].strip()
-                    val = parts[1].strip().split()[0]
-                    meminfo[key] = int(val) * 1024  # kB -> bytes
-
-            def _gb(v: int) -> float:
-                return v / (1024 ** 3)
-
-            ram_total = meminfo.get("MemTotal", 0)
-            ram_avail = meminfo.get("MemAvailable", 0)
-            ram_used = max(0, ram_total - ram_avail)
-            ram_pct = (ram_used / ram_total * 100.0) if ram_total else 0.0
-
-            swap_total = meminfo.get("SwapTotal", 0)
-            swap_free = meminfo.get("SwapFree", 0)
-            swap_used = max(0, swap_total - swap_free)
-            swap_pct = (swap_used / swap_total * 100.0) if swap_total else 0.0
-
-            memory_line = (
-                f"Memory: RAM {_gb(ram_used):.2f}/{_gb(ram_total):.2f} GB ({ram_pct:.1f}%) • "
-                f"Virtual/Pagefile {_gb(swap_used):.2f}/{_gb(swap_total):.2f} GB ({swap_pct:.1f}%)"
-            )
-        except Exception:
-            memory_line = "Memory: RAM/Virtual usage unavailable"
-
-    st.markdown(f"""
-        <div style="text-align: center; color: #80cbc4; font-size: 0.8rem; opacity: 0.7;">
-            Project lead is Robert Salita research@AiPolice.org. Code written in Python by Cursor AI. UI written in streamlit. Data engine is polars. Repo: <a href="https://github.com/BSalita/Elo_Ratings" target="_blank" style="color: #80cbc4;">github.com/BSalita/Elo_Ratings</a><br>
-            Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}<br>
-            Streamlit:{st.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pd.__version__} polars:{pl.__version__} duckdb:{duckdb.__version__} endplay:{ENDPLAY_VERSION}<br>
-            {memory_line}
-        </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown(f"""
-        <div style="text-align: center; padding: 2rem 0; color: #80cbc4; font-size: 0.9rem; opacity: 0.8;">
-            Data sourced using {selected_api_name} • {selected_tournament_label}<br>
-            System Current Date: {datetime.now().strftime('%Y-%m-%d')}
-        </div>
-    """, unsafe_allow_html=True)
+    render_app_footer(
+        st,
+        ENDPLAY_VERSION,
+        source_line=f"Data sourced using {selected_api_name} • {selected_tournament_label}",
+        dependency_versions={
+            "pandas": pd.__version__,
+            "polars": pl.__version__,
+            "duckdb": duckdb.__version__,
+        },
+    )
 
 
 if __name__ == "__main__":

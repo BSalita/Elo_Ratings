@@ -10,6 +10,7 @@ import os
 # Must be set before any numpy/scipy/MKL imports.
 os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
 
+import logging
 import pathlib
 import sys
 import time
@@ -29,8 +30,8 @@ if sys.platform == "win32":
                 os._exit(0)
             return False
         _kernel32.SetConsoleCtrlHandler(_console_ctrl_handler, True)
-    except Exception:
-        pass
+    except (AttributeError, OSError) as exc:
+        sys.stderr.write(f"[acbl] console ctrl handler setup skipped: {exc}\n")
 
 import pandas as pd
 import polars as pl
@@ -56,7 +57,10 @@ from elo_common import (
     ASSISTANT_LOGO_URL,
     apply_app_theme,
     post_process_elo_table,
+    render_app_footer,
 )
+
+logger = logging.getLogger(__name__)
 
 # -------------------------------
 # Masterpoints Range - Single Source of Truth
@@ -200,7 +204,7 @@ def get_db_connection():
         st.session_state.db_connection = duckdb.connect()
     # Configure DuckDB pragmas on every access (idempotent), so existing sessions pick up settings
     try:
-        import tempfile, os
+        import tempfile
         tmp_dir = tempfile.gettempdir().replace('\\', '/')
         st.session_state.db_connection.execute(f"PRAGMA temp_directory='{tmp_dir}';")
         # Use a conservative memory limit and enable parallelism sensibly
@@ -209,9 +213,51 @@ def get_db_connection():
         st.session_state.db_connection.execute(f"PRAGMA threads={threads};")
         # Reduce overhead in certain aggregations
         st.session_state.db_connection.execute("PRAGMA preserve_insertion_order=false;")
-    except Exception:
-        pass
+    except (duckdb.Error, OSError, RuntimeError) as exc:
+        logger.warning("DuckDB PRAGMA setup failed; continuing with defaults: %s", exc)
     return st.session_state.db_connection
+
+
+def _get_or_build_report_table_df(
+    df: pl.DataFrame,
+    generated_sql: str,
+    rating_type: str,
+    top_n: int,
+    min_sessions: int,
+    rating_method: str,
+    moving_avg_days: int,
+    elo_rating_type: str,
+    cache_key: str,
+    use_sql_engine: bool,
+) -> tuple[pl.DataFrame, bool, str]:
+    """Build report dataframe once and share between table/PDF flows."""
+    engine_name = "SQL" if use_sql_engine else "Polars"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key], True, engine_name
+
+    if use_sql_engine:
+        con = get_db_connection()
+        con.register('self', df)
+        table_df = con.execute(generated_sql).pl()
+    else:
+        if rating_type == "Players":
+            table_df = show_top_players(
+                df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type
+            )
+        elif rating_type == "Pairs":
+            table_df = show_top_pairs(
+                df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type
+            )
+        else:
+            raise ValueError(f"Invalid rating type: {rating_type}")
+
+    # Post-process: scale Elo to chess range (~2800 top) and add Title column.
+    # ACBL uses 1.6x scaling (FFBridge uses 2.0x).
+    elo_col = 'Player_Elo_Score' if rating_type == "Players" else 'Pair_Elo_Score'
+    table_df = post_process_elo_table(table_df, elo_col, scale_factor=1.6)
+    st.session_state[cache_key] = table_df
+    _prune_table_cache(current_key=cache_key, max_entries=2)
+    return table_df, False, engine_name
 
 def execute_sql_query(df, query, key):
     """Execute SQL query on dataframe using DuckDB."""
@@ -2135,10 +2181,17 @@ def main():
         all_data = st.session_state.all_data
 
     def ensure_dataset_loaded(dataset_name: str, columns: list[str] | None = None):
-        """Load missing dataset on-demand (used by debug/comparison paths)."""
+        """Load missing dataset on-demand; reload if required columns are missing."""
         nonlocal all_data
         if dataset_name in all_data:
-            return
+            if columns is None:
+                return
+            existing_cols = set(all_data[dataset_name].columns)
+            needed_cols = set(columns)
+            if needed_cols.issubset(existing_cols):
+                return
+            # Reload with union of existing + required columns when switching modes
+            columns = sorted(existing_cols | needed_cols)
         with st.spinner(f"Loading {dataset_name} dataset..."):
             all_data[dataset_name] = load_dataset(dataset_name, date_from_str, columns=columns)
         st.session_state.all_data = all_data
@@ -2533,44 +2586,43 @@ def main():
             
             # 2. Execute and show results - Use selected engine (SQL is 2-3x faster)
             use_sql = st.session_state.get('use_sql_engine', True)
-            engine_name = "SQL" if use_sql else "Polars"
-            
             # Cache the table_df to avoid regenerating on every rerun (e.g., when Execute Query button is clicked)
             cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}_{st.session_state.get('masterpoints_filter','All')}"
-            
-            if cache_key in st.session_state:
-                # Use cached result
-                table_df = st.session_state[cache_key]
-                st.info(f"✅ Using cached {rating_type} report ({len(table_df)} rows)")
-            else:
-                # Generate new result
-                with st.spinner(f"Building {rating_type} report using {engine_name} engine..."):
-                    try:
-                        if use_sql:
-                            # Use SQL engine (faster)
-                            con = get_db_connection()
-                            con.register('self', df)
-                            table_df = con.execute(generated_sql).pl()
-                        else:
-                            # Use Polars engine (for comparison/debugging)
-                            if rating_type == "Players":
-                                table_df = show_top_players(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
-                            elif rating_type == "Pairs":
-                                table_df = show_top_pairs(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
-                        
-                        # Post-process: scale Elo to chess range (~2800 top) and add Title column
-                        # ACBL uses 1.6x scaling (FFBridge uses 2.0x)
-                        elo_col = 'Player_Elo_Score' if rating_type == "Players" else 'Pair_Elo_Score'
-                        table_df = post_process_elo_table(table_df, elo_col, scale_factor=1.6)
-                        
-                        # Cache the result
-                        st.session_state[cache_key] = table_df
-                        _prune_table_cache(current_key=cache_key, max_entries=2)
-                        st.success(f"✅ Report generated successfully using {engine_name} engine. Returned {len(table_df)} rows.")
-                    except Exception as e:
-                        st.error(f"❌ Report generation failed with {engine_name} engine: {e}")
-                        st.error("Please try again or contact support if the problem persists.")
-                        return
+            try:
+                if cache_key in st.session_state:
+                    table_df, _used_cache, engine_name = _get_or_build_report_table_df(
+                        df=df,
+                        generated_sql=generated_sql,
+                        rating_type=rating_type,
+                        top_n=int(top_n),
+                        min_sessions=int(min_sessions),
+                        rating_method=rating_method,
+                        moving_avg_days=moving_avg_days,
+                        elo_rating_type=elo_rating_type,
+                        cache_key=cache_key,
+                        use_sql_engine=use_sql,
+                    )
+                    st.info(f"✅ Using cached {rating_type} report ({len(table_df)} rows)")
+                else:
+                    engine_name = "SQL" if use_sql else "Polars"
+                    with st.spinner(f"Building {rating_type} report using {engine_name} engine..."):
+                        table_df, _used_cache, engine_name = _get_or_build_report_table_df(
+                            df=df,
+                            generated_sql=generated_sql,
+                            rating_type=rating_type,
+                            top_n=int(top_n),
+                            min_sessions=int(min_sessions),
+                            rating_method=rating_method,
+                            moving_avg_days=moving_avg_days,
+                            elo_rating_type=elo_rating_type,
+                            cache_key=cache_key,
+                            use_sql_engine=use_sql,
+                        )
+                    st.success(f"✅ Report generated successfully using {engine_name} engine. Returned {len(table_df)} rows.")
+            except Exception as e:
+                st.error(f"❌ Report generation failed: {e}")
+                st.error("Please try again or contact support if the problem persists.")
+                return
             
             # Display results with exactly 25 viewable rows (common for both paths)
             if 'table_df' in locals():
@@ -2801,43 +2853,42 @@ def main():
         if st.session_state.get('content_mode') == 'pdf':
             # Use the same caching mechanism as Display Table
             cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}_{st.session_state.get('masterpoints_filter','All')}"
-            
-            if cache_key in st.session_state:
-                # Reuse cached dataframe
-                table_df = st.session_state[cache_key]
-                st.info(f"✅ Using cached {rating_type} report for PDF generation ({len(table_df)} rows)")
-            else:
-                # Generate table data for PDF - use selected engine (SQL is 2-3x faster)
-                use_sql = st.session_state.get('use_sql_engine', True)
-                engine_name = "SQL" if use_sql else "Polars"
-                
-                with st.spinner(f"Generating {rating_type} data for PDF using {engine_name} engine..."):
-                    try:
-                        if use_sql:
-                            # Use SQL engine (faster)
-                            con = get_db_connection()
-                            con.register('self', df)
-                            table_df = con.execute(generated_sql).pl()
-                        else:
-                            # Use Polars engine (for comparison/debugging)
-                            if rating_type == "Players":
-                                table_df = show_top_players(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
-                            elif rating_type == "Pairs":
-                                table_df = show_top_pairs(df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type)
-                        
-                        # Post-process: scale Elo to chess range (~2800 top) and add Title column
-                        # ACBL uses 1.6x scaling (FFBridge uses 2.0x)
-                        elo_col = 'Player_Elo_Score' if rating_type == "Players" else 'Pair_Elo_Score'
-                        table_df = post_process_elo_table(table_df, elo_col, scale_factor=1.6)
-                        
-                        # Cache the result
-                        st.session_state[cache_key] = table_df
-                        _prune_table_cache(current_key=cache_key, max_entries=2)
-                        st.info(f"✅ Using {engine_name} engine for PDF generation")
-                    except Exception as e:
-                        st.error(f"❌ PDF Generation Failed with {engine_name} engine: {e}")
-                        st.error("Unable to generate PDF. Please try again or contact support if the problem persists.")
-                        return
+            use_sql = st.session_state.get('use_sql_engine', True)
+            try:
+                if cache_key in st.session_state:
+                    table_df, _used_cache, engine_name = _get_or_build_report_table_df(
+                        df=df,
+                        generated_sql=generated_sql,
+                        rating_type=rating_type,
+                        top_n=int(top_n),
+                        min_sessions=int(min_sessions),
+                        rating_method=rating_method,
+                        moving_avg_days=moving_avg_days,
+                        elo_rating_type=elo_rating_type,
+                        cache_key=cache_key,
+                        use_sql_engine=use_sql,
+                    )
+                    st.info(f"✅ Using cached {rating_type} report for PDF generation ({len(table_df)} rows)")
+                else:
+                    engine_name = "SQL" if use_sql else "Polars"
+                    with st.spinner(f"Generating {rating_type} data for PDF using {engine_name} engine..."):
+                        table_df, _used_cache, engine_name = _get_or_build_report_table_df(
+                            df=df,
+                            generated_sql=generated_sql,
+                            rating_type=rating_type,
+                            top_n=int(top_n),
+                            min_sessions=int(min_sessions),
+                            rating_method=rating_method,
+                            moving_avg_days=moving_avg_days,
+                            elo_rating_type=elo_rating_type,
+                            cache_key=cache_key,
+                            use_sql_engine=use_sql,
+                        )
+                    st.info(f"✅ Using {engine_name} engine for PDF generation")
+            except Exception as e:
+                st.error(f"❌ PDF Generation Failed: {e}")
+                st.error("Unable to generate PDF. Please try again or contact support if the problem persists.")
+                return
             
             created_on = time.strftime("%Y-%m-%d")
             #pdf_title = f"{title} From {date_range}"
@@ -2870,66 +2921,15 @@ def main():
                 mime="application/pdf",
             )
 
-    # Styled footer (matches FFBridge app)
-    try:
-        import psutil
-
-        def _gb(v: int) -> float:
-            return v / (1024 ** 3)
-
-        vm = psutil.virtual_memory()
-        sm = psutil.swap_memory()
-        memory_line = (
-            f"Memory: RAM {_gb(vm.used):.2f}/{_gb(vm.total):.2f} GB ({vm.percent:.1f}%) • "
-            f"Virtual/Pagefile {_gb(sm.used):.2f}/{_gb(sm.total):.2f} GB ({sm.percent:.1f}%)"
-        )
-    except Exception:
-        # Fallback for Linux containers without psutil.
-        try:
-            meminfo = {}
-            with open("/proc/meminfo", "r", encoding="utf-8") as f:
-                for line in f:
-                    parts = line.split(":", 1)
-                    if len(parts) != 2:
-                        continue
-                    key = parts[0].strip()
-                    val = parts[1].strip().split()[0]
-                    meminfo[key] = int(val) * 1024  # kB -> bytes
-
-            def _gb(v: int) -> float:
-                return v / (1024 ** 3)
-
-            ram_total = meminfo.get("MemTotal", 0)
-            ram_avail = meminfo.get("MemAvailable", 0)
-            ram_used = max(0, ram_total - ram_avail)
-            ram_pct = (ram_used / ram_total * 100.0) if ram_total else 0.0
-
-            swap_total = meminfo.get("SwapTotal", 0)
-            swap_free = meminfo.get("SwapFree", 0)
-            swap_used = max(0, swap_total - swap_free)
-            swap_pct = (swap_used / swap_total * 100.0) if swap_total else 0.0
-
-            memory_line = (
-                f"Memory: RAM {_gb(ram_used):.2f}/{_gb(ram_total):.2f} GB ({ram_pct:.1f}%) • "
-                f"Virtual/Pagefile {_gb(swap_used):.2f}/{_gb(swap_total):.2f} GB ({swap_pct:.1f}%)"
-            )
-        except Exception:
-            memory_line = "Memory: RAM/Virtual usage unavailable"
-
-    st.markdown(f"""
-        <div style="text-align: center; color: #80cbc4; font-size: 0.8rem; opacity: 0.7;">
-            Project lead is Robert Salita research@AiPolice.org. Code written in Python by Cursor AI. UI written in streamlit. Data engine is polars. Repo: <a href="https://github.com/BSalita/Elo_Ratings" target="_blank" style="color: #80cbc4;">github.com/BSalita/Elo_Ratings</a><br>
-            Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}<br>
-            Streamlit:{st.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pd.__version__} polars:{pl.__version__} duckdb:{duckdb.__version__} endplay:{ENDPLAY_VERSION}<br>
-            {memory_line}
-        </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown(f"""
-        <div style="text-align: center; padding: 2rem 0; color: #80cbc4; font-size: 0.9rem; opacity: 0.8;">
-            System Current Date: {datetime.now().strftime('%Y-%m-%d')}
-        </div>
-    """, unsafe_allow_html=True)
+    render_app_footer(
+        st,
+        ENDPLAY_VERSION,
+        dependency_versions={
+            "pandas": pd.__version__,
+            "polars": pl.__version__,
+            "duckdb": duckdb.__version__,
+        },
+    )
 
 
 if __name__ == "__main__":
