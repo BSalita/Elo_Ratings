@@ -1832,6 +1832,8 @@ def initialize_session_state():
         # Initialize other session state variables
         if 'show_sql_query' not in st.session_state:
             st.session_state.show_sql_query = False
+        if 'enable_custom_queries' not in st.session_state:
+            st.session_state.enable_custom_queries = False
         if 'sql_queries' not in st.session_state:
             st.session_state.sql_queries = []
         if 'use_sql_engine' not in st.session_state:
@@ -1932,6 +1934,21 @@ def _show_opponent_aggregation(detail: pl.DataFrame, selected_row) -> None:
 
     date_val = session_boards.select("Date").row(0)[0]
     st.markdown(f"#### Opponent Breakdown — Session {session_id} ({str(date_val)[:10]})")
+    if st.session_state.get('show_sql_query', False):
+        st.code(
+            f"""SELECT
+  Opponents,
+  COUNT(*) AS Boards,
+  AVG(Pct) AS Avg_Pct,
+  FIRST(Elo_Before) AS Elo_Start,
+  LAST(Elo_After) AS Elo_End,
+  LAST(Elo_After) - FIRST(Elo_Before) AS Elo_Delta
+FROM detail
+WHERE Session = '{session_id}'
+GROUP BY Opponents
+ORDER BY Opponents;""",
+            language='sql',
+        )
 
     agg_cols = [
         pl.col("Opponents").first().alias("Opponents"),
@@ -1966,6 +1983,19 @@ def _show_all_opponents_aggregation(detail: pl.DataFrame, key_suffix: str) -> No
         return
 
     st.markdown("#### Opponent Summary — All Sessions")
+    if st.session_state.get('show_sql_query', False):
+        st.code(
+            """SELECT
+  Opponents,
+  COUNT(*) AS Boards,
+  COUNT(DISTINCT Session) AS Sessions,
+  AVG(Pct) AS Avg_Pct,
+  AVG(Elo_Delta) AS Avg_Elo_Delta
+FROM detail
+GROUP BY Opponents
+ORDER BY Boards DESC;""",
+            language='sql',
+        )
 
     agg_cols = [
         pl.len().alias("Boards"),
@@ -2359,6 +2389,8 @@ def main():
     # Initialize SQL query settings
     if 'show_sql_query' not in st.session_state:
         st.session_state.show_sql_query = False
+    if 'enable_custom_queries' not in st.session_state:
+        st.session_state.enable_custom_queries = False
     if 'sql_queries' not in st.session_state:
         st.session_state.sql_queries = []
 
@@ -2459,6 +2491,12 @@ def main():
         with st.sidebar.expander("🔧 **Developer Settings**"):
             show_sql = st.checkbox('Show SQL Query', value=st.session_state.show_sql_query, help='Show SQL used to query dataframes.')
             st.session_state.show_sql_query = show_sql
+            enable_custom_queries = st.checkbox(
+                "Enable custom queries",
+                value=st.session_state.get("enable_custom_queries", False),
+                help="Show the 'Run Additional SQL Queries' panel below the results table."
+            )
+            st.session_state.enable_custom_queries = enable_custom_queries
             
             if _acbl_use_remote_api():
                 st.caption("API mode enabled: local Polars/SQL comparison tools are disabled.")
@@ -3040,7 +3078,7 @@ def main():
                 st.session_state.table_displayed = True
             
             # 3. SQL Query Interface for additional queries (only if enabled)
-            if st.session_state.get('show_sql_query', False):
+            if st.session_state.get('show_sql_query', False) and st.session_state.get('enable_custom_queries', False):
                 st.markdown("---")
                 st.markdown("### 🔍 Run Additional SQL Queries")
                 st.caption("Query the results above. Only the displayed columns are available. The results table is available as 'self'.")

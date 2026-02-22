@@ -25,6 +25,79 @@ app.add_middleware(
 )
 
 
+def _read_text(path: pathlib.Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+
+
+def _detect_cgroup_limits() -> dict:
+    """Best-effort container limits from cgroups (v2 first, then v1)."""
+    memory_limit_bytes: int | None = None
+    cpu_limit_cores: float | None = None
+
+    # cgroup v2
+    mem_max_v2 = _read_text(pathlib.Path("/sys/fs/cgroup/memory.max"))
+    if mem_max_v2 and mem_max_v2 != "max":
+        try:
+            memory_limit_bytes = int(mem_max_v2)
+        except ValueError:
+            memory_limit_bytes = None
+
+    cpu_max_v2 = _read_text(pathlib.Path("/sys/fs/cgroup/cpu.max"))
+    if cpu_max_v2:
+        parts = cpu_max_v2.split()
+        if len(parts) == 2 and parts[0] != "max":
+            try:
+                quota = int(parts[0])
+                period = int(parts[1])
+                if quota > 0 and period > 0:
+                    cpu_limit_cores = quota / period
+            except ValueError:
+                cpu_limit_cores = None
+
+    # cgroup v1 fallbacks
+    if memory_limit_bytes is None:
+        mem_v1 = _read_text(pathlib.Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+        if mem_v1:
+            try:
+                value = int(mem_v1)
+                # Ignore "effectively unlimited" sentinel values.
+                if value < (1 << 60):
+                    memory_limit_bytes = value
+            except ValueError:
+                pass
+
+    if cpu_limit_cores is None:
+        quota_v1 = _read_text(pathlib.Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"))
+        period_v1 = _read_text(pathlib.Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us"))
+        if quota_v1 and period_v1:
+            try:
+                quota = int(quota_v1)
+                period = int(period_v1)
+                if quota > 0 and period > 0:
+                    cpu_limit_cores = quota / period
+            except ValueError:
+                pass
+
+    return {
+        "memory_limit_bytes": memory_limit_bytes,
+        "cpu_limit_cores": cpu_limit_cores,
+    }
+
+
+def _recommended_threads() -> int:
+    limits = _detect_cgroup_limits()
+    host_cpus = int(os.cpu_count() or 4)
+    if limits["cpu_limit_cores"] is not None:
+        cpu_budget = max(1, int(limits["cpu_limit_cores"]))
+    else:
+        cpu_budget = host_cpus
+    # Keep conservative default while respecting container CPU budget.
+    return max(4, cpu_budget // 2) if cpu_budget >= 8 else max(1, cpu_budget)
+
+
 def _r2_enabled() -> bool:
     return bool(os.getenv("R2_BUCKET", "").strip())
 
@@ -174,20 +247,42 @@ def _required_columns_for_detail(rating_type: str, elo_rating_type: str) -> list
 def _server_runtime_info() -> dict:
     vm = psutil.virtual_memory()
     sm = psutil.swap_memory()
+    proc = psutil.Process(os.getpid())
+    proc_mem = proc.memory_info()
+    limits = _detect_cgroup_limits()
+
+    mem_limit_bytes = limits["memory_limit_bytes"] if limits["memory_limit_bytes"] is not None else int(vm.total)
+    ram_used_bytes = int(proc_mem.rss)
+    ram_percent = (ram_used_bytes / mem_limit_bytes * 100.0) if mem_limit_bytes > 0 else 0.0
+
+    if limits["cpu_limit_cores"] is not None:
+        cpu_count = max(1, int(limits["cpu_limit_cores"]))
+        cpu_limit_cores = round(float(limits["cpu_limit_cores"]), 2)
+    else:
+        cpu_count = int(os.cpu_count() or 0)
+        cpu_limit_cores = None
+
+    threads = _recommended_threads()
     return {
         "api_process_started_at": API_PROCESS_STARTED_AT.isoformat(),
         "api_uptime_seconds": round(time.time() - API_PROCESS_STARTED_AT.timestamp(), 3),
         "api_source_file": str(API_SOURCE_PATH),
         "api_source_mtime": datetime.fromtimestamp(API_SOURCE_PATH.stat().st_mtime, tz=timezone.utc).isoformat(),
-        "ram_used_gb": round(vm.used / (1024 ** 3), 2),
-        "ram_total_gb": round(vm.total / (1024 ** 3), 2),
-        "ram_percent": round(vm.percent, 1),
+        # Container-aware metrics (preferred for Railway limits)
+        "ram_used_gb": round(ram_used_bytes / (1024 ** 3), 2),
+        "ram_total_gb": round(mem_limit_bytes / (1024 ** 3), 2),
+        "ram_percent": round(ram_percent, 1),
+        "cpu_count": cpu_count,
+        "cpu_limit_cores": cpu_limit_cores,
+        "threads": threads,
+        # Host metrics (diagnostic only)
+        "host_ram_total_gb": round(vm.total / (1024 ** 3), 2),
+        "host_ram_percent": round(vm.percent, 1),
+        "process_rss_gb": round(proc_mem.rss / (1024 ** 3), 2),
         "swap_used_gb": round(sm.used / (1024 ** 3), 2),
         "swap_total_gb": round(sm.total / (1024 ** 3), 2),
         "swap_percent": round(sm.percent, 1),
         "swap_enabled": bool(sm.total > 0),
-        "cpu_count": int(os.cpu_count() or 0),
-        "threads": int(max(4, (os.cpu_count() or 4) // 2)),
     }
 
 
@@ -492,7 +587,7 @@ def acbl_report(
         t_sql_start = time.perf_counter()
         con = duckdb.connect()
         try:
-            con.execute(f"PRAGMA threads={max(4, (os.cpu_count() or 4) // 2)};")
+            con.execute(f"PRAGMA threads={_recommended_threads()};")
             con.execute("PRAGMA preserve_insertion_order=false;")
             con.register("self", df)
             if rating_type == "Players":
