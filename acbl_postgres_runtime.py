@@ -100,7 +100,6 @@ def ensure_runtime_tables_fresh(
             df = loader_fn(dataset_name)
             if progress_callback is not None:
                 progress_callback(completed_datasets, total_datasets, dataset_name, "loading", 1.0)
-                progress_callback(completed_datasets, total_datasets, dataset_name, "replacing", 0.0)
             _replace_table(
                 conn,
                 table_name,
@@ -116,9 +115,18 @@ def ensure_runtime_tables_fresh(
                         0.0 if total <= 0 else min(1.0, float(copied) / float(total)),
                     ))
                 ),
+                stage_progress_callback=(
+                    None
+                    if progress_callback is None
+                    else (lambda stage, stage_progress: progress_callback(
+                        completed_datasets,
+                        total_datasets,
+                        dataset_name,
+                        stage,
+                        stage_progress,
+                    ))
+                ),
             )
-            if progress_callback is not None:
-                progress_callback(completed_datasets, total_datasets, dataset_name, "replacing", 1.0)
             _upsert_meta(conn, dataset_name, table_name, len(df))
             results.append(
                 RefreshResult(
@@ -225,21 +233,50 @@ def _replace_table(
     table_name: str,
     df: pl.DataFrame,
     copy_progress_callback: Callable[[int, int], None] | None = None,
+    stage_progress_callback: Callable[[str, float], None] | None = None,
 ) -> None:
     tmp_table = f"{table_name}__tmp_load"
     with conn.cursor() as cur:
+        if stage_progress_callback is not None:
+            stage_progress_callback("replace_drop_temp", 0.0)
         cur.execute(f"DROP TABLE IF EXISTS {tmp_table}")
+        if stage_progress_callback is not None:
+            stage_progress_callback("replace_drop_temp", 1.0)
+            stage_progress_callback("replace_drop_old", 0.0)
         cur.execute(f"DROP TABLE IF EXISTS {table_name}")
+        if stage_progress_callback is not None:
+            stage_progress_callback("replace_drop_old", 1.0)
+            stage_progress_callback("replace_create_table", 0.0)
         cur.execute(f"CREATE TABLE {tmp_table} ({_pg_columns_ddl(df)})")
+        if stage_progress_callback is not None:
+            stage_progress_callback("replace_create_table", 1.0)
 
-    _copy_df_to_table(conn, df, tmp_table, progress_callback=copy_progress_callback)
+    _copy_df_to_table(
+        conn,
+        df,
+        tmp_table,
+        progress_callback=copy_progress_callback,
+        stage_progress_callback=stage_progress_callback,
+    )
 
     with conn.cursor() as cur:
+        if stage_progress_callback is not None:
+            stage_progress_callback("replace_rename", 0.0)
         cur.execute(f"ALTER TABLE {tmp_table} RENAME TO {table_name}")
+        if stage_progress_callback is not None:
+            stage_progress_callback("replace_rename", 1.0)
         if "Date" in df.columns:
+            if stage_progress_callback is not None:
+                stage_progress_callback("replace_index_date", 0.0)
             cur.execute(f"CREATE INDEX IF NOT EXISTS {table_name}_date_idx ON {table_name}(\"Date\")")
+            if stage_progress_callback is not None:
+                stage_progress_callback("replace_index_date", 1.0)
         if "session_id" in df.columns:
+            if stage_progress_callback is not None:
+                stage_progress_callback("replace_index_session", 0.0)
             cur.execute(f"CREATE INDEX IF NOT EXISTS {table_name}_session_idx ON {table_name}(session_id)")
+            if stage_progress_callback is not None:
+                stage_progress_callback("replace_index_session", 1.0)
 
 
 def _copy_df_to_table(
@@ -247,12 +284,17 @@ def _copy_df_to_table(
     df: pl.DataFrame,
     table_name: str,
     progress_callback: Callable[[int, int], None] | None = None,
+    stage_progress_callback: Callable[[str, float], None] | None = None,
 ) -> None:
     columns = [f"\"{c}\"" for c in df.columns]
     copy_sql = f"COPY {table_name} ({','.join(columns)}) FROM STDIN WITH (FORMAT CSV, HEADER FALSE, NULL '')"
 
     tmp_path = Path(tempfile.gettempdir()) / f"{table_name}.csv"
+    if stage_progress_callback is not None:
+        stage_progress_callback("serialize_csv", 0.0)
     df.write_csv(tmp_path, include_header=False, null_value="")
+    if stage_progress_callback is not None:
+        stage_progress_callback("serialize_csv", 1.0)
     try:
         total_size = int(tmp_path.stat().st_size) if tmp_path.exists() else 0
         if progress_callback is not None:

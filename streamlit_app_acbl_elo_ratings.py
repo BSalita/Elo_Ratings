@@ -2166,16 +2166,28 @@ def main():
                 stage_labels = {
                     "checking": "Checking freshness",
                     "loading": "Loading parquet",
-                    "replacing": "Preparing PostgreSQL table",
+                    "replace_drop_temp": "Dropping temp table",
+                    "replace_drop_old": "Dropping existing table",
+                    "replace_create_table": "Creating temp PostgreSQL table",
+                    "serialize_csv": "Serializing data to CSV",
                     "copying": "Copying rows to PostgreSQL",
+                    "replace_rename": "Renaming temp table",
+                    "replace_index_date": "Creating Date index",
+                    "replace_index_session": "Creating session index",
                     "skip": "Already fresh, skipping reload",
                     "done": "Completed",
                 }
                 dataset_progress_by_stage = {
                     "checking": 0.05,
                     "loading": 0.25 + (0.35 * safe_stage_progress),
-                    "replacing": 0.60 + (0.10 * safe_stage_progress),
-                    "copying": 0.70 + (0.30 * safe_stage_progress),
+                    "replace_drop_temp": 0.33 + (0.03 * safe_stage_progress),
+                    "replace_drop_old": 0.36 + (0.04 * safe_stage_progress),
+                    "replace_create_table": 0.40 + (0.08 * safe_stage_progress),
+                    "serialize_csv": 0.48 + (0.12 * safe_stage_progress),
+                    "copying": 0.60 + (0.32 * safe_stage_progress),
+                    "replace_rename": 0.92 + (0.03 * safe_stage_progress),
+                    "replace_index_date": 0.95 + (0.03 * safe_stage_progress),
+                    "replace_index_session": 0.98 + (0.02 * safe_stage_progress),
                     "skip": 1.0,
                     "done": 1.0,
                 }
@@ -2185,11 +2197,14 @@ def main():
                 ) * 100.0
                 pct = int(max(0.0, min(100.0, overall_progress)))
                 label = stage_labels.get(stage, "Working")
+                detail = ""
+                if stage in ("copying", "serialize_csv", "loading"):
+                    detail = f" {int(safe_stage_progress * 100)}%"
                 refresh_progress.progress(
                     pct,
                     text=(
                         f"Checking PostgreSQL runtime freshness... {label} {dataset} "
-                        f"({safe_completed}/{safe_total}) [{elapsed_sec}s]"
+                        f"({safe_completed}/{safe_total}){detail} [{elapsed_sec}s]"
                     ),
                 )
 
