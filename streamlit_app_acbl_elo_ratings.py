@@ -3352,7 +3352,6 @@ ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
                 mime="application/pdf",
             )
 
-    app_info()
     render_app_footer(
         st,
         ENDPLAY_VERSION,
