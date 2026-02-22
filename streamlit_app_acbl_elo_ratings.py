@@ -2456,6 +2456,17 @@ def main():
     # -------------------------------
 
     with st.sidebar:
+        # Improve contrast for sidebar expander titles (e.g., Developer Settings)
+        st.markdown(
+            """
+            <style>
+            section[data-testid="stSidebar"] details summary p {
+                color: #ffc107 !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
         st.sidebar.markdown("🔗 [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
         club_or_tournament = st.radio("Event type", options=["Club", "Tournament"], index=0, horizontal=True, key="event_type")
@@ -2911,8 +2922,8 @@ def main():
             
             # 1. Show the SQL query used in a compact scrollable container (only if enabled)
             if st.session_state.get('show_sql_query', False):
-                st.markdown("### 📝 SQL Query Used")
-                st.text_area("SQL Query", value=generated_sql, height=200, disabled=True, label_visibility="collapsed")
+                with st.expander("SQL Query", expanded=False):
+                    st.code(generated_sql, language='sql')
             
             # 2. Execute and show results - Use selected engine (SQL is 2-3x faster)
             use_sql = st.session_state.get('use_sql_engine', True)
