@@ -2162,6 +2162,7 @@ WHERE Player_ID_N = '{player_id}'
 ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
         )
 
+        st.markdown("#### Board-by-Board Detail")
         grid_resp = _render_detail_aggrid(detail, key=f"detail_player_{player_id}", selectable=True)
 
         # --- Opponent aggregation for selected session ---
@@ -2283,6 +2284,7 @@ WHERE
 ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
         )
 
+        st.markdown("#### Board-by-Board Detail")
         grid_resp = _render_detail_aggrid(detail, key=f"detail_pair_{pair_ids}", selectable=True)
 
         # --- Opponent aggregation for selected session ---
