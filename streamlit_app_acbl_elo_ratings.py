@@ -12,6 +12,7 @@ os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
 
 import logging
 import pathlib
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -208,8 +209,26 @@ def _db_register(con, name: str, df) -> None:
     _ = (con, name, df)
 
 
+def _quote_pg_identifiers_in_sql(sql: str, available_columns: set[str] | None) -> str:
+    """Quote mixed-case PostgreSQL column identifiers in generated SQL."""
+    if not available_columns:
+        return sql
+
+    rewritten = sql
+    for col in sorted(available_columns, key=len, reverse=True):
+        if not isinstance(col, str) or not col:
+            continue
+        # Only quote identifiers that need quoting in PostgreSQL (e.g., Date, Player_ID_N).
+        if col == col.lower() and re.fullmatch(r"[a-z_][a-z0-9_]*", col):
+            continue
+        pattern = rf'(?<!")\b{re.escape(col)}\b(?!")'
+        rewritten = re.sub(pattern, f'"{col}"', rewritten)
+    return rewritten
+
+
 def _get_or_build_report_table_df(
     source_table: str,
+    source_columns: set[str] | None,
     generated_sql: str,
     rating_type: str,
     top_n: int,
@@ -228,6 +247,7 @@ def _get_or_build_report_table_df(
     _ = (top_n, min_sessions, rating_method, moving_avg_days, elo_rating_type, use_sql_engine)
     con = get_db_connection()
     sql = generated_sql.replace("FROM self", f"FROM {source_table}")
+    sql = _quote_pg_identifiers_in_sql(sql, source_columns)
     table_df = read_sql_polars(con, sql)
 
     # Post-process: scale Elo to chess range (~2800 top) and add Title column.
@@ -2647,6 +2667,7 @@ def main():
                 if cache_key in st.session_state:
                     table_df, _used_cache, engine_name = _get_or_build_report_table_df(
                         source_table=source_table,
+                        source_columns=source_columns,
                         generated_sql=generated_sql,
                         rating_type=rating_type,
                         top_n=int(top_n),
@@ -2663,6 +2684,7 @@ def main():
                     with st.spinner(f"Building {rating_type} report using {engine_name} engine..."):
                         table_df, _used_cache, engine_name = _get_or_build_report_table_df(
                             source_table=source_table,
+                            source_columns=source_columns,
                             generated_sql=generated_sql,
                             rating_type=rating_type,
                             top_n=int(top_n),
@@ -2912,6 +2934,7 @@ def main():
                 if cache_key in st.session_state:
                     table_df, _used_cache, engine_name = _get_or_build_report_table_df(
                         source_table=source_table,
+                        source_columns=source_columns,
                         generated_sql=generated_sql,
                         rating_type=rating_type,
                         top_n=int(top_n),
@@ -2928,6 +2951,7 @@ def main():
                     with st.spinner(f"Generating {rating_type} data for PDF using {engine_name} engine..."):
                         table_df, _used_cache, engine_name = _get_or_build_report_table_df(
                             source_table=source_table,
+                            source_columns=source_columns,
                             generated_sql=generated_sql,
                             rating_type=rating_type,
                             top_n=int(top_n),
