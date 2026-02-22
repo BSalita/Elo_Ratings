@@ -2455,8 +2455,8 @@ def main():
         st.sidebar.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
         #st.sidebar.markdown("🔗 [BridgeWebs Postmortem](https://bridgewebs.postmortem.chat)")
         
-        # Developer Options
-        with st.expander("🔧 **Developer Options**"):
+        # Developer Settings (kept in sidebar for SQL-gating control)
+        with st.sidebar.expander("🔧 **Developer Settings**"):
             show_sql = st.checkbox('Show SQL Query', value=st.session_state.show_sql_query, help='Show SQL used to query dataframes.')
             st.session_state.show_sql_query = show_sql
             
@@ -2709,7 +2709,29 @@ def main():
             generated_sql = str(remote_payload.get("generated_sql", "") or "")
             st.info(f"✅ Using remote ACBL API ({dataset_type}, {online_filter.lower()} games)")
             perf = remote_payload.get("perf", {}) if isinstance(remote_payload, dict) else {}
+            server = remote_payload.get("server", {}) if isinstance(remote_payload, dict) else {}
             if isinstance(perf, dict) and perf:
+                if isinstance(server, dict) and server:
+                    source_mtime = server.get("api_source_mtime", "n/a")
+                    uptime_seconds = float(server.get("api_uptime_seconds", 0) or 0)
+                    uptime_minutes = uptime_seconds / 60.0
+                    if server.get("swap_enabled", False):
+                        swap_str = (
+                            f"{server.get('swap_used_gb', 0)}/{server.get('swap_total_gb', 0)} GB "
+                            f"({server.get('swap_percent', 0)}%)"
+                        )
+                    else:
+                        swap_str = "N/A (swap disabled)"
+                    server_str = (
+                        f"api_source_datetime:{source_mtime} | "
+                        f"api_uptime:{uptime_minutes:.1f}m ({uptime_seconds:.1f}s) | "
+                        f"Memory: RAM {server.get('ram_used_gb', 0)}/{server.get('ram_total_gb', 0)} GB "
+                        f"({server.get('ram_percent', 0)}%) • "
+                        f"Virtual/Pagefile {swap_str} • "
+                        f"CPU/Threads {server.get('cpu_count', 0)}/{server.get('threads', 0)}"
+                    )
+                else:
+                    server_str = "Memory/CPU unavailable"
                 st.caption(
                     "API performance — "
                     f"source:{perf.get('source', 'unknown')} | "
@@ -2719,7 +2741,8 @@ def main():
                     f"sql:{perf.get('sql_seconds', 0)}s | "
                     f"serialize:{perf.get('serialize_seconds', 0)}s | "
                     f"total:{perf.get('total_seconds', 0)}s | "
-                    f"rows in/out:{perf.get('input_rows', '?')}/{perf.get('output_rows', '?')}"
+                    f"rows in/out:{perf.get('input_rows', '?')}/{perf.get('output_rows', '?')} | "
+                    f"{server_str}"
                 )
         else:
             ensure_dataset_loaded(dataset_type, columns=_required_columns_for_mode(rating_type, elo_rating_type))

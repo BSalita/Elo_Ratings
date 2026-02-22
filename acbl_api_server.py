@@ -3,14 +3,17 @@ from __future__ import annotations
 import os
 import pathlib
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import duckdb
 import polars as pl
+import psutil
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
+API_SOURCE_PATH = pathlib.Path(__file__).resolve()
+API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 
 app = FastAPI(title="ACBL Elo API", version="1.0.0")
 app.add_middleware(
@@ -166,6 +169,26 @@ def _required_columns_for_detail(rating_type: str, elo_rating_type: str) -> list
             cols.add(pair_ew)
         cols.update({"Elo_R_NS_Before", "Elo_R_EW_Before"})
     return sorted(cols)
+
+
+def _server_runtime_info() -> dict:
+    vm = psutil.virtual_memory()
+    sm = psutil.swap_memory()
+    return {
+        "api_process_started_at": API_PROCESS_STARTED_AT.isoformat(),
+        "api_uptime_seconds": round(time.time() - API_PROCESS_STARTED_AT.timestamp(), 3),
+        "api_source_file": str(API_SOURCE_PATH),
+        "api_source_mtime": datetime.fromtimestamp(API_SOURCE_PATH.stat().st_mtime, tz=timezone.utc).isoformat(),
+        "ram_used_gb": round(vm.used / (1024 ** 3), 2),
+        "ram_total_gb": round(vm.total / (1024 ** 3), 2),
+        "ram_percent": round(vm.percent, 1),
+        "swap_used_gb": round(sm.used / (1024 ** 3), 2),
+        "swap_total_gb": round(sm.total / (1024 ** 3), 2),
+        "swap_percent": round(sm.percent, 1),
+        "swap_enabled": bool(sm.total > 0),
+        "cpu_count": int(os.cpu_count() or 0),
+        "threads": int(max(4, (os.cpu_count() or 4) // 2)),
+    }
 
 
 def _build_player_detail(df: pl.DataFrame, player_id: str, elo_rating_type: str) -> pl.DataFrame:
@@ -513,6 +536,7 @@ def acbl_report(
             "elapsed_seconds": elapsed,
             "moving_avg_days": moving_avg_days,
             "perf": perf,
+            "server": _server_runtime_info(),
         }
     except HTTPException:
         raise
@@ -585,6 +609,7 @@ def acbl_detail(
             "ended_at": ended_at.isoformat(),
             "elapsed_seconds": elapsed,
             "perf": perf,
+            "server": _server_runtime_info(),
         }
     except HTTPException:
         raise
