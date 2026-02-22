@@ -1851,13 +1851,8 @@ def initialize_session_state():
 
 def app_info() -> None:
     """Display app information"""
-    info_line_1 = (
-        "Project lead is Robert Salita research@AiPolice.org. "
-        "Code written in Python by Cursor AI. UI written in streamlit. "
-        "Data engine is polars. Repo: github.com/BSalita/Elo_Ratings"
-    )
-    info_line_2 = f"Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}"
-    info_line_3 = (
+    info_line_1 = f"Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}"
+    info_line_2 = (
         f"Streamlit:{st.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} "
         f"pandas:{pd.__version__} polars:{pl.__version__} duckdb:{duckdb.__version__} endplay:{ENDPLAY_VERSION}"
     )
@@ -1875,13 +1870,13 @@ def app_info() -> None:
             swap_str = f"{_gb(sm.used):.2f}/{_gb(sm.total):.2f} GB ({sm.percent:.1f}%)"
         else:
             swap_str = "N/A (swap disabled)"
-        info_line_4 = (
+        info_line_3 = (
             f"Memory: RAM {_gb(vm.used):.2f}/{_gb(vm.total):.2f} GB ({vm.percent:.1f}%) "
             f"• Virtual/Pagefile {swap_str} • CPU/Threads {cpu_count}/{threads}"
         )
     except Exception:
-        info_line_4 = "Memory: RAM/Virtual usage unavailable"
-    info_line_5 = f"System Current Date: {datetime.now().strftime('%Y-%m-%d')}"
+        info_line_3 = "Memory: RAM/Virtual usage unavailable"
+    info_line_4 = f"System Current Date: {datetime.now().strftime('%Y-%m-%d')}"
 
     st.markdown(
         f"""
@@ -1890,7 +1885,6 @@ def app_info() -> None:
             <p>{info_line_2}</p>
             <p>{info_line_3}</p>
             <p>{info_line_4}</p>
-            <p>{info_line_5}</p>
         </div>
         """,
         unsafe_allow_html=True,
