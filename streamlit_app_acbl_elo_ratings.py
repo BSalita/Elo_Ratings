@@ -2863,14 +2863,14 @@ def main():
                     server_resources_str = "Memory/CPU unavailable"
                 st.caption(
                     "API performance — "
-                    f"{api_meta_str} | "
-                    f"source:{perf.get('source', 'unknown')} | "
-                    f"parse:{perf.get('parse_seconds', 0)}s | "
-                    f"load:{perf.get('load_seconds', 0)}s | "
-                    f"filter:{perf.get('filter_seconds', 0)}s | "
-                    f"sql:{perf.get('sql_seconds', 0)}s | "
-                    f"serialize:{perf.get('serialize_seconds', 0)}s | "
-                    f"total:{perf.get('total_seconds', 0)}s | "
+                    f"{api_meta_str} • "
+                    f"source:{perf.get('source', 'unknown')} • "
+                    f"parse:{perf.get('parse_seconds', 0)}s • "
+                    f"load:{perf.get('load_seconds', 0)}s • "
+                    f"filter:{perf.get('filter_seconds', 0)}s • "
+                    f"sql:{perf.get('sql_seconds', 0)}s • "
+                    f"serialize:{perf.get('serialize_seconds', 0)}s • "
+                    f"total:{perf.get('total_seconds', 0)}s • "
                     f"rows in/out:{perf.get('input_rows', '?')}/{perf.get('output_rows', '?')}"
                 )
                 st.caption(f"Server resources — {server_resources_str}")
