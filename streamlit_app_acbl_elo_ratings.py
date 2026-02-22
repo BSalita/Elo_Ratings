@@ -171,8 +171,8 @@ def _acbl_api_base_url() -> str | None:
 
 
 def _acbl_use_remote_api() -> bool:
-    """Remote API mode is enabled when ACBL_API_BASE_URL is set."""
-    return _acbl_api_base_url() is not None
+    """ACBL app is API-only; URL must be configured."""
+    return True
 
 
 def _fetch_remote_report_table(
@@ -1851,13 +1851,13 @@ def initialize_session_state():
 
 def app_info() -> None:
     """Display app information"""
-    st.caption(
+    info_line_1 = (
         "Project lead is Robert Salita research@AiPolice.org. "
         "Code written in Python by Cursor AI. UI written in streamlit. "
         "Data engine is polars. Repo: github.com/BSalita/Elo_Ratings"
     )
-    st.caption(f"Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}")
-    st.caption(
+    info_line_2 = f"Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}"
+    info_line_3 = (
         f"Streamlit:{st.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} "
         f"pandas:{pd.__version__} polars:{pl.__version__} duckdb:{duckdb.__version__} endplay:{ENDPLAY_VERSION}"
     )
@@ -1875,13 +1875,26 @@ def app_info() -> None:
             swap_str = f"{_gb(sm.used):.2f}/{_gb(sm.total):.2f} GB ({sm.percent:.1f}%)"
         else:
             swap_str = "N/A (swap disabled)"
-        st.caption(
+        info_line_4 = (
             f"Memory: RAM {_gb(vm.used):.2f}/{_gb(vm.total):.2f} GB ({vm.percent:.1f}%) "
             f"• Virtual/Pagefile {swap_str} • CPU/Threads {cpu_count}/{threads}"
         )
     except Exception:
-        st.caption("Memory: RAM/Virtual usage unavailable")
-    st.caption(f"System Current Date: {datetime.now().strftime('%Y-%m-%d')}")
+        info_line_4 = "Memory: RAM/Virtual usage unavailable"
+    info_line_5 = f"System Current Date: {datetime.now().strftime('%Y-%m-%d')}"
+
+    st.markdown(
+        f"""
+        <div style="text-align: center;">
+            <p>{info_line_1}</p>
+            <p>{info_line_2}</p>
+            <p>{info_line_3}</p>
+            <p>{info_line_4}</p>
+            <p>{info_line_5}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     return
 
 
@@ -2308,6 +2321,15 @@ def main():
     
     # Initialize session state
     initialize_session_state()
+
+    # API-only mode: require remote API base URL.
+    api_base_url = _acbl_api_base_url()
+    if not api_base_url:
+        st.error(
+            "ACBL_API_BASE_URL is required. This Streamlit app now runs in API-only mode. "
+            "Set ACBL_API_BASE_URL to your deployed ACBL API service URL."
+        )
+        st.stop()
     
     # Apply common dark green/gold theme (shared with FFBridge app)
     apply_app_theme(st)
@@ -2361,6 +2383,10 @@ def main():
         st.session_state.data_date_from = date_from_str
         st.session_state.loaded_columns = {}
     else:
+        st.error("Local fallback mode is disabled. Configure ACBL_API_BASE_URL.")
+        st.stop()
+        return
+    if False:
         required_cols_set = set(required_columns)
         stored_cols_set = set(st.session_state.get('loaded_columns', {}).get(selected_event_for_load, []))
         must_reload = (
