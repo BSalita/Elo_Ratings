@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import pathlib
 import time
-import gc
 from datetime import datetime, timezone
 
 import duckdb
@@ -15,6 +14,16 @@ from fastapi.middleware.cors import CORSMiddleware
 DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
+
+# Module-level caches to avoid re-reading parquet files on every request.
+# Keys are source paths; values are the cached objects.
+_SCHEMA_CACHE: dict[str, dict] = {}
+_FRAME_CACHE: dict[str, pl.DataFrame] = {}
+_FRAME_CACHE_TIMES: dict[str, float] = {}
+
+import threading as _threading
+_DB_LOCK = _threading.Lock()
+_DB_CON: duckdb.DuckDBPyConnection | None = None
 
 app = FastAPI(title="ACBL Elo API", version="1.0.0")
 app.add_middleware(
@@ -137,20 +146,21 @@ def _parquet_source_for(club_or_tournament: str) -> tuple[str, dict | None]:
 
 def load_elo_ratings_schema_map(club_or_tournament: str) -> dict:
     source_path, storage_options = _parquet_source_for(club_or_tournament)
+    if source_path in _SCHEMA_CACHE:
+        return _SCHEMA_CACHE[source_path]
     df0 = pl.read_parquet(source_path, n_rows=0, storage_options=storage_options)
+    _SCHEMA_CACHE[source_path] = df0.schema
     return df0.schema
 
 
-def load_elo_ratings(club_or_tournament: str, columns: list[str] | None = None, date_from: datetime | None = None) -> pl.DataFrame:
+def _load_full_frame(club_or_tournament: str) -> pl.DataFrame:
+    """Load the full parquet once and cache it at module level."""
     source_path, storage_options = _parquet_source_for(club_or_tournament)
+    if source_path in _FRAME_CACHE:
+        return _FRAME_CACHE[source_path]
+
     schema_map = load_elo_ratings_schema_map(club_or_tournament)
     lf = pl.scan_parquet(source_path, storage_options=storage_options)
-
-    if columns:
-        columns = list(dict.fromkeys(columns))
-        if date_from is not None and "Date" in schema_map and "Date" not in columns:
-            columns = ["Date", *columns]
-        lf = lf.select([c for c in columns if c in schema_map])
 
     if "Date" in schema_map:
         if schema_map["Date"] == pl.Utf8:
@@ -167,10 +177,45 @@ def load_elo_ratings(club_or_tournament: str, columns: list[str] | None = None, 
         else:
             lf = lf.with_columns(pl.col("Date").cast(pl.Datetime, strict=False).alias("Date"))
 
-    if date_from is not None and "Date" in schema_map:
-        lf = lf.filter(pl.col("Date") >= pl.lit(date_from))
+    full_df = lf.collect(engine="streaming")
+    _FRAME_CACHE[source_path] = full_df
+    _FRAME_CACHE_TIMES[source_path] = time.time()
+    return full_df
 
-    return lf.collect(engine="streaming")
+
+def load_elo_ratings(club_or_tournament: str, columns: list[str] | None = None, date_from: datetime | None = None) -> pl.DataFrame:
+    """Return a (possibly filtered) view of the cached full frame."""
+    full_df = _load_full_frame(club_or_tournament)
+    schema_map = load_elo_ratings_schema_map(club_or_tournament)
+    df = full_df
+
+    if columns:
+        columns = list(dict.fromkeys(columns))
+        if date_from is not None and "Date" in schema_map and "Date" not in columns:
+            columns = ["Date", *columns]
+        valid = [c for c in columns if c in df.columns]
+        if valid:
+            df = df.select(valid)
+
+    if date_from is not None and "Date" in df.columns:
+        df = df.filter(pl.col("Date") >= pl.lit(date_from))
+
+    return df
+
+
+def _get_db_connection() -> duckdb.DuckDBPyConnection:
+    """Return a long-lived DuckDB connection, creating it on first call."""
+    global _DB_CON
+    if _DB_CON is not None:
+        return _DB_CON
+    with _DB_LOCK:
+        if _DB_CON is not None:
+            return _DB_CON
+        con = duckdb.connect()
+        con.execute(f"PRAGMA threads={_recommended_threads()};")
+        con.execute("PRAGMA preserve_insertion_order=false;")
+        _DB_CON = con
+    return _DB_CON
 
 
 def _filter_valid_percentages_acbl(df: pl.DataFrame) -> pl.DataFrame:
@@ -264,6 +309,17 @@ def _server_runtime_info() -> dict:
         cpu_limit_cores = None
 
     threads = _recommended_threads()
+
+    cached_frames = {}
+    for src, cached_time in _FRAME_CACHE_TIMES.items():
+        frame = _FRAME_CACHE.get(src)
+        rows = len(frame) if frame is not None else 0
+        cached_frames[pathlib.Path(src).name] = {
+            "rows": rows,
+            "cached_at": datetime.fromtimestamp(cached_time, tz=timezone.utc).isoformat(),
+            "age_seconds": round(time.time() - cached_time, 1),
+        }
+
     return {
         "api_process_started_at": API_PROCESS_STARTED_AT.isoformat(),
         "api_uptime_seconds": round(time.time() - API_PROCESS_STARTED_AT.timestamp(), 3),
@@ -284,24 +340,9 @@ def _server_runtime_info() -> dict:
         "swap_total_gb": round(sm.total / (1024 ** 3), 2),
         "swap_percent": round(sm.percent, 1),
         "swap_enabled": bool(sm.total > 0),
+        "frame_cache": cached_frames,
     }
 
-
-def _post_request_memory_cleanup() -> float:
-    """Best-effort allocator cleanup; returns elapsed seconds."""
-    t0 = time.perf_counter()
-    gc.collect()
-    try:
-        import pyarrow as pa
-        pa.default_memory_pool().release_unused()
-    except Exception:
-        pass
-    try:
-        import ctypes
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass
-    return round(time.perf_counter() - t0, 3)
 
 
 def _build_player_detail(df: pl.DataFrame, player_id: str, elo_rating_type: str) -> pl.DataFrame:
@@ -603,18 +644,18 @@ def acbl_report(
         t_filter_end = time.perf_counter()
 
         t_sql_start = time.perf_counter()
-        con = duckdb.connect()
-        try:
-            con.execute(f"PRAGMA threads={_recommended_threads()};")
-            con.execute("PRAGMA preserve_insertion_order=false;")
+        con = _get_db_connection()
+        with _DB_LOCK:
+            try:
+                con.unregister("self")
+            except Exception:
+                pass
             con.register("self", df)
             if rating_type == "Players":
                 generated_sql = generate_top_players_sql(top_n, min_sessions, rating_method, elo_rating_type)
             else:
                 generated_sql = generate_top_pairs_sql(top_n, min_sessions, rating_method, elo_rating_type)
             result_df = con.execute(generated_sql).pl()
-        finally:
-            con.close()
         t_sql_end = time.perf_counter()
 
         t_serialize_start = time.perf_counter()
@@ -653,9 +694,6 @@ def acbl_report(
             "server": _server_runtime_info(),
         }
         del result_df
-        del df
-        cleanup_seconds = _post_request_memory_cleanup()
-        response_payload["perf"]["cleanup_seconds"] = cleanup_seconds
         response_payload["perf"]["total_seconds"] = round(time.perf_counter() - t0, 3)
         return response_payload
     except HTTPException:
@@ -733,9 +771,6 @@ def acbl_detail(
             "server": _server_runtime_info(),
         }
         del detail
-        del df
-        cleanup_seconds = _post_request_memory_cleanup()
-        response_payload["perf"]["cleanup_seconds"] = cleanup_seconds
         response_payload["perf"]["total_seconds"] = round(time.perf_counter() - t0, 3)
         return response_payload
     except HTTPException:
