@@ -36,8 +36,14 @@ if sys.platform == "win32":
 import pandas as pd
 import polars as pl
 import streamlit as st
-import duckdb
 from streamlit_extras.bottom_container import bottom
+from acbl_postgres_runtime import (
+    ensure_runtime_tables_fresh,
+    get_pg_connection,
+    get_table_columns,
+    postgres_table_for_dataset,
+    read_sql_polars,
+)
 
 try:
     import endplay
@@ -191,48 +197,19 @@ def _prune_table_cache(current_key: str, max_entries: int = 2) -> None:
 # -------------------------------
 
 def get_db_connection():
-    """Get or create a session-specific database connection.
-    
-    This ensures each Streamlit session has its own database connection,
-    preventing concurrency issues when multiple users access the app.
-    
-    Returns:
-        duckdb.DuckDBPyConnection: Session-specific database connection
-    """
+    """Get or create a session-specific PostgreSQL connection."""
     if 'db_connection' not in st.session_state:
-        # Create a new connection for this session
-        st.session_state.db_connection = duckdb.connect()
-    # Configure DuckDB pragmas on every access (idempotent), so existing sessions pick up settings
-    try:
-        import tempfile
-        tmp_dir = tempfile.gettempdir().replace('\\', '/')
-        st.session_state.db_connection.execute(f"PRAGMA temp_directory='{tmp_dir}';")
-        # Use a conservative memory limit and enable parallelism sensibly
-        st.session_state.db_connection.execute("PRAGMA memory_limit='6GB';")
-        threads = max(4, (os.cpu_count() or 4) // 2)
-        st.session_state.db_connection.execute(f"PRAGMA threads={threads};")
-        # Reduce overhead in certain aggregations
-        st.session_state.db_connection.execute("PRAGMA preserve_insertion_order=false;")
-    except (duckdb.Error, OSError, RuntimeError) as exc:
-        logger.warning("DuckDB PRAGMA setup failed; continuing with defaults: %s", exc)
+        st.session_state.db_connection = get_pg_connection()
     return st.session_state.db_connection
 
 
 def _db_register(con, name: str, df) -> None:
-    """Unregister any existing view then register the new frame.
-
-    DuckDB holds a reference to the registered Arrow/Polars buffer, so
-    re-registering without unregistering first leaks the old frame.
-    """
-    try:
-        con.unregister(name)
-    except Exception:
-        pass
-    con.register(name, df)
+    """Compatibility no-op (legacy duckdb path removed for runtime)."""
+    _ = (con, name, df)
 
 
 def _get_or_build_report_table_df(
-    df: pl.DataFrame,
+    source_table: str,
     generated_sql: str,
     rating_type: str,
     top_n: int,
@@ -244,25 +221,14 @@ def _get_or_build_report_table_df(
     use_sql_engine: bool,
 ) -> tuple[pl.DataFrame, bool, str]:
     """Build report dataframe once and share between table/PDF flows."""
-    engine_name = "SQL" if use_sql_engine else "Polars"
+    engine_name = "SQL (PostgreSQL)"
     if cache_key in st.session_state:
         return st.session_state[cache_key], True, engine_name
 
-    if use_sql_engine:
-        con = get_db_connection()
-        _db_register(con, 'self', df)
-        table_df = con.execute(generated_sql).pl()
-    else:
-        if rating_type == "Players":
-            table_df = show_top_players(
-                df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type
-            )
-        elif rating_type == "Pairs":
-            table_df = show_top_pairs(
-                df, int(top_n), int(min_sessions), rating_method, moving_avg_days, elo_rating_type
-            )
-        else:
-            raise ValueError(f"Invalid rating type: {rating_type}")
+    _ = (top_n, min_sessions, rating_method, moving_avg_days, elo_rating_type, use_sql_engine)
+    con = get_db_connection()
+    sql = generated_sql.replace("FROM self", f"FROM {source_table}")
+    table_df = read_sql_polars(con, sql)
 
     # Post-process: scale Elo to chess range (~2800 top) and add Title column.
     # ACBL uses 1.6x scaling (FFBridge uses 2.0x).
@@ -272,19 +238,20 @@ def _get_or_build_report_table_df(
     _prune_table_cache(current_key=cache_key, max_entries=2)
     return table_df, False, engine_name
 
-def execute_sql_query(df, query, key):
-    """Execute SQL query on dataframe using DuckDB."""
+def execute_sql_query(query: str, key: str):
+    """Execute ad-hoc SQL query against current PostgreSQL dataset table."""
     try:
         # Show SQL query if enabled
         if st.session_state.get('show_sql_query', False):
             st.text(f"SQL Query: {query}")
 
-        # If query doesn't contain 'FROM', add 'FROM self' to the beginning
+        # If query doesn't contain FROM, add FROM current runtime table.
+        source_table = st.session_state.get("current_dataset_table", "acbl_club_elo_ratings")
         if 'from ' not in query.lower():
-            query = 'FROM self ' + query
+            query = f"FROM {source_table} " + query
 
         con = get_db_connection()
-        result_df = con.execute(query).pl()
+        result_df = read_sql_polars(con, query)
         
         if st.session_state.get('show_sql_query', False):
             st.text(f"Result is a dataframe of {len(result_df)} rows.")
@@ -302,19 +269,10 @@ def sql_input_callback():
     """Handle SQL query input submission."""
     query = st.session_state.get('sql_query_input', '').strip()
     if query:
-        # Get the current dataset
-        dataset_type = st.session_state.get('current_dataset_type', 'club')
-        if dataset_type in st.session_state.get('all_data', {}):
-            df = st.session_state.all_data[dataset_type]
-            # Register the dataframe with DuckDB
-            con = get_db_connection()
-            _db_register(con, 'self', df)
-            # Execute the query
-            execute_sql_query(df, query, f'sql_query_result_{len(st.session_state.get("sql_queries", []))}')
-            # Store query in history
-            if 'sql_queries' not in st.session_state:
-                st.session_state.sql_queries = []
-            st.session_state.sql_queries.append(query)
+        execute_sql_query(query, f"sql_query_result_{len(st.session_state.get('sql_queries', []))}")
+        if 'sql_queries' not in st.session_state:
+            st.session_state.sql_queries = []
+        st.session_state.sql_queries.append(query)
 
 
 # -------------------------------
@@ -835,7 +793,7 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
         SELECT Date, session_id, Player_ID_{pos} as Player_ID, Player_Name_{pos} as Player_Name, 
                MasterPoints_{pos} as MasterPoints, {elo_col} as Elo_R_Player, '{pos}' as Position,
                Is_Par_Suit, Is_Par_Contract, Is_Sacrifice, DD_Tricks_Diff
-        FROM self WHERE Player_ID_{pos} IS NOT NULL AND {elo_col} IS NOT NULL AND NOT isnan({elo_col})""")
+        FROM self WHERE Player_ID_{pos} IS NOT NULL AND {elo_col} IS NOT NULL AND ({elo_col} = {elo_col})""")
     
     # For Latest method, use simple LAST() aggregation like pairs do
     if rating_method == 'Latest':
@@ -847,9 +805,9 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
         player_aggregates AS (
             SELECT 
                 Player_ID,
-                LAST(Player_Name) as Player_Name,
+                (array_agg(Player_Name ORDER BY Date DESC))[1] as Player_Name,
                 MAX(MasterPoints) as MasterPoints,
-                LAST(Elo_R_Player) as Player_Elo_Score,
+                (array_agg(Elo_R_Player ORDER BY Date DESC))[1] as Player_Elo_Score,
                 COUNT(DISTINCT session_id) as Sessions_Played,
                 COUNT(DISTINCT Position) as Positions_Played,
                 AVG(CAST(Is_Par_Suit AS INTEGER)) as Par_Suit_Rate,
@@ -890,7 +848,7 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
         player_aggregates AS (
             SELECT 
                 Player_ID,
-                LAST(Player_Name) as Player_Name,
+                (array_agg(Player_Name ORDER BY Date DESC))[1] as Player_Name,
                 MAX(MasterPoints) as MasterPoints,
                 {f'{rating_agg}(Elo_R_Player)'} as Player_Elo_Score,
                 COUNT(DISTINCT session_id) as Sessions_Played,
@@ -932,11 +890,11 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
     
     # Determine aggregation function based on rating method
     if rating_method == 'Avg':
-        rating_agg = 'AVG'
+        rating_expr = "AVG(Elo_R_Pair)"
     elif rating_method == 'Max':
-        rating_agg = 'MAX'
+        rating_expr = "MAX(Elo_R_Pair)"
     elif rating_method == 'Latest':
-        rating_agg = 'LAST'
+        rating_expr = "(array_agg(Elo_R_Pair ORDER BY Date DESC))[1]"
     else:
         raise ValueError(f"Invalid rating method: {rating_method}. Supported methods: Avg, Max, Latest")
     
@@ -995,7 +953,7 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
             (COALESCE(MasterPoints_N, 0) + COALESCE(MasterPoints_S, 0)) / 2.0 as Avg_MPs,
             SQRT(COALESCE(MasterPoints_N, 0) * COALESCE(MasterPoints_S, 0)) as Geo_MPs,
             {f'''CASE 
-                WHEN {player_elo_n} IS NOT NULL AND {player_elo_s} IS NOT NULL AND NOT isnan({player_elo_n}) AND NOT isnan({player_elo_s})
+                WHEN {player_elo_n} IS NOT NULL AND {player_elo_s} IS NOT NULL AND ({player_elo_n} = {player_elo_n}) AND ({player_elo_s} = {player_elo_s})
                 THEN ({player_elo_n} + {player_elo_s}) / 2.0
                 ELSE NULL
             END''' if player_elo_n is not None else 'NULL'} as Avg_Player_Elo,
@@ -1004,7 +962,7 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
             Is_Sacrifice,
             DD_Tricks_Diff
         FROM self 
-        WHERE {('1=0' if available_columns is not None and pair_ns_col is None else f"{pair_ns_col} IS NOT NULL AND NOT isnan({pair_ns_col})")}
+        WHERE {('1=0' if available_columns is not None and pair_ns_col is None else f"{pair_ns_col} IS NOT NULL AND ({pair_ns_col} = {pair_ns_col})")}
         
         UNION ALL
         
@@ -1023,7 +981,7 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
             (COALESCE(MasterPoints_E, 0) + COALESCE(MasterPoints_W, 0)) / 2.0 as Avg_MPs,
             SQRT(COALESCE(MasterPoints_E, 0) * COALESCE(MasterPoints_W, 0)) as Geo_MPs,
             {f'''CASE 
-                WHEN {player_elo_e} IS NOT NULL AND {player_elo_w} IS NOT NULL AND NOT isnan({player_elo_e}) AND NOT isnan({player_elo_w})
+                WHEN {player_elo_e} IS NOT NULL AND {player_elo_w} IS NOT NULL AND ({player_elo_e} = {player_elo_e}) AND ({player_elo_w} = {player_elo_w})
                 THEN ({player_elo_e} + {player_elo_w}) / 2.0
                 ELSE NULL
             END''' if player_elo_e is not None else 'NULL'} as Avg_Player_Elo,
@@ -1032,13 +990,13 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, mo
             Is_Sacrifice,
             DD_Tricks_Diff
         FROM self 
-        WHERE {('1=0' if available_columns is not None and pair_ew_col is None else f"{pair_ew_col} IS NOT NULL AND NOT isnan({pair_ew_col})")}
+        WHERE {('1=0' if available_columns is not None and pair_ew_col is None else f"{pair_ew_col} IS NOT NULL AND ({pair_ew_col} = {pair_ew_col})")}
     ),
     pair_aggregates AS (
         SELECT 
             Pair_IDs,
-            LAST(Pair_Names) as Pair_Names,
-            {f'{rating_agg}(Elo_R_Pair)'} as Pair_Elo_Score,
+            (array_agg(Pair_Names ORDER BY Date DESC))[1] as Pair_Names,
+            {rating_expr} as Pair_Elo_Score,
             AVG(Avg_MPs) as Avg_MPs,
             AVG(Geo_MPs) as Geo_MPs,
             COUNT(DISTINCT session_id) as Sessions,
@@ -1311,10 +1269,8 @@ def debug_single_comparison(df: pl.DataFrame, top_n: int = 10, min_sessions: int
     polars_df = show_top_players(df, top_n, min_sessions, rating_method, 10, elo_rating_type)
     
     # Run SQL implementation
-    con = get_db_connection()
-    _db_register(con, 'self', df)
     sql_query = generate_top_players_sql(top_n, min_sessions, rating_method, 10, elo_rating_type, set(df.columns))
-    sql_df = con.execute(sql_query).pl()
+    sql_df = pl.SQLContext(self=df).execute(sql_query).collect()
     
     # Compare intermediate steps - let's look at the raw aggregated data before ranking
     # Get the player_aggregates step from Polars
@@ -1463,18 +1419,13 @@ def run_comprehensive_comparison(all_data: dict, top_n: int = 100, min_sessions:
                         # Run SQL implementation with timing
                         sql_start = time.time()
                         con = get_db_connection()
-                        _db_register(con, 'self', df_use)
-                        # Ensure PRAGMAs are applied for potentially large club queries
-                        try:
-                            con.execute("PRAGMA preserve_insertion_order=false;")
-                        except Exception:
-                            pass
+                        _ = con
                         if rating_type == "Players":
                             sql_query = generate_top_players_sql(top_n, min_sessions, rating_method, 10, elo_rating_type, set(df_use.columns))
                         else:  # Pairs
                             sql_query = generate_top_pairs_sql(top_n, min_sessions, rating_method, 10, elo_rating_type, set(df_use.columns))
                         
-                        sql_df = con.execute(sql_query).pl()
+                        sql_df = pl.SQLContext(self=df_use).execute(sql_query).collect()
                         sql_time = time.time() - sql_start
                         
                         # Compare results
@@ -1888,6 +1839,38 @@ def _show_all_opponents_aggregation(detail: pl.DataFrame, key_suffix: str) -> No
     _render_detail_aggrid(opp_all, key=f"opp_all_{key_suffix}")
 
 
+def _load_detail_subset_from_postgres(
+    source_table: str,
+    selected_row,
+    rating_type: str,
+    runtime_filter_sql: str,
+) -> pl.DataFrame:
+    """Load only the subset required by detail panels from PostgreSQL."""
+    con = get_db_connection()
+    if rating_type == "Players":
+        player_id = str(selected_row.get("Player_ID", "")).replace("'", "''")
+        if not player_id:
+            return pl.DataFrame()
+        where_sql = (
+            f"({runtime_filter_sql}) AND ("
+            f"Player_ID_N = '{player_id}' OR Player_ID_E = '{player_id}' OR "
+            f"Player_ID_S = '{player_id}' OR Player_ID_W = '{player_id}')"
+        )
+    else:
+        pair_ids = str(selected_row.get("Pair_IDs", ""))
+        if "-" not in pair_ids:
+            return pl.DataFrame()
+        player_a, player_b = pair_ids.split("-", 1)
+        player_a = player_a.replace("'", "''")
+        player_b = player_b.replace("'", "''")
+        where_sql = (
+            f"({runtime_filter_sql}) AND ("
+            f"(LEAST(Player_ID_N, Player_ID_S) = '{player_a}' AND GREATEST(Player_ID_N, Player_ID_S) = '{player_b}') OR "
+            f"(LEAST(Player_ID_E, Player_ID_W) = '{player_a}' AND GREATEST(Player_ID_E, Player_ID_W) = '{player_b}'))"
+        )
+    return read_sql_polars(con, f"SELECT * FROM {source_table} WHERE {where_sql}")
+
+
 def _show_detail_for_selected_row(
     selected_row,
     raw_df: pl.DataFrame,
@@ -2145,6 +2128,7 @@ def main():
     # Sidebar will be created after data loading is complete
     # Set default values for data loading
     date_from = None  # Default to all time for initial loading
+    date_from_str = "None" if date_from is None else date_from.isoformat()
 
     # Load all columns initially (sidebar controls will be available after loading)
     needed_cols = None  # Load all columns
@@ -2153,100 +2137,50 @@ def main():
     # Data Loading
     # -------------------------------
 
-    def load_dataset(dataset_name: str, date_from_str: str, columns: list[str] | None = None):
-        """Load one dataset lazily to reduce memory pressure."""
-        date_from = None if date_from_str == "None" else datetime.fromisoformat(date_from_str)
-        df = load_elo_ratings(dataset_name, columns=columns, date_from=date_from)
+    def load_dataset_for_refresh(dataset_name: str) -> pl.DataFrame:
+        """Load full parquet dataset for PostgreSQL refresh."""
+        df = load_elo_ratings(dataset_name, columns=None, date_from=None)
         return _filter_valid_percentages_acbl(df)
 
-    # Convert date_from to string for caching key
-    date_from_str = "None" if date_from is None else date_from.isoformat()
+    refresh_enabled = os.getenv("ACBL_PG_STARTUP_REFRESH_ENABLED", "1").strip() != "0"
+    stale_hours = int(os.getenv("ACBL_PG_REFRESH_STALE_HOURS", "24").strip() or "24")
 
-    # Load only the currently selected event dataset (lazy loading).
+    try:
+        pg_conn = get_db_connection()
+        if not st.session_state.get("pg_startup_refresh_done", False):
+            with st.spinner("Checking PostgreSQL runtime freshness..."):
+                refresh_results = ensure_runtime_tables_fresh(
+                    pg_conn,
+                    loader_fn=load_dataset_for_refresh,
+                    stale_hours=stale_hours,
+                    refresh_enabled=refresh_enabled,
+                )
+            st.session_state.pg_startup_refresh_done = True
+            st.session_state.pg_refresh_results = refresh_results
+    except Exception as e:
+        st.error(f"PostgreSQL startup refresh failed: {e}")
+        st.stop()
+
     selected_event_for_load = st.session_state.get("event_type", "Club").lower()
     selected_event_for_load = "club" if selected_event_for_load not in ("club", "tournament") else selected_event_for_load
     selected_rating_for_load = st.session_state.get("rating_type", "Players")
     selected_elo_type_for_load = st.session_state.get("elo_rating_type", "Current Rating (End of Session)")
     required_columns = _required_columns_for_mode(selected_rating_for_load, selected_elo_type_for_load)
-    required_cols_set = set(required_columns)
-    stored_cols_set = set(st.session_state.get('loaded_columns', {}).get(selected_event_for_load, []))
-    must_reload = (
-        'all_data' not in st.session_state
-        or 'data_date_from' not in st.session_state
-        or st.session_state.data_date_from != date_from_str
-        or st.session_state.get('loaded_dataset') != selected_event_for_load
-        or selected_event_for_load not in st.session_state.get('all_data', {})
-        or not required_cols_set.issubset(stored_cols_set)  # missing columns
-        or stored_cols_set - required_cols_set  # excess columns — trim to save memory
-    )
-    if must_reload:
-        try:
-            import gc
+    source_table = postgres_table_for_dataset(selected_event_for_load)
+    source_columns = get_table_columns(pg_conn, source_table)
+    st.session_state.current_dataset_table = source_table
 
-            # Hard reset of switch-sensitive state to prevent retained references.
-            _clear_table_cache()
-            if 'sql_query_history' in st.session_state:
-                st.session_state.sql_query_history = []
-
-            # Drop all loaded dataframes immediately.
-            if 'all_data' in st.session_state:
-                st.session_state.all_data = {}
-
-            # Recreate DuckDB connection on dataset switch.
-            # This guarantees no registered/relation state can pin prior frames.
-            if 'db_connection' in st.session_state:
-                try:
-                    st.session_state.db_connection.close()
-                except Exception:
-                    pass
-                del st.session_state.db_connection
-
-            # Keep metadata only for the active dataset.
-            st.session_state.loaded_columns = {}
-
-            gc.collect()
-            with st.spinner(f"Loading {selected_event_for_load} dataset..."):
-                all_data = {
-                    selected_event_for_load: load_dataset(
-                        selected_event_for_load, date_from_str, columns=required_columns
-                    )
-                }
-
-            st.success("Datasets loaded successfully")
-
-            # Store data and column set in session state for reuse
-            st.session_state.all_data = all_data
-            st.session_state.data_date_from = date_from_str
-            st.session_state.loaded_dataset = selected_event_for_load
-            st.session_state.loaded_columns[selected_event_for_load] = required_cols_set
-
-        except Exception as e:
-            st.error(f"Failed to load datasets: {e}")
-            st.stop()
-    else:
-        # Use already loaded data
-        all_data = st.session_state.all_data
+    # Debug-only parquet loaders for comparison tools (not used in runtime query path).
+    all_data: dict[str, pl.DataFrame] = {}
 
     def ensure_dataset_loaded(dataset_name: str, columns: list[str] | None = None):
-        """Load missing dataset on-demand; reload only if required columns are missing."""
         nonlocal all_data
         if dataset_name in all_data:
-            if columns is None:
-                return
-            existing_cols = set(all_data[dataset_name].columns)
-            needed_cols = set(columns)
-            if needed_cols.issubset(existing_cols):
-                return
-            # Drop old frame before reloading to free memory promptly
-            import gc
-            all_data[dataset_name] = None
-            gc.collect()
-        with st.spinner(f"Loading {dataset_name} dataset..."):
-            all_data[dataset_name] = load_dataset(dataset_name, date_from_str, columns=columns)
-        if 'loaded_columns' not in st.session_state:
-            st.session_state.loaded_columns = {}
-        st.session_state.loaded_columns[dataset_name] = set(columns) if columns else None
-        st.session_state.all_data = all_data
+            return
+        date_from_local = None if date_from_str == "None" else datetime.fromisoformat(date_from_str)
+        all_data[dataset_name] = _filter_valid_percentages_acbl(
+            load_elo_ratings(dataset_name, columns=columns, date_from=date_from_local)
+        )
     
     # Initialize SQL query settings
     if 'show_sql_query' not in st.session_state:
@@ -2260,6 +2194,12 @@ def main():
 
     with st.sidebar:
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
+        if st.session_state.get("pg_refresh_results"):
+            pg_status_bits = []
+            for r in st.session_state.pg_refresh_results:
+                action = "refreshed" if r.refreshed else "fresh"
+                pg_status_bits.append(f"{r.dataset}:{action}:{r.row_count}")
+            st.sidebar.caption("PG startup: " + " | ".join(pg_status_bits))
         st.sidebar.markdown("🔗 [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
         club_or_tournament = st.radio("Event type", options=["Club", "Tournament"], index=0, horizontal=True, key="event_type")
         rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=True, key="rating_type")
@@ -2500,12 +2440,10 @@ def main():
             
             # Run SQL implementation
             st.write("Running SQL implementation...")
-            con = get_db_connection()
-            _db_register(con, 'self', df)
             sql_query = generate_top_players_sql(10, 5, rating_method, 10, elo_rating_type, set(df.columns))
             st.code(sql_query, language='sql')
             
-            sql_df = con.execute(sql_query).pl()
+            sql_df = pl.SQLContext(self=df).execute(sql_query).collect()
             st.write(f"SQL result shape: {sql_df.shape}")
             st.write("SQL columns:", list(sql_df.columns))
             st.dataframe(sql_df.head(3))
@@ -2565,47 +2503,42 @@ def main():
             "date_from": None if date_from is None else date_from.isoformat(),
         }
 
-        # Get data
+        # Runtime dataset source is PostgreSQL table (not in-memory frame).
         dataset_type = club_or_tournament.lower()
-        ensure_dataset_loaded(dataset_type, columns=_required_columns_for_mode(rating_type, elo_rating_type))
-        df = all_data[dataset_type]
-        
-        # Apply date range filter
-        if date_from is not None and 'Date' in df.columns:
-            df = df.filter(pl.col('Date') >= pl.lit(date_from))
-        
-        # Apply online filter if specified
-        if online_filter == "Local Only":
-            # Local games: rows explicitly marked as not virtual (False)
-            if "is_virtual_game" in df.columns:
-                df = df.filter(pl.col("is_virtual_game") == False)
-        elif online_filter == "Online Only":
-            # Online games: rows where is_virtual_game is null (virtual/online)
-            if "is_virtual_game" in df.columns:
-                df = df.filter(pl.col("is_virtual_game").is_null())
-        # For "All", no filtering is applied
-        
-        # Store online filter in session state for comprehensive comparison
-        st.session_state.online_filter = online_filter
-        
-        # Avoid computing len(df) which can be expensive on large datasets
-        st.info(f"✅ Using {dataset_type} dataset ({online_filter.lower()} games)")
-        
-        # Store current dataset type
+        source_table = postgres_table_for_dataset(dataset_type)
         st.session_state.current_dataset_type = dataset_type
+        st.session_state.current_dataset_table = source_table
+        st.session_state.online_filter = online_filter
 
-        # Compute date range for captions
+        # Build shared filter predicate for SQL generation/replacement.
+        filter_clauses: list[str] = []
+        if date_from is not None:
+            filter_clauses.append(f"\"Date\" >= '{date_from.isoformat()}'::timestamptz")
+        if online_filter == "Local Only":
+            filter_clauses.append("is_virtual_game = FALSE")
+        elif online_filter == "Online Only":
+            filter_clauses.append("is_virtual_game IS NULL")
+        runtime_filter_sql = " AND ".join(filter_clauses) if filter_clauses else "TRUE"
+
+        # Build date range caption from PostgreSQL source.
         try:
-            date_min, date_max = df.select([pl.col("Date").min().alias("min"), pl.col("Date").max().alias("max")]).row(0)
-            date_range = f"{str(date_min)[:10]} to {str(date_max)[:10]}"
+            range_df = read_sql_polars(
+                pg_conn,
+                f"""
+                SELECT MIN("Date") AS min_date, MAX("Date") AS max_date
+                FROM {source_table}
+                WHERE {runtime_filter_sql}
+                """,
+            )
+            if range_df.is_empty() or range_df["min_date"][0] is None:
+                date_range = ""
+            else:
+                date_range = f"{str(range_df['min_date'][0])[:10]} to {str(range_df['max_date'][0])[:10]}"
         except Exception:
             date_range = ""
 
-        # Prepare column names before any external registration to avoid borrow issues
-        try:
-            df_columns = set(df.schema.keys())
-        except Exception:
-            df_columns = set(df.columns)
+        df_columns = source_columns
+        st.info(f"✅ Using PostgreSQL table `{source_table}` ({online_filter.lower()} games)")
 
         # Generate SQL query based on report type
         if rating_type == "Players":
@@ -2637,13 +2570,19 @@ def main():
                 st.text_area("SQL Query", value=generated_sql, height=200, disabled=True, label_visibility="collapsed")
             
             # 2. Execute and show results - Use selected engine (SQL is 2-3x faster)
-            use_sql = st.session_state.get('use_sql_engine', True)
+            use_sql = True
+            st.session_state.use_sql_engine = True
+            # Apply runtime filters by pushing them into each source-table WHERE clause.
+            generated_sql = generated_sql.replace(
+                "FROM self WHERE",
+                f"FROM {source_table} WHERE ({runtime_filter_sql}) AND",
+            )
             # Cache the table_df to avoid regenerating on every rerun (e.g., when Execute Query button is clicked)
             cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}_{st.session_state.get('masterpoints_filter','All')}"
             try:
                 if cache_key in st.session_state:
                     table_df, _used_cache, engine_name = _get_or_build_report_table_df(
-                        df=df,
+                        source_table=source_table,
                         generated_sql=generated_sql,
                         rating_type=rating_type,
                         top_n=int(top_n),
@@ -2659,7 +2598,7 @@ def main():
                     engine_name = "SQL" if use_sql else "Polars"
                     with st.spinner(f"Building {rating_type} report using {engine_name} engine..."):
                         table_df, _used_cache, engine_name = _get_or_build_report_table_df(
-                            df=df,
+                            source_table=source_table,
                             generated_sql=generated_sql,
                             rating_type=rating_type,
                             top_n=int(top_n),
@@ -2793,7 +2732,13 @@ def main():
                 selected_rows = grid_response.get('selected_rows', None)
                 if selected_rows is not None and len(selected_rows) > 0:
                     selected_row = selected_rows.iloc[0] if hasattr(selected_rows, 'iloc') else selected_rows[0]
-                    _show_detail_for_selected_row(selected_row, df, rating_type, elo_rating_type)
+                    detail_raw_df = _load_detail_subset_from_postgres(
+                        source_table=source_table,
+                        selected_row=selected_row,
+                        rating_type=rating_type,
+                        runtime_filter_sql=runtime_filter_sql,
+                    )
+                    _show_detail_for_selected_row(selected_row, detail_raw_df, rating_type, elo_rating_type)
                 
                 # Mark that table is displayed (lightweight state only)
                 st.session_state.table_displayed = True
@@ -2863,8 +2808,8 @@ def main():
                             
                             # Execute query on the query results table, not the raw dataset
                             con = get_db_connection()
-                            _db_register(con, 'self', table_df)
-                            result_df = con.execute(processed_query).pl()
+                            _ = con
+                            result_df = pl.SQLContext(self=table_df).execute(processed_query).collect()
                             
                             # Store in history
                             st.session_state.sql_query_history.append({
@@ -2902,7 +2847,7 @@ def main():
             try:
                 if cache_key in st.session_state:
                     table_df, _used_cache, engine_name = _get_or_build_report_table_df(
-                        df=df,
+                        source_table=source_table,
                         generated_sql=generated_sql,
                         rating_type=rating_type,
                         top_n=int(top_n),
@@ -2918,7 +2863,7 @@ def main():
                     engine_name = "SQL" if use_sql else "Polars"
                     with st.spinner(f"Generating {rating_type} data for PDF using {engine_name} engine..."):
                         table_df, _used_cache, engine_name = _get_or_build_report_table_df(
-                            df=df,
+                            source_table=source_table,
                             generated_sql=generated_sql,
                             rating_type=rating_type,
                             top_n=int(top_n),
@@ -2972,7 +2917,7 @@ def main():
         dependency_versions={
             "pandas": pd.__version__,
             "polars": pl.__version__,
-            "duckdb": duckdb.__version__,
+            "postgres_runtime": "enabled",
         },
     )
 
