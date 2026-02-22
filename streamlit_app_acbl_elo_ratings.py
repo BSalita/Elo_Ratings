@@ -1851,9 +1851,16 @@ def initialize_session_state():
 
 def app_info() -> None:
     """Display app information"""
-    st.caption(f"Project lead is Robert Salita research@AiPolice.org. Code written in Python. UI written in streamlit. Data engine is polars. Query engine is duckdb. Bridge lib is endplay. Self hosted using Cloudflare Tunnel. Repo:https://github.com/BSalita")
-    st.caption(f"App:{st.session_state.app_datetime} Streamlit:{st.__version__} Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}")
-    st.caption(f"Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pd.__version__} polars:{pl.__version__} endplay:{ENDPLAY_VERSION}")
+    st.caption(
+        "Project lead is Robert Salita research@AiPolice.org. "
+        "Code written in Python by Cursor AI. UI written in streamlit. "
+        "Data engine is polars. Repo: github.com/BSalita/Elo_Ratings"
+    )
+    st.caption(f"Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}")
+    st.caption(
+        f"Streamlit:{st.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} "
+        f"pandas:{pd.__version__} polars:{pl.__version__} duckdb:{duckdb.__version__} endplay:{ENDPLAY_VERSION}"
+    )
     try:
         import psutil
 
@@ -1862,12 +1869,19 @@ def app_info() -> None:
 
         vm = psutil.virtual_memory()
         sm = psutil.swap_memory()
+        cpu_count = os.cpu_count() or 0
+        threads = max(4, cpu_count // 2) if cpu_count else 0
+        if sm.total > 0:
+            swap_str = f"{_gb(sm.used):.2f}/{_gb(sm.total):.2f} GB ({sm.percent:.1f}%)"
+        else:
+            swap_str = "N/A (swap disabled)"
         st.caption(
-            f"Memory: RAM {_gb(vm.used):.2f}/{_gb(vm.total):.2f} GB ({vm.percent:.1f}%) | "
-            f"Virtual/Pagefile {_gb(sm.used):.2f}/{_gb(sm.total):.2f} GB ({sm.percent:.1f}%)"
+            f"Memory: RAM {_gb(vm.used):.2f}/{_gb(vm.total):.2f} GB ({vm.percent:.1f}%) "
+            f"• Virtual/Pagefile {swap_str} • CPU/Threads {cpu_count}/{threads}"
         )
     except Exception:
         st.caption("Memory: RAM/Virtual usage unavailable")
+    st.caption(f"System Current Date: {datetime.now().strftime('%Y-%m-%d')}")
     return
 
 
@@ -1922,6 +1936,14 @@ def _render_detail_aggrid(detail_df: pl.DataFrame, key: str, selectable: bool = 
     return response if selectable else None
 
 
+def _show_sql_query_block(sql_text: str) -> None:
+    """Render SQL in a collapsed expander when SQL visibility is enabled."""
+    if not st.session_state.get("show_sql_query", False):
+        return
+    with st.expander("SQL Query", expanded=False):
+        st.code(sql_text, language="sql")
+
+
 def _show_opponent_aggregation(detail: pl.DataFrame, selected_row) -> None:
     """Given the full board-level detail and a clicked row, show per-opponent aggregation for that session."""
     session_id = selected_row.get('Session')
@@ -1934,9 +1956,8 @@ def _show_opponent_aggregation(detail: pl.DataFrame, selected_row) -> None:
 
     date_val = session_boards.select("Date").row(0)[0]
     st.markdown(f"#### Opponent Breakdown — Session {session_id} ({str(date_val)[:10]})")
-    if st.session_state.get('show_sql_query', False):
-        st.code(
-            f"""SELECT
+    _show_sql_query_block(
+        f"""SELECT
   Opponents,
   COUNT(*) AS Boards,
   AVG(Pct) AS Avg_Pct,
@@ -1946,9 +1967,8 @@ def _show_opponent_aggregation(detail: pl.DataFrame, selected_row) -> None:
 FROM detail
 WHERE Session = '{session_id}'
 GROUP BY Opponents
-ORDER BY Opponents;""",
-            language='sql',
-        )
+ORDER BY Opponents;"""
+    )
 
     agg_cols = [
         pl.col("Opponents").first().alias("Opponents"),
@@ -1983,9 +2003,8 @@ def _show_all_opponents_aggregation(detail: pl.DataFrame, key_suffix: str) -> No
         return
 
     st.markdown("#### Opponent Summary — All Sessions")
-    if st.session_state.get('show_sql_query', False):
-        st.code(
-            """SELECT
+    _show_sql_query_block(
+        """SELECT
   Opponents,
   COUNT(*) AS Boards,
   COUNT(DISTINCT Session) AS Sessions,
@@ -1993,9 +2012,8 @@ def _show_all_opponents_aggregation(detail: pl.DataFrame, key_suffix: str) -> No
   AVG(Elo_Delta) AS Avg_Elo_Delta
 FROM detail
 GROUP BY Opponents
-ORDER BY Boards DESC;""",
-            language='sql',
-        )
+ORDER BY Boards DESC;"""
+    )
 
     agg_cols = [
         pl.len().alias("Boards"),
@@ -2116,6 +2134,26 @@ def _show_detail_for_selected_row(
 
         # --- All-sessions opponent summary (shown first for visibility) ---
         _show_all_opponents_aggregation(detail, key_suffix=f"player_{player_id}")
+        _show_sql_query_block(
+            f"""SELECT
+  Date,
+  session_id AS Session,
+  Round,
+  Board,
+  Seat,
+  Partner,
+  Opponents,
+  Pct,
+  Elo_Before,
+  Elo_After,
+  Elo_After - Elo_Before AS Elo_Delta
+FROM raw_df
+WHERE Player_ID_N = '{player_id}'
+   OR Player_ID_E = '{player_id}'
+   OR Player_ID_S = '{player_id}'
+   OR Player_ID_W = '{player_id}'
+ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
+        )
 
         grid_resp = _render_detail_aggrid(detail, key=f"detail_player_{player_id}", selectable=True)
 
@@ -2218,6 +2256,25 @@ def _show_detail_for_selected_row(
 
         # --- All-sessions opponent summary (shown first for visibility) ---
         _show_all_opponents_aggregation(detail, key_suffix=f"pair_{pair_ids}")
+        _show_sql_query_block(
+            f"""SELECT
+  Date,
+  session_id AS Session,
+  Round,
+  Board,
+  Side,
+  Opponents,
+  Pct,
+  Elo_Before,
+  Elo_After,
+  Elo_After - Elo_Before AS Elo_Delta
+FROM raw_df
+WHERE
+  (LEAST(Player_ID_N, Player_ID_S) = '{player_a}' AND GREATEST(Player_ID_N, Player_ID_S) = '{player_b}')
+  OR
+  (LEAST(Player_ID_E, Player_ID_W) = '{player_a}' AND GREATEST(Player_ID_E, Player_ID_W) = '{player_b}')
+ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
+        )
 
         grid_resp = _render_detail_aggrid(detail, key=f"detail_pair_{pair_ids}", selectable=True)
 
@@ -2760,18 +2817,22 @@ def main():
                         )
                     else:
                         swap_str = "N/A (swap disabled)"
-                    server_str = (
+                    api_meta_str = (
                         f"api_source_datetime:{source_mtime} | "
-                        f"api_uptime:{uptime_minutes:.1f}m ({uptime_seconds:.1f}s) | "
+                        f"api_uptime:{uptime_minutes:.1f}m ({uptime_seconds:.1f}s)"
+                    )
+                    server_resources_str = (
                         f"Memory: RAM {server.get('ram_used_gb', 0)}/{server.get('ram_total_gb', 0)} GB "
                         f"({server.get('ram_percent', 0)}%) • "
                         f"Virtual/Pagefile {swap_str} • "
                         f"CPU/Threads {server.get('cpu_count', 0)}/{server.get('threads', 0)}"
                     )
                 else:
-                    server_str = "Memory/CPU unavailable"
+                    api_meta_str = "api_source_datetime:n/a | api_uptime:n/a"
+                    server_resources_str = "Memory/CPU unavailable"
                 st.caption(
                     "API performance — "
+                    f"{api_meta_str} | "
                     f"source:{perf.get('source', 'unknown')} | "
                     f"parse:{perf.get('parse_seconds', 0)}s | "
                     f"load:{perf.get('load_seconds', 0)}s | "
@@ -2779,9 +2840,9 @@ def main():
                     f"sql:{perf.get('sql_seconds', 0)}s | "
                     f"serialize:{perf.get('serialize_seconds', 0)}s | "
                     f"total:{perf.get('total_seconds', 0)}s | "
-                    f"rows in/out:{perf.get('input_rows', '?')}/{perf.get('output_rows', '?')} | "
-                    f"{server_str}"
+                    f"rows in/out:{perf.get('input_rows', '?')}/{perf.get('output_rows', '?')}"
                 )
+                st.caption(f"Server resources — {server_resources_str}")
         else:
             ensure_dataset_loaded(dataset_type, columns=_required_columns_for_mode(rating_type, elo_rating_type))
             df = all_data[dataset_type]
@@ -3038,6 +3099,13 @@ def main():
                                         n_sessions = detail.select("Session").n_unique()
                                         st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
                                         _show_all_opponents_aggregation(detail, key_suffix=f"player_{player_id}")
+                                        _show_sql_query_block(
+                                            f"""SELECT *
+FROM acbl_detail_api
+WHERE rating_type = 'Players'
+  AND player_id = '{player_id}'
+ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
+                                        )
                                         detail_grid = _render_detail_aggrid(detail, key=f"detail_player_remote_{player_id}", selectable=True)
                                         if detail_grid is not None:
                                             sel = detail_grid.get("selected_rows", None)
@@ -3065,6 +3133,13 @@ def main():
                                         n_sessions = detail.select("Session").n_unique()
                                         st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
                                         _show_all_opponents_aggregation(detail, key_suffix=f"pair_{pair_ids}")
+                                        _show_sql_query_block(
+                                            f"""SELECT *
+FROM acbl_detail_api
+WHERE rating_type = 'Pairs'
+  AND pair_ids = '{pair_ids}'
+ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
+                                        )
                                         detail_grid = _render_detail_aggrid(detail, key=f"detail_pair_remote_{pair_ids}", selectable=True)
                                         if detail_grid is not None:
                                             sel = detail_grid.get("selected_rows", None)
@@ -3080,6 +3155,7 @@ def main():
             # 3. SQL Query Interface for additional queries (only if enabled)
             if st.session_state.get('show_sql_query', False) and st.session_state.get('enable_custom_queries', False):
                 st.markdown("---")
+                app_info()
                 st.markdown("### 🔍 Run Additional SQL Queries")
                 st.caption("Query the results above. Only the displayed columns are available. The results table is available as 'self'.")
                 
