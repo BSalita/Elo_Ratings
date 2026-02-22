@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 import polars as pl
-import psycopg
+import psycopg  # pyright: ignore[reportMissingImports]
 
 
 DATASET_TABLES = {
@@ -81,7 +81,7 @@ def ensure_runtime_tables_fresh(
     loader_fn: Callable[[str], pl.DataFrame],
     stale_hours: int = 24,
     refresh_enabled: bool = True,
-    progress_callback: Callable[[int, int, str, str], None] | None = None,
+    progress_callback: Callable[[int, int, str, str, float], None] | None = None,
 ) -> list[RefreshResult]:
     _ensure_meta_table(conn)
     results: list[RefreshResult] = []
@@ -91,12 +91,34 @@ def ensure_runtime_tables_fresh(
 
     for dataset_name in datasets:
         if progress_callback is not None:
-            progress_callback(completed_datasets, total_datasets, dataset_name, "start")
+            progress_callback(completed_datasets, total_datasets, dataset_name, "checking", 0.0)
         table_name = postgres_table_for_dataset(dataset_name)
         must_refresh, reason = _must_refresh(conn, dataset_name, table_name, stale_hours, refresh_enabled)
         if must_refresh:
+            if progress_callback is not None:
+                progress_callback(completed_datasets, total_datasets, dataset_name, "loading", 0.0)
             df = loader_fn(dataset_name)
-            _replace_table(conn, table_name, df)
+            if progress_callback is not None:
+                progress_callback(completed_datasets, total_datasets, dataset_name, "loading", 1.0)
+                progress_callback(completed_datasets, total_datasets, dataset_name, "replacing", 0.0)
+            _replace_table(
+                conn,
+                table_name,
+                df,
+                copy_progress_callback=(
+                    None
+                    if progress_callback is None
+                    else (lambda copied, total: progress_callback(
+                        completed_datasets,
+                        total_datasets,
+                        dataset_name,
+                        "copying",
+                        0.0 if total <= 0 else min(1.0, float(copied) / float(total)),
+                    ))
+                ),
+            )
+            if progress_callback is not None:
+                progress_callback(completed_datasets, total_datasets, dataset_name, "replacing", 1.0)
             _upsert_meta(conn, dataset_name, table_name, len(df))
             results.append(
                 RefreshResult(
@@ -108,6 +130,8 @@ def ensure_runtime_tables_fresh(
                 )
             )
         else:
+            if progress_callback is not None:
+                progress_callback(completed_datasets, total_datasets, dataset_name, "skip", 1.0)
             results.append(
                 RefreshResult(
                     refreshed=False,
@@ -119,7 +143,7 @@ def ensure_runtime_tables_fresh(
             )
         completed_datasets += 1
         if progress_callback is not None:
-            progress_callback(completed_datasets, total_datasets, dataset_name, "done")
+            progress_callback(completed_datasets, total_datasets, dataset_name, "done", 1.0)
     return results
 
 
@@ -196,14 +220,19 @@ def _upsert_meta(conn: psycopg.Connection, dataset_name: str, table_name: str, r
         )
 
 
-def _replace_table(conn: psycopg.Connection, table_name: str, df: pl.DataFrame) -> None:
+def _replace_table(
+    conn: psycopg.Connection,
+    table_name: str,
+    df: pl.DataFrame,
+    copy_progress_callback: Callable[[int, int], None] | None = None,
+) -> None:
     tmp_table = f"{table_name}__tmp_load"
     with conn.cursor() as cur:
         cur.execute(f"DROP TABLE IF EXISTS {tmp_table}")
         cur.execute(f"DROP TABLE IF EXISTS {table_name}")
         cur.execute(f"CREATE TABLE {tmp_table} ({_pg_columns_ddl(df)})")
 
-    _copy_df_to_table(conn, df, tmp_table)
+    _copy_df_to_table(conn, df, tmp_table, progress_callback=copy_progress_callback)
 
     with conn.cursor() as cur:
         cur.execute(f"ALTER TABLE {tmp_table} RENAME TO {table_name}")
@@ -213,21 +242,35 @@ def _replace_table(conn: psycopg.Connection, table_name: str, df: pl.DataFrame) 
             cur.execute(f"CREATE INDEX IF NOT EXISTS {table_name}_session_idx ON {table_name}(session_id)")
 
 
-def _copy_df_to_table(conn: psycopg.Connection, df: pl.DataFrame, table_name: str) -> None:
+def _copy_df_to_table(
+    conn: psycopg.Connection,
+    df: pl.DataFrame,
+    table_name: str,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> None:
     columns = [f"\"{c}\"" for c in df.columns]
     copy_sql = f"COPY {table_name} ({','.join(columns)}) FROM STDIN WITH (FORMAT CSV, HEADER FALSE, NULL '')"
 
     tmp_path = Path(tempfile.gettempdir()) / f"{table_name}.csv"
     df.write_csv(tmp_path, include_header=False, null_value="")
     try:
+        total_size = int(tmp_path.stat().st_size) if tmp_path.exists() else 0
+        if progress_callback is not None:
+            progress_callback(0, total_size)
         with conn.cursor() as cur:
             with cur.copy(copy_sql) as cp:
                 with open(tmp_path, "r", encoding="utf-8") as f:
+                    copied_size = 0
                     while True:
                         chunk = f.read(1024 * 1024)
                         if not chunk:
                             break
                         cp.write(chunk)
+                        copied_size += len(chunk.encode("utf-8"))
+                        if progress_callback is not None:
+                            progress_callback(min(copied_size, total_size), total_size)
+        if progress_callback is not None:
+            progress_callback(total_size, total_size)
     finally:
         try:
             tmp_path.unlink(missing_ok=True)

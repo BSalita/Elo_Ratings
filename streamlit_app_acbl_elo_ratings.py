@@ -2149,14 +2149,48 @@ def main():
         pg_conn = get_db_connection()
         if not st.session_state.get("pg_startup_refresh_done", False):
             refresh_progress = st.progress(0, text="Checking PostgreSQL runtime freshness... (0/2)")
+            refresh_started_at = time.time()
 
-            def _on_pg_refresh_progress(completed: int, total: int, dataset: str, stage: str) -> None:
+            def _on_pg_refresh_progress(
+                completed: int,
+                total: int,
+                dataset: str,
+                stage: str,
+                stage_progress: float,
+            ) -> None:
                 safe_total = max(1, int(total))
-                pct = int((int(completed) / safe_total) * 100)
-                status_verb = "Refreshing" if stage == "start" else "Completed"
+                safe_completed = max(0, int(completed))
+                safe_stage_progress = max(0.0, min(1.0, float(stage_progress)))
+                elapsed_sec = int(max(0.0, time.time() - refresh_started_at))
+
+                stage_labels = {
+                    "checking": "Checking freshness",
+                    "loading": "Loading parquet",
+                    "replacing": "Preparing PostgreSQL table",
+                    "copying": "Copying rows to PostgreSQL",
+                    "skip": "Already fresh, skipping reload",
+                    "done": "Completed",
+                }
+                dataset_progress_by_stage = {
+                    "checking": 0.05,
+                    "loading": 0.25 + (0.35 * safe_stage_progress),
+                    "replacing": 0.60 + (0.10 * safe_stage_progress),
+                    "copying": 0.70 + (0.30 * safe_stage_progress),
+                    "skip": 1.0,
+                    "done": 1.0,
+                }
+                dataset_progress = dataset_progress_by_stage.get(stage, 0.0)
+                overall_progress = (
+                    min(float(safe_total), float(safe_completed) + dataset_progress) / float(safe_total)
+                ) * 100.0
+                pct = int(max(0.0, min(100.0, overall_progress)))
+                label = stage_labels.get(stage, "Working")
                 refresh_progress.progress(
                     pct,
-                    text=f"Checking PostgreSQL runtime freshness... {status_verb} {dataset} ({completed}/{safe_total})",
+                    text=(
+                        f"Checking PostgreSQL runtime freshness... {label} {dataset} "
+                        f"({safe_completed}/{safe_total}) [{elapsed_sec}s]"
+                    ),
                 )
 
             refresh_results = ensure_runtime_tables_fresh(
