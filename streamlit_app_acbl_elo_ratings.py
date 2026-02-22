@@ -2164,6 +2164,7 @@ def main():
                 elapsed_sec = int(max(0.0, time.time() - refresh_started_at))
 
                 stage_labels = {
+                    "waiting_lock": "Waiting for refresh lock",
                     "checking": "Checking freshness",
                     "loading": "Loading parquet",
                     "replace_drop_temp": "Dropping temp table",
@@ -2178,6 +2179,7 @@ def main():
                     "done": "Completed",
                 }
                 dataset_progress_by_stage = {
+                    "waiting_lock": 0.01 + (0.03 * safe_stage_progress),
                     "checking": 0.05,
                     "loading": 0.25 + (0.35 * safe_stage_progress),
                     "replace_drop_temp": 0.33 + (0.03 * safe_stage_progress),
@@ -2198,7 +2200,7 @@ def main():
                 pct = int(max(0.0, min(100.0, overall_progress)))
                 label = stage_labels.get(stage, "Working")
                 detail = ""
-                if stage in ("copying", "serialize_csv", "loading"):
+                if stage in ("copying", "serialize_csv", "loading", "waiting_lock"):
                     detail = f" {int(safe_stage_progress * 100)}%"
                 refresh_progress.progress(
                     pct,

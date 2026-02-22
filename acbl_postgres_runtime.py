@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ DATASET_TABLES = {
 }
 
 META_TABLE = "acbl_runtime_refresh_meta"
+REFRESH_ADVISORY_LOCK_KEY = 684037921
 
 
 @dataclass
@@ -44,7 +46,13 @@ def get_database_url() -> str:
 
 
 def get_pg_connection() -> psycopg.Connection:
-    return psycopg.connect(get_database_url(), autocommit=True)
+    conn = psycopg.connect(get_database_url(), autocommit=True)
+    lock_timeout_ms = int(os.getenv("ACBL_PG_LOCK_TIMEOUT_MS", "15000").strip() or "15000")
+    statement_timeout_ms = int(os.getenv("ACBL_PG_STATEMENT_TIMEOUT_MS", "1800000").strip() or "1800000")
+    with conn.cursor() as cur:
+        cur.execute(f"SET lock_timeout = '{max(1, lock_timeout_ms)}ms'")
+        cur.execute(f"SET statement_timeout = '{max(1000, statement_timeout_ms)}ms'")
+    return conn
 
 
 def postgres_table_for_dataset(dataset_name: str) -> str:
@@ -88,71 +96,107 @@ def ensure_runtime_tables_fresh(
     datasets = ("club", "tournament")
     total_datasets = len(datasets)
     completed_datasets = 0
+    lock_wait_seconds = int(os.getenv("ACBL_PG_REFRESH_LOCK_WAIT_SECONDS", "30").strip() or "30")
+    lock_wait_seconds = max(1, lock_wait_seconds)
 
-    for dataset_name in datasets:
-        if progress_callback is not None:
-            progress_callback(completed_datasets, total_datasets, dataset_name, "checking", 0.0)
-        table_name = postgres_table_for_dataset(dataset_name)
-        must_refresh, reason = _must_refresh(conn, dataset_name, table_name, stale_hours, refresh_enabled)
-        if must_refresh:
+    _acquire_refresh_lock(conn, lock_wait_seconds, progress_callback)
+    try:
+        for dataset_name in datasets:
             if progress_callback is not None:
-                progress_callback(completed_datasets, total_datasets, dataset_name, "loading", 0.0)
-            df = loader_fn(dataset_name)
-            if progress_callback is not None:
-                progress_callback(completed_datasets, total_datasets, dataset_name, "loading", 1.0)
-            _replace_table(
-                conn,
-                table_name,
-                df,
-                copy_progress_callback=(
-                    None
-                    if progress_callback is None
-                    else (lambda copied, total: progress_callback(
-                        completed_datasets,
-                        total_datasets,
-                        dataset_name,
-                        "copying",
-                        0.0 if total <= 0 else min(1.0, float(copied) / float(total)),
-                    ))
-                ),
-                stage_progress_callback=(
-                    None
-                    if progress_callback is None
-                    else (lambda stage, stage_progress: progress_callback(
-                        completed_datasets,
-                        total_datasets,
-                        dataset_name,
-                        stage,
-                        stage_progress,
-                    ))
-                ),
-            )
-            _upsert_meta(conn, dataset_name, table_name, len(df))
-            results.append(
-                RefreshResult(
-                    refreshed=True,
-                    dataset=dataset_name,
-                    row_count=len(df),
-                    refreshed_at_utc=datetime.now(timezone.utc),
-                    reason=reason,
+                progress_callback(completed_datasets, total_datasets, dataset_name, "checking", 0.0)
+            table_name = postgres_table_for_dataset(dataset_name)
+            must_refresh, reason = _must_refresh(conn, dataset_name, table_name, stale_hours, refresh_enabled)
+            if must_refresh:
+                if progress_callback is not None:
+                    progress_callback(completed_datasets, total_datasets, dataset_name, "loading", 0.0)
+                df = loader_fn(dataset_name)
+                if progress_callback is not None:
+                    progress_callback(completed_datasets, total_datasets, dataset_name, "loading", 1.0)
+                _replace_table(
+                    conn,
+                    table_name,
+                    df,
+                    copy_progress_callback=(
+                        None
+                        if progress_callback is None
+                        else (lambda copied, total: progress_callback(
+                            completed_datasets,
+                            total_datasets,
+                            dataset_name,
+                            "copying",
+                            0.0 if total <= 0 else min(1.0, float(copied) / float(total)),
+                        ))
+                    ),
+                    stage_progress_callback=(
+                        None
+                        if progress_callback is None
+                        else (lambda stage, stage_progress: progress_callback(
+                            completed_datasets,
+                            total_datasets,
+                            dataset_name,
+                            stage,
+                            stage_progress,
+                        ))
+                    ),
                 )
-            )
-        else:
-            if progress_callback is not None:
-                progress_callback(completed_datasets, total_datasets, dataset_name, "skip", 1.0)
-            results.append(
-                RefreshResult(
-                    refreshed=False,
-                    dataset=dataset_name,
-                    row_count=_table_row_count(conn, table_name),
-                    refreshed_at_utc=datetime.now(timezone.utc),
-                    reason=reason,
+                _upsert_meta(conn, dataset_name, table_name, len(df))
+                results.append(
+                    RefreshResult(
+                        refreshed=True,
+                        dataset=dataset_name,
+                        row_count=len(df),
+                        refreshed_at_utc=datetime.now(timezone.utc),
+                        reason=reason,
+                    )
                 )
-            )
-        completed_datasets += 1
-        if progress_callback is not None:
-            progress_callback(completed_datasets, total_datasets, dataset_name, "done", 1.0)
+            else:
+                if progress_callback is not None:
+                    progress_callback(completed_datasets, total_datasets, dataset_name, "skip", 1.0)
+                results.append(
+                    RefreshResult(
+                        refreshed=False,
+                        dataset=dataset_name,
+                        row_count=_table_row_count(conn, table_name),
+                        refreshed_at_utc=datetime.now(timezone.utc),
+                        reason=reason,
+                    )
+                )
+            completed_datasets += 1
+            if progress_callback is not None:
+                progress_callback(completed_datasets, total_datasets, dataset_name, "done", 1.0)
+    finally:
+        _release_refresh_lock(conn)
     return results
+
+
+def _acquire_refresh_lock(
+    conn: psycopg.Connection,
+    wait_seconds: int,
+    progress_callback: Callable[[int, int, str, str, float], None] | None = None,
+) -> None:
+    deadline = time.time() + max(1, int(wait_seconds))
+    while True:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (REFRESH_ADVISORY_LOCK_KEY,))
+            got_lock = bool(cur.fetchone()[0])
+        if got_lock:
+            return
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise TimeoutError(
+                "Timed out waiting for PostgreSQL refresh lock. "
+                "Another refresh is running; try again shortly."
+            )
+        if progress_callback is not None:
+            waited = max(0.0, float(wait_seconds) - max(0.0, remaining))
+            progress_callback(0, 2, "club", "waiting_lock", min(1.0, waited / float(wait_seconds)))
+        time.sleep(min(1.0, max(0.1, remaining)))
+
+
+def _release_refresh_lock(conn: psycopg.Connection) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_unlock(%s)", (REFRESH_ADVISORY_LOCK_KEY,))
 
 
 def _must_refresh(
