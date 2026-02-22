@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import pathlib
 import time
+import gc
 from datetime import datetime, timezone
 
 import duckdb
@@ -284,6 +285,23 @@ def _server_runtime_info() -> dict:
         "swap_percent": round(sm.percent, 1),
         "swap_enabled": bool(sm.total > 0),
     }
+
+
+def _post_request_memory_cleanup() -> float:
+    """Best-effort allocator cleanup; returns elapsed seconds."""
+    t0 = time.perf_counter()
+    gc.collect()
+    try:
+        import pyarrow as pa
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    return round(time.perf_counter() - t0, 3)
 
 
 def _build_player_detail(df: pl.DataFrame, player_id: str, elo_rating_type: str) -> pl.DataFrame:
@@ -610,6 +628,8 @@ def acbl_report(
 
         ended_at = datetime.now()
         elapsed = (ended_at - started_at).total_seconds()
+        input_rows = len(df)
+        output_rows = len(result_df)
         perf = {
             "source": "r2" if _r2_enabled() else "local",
             "parse_seconds": round(t_parse_end - t_parse_start, 3),
@@ -617,15 +637,14 @@ def acbl_report(
             "filter_seconds": round(t_filter_end - t_filter_start, 3),
             "sql_seconds": round(t_sql_end - t_sql_start, 3),
             "serialize_seconds": round(t_serialize_end - t_serialize_start, 3),
-            "total_seconds": round(time.perf_counter() - t0, 3),
-            "input_rows": len(df),
-            "output_rows": len(result_df),
+            "input_rows": input_rows,
+            "output_rows": output_rows,
         }
-        return {
+        response_payload = {
             "rows": result_rows,
             "generated_sql": generated_sql,
             "date_range": date_range,
-            "row_count": len(result_df),
+            "row_count": output_rows,
             "started_at": started_at.isoformat(),
             "ended_at": ended_at.isoformat(),
             "elapsed_seconds": elapsed,
@@ -633,6 +652,12 @@ def acbl_report(
             "perf": perf,
             "server": _server_runtime_info(),
         }
+        del result_df
+        del df
+        cleanup_seconds = _post_request_memory_cleanup()
+        response_payload["perf"]["cleanup_seconds"] = cleanup_seconds
+        response_payload["perf"]["total_seconds"] = round(time.perf_counter() - t0, 3)
+        return response_payload
     except HTTPException:
         raise
     except Exception as exc:
@@ -686,6 +711,8 @@ def acbl_detail(
 
         ended_at = datetime.now()
         elapsed = (ended_at - started_at).total_seconds()
+        input_rows = len(df)
+        output_rows = len(detail)
         perf = {
             "source": "r2" if _r2_enabled() else "local",
             "parse_seconds": round(t_parse_end - t_parse_start, 3),
@@ -693,19 +720,24 @@ def acbl_detail(
             "filter_seconds": round(t_filter_end - t_filter_start, 3),
             "build_seconds": round(t_build_end - t_build_start, 3),
             "serialize_seconds": round(t_serialize_end - t_serialize_start, 3),
-            "total_seconds": round(time.perf_counter() - t0, 3),
-            "input_rows": len(df),
-            "output_rows": len(detail),
+            "input_rows": input_rows,
+            "output_rows": output_rows,
         }
-        return {
+        response_payload = {
             "rows": detail_rows,
-            "row_count": len(detail),
+            "row_count": output_rows,
             "started_at": started_at.isoformat(),
             "ended_at": ended_at.isoformat(),
             "elapsed_seconds": elapsed,
             "perf": perf,
             "server": _server_runtime_info(),
         }
+        del detail
+        del df
+        cleanup_seconds = _post_request_memory_cleanup()
+        response_payload["perf"]["cleanup_seconds"] = cleanup_seconds
+        response_payload["perf"]["total_seconds"] = round(time.perf_counter() - t0, 3)
+        return response_payload
     except HTTPException:
         raise
     except Exception as exc:
