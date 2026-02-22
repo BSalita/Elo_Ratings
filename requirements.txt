@@ -9,6 +9,8 @@ python-dotenv
 
 # HTTP requests for API calls
 requests
+fastapi
+uvicorn
 
 # Data processing and analysis
 pandas

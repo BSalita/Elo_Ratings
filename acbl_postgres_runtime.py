@@ -97,6 +97,7 @@ def ensure_runtime_tables_fresh(
     total_datasets = len(datasets)
     completed_datasets = 0
     lock_wait_seconds = int(os.getenv("ACBL_PG_REFRESH_LOCK_WAIT_SECONDS", "30").strip() or "30")
+                progress_callback(completed_datasets, total_datasets, dataset_name, "replacing", 0.0)
     lock_wait_seconds = max(1, lock_wait_seconds)
 
     _acquire_refresh_lock(conn, lock_wait_seconds, progress_callback)
@@ -125,6 +126,8 @@ def ensure_runtime_tables_fresh(
                             dataset_name,
                             "copying",
                             0.0 if total <= 0 else min(1.0, float(copied) / float(total)),
+            if progress_callback is not None:
+                progress_callback(completed_datasets, total_datasets, dataset_name, "replacing", 1.0)
                         ))
                     ),
                     stage_progress_callback=(
@@ -187,6 +190,7 @@ def _acquire_refresh_lock(
             raise TimeoutError(
                 "Timed out waiting for PostgreSQL refresh lock. "
                 "Another refresh is running; try again shortly."
+        completed_datasets += 1
             )
         if progress_callback is not None:
             waited = max(0.0, float(wait_seconds) - max(0.0, remaining))
