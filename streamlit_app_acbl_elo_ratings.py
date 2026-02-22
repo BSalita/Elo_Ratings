@@ -2148,13 +2148,26 @@ def main():
     try:
         pg_conn = get_db_connection()
         if not st.session_state.get("pg_startup_refresh_done", False):
-            with st.spinner("Checking PostgreSQL runtime freshness..."):
-                refresh_results = ensure_runtime_tables_fresh(
-                    pg_conn,
-                    loader_fn=load_dataset_for_refresh,
-                    stale_hours=stale_hours,
-                    refresh_enabled=refresh_enabled,
+            refresh_progress = st.progress(0, text="Checking PostgreSQL runtime freshness... (0/2)")
+
+            def _on_pg_refresh_progress(completed: int, total: int, dataset: str, stage: str) -> None:
+                safe_total = max(1, int(total))
+                pct = int((int(completed) / safe_total) * 100)
+                status_verb = "Refreshing" if stage == "start" else "Completed"
+                refresh_progress.progress(
+                    pct,
+                    text=f"Checking PostgreSQL runtime freshness... {status_verb} {dataset} ({completed}/{safe_total})",
                 )
+
+            refresh_results = ensure_runtime_tables_fresh(
+                pg_conn,
+                loader_fn=load_dataset_for_refresh,
+                stale_hours=stale_hours,
+                refresh_enabled=refresh_enabled,
+                progress_callback=_on_pg_refresh_progress,
+            )
+            refresh_progress.progress(100, text="Checking PostgreSQL runtime freshness... done (2/2)")
+            refresh_progress.empty()
             st.session_state.pg_startup_refresh_done = True
             st.session_state.pg_refresh_results = refresh_results
     except Exception as e:

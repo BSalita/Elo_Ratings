@@ -81,11 +81,17 @@ def ensure_runtime_tables_fresh(
     loader_fn: Callable[[str], pl.DataFrame],
     stale_hours: int = 24,
     refresh_enabled: bool = True,
+    progress_callback: Callable[[int, int, str, str], None] | None = None,
 ) -> list[RefreshResult]:
     _ensure_meta_table(conn)
     results: list[RefreshResult] = []
+    datasets = ("club", "tournament")
+    total_datasets = len(datasets)
+    completed_datasets = 0
 
-    for dataset_name in ("club", "tournament"):
+    for dataset_name in datasets:
+        if progress_callback is not None:
+            progress_callback(completed_datasets, total_datasets, dataset_name, "start")
         table_name = postgres_table_for_dataset(dataset_name)
         must_refresh, reason = _must_refresh(conn, dataset_name, table_name, stale_hours, refresh_enabled)
         if must_refresh:
@@ -111,6 +117,9 @@ def ensure_runtime_tables_fresh(
                     reason=reason,
                 )
             )
+        completed_datasets += 1
+        if progress_callback is not None:
+            progress_callback(completed_datasets, total_datasets, dataset_name, "done")
     return results
 
 
