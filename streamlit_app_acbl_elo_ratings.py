@@ -2971,7 +2971,6 @@ def main():
                         cache_key=cache_key,
                         use_sql_engine=use_sql,
                     )
-                    st.info(f"✅ Using cached {rating_type} report ({len(table_df)} rows)")
                 else:
                     engine_name = "SQL" if use_sql else "Polars"
                     with st.spinner(f"Building {rating_type} report using {engine_name} engine..."):
@@ -2995,7 +2994,7 @@ def main():
             
             # Display results with exactly 25 viewable rows (common for both paths)
             if 'table_df' in locals():
-                st.markdown("### 📊 Query Results")
+                st.markdown(f"### 📊 Query Results ({len(table_df)} rows)")
                 # Standardize on Polars for filtering; convert to pandas only right before AgGrid
                 work_df = table_df
                 try:
@@ -3192,7 +3191,6 @@ ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
             # 3. SQL Query Interface for additional queries (only if enabled)
             if st.session_state.get('show_sql_query', False) and st.session_state.get('enable_custom_queries', False):
                 st.markdown("---")
-                app_info()
                 st.markdown("### 🔍 Run Additional SQL Queries")
                 st.caption("Query the results above. Only the displayed columns are available. The results table is available as 'self'.")
                 
@@ -3360,6 +3358,7 @@ ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
                 mime="application/pdf",
             )
 
+    app_info()
     render_app_footer(
         st,
         ENDPLAY_VERSION,
