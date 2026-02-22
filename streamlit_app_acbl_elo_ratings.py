@@ -204,15 +204,61 @@ def _fetch_remote_report_table(
     }
 
     timeout_seconds = int(os.getenv("ACBL_API_TIMEOUT_SECONDS", "180"))
-    response = requests.get(
-        f"{base_url}/acbl/report",
-        params=params,
-        timeout=timeout_seconds,
-    )
-    response.raise_for_status()
-    payload = response.json()
+    request_url = f"{base_url}/acbl/report"
+    try:
+        response = requests.get(
+            request_url,
+            params=params,
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.exceptions.RequestException as exc:
+        hint = (
+            "If Streamlit and API are in different Railway projects, use the API public URL "
+            "(https://...) for ACBL_API_BASE_URL instead of *.railway.internal."
+        )
+        raise RuntimeError(
+            f"ACBL API request failed for {request_url}: {exc}. {hint}"
+        ) from exc
     rows = payload.get("rows", [])
     return pl.DataFrame(rows), payload
+
+
+def _fetch_remote_detail_table(
+    club_or_tournament: str,
+    rating_type: str,
+    elo_rating_type: str,
+    date_from: datetime | None,
+    online_filter: str,
+    player_id: str | None = None,
+    pair_ids: str | None = None,
+) -> pl.DataFrame:
+    """Fetch session-level detail rows from the ACBL API service."""
+    base_url = _acbl_api_base_url()
+    if base_url is None:
+        raise ValueError("ACBL_API_BASE_URL is not configured")
+
+    params = {
+        "club_or_tournament": club_or_tournament.lower(),
+        "rating_type": rating_type,
+        "elo_rating_type": elo_rating_type,
+        "date_from": None if date_from is None else date_from.isoformat(),
+        "online_filter": online_filter,
+        "player_id": player_id,
+        "pair_ids": pair_ids,
+    }
+
+    timeout_seconds = int(os.getenv("ACBL_API_TIMEOUT_SECONDS", "180"))
+    request_url = f"{base_url}/acbl/detail"
+    try:
+        response = requests.get(request_url, params=params, timeout=timeout_seconds)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"ACBL API detail request failed for {request_url}: {exc}") from exc
+
+    return pl.DataFrame(payload.get("rows", []))
 
 
 def _table_cache_keys() -> list[str]:
@@ -2414,35 +2460,43 @@ def main():
             show_sql = st.checkbox('Show SQL Query', value=st.session_state.show_sql_query, help='Show SQL used to query dataframes.')
             st.session_state.show_sql_query = show_sql
             
-            # Query engine selection (SQL is 2-3x faster)
-            use_sql_engine = st.checkbox('Use SQL Engine (2-3x faster)', value=st.session_state.get('use_sql_engine', True), 
-                                        help='SQL engine is 2-3x faster than Polars. Uncheck to use Polars engine for comparison.')
-            st.session_state.use_sql_engine = use_sql_engine
-            
-            # Comparison mode toggle (default relaxed)
-            strict = st.checkbox('Strict comparison (include name columns)', value=st.session_state.get('strict_comparison', False))
-            st.session_state.strict_comparison = strict
-            # Fast comparison options (limit club dataset by recent days)
-            fast_comp = st.checkbox('Fast comparison (limit club to recent days)', value=st.session_state.get('fast_comparison', True))
-            st.session_state.fast_comparison = fast_comp
-            fast_days = st.number_input('Fast comparison club days', min_value=30, max_value=3650, value=int(st.session_state.get('fast_comparison_days', 180)) if isinstance(st.session_state.get('fast_comparison_days', 180), int) else 180, step=30, help='When enabled, comparisons filter club data to the most recent N days for speed.')
-            st.session_state.fast_comparison_days = int(fast_days)
-            
-            run_comprehensive = st.button("Run Polars vs SQL Comparison", help="Test all combinations: datasets × rating types × methods × elo types")
-            if run_comprehensive:
-                st.session_state.run_comprehensive_comparison = True
-            # New: dataset-specific comparison buttons
-            run_club_only = st.button("Run Club-only Comparison", help="Compare only club dataset across all variations")
-            if run_club_only:
-                st.session_state.run_comprehensive_comparison_club = True
-            run_tournament_only = st.button("Run Tournament-only Comparison", help="Compare only tournament dataset across all variations")
-            if run_tournament_only:
-                st.session_state.run_comprehensive_comparison_tournament = True
-            
-            # Debug single test button
-            debug_single = st.button("Run Polars vs SQL Single Test", help="Run a single test to debug issues")
-            if debug_single:
-                st.session_state.debug_single_test = True
+            if _acbl_use_remote_api():
+                st.caption("API mode enabled: local Polars/SQL comparison tools are disabled.")
+                st.session_state.use_sql_engine = True
+                st.session_state.run_comprehensive_comparison = False
+                st.session_state.run_comprehensive_comparison_club = False
+                st.session_state.run_comprehensive_comparison_tournament = False
+                st.session_state.debug_single_test = False
+            else:
+                # Query engine selection (SQL is 2-3x faster)
+                use_sql_engine = st.checkbox('Use SQL Engine (2-3x faster)', value=st.session_state.get('use_sql_engine', True), 
+                                            help='SQL engine is 2-3x faster than Polars. Uncheck to use Polars engine for comparison.')
+                st.session_state.use_sql_engine = use_sql_engine
+                
+                # Comparison mode toggle (default relaxed)
+                strict = st.checkbox('Strict comparison (include name columns)', value=st.session_state.get('strict_comparison', False))
+                st.session_state.strict_comparison = strict
+                # Fast comparison options (limit club dataset by recent days)
+                fast_comp = st.checkbox('Fast comparison (limit club to recent days)', value=st.session_state.get('fast_comparison', True))
+                st.session_state.fast_comparison = fast_comp
+                fast_days = st.number_input('Fast comparison club days', min_value=30, max_value=3650, value=int(st.session_state.get('fast_comparison_days', 180)) if isinstance(st.session_state.get('fast_comparison_days', 180), int) else 180, step=30, help='When enabled, comparisons filter club data to the most recent N days for speed.')
+                st.session_state.fast_comparison_days = int(fast_days)
+                
+                run_comprehensive = st.button("Run Polars vs SQL Comparison", help="Test all combinations: datasets × rating types × methods × elo types")
+                if run_comprehensive:
+                    st.session_state.run_comprehensive_comparison = True
+                # New: dataset-specific comparison buttons
+                run_club_only = st.button("Run Club-only Comparison", help="Compare only club dataset across all variations")
+                if run_club_only:
+                    st.session_state.run_comprehensive_comparison_club = True
+                run_tournament_only = st.button("Run Tournament-only Comparison", help="Compare only tournament dataset across all variations")
+                if run_tournament_only:
+                    st.session_state.run_comprehensive_comparison_tournament = True
+                
+                # Debug single test button
+                debug_single = st.button("Run Polars vs SQL Single Test", help="Run a single test to debug issues")
+                if debug_single:
+                    st.session_state.debug_single_test = True
 
     # Determine date_from based on selection
     now = datetime.now()
@@ -2634,22 +2688,39 @@ def main():
         remote_table_df: pl.DataFrame | None = None
 
         if use_remote_api:
-            with st.spinner("Fetching pre-aggregated report from ACBL API..."):
-                remote_table_df, remote_payload = _fetch_remote_report_table(
-                    club_or_tournament=club_or_tournament,
-                    rating_type=rating_type,
-                    top_n=int(top_n),
-                    min_sessions=int(min_sessions),
-                    rating_method=rating_method,
-                    moving_avg_days=int(moving_avg_days),
-                    elo_rating_type=elo_rating_type,
-                    date_from=date_from,
-                    online_filter=online_filter,
-                )
+            try:
+                with st.spinner("Fetching pre-aggregated report from ACBL API..."):
+                    remote_table_df, remote_payload = _fetch_remote_report_table(
+                        club_or_tournament=club_or_tournament,
+                        rating_type=rating_type,
+                        top_n=int(top_n),
+                        min_sessions=int(min_sessions),
+                        rating_method=rating_method,
+                        moving_avg_days=int(moving_avg_days),
+                        elo_rating_type=elo_rating_type,
+                        date_from=date_from,
+                        online_filter=online_filter,
+                    )
+            except Exception as exc:
+                st.error(str(exc))
+                st.stop()
             df = pl.DataFrame()
             date_range = str(remote_payload.get("date_range", "") or "")
             generated_sql = str(remote_payload.get("generated_sql", "") or "")
             st.info(f"✅ Using remote ACBL API ({dataset_type}, {online_filter.lower()} games)")
+            perf = remote_payload.get("perf", {}) if isinstance(remote_payload, dict) else {}
+            if isinstance(perf, dict) and perf:
+                st.caption(
+                    "API performance — "
+                    f"source:{perf.get('source', 'unknown')} | "
+                    f"parse:{perf.get('parse_seconds', 0)}s | "
+                    f"load:{perf.get('load_seconds', 0)}s | "
+                    f"filter:{perf.get('filter_seconds', 0)}s | "
+                    f"sql:{perf.get('sql_seconds', 0)}s | "
+                    f"serialize:{perf.get('serialize_seconds', 0)}s | "
+                    f"total:{perf.get('total_seconds', 0)}s | "
+                    f"rows in/out:{perf.get('input_rows', '?')}/{perf.get('output_rows', '?')}"
+                )
         else:
             ensure_dataset_loaded(dataset_type, columns=_required_columns_for_mode(rating_type, elo_rating_type))
             df = all_data[dataset_type]
@@ -2882,7 +2953,65 @@ def main():
                     selected_row = selected_rows.iloc[0] if hasattr(selected_rows, 'iloc') else selected_rows[0]
                     _show_detail_for_selected_row(selected_row, df, rating_type, elo_rating_type)
                 elif selected_rows is not None and len(selected_rows) > 0 and use_remote_api:
-                    st.info("Session-level detail view is not yet enabled in API mode.")
+                    selected_row = selected_rows.iloc[0] if hasattr(selected_rows, 'iloc') else selected_rows[0]
+                    try:
+                        with st.spinner("Loading session history from ACBL API..."):
+                            if rating_type == "Players":
+                                player_id = str(selected_row.get("Player_ID", ""))
+                                player_name = selected_row.get("Player_Name", "Unknown")
+                                if not player_id:
+                                    st.warning("Missing Player_ID in selected row.")
+                                else:
+                                    st.markdown(f"#### Session History: **{player_name}** ({player_id})")
+                                    detail = _fetch_remote_detail_table(
+                                        club_or_tournament=club_or_tournament,
+                                        rating_type=rating_type,
+                                        elo_rating_type=elo_rating_type,
+                                        date_from=date_from,
+                                        online_filter=online_filter,
+                                        player_id=player_id,
+                                    )
+                                    if detail.is_empty():
+                                        st.info("No session data found for this player.")
+                                    else:
+                                        n_sessions = detail.select("Session").n_unique()
+                                        st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
+                                        _show_all_opponents_aggregation(detail, key_suffix=f"player_{player_id}")
+                                        detail_grid = _render_detail_aggrid(detail, key=f"detail_player_remote_{player_id}", selectable=True)
+                                        if detail_grid is not None:
+                                            sel = detail_grid.get("selected_rows", None)
+                                            if sel is not None and len(sel) > 0:
+                                                sel_row = sel.iloc[0] if hasattr(sel, "iloc") else sel[0]
+                                                _show_opponent_aggregation(detail, sel_row)
+                            else:
+                                pair_ids = str(selected_row.get("Pair_IDs", ""))
+                                pair_names = selected_row.get("Pair_Names", "Unknown")
+                                if not pair_ids:
+                                    st.warning("Missing Pair_IDs in selected row.")
+                                else:
+                                    st.markdown(f"#### Session History: **{pair_names}**")
+                                    detail = _fetch_remote_detail_table(
+                                        club_or_tournament=club_or_tournament,
+                                        rating_type=rating_type,
+                                        elo_rating_type=elo_rating_type,
+                                        date_from=date_from,
+                                        online_filter=online_filter,
+                                        pair_ids=pair_ids,
+                                    )
+                                    if detail.is_empty():
+                                        st.info("No session data found for this pair.")
+                                    else:
+                                        n_sessions = detail.select("Session").n_unique()
+                                        st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
+                                        _show_all_opponents_aggregation(detail, key_suffix=f"pair_{pair_ids}")
+                                        detail_grid = _render_detail_aggrid(detail, key=f"detail_pair_remote_{pair_ids}", selectable=True)
+                                        if detail_grid is not None:
+                                            sel = detail_grid.get("selected_rows", None)
+                                            if sel is not None and len(sel) > 0:
+                                                sel_row = sel.iloc[0] if hasattr(sel, "iloc") else sel[0]
+                                                _show_opponent_aggregation(detail, sel_row)
+                    except Exception as exc:
+                        st.error(f"Session detail API request failed: {exc}")
                 
                 # Mark that table is displayed (lightweight state only)
                 st.session_state.table_displayed = True

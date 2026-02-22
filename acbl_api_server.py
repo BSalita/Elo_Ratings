@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import time
 from datetime import datetime
 
 import duckdb
@@ -142,6 +143,134 @@ def _required_columns_for_mode(rating_type: str, elo_rating_type: str) -> list[s
             for p in "NESW":
                 cols.add(player_pat.format(pos=p))
     return sorted(cols)
+
+
+def _required_columns_for_detail(rating_type: str, elo_rating_type: str) -> list[str]:
+    cols = {"Date", "session_id", "Pct_NS", "Round", "Board"}
+    for p in "NESW":
+        cols.update({f"Player_ID_{p}", f"Player_Name_{p}"})
+
+    elo_cols = get_elo_column_names(elo_rating_type)
+    if rating_type == "Players":
+        player_pat = elo_cols.get("player_pattern")
+        if player_pat:
+            for p in "NESW":
+                cols.add(player_pat.format(pos=p))
+                cols.add(f"Elo_R_{p}_Before")
+    else:
+        pair_ns = elo_cols.get("pair_ns")
+        pair_ew = elo_cols.get("pair_ew")
+        if pair_ns:
+            cols.add(pair_ns)
+        if pair_ew:
+            cols.add(pair_ew)
+        cols.update({"Elo_R_NS_Before", "Elo_R_EW_Before"})
+    return sorted(cols)
+
+
+def _build_player_detail(df: pl.DataFrame, player_id: str, elo_rating_type: str) -> pl.DataFrame:
+    elo_columns = get_elo_column_names(elo_rating_type)
+    frames: list[pl.DataFrame] = []
+    for pos in "NESW":
+        elo_col = elo_columns["player_pattern"].format(pos=pos) if elo_columns["player_pattern"] else None
+        if elo_col is None or elo_col not in df.columns:
+            continue
+        partner_pos_map = {"N": "S", "S": "N", "E": "W", "W": "E"}
+        partner = partner_pos_map[pos]
+        opp1, opp2 = (("E", "W") if pos in ("N", "S") else ("N", "S"))
+        cols_to_select = [pl.col("Date"), pl.col("session_id").alias("Session")]
+        if "Round" in df.columns:
+            cols_to_select.append(pl.col("Round"))
+        if "Board" in df.columns:
+            cols_to_select.append(pl.col("Board"))
+        is_ns = pos in ("N", "S")
+        if "Pct_NS" in df.columns:
+            pct_expr = (pl.col("Pct_NS").cast(pl.Float64) * 100).round(1) if is_ns else ((1 - pl.col("Pct_NS").cast(pl.Float64)) * 100).round(1)
+        else:
+            pct_expr = pl.lit(None, dtype=pl.Float64)
+        before_col = f"Elo_R_{pos}_Before" if elo_rating_type in ("Current Rating (End of Session)", "Rating at Start of Session") else None
+        cols_to_select += [
+            pl.lit(pos).alias("Seat"),
+            pl.col(f"Player_Name_{partner}").alias("Partner"),
+            (pl.col(f"Player_Name_{opp1}") + " - " + pl.col(f"Player_Name_{opp2}")).alias("Opponents"),
+            pct_expr.alias("Pct"),
+        ]
+        if before_col and before_col in df.columns:
+            cols_to_select.append(pl.col(before_col).cast(pl.Float64).round(0).cast(pl.Int32, strict=False).alias("Elo_Before"))
+        cols_to_select.append(pl.col(elo_col).cast(pl.Float64).round(0).cast(pl.Int32, strict=False).alias("Elo_After"))
+        frames.append(df.filter(pl.col(f"Player_ID_{pos}") == player_id).select(cols_to_select))
+
+    if not frames:
+        return pl.DataFrame()
+    detail = pl.concat(frames, how="diagonal")
+    sort_cols = ["Date", "Session"]
+    sort_desc = [True, True]
+    if "Round" in detail.columns:
+        sort_cols.append("Round")
+        sort_desc.append(False)
+    if "Board" in detail.columns:
+        sort_cols.append("Board")
+        sort_desc.append(False)
+    detail = detail.sort(sort_cols, descending=sort_desc)
+    if "Elo_Before" in detail.columns and "Elo_After" in detail.columns:
+        detail = detail.with_columns((pl.col("Elo_After") - pl.col("Elo_Before")).alias("Elo_Delta"))
+    return detail
+
+
+def _build_pair_detail(df: pl.DataFrame, pair_ids: str, elo_rating_type: str) -> pl.DataFrame:
+    if "-" not in pair_ids:
+        return pl.DataFrame()
+    player_a, player_b = pair_ids.split("-", 1)
+    elo_columns = get_elo_column_names(elo_rating_type)
+    frames: list[pl.DataFrame] = []
+    for side, id1_col, id2_col in [("NS", "Player_ID_N", "Player_ID_S"), ("EW", "Player_ID_E", "Player_ID_W")]:
+        pair_elo_col = elo_columns.get(f"pair_{side.lower()}")
+        if not pair_elo_col or pair_elo_col not in df.columns:
+            continue
+        side_df = df.filter(
+            (pl.min_horizontal(pl.col(id1_col), pl.col(id2_col)) == player_a)
+            & (pl.max_horizontal(pl.col(id1_col), pl.col(id2_col)) == player_b)
+        )
+        if side_df.is_empty():
+            continue
+        opp_side = "EW" if side == "NS" else "NS"
+        opp1, opp2 = (("E", "W") if opp_side == "EW" else ("N", "S"))
+        cols_to_select = [pl.col("Date"), pl.col("session_id").alias("Session")]
+        if "Round" in df.columns:
+            cols_to_select.append(pl.col("Round"))
+        if "Board" in df.columns:
+            cols_to_select.append(pl.col("Board"))
+        is_ns = side == "NS"
+        if "Pct_NS" in df.columns:
+            pct_expr = (pl.col("Pct_NS").cast(pl.Float64) * 100).round(1) if is_ns else ((1 - pl.col("Pct_NS").cast(pl.Float64)) * 100).round(1)
+        else:
+            pct_expr = pl.lit(None, dtype=pl.Float64)
+        before_col = f"Elo_R_{side}_Before" if elo_rating_type in ("Current Rating (End of Session)", "Rating at Start of Session") else None
+        cols_to_select += [
+            pl.lit(side).alias("Side"),
+            (pl.col(f"Player_Name_{opp1}") + " - " + pl.col(f"Player_Name_{opp2}")).alias("Opponents"),
+            pct_expr.alias("Pct"),
+        ]
+        if before_col and before_col in df.columns:
+            cols_to_select.append(pl.col(before_col).cast(pl.Float64).round(0).cast(pl.Int32, strict=False).alias("Elo_Before"))
+        cols_to_select.append(pl.col(pair_elo_col).cast(pl.Float64).round(0).cast(pl.Int32, strict=False).alias("Elo_After"))
+        frames.append(side_df.select(cols_to_select))
+
+    if not frames:
+        return pl.DataFrame()
+    detail = pl.concat(frames, how="diagonal")
+    sort_cols = ["Date", "Session"]
+    sort_desc = [True, True]
+    if "Round" in detail.columns:
+        sort_cols.append("Round")
+        sort_desc.append(False)
+    if "Board" in detail.columns:
+        sort_cols.append("Board")
+        sort_desc.append(False)
+    detail = detail.sort(sort_cols, descending=sort_desc)
+    if "Elo_Before" in detail.columns and "Elo_After" in detail.columns:
+        detail = detail.with_columns((pl.col("Elo_After") - pl.col("Elo_Before")).alias("Elo_Delta"))
+    return detail
 
 
 def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, elo_rating_type: str) -> str:
@@ -318,17 +447,26 @@ def acbl_report(
     online_filter: str = Query("All"),
 ) -> dict:
     started_at = datetime.now()
+    t0 = time.perf_counter()
     try:
+        t_parse_start = time.perf_counter()
         parsed_date_from = None if not date_from else datetime.fromisoformat(date_from)
+        t_parse_end = time.perf_counter()
+
+        t_load_start = time.perf_counter()
         required_columns = _required_columns_for_mode(rating_type, elo_rating_type)
         df = load_elo_ratings(club_or_tournament, columns=required_columns, date_from=parsed_date_from)
         df = _filter_valid_percentages_acbl(df)
+        t_load_end = time.perf_counter()
 
+        t_filter_start = time.perf_counter()
         if online_filter == "Local Only" and "is_virtual_game" in df.columns:
             df = df.filter(pl.col("is_virtual_game") == False)
         elif online_filter == "Online Only" and "is_virtual_game" in df.columns:
             df = df.filter(pl.col("is_virtual_game").is_null())
+        t_filter_end = time.perf_counter()
 
+        t_sql_start = time.perf_counter()
         con = duckdb.connect()
         try:
             con.execute(f"PRAGMA threads={max(4, (os.cpu_count() or 4) // 2)};")
@@ -341,6 +479,11 @@ def acbl_report(
             result_df = con.execute(generated_sql).pl()
         finally:
             con.close()
+        t_sql_end = time.perf_counter()
+
+        t_serialize_start = time.perf_counter()
+        result_rows = result_df.to_dicts()
+        t_serialize_end = time.perf_counter()
 
         date_range = ""
         if "Date" in df.columns and not df.is_empty():
@@ -349,8 +492,19 @@ def acbl_report(
 
         ended_at = datetime.now()
         elapsed = (ended_at - started_at).total_seconds()
+        perf = {
+            "source": "r2" if _r2_enabled() else "local",
+            "parse_seconds": round(t_parse_end - t_parse_start, 3),
+            "load_seconds": round(t_load_end - t_load_start, 3),
+            "filter_seconds": round(t_filter_end - t_filter_start, 3),
+            "sql_seconds": round(t_sql_end - t_sql_start, 3),
+            "serialize_seconds": round(t_serialize_end - t_serialize_start, 3),
+            "total_seconds": round(time.perf_counter() - t0, 3),
+            "input_rows": len(df),
+            "output_rows": len(result_df),
+        }
         return {
-            "rows": result_df.to_dicts(),
+            "rows": result_rows,
             "generated_sql": generated_sql,
             "date_range": date_range,
             "row_count": len(result_df),
@@ -358,6 +512,79 @@ def acbl_report(
             "ended_at": ended_at.isoformat(),
             "elapsed_seconds": elapsed,
             "moving_avg_days": moving_avg_days,
+            "perf": perf,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/acbl/detail")
+def acbl_detail(
+    club_or_tournament: str = Query(..., pattern="^(club|tournament)$"),
+    rating_type: str = Query(..., pattern="^(Players|Pairs)$"),
+    elo_rating_type: str = Query("Current Rating (End of Session)"),
+    date_from: str | None = Query(None),
+    online_filter: str = Query("All"),
+    player_id: str | None = Query(None),
+    pair_ids: str | None = Query(None),
+) -> dict:
+    started_at = datetime.now()
+    t0 = time.perf_counter()
+    try:
+        t_parse_start = time.perf_counter()
+        parsed_date_from = None if not date_from else datetime.fromisoformat(date_from)
+        t_parse_end = time.perf_counter()
+
+        t_load_start = time.perf_counter()
+        required_columns = _required_columns_for_detail(rating_type, elo_rating_type)
+        df = load_elo_ratings(club_or_tournament, columns=required_columns, date_from=parsed_date_from)
+        df = _filter_valid_percentages_acbl(df)
+        t_load_end = time.perf_counter()
+
+        t_filter_start = time.perf_counter()
+        if online_filter == "Local Only" and "is_virtual_game" in df.columns:
+            df = df.filter(pl.col("is_virtual_game") == False)
+        elif online_filter == "Online Only" and "is_virtual_game" in df.columns:
+            df = df.filter(pl.col("is_virtual_game").is_null())
+        t_filter_end = time.perf_counter()
+
+        t_build_start = time.perf_counter()
+        if rating_type == "Players":
+            if not player_id:
+                raise HTTPException(status_code=400, detail="player_id is required for Players detail.")
+            detail = _build_player_detail(df, player_id=str(player_id), elo_rating_type=elo_rating_type)
+        else:
+            if not pair_ids:
+                raise HTTPException(status_code=400, detail="pair_ids is required for Pairs detail.")
+            detail = _build_pair_detail(df, pair_ids=str(pair_ids), elo_rating_type=elo_rating_type)
+        t_build_end = time.perf_counter()
+
+        t_serialize_start = time.perf_counter()
+        detail_rows = detail.to_dicts()
+        t_serialize_end = time.perf_counter()
+
+        ended_at = datetime.now()
+        elapsed = (ended_at - started_at).total_seconds()
+        perf = {
+            "source": "r2" if _r2_enabled() else "local",
+            "parse_seconds": round(t_parse_end - t_parse_start, 3),
+            "load_seconds": round(t_load_end - t_load_start, 3),
+            "filter_seconds": round(t_filter_end - t_filter_start, 3),
+            "build_seconds": round(t_build_end - t_build_start, 3),
+            "serialize_seconds": round(t_serialize_end - t_serialize_start, 3),
+            "total_seconds": round(time.perf_counter() - t0, 3),
+            "input_rows": len(df),
+            "output_rows": len(detail),
+        }
+        return {
+            "rows": detail_rows,
+            "row_count": len(detail),
+            "started_at": started_at.isoformat(),
+            "ended_at": ended_at.isoformat(),
+            "elapsed_seconds": elapsed,
+            "perf": perf,
         }
     except HTTPException:
         raise
