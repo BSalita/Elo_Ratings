@@ -773,7 +773,6 @@ def main():
             st.stop()
         date_range = str(remote_payload.get("date_range", "") or "")
         generated_sql = str(remote_payload.get("generated_sql", "") or "")
-        st.info(f"✅ Using remote ACBL API ({dataset_type}, {online_filter.lower()} games)")
         perf = remote_payload.get("perf", {}) if isinstance(remote_payload, dict) else {}
         server = remote_payload.get("server", {}) if isinstance(remote_payload, dict) else {}
         if isinstance(perf, dict) and perf:
