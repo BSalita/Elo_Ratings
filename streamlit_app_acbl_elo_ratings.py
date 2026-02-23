@@ -138,6 +138,8 @@ def _fetch_remote_report_table(
     base_url = _acbl_api_base_url()
     if base_url is None:
         raise ValueError("ACBL_API_BASE_URL is not configured")
+    if int(top_n) > 1000:
+        raise ValueError("Top N must be <= 1000 for /acbl/report")
 
     params = {
         "club_or_tournament": club_or_tournament.lower(),
@@ -161,6 +163,26 @@ def _fetch_remote_report_table(
         )
         response.raise_for_status()
         payload = response.json()
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        detail = ""
+        if exc.response is not None:
+            try:
+                detail = str(exc.response.json())
+            except ValueError:
+                detail = (exc.response.text or "").strip()
+        if status == 422:
+            raise RuntimeError(
+                f"ACBL API request failed for {request_url}: HTTP 422 Unprocessable Entity. "
+                f"Request params were invalid. Details: {detail}"
+            ) from exc
+        hint = (
+            "If Streamlit and API are in different Railway projects, use the API public URL "
+            "(https://...) for ACBL_API_BASE_URL instead of *.railway.internal."
+        )
+        raise RuntimeError(
+            f"ACBL API request failed for {request_url}: {exc}. {hint}"
+        ) from exc
     except requests.exceptions.RequestException as exc:
         hint = (
             "If Streamlit and API are in different Railway projects, use the API public URL "
@@ -577,7 +599,14 @@ def main():
         st.sidebar.markdown("🔗 [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
         club_or_tournament = st.radio("Event type", options=["Club", "Tournament"], index=0, horizontal=True, key="event_type")
         rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=True, key="rating_type")
-        top_n = st.number_input("Top N players or pairs", min_value=50, max_value=5000, value=1000, step=50)
+        top_n = st.number_input(
+            "Top N players or pairs",
+            min_value=50,
+            max_value=1000,
+            value=1000,
+            step=50,
+            help="Remote ACBL API currently supports up to 1000 rows.",
+        )
         min_sessions = st.number_input("Minimum sessions played", min_value=1, max_value=200, value=30, step=1)
         rating_method = st.selectbox("Elo Rating statistic", options=["Avg", "Max", "Latest"], index=0)
         
