@@ -789,7 +789,7 @@ def main():
                 else:
                     swap_str = "N/A (swap disabled)"
                 api_meta_str = (
-                    f"api_source_datetime:{source_mtime} | "
+                    f"api_source_datetime:{source_mtime} • "
                     f"api_uptime:{uptime_minutes:.1f}m ({uptime_seconds:.1f}s)"
                 )
                 server_resources_str = (
@@ -799,7 +799,7 @@ def main():
                     f"CPU/Threads {server.get('cpu_count', 0)}/{server.get('threads', 0)}"
                 )
             else:
-                api_meta_str = "api_source_datetime:n/a | api_uptime:n/a"
+                api_meta_str = "api_source_datetime:n/a • api_uptime:n/a"
                 server_resources_str = "Memory/CPU unavailable"
             st.caption(
                 "API performance — "
