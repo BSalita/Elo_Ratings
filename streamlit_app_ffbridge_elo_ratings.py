@@ -1221,17 +1221,27 @@ def main():
         st.sidebar.markdown("🔗 [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
         
         # API Backend selection
-        # Railway-friendly default: use Classic only when token is present, otherwise Lancelot.
+        # Keep widget state and canonical state separate so explicit reruns do not
+        # unexpectedly reset the selected API.
+        api_options = list(API_BACKENDS.keys())
+        has_classic_token = bool(os.getenv("FFBRIDGE_BEARER_TOKEN", "").strip())
+        default_api = "FFBridge Classic API" if has_classic_token else "FFBridge Lancelot API"
         if "selected_api" not in st.session_state:
-            has_classic_token = bool(os.getenv("FFBRIDGE_BEARER_TOKEN", "").strip())
-            st.session_state.selected_api = "FFBridge Classic API" if has_classic_token else "FFBridge Lancelot API"
+            st.session_state.selected_api = default_api
+        if st.session_state.selected_api not in api_options:
+            st.session_state.selected_api = default_api
+        if "selected_api_widget" not in st.session_state:
+            st.session_state.selected_api_widget = st.session_state.selected_api
+        if st.session_state.selected_api_widget not in api_options:
+            st.session_state.selected_api_widget = st.session_state.selected_api
         
         selected_api_name = st.selectbox(
             "Bridge API",
-            options=list(API_BACKENDS.keys()),
-            key="selected_api",
+            options=api_options,
+            key="selected_api_widget",
             help="Select which API to use for data"
         )
+        st.session_state.selected_api = selected_api_name
         
         # Get the appropriate API module
         api_module = API_BACKENDS[selected_api_name]
@@ -1242,6 +1252,7 @@ def main():
             if fallback_api in API_BACKENDS:
                 st.warning("Classic API auth missing. Automatically using Lancelot API.")
                 st.session_state.selected_api = fallback_api
+                st.session_state.selected_api_widget = fallback_api
                 selected_api_name = fallback_api
                 api_module = API_BACKENDS[selected_api_name]
             else:

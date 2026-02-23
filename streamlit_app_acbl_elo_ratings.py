@@ -756,7 +756,7 @@ def main():
         remote_table_df: pl.DataFrame | None = None
 
         try:
-            with st.spinner("Fetching pre-aggregated report from ACBL API..."):
+            with st.spinner("Fetching data from API server (takes up to 30 seconds)..."):
                 remote_table_df, remote_payload = _fetch_remote_report_table(
                     club_or_tournament=club_or_tournament,
                     rating_type=rating_type,
