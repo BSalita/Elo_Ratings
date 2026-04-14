@@ -939,75 +939,43 @@ def main():
                 # Convert to pandas for AgGrid rendering
                 display_df = work_df.to_pandas()
                 
-                # Use AgGrid directly with precise height control for exactly 25 rows
                 from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme
                 
                 gb = GridOptionsBuilder.from_dataframe(display_df)
-                gb.configure_selection(selection_mode='single', use_checkbox=False)  # Enable single row selection
-                gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True, wrapHeaderText=True, autoHeaderHeight=True)
-                
-                # Configure numeric columns for proper sorting
+                gb.configure_selection(selection_mode='single', use_checkbox=False)
+                gb.configure_default_column(
+                    cellStyle={'color': 'black', 'font-size': '12px'},
+                    suppressMenu=True,
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
                 for col in display_df.columns:
                     if pd.api.types.is_numeric_dtype(display_df[col]):
                         gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
-                
-                # Don't configure pagination - we want scrolling instead
                 gb.configure_side_bar()
                 gridOptions = gb.build()
                 
-                # Configure for scrolling with adjustable height
                 gridOptions['rowHeight'] = 28
-                gridOptions['suppressPaginationPanel'] = True
-                gridOptions['suppressHorizontalScroll'] = False  # Allow horizontal scrollbar if needed
-                gridOptions['domLayout'] = 'normal'  # Use normal layout (not autoHeight)
-
-                # Dynamically size height: show up to 25 rows; if fewer, shrink to fit
+                gridOptions['domLayout'] = 'normal'
+                
+                max_rows_visible = 25
                 header_height = 50
                 row_height = gridOptions['rowHeight']
-                max_rows_visible = 25
-                total_rows = len(display_df)
-                visible_rows = max(1, min(total_rows, max_rows_visible))
-                if total_rows <= max_rows_visible:
-                    # No vertical scrollbar needed; fit exactly to number of rows
-                    gridOptions['alwaysShowVerticalScroll'] = False
-                    exact_height = header_height + visible_rows * row_height + 20
-                else:
-                    # Use fixed height with vertical scrollbar
-                    gridOptions['alwaysShowVerticalScroll'] = True
-                    exact_height = header_height + max_rows_visible * row_height + 20
+                visible_rows = min(len(display_df), max_rows_visible)
+                exact_height = header_height + max(visible_rows, 1) * row_height + 20
                 
-                # Custom CSS to ensure scrollbars are visible
-                custom_css = {
-                    ".ag-theme-balham .ag-body-viewport": {
-                        "overflow-y": "auto !important",
-                        "overflow-x": "auto !important"
-                    },
-                    ".ag-theme-balham .ag-body-horizontal-scroll": {
-                        "display": "block !important"
-                    },
-                    ".ag-theme-balham .ag-body-vertical-scroll": {
-                        "display": "block !important"
-                    }
-                }
+                st.caption(f"Click a row to view session history details — {len(display_df)} rows")
                 
-                st.caption(f"Click a row to view session history details — {len(display_df)} rows, height={exact_height}px")
-                
-                # Create dynamic key that resets selection when data/filters change
                 dynamic_key = f"table-{rating_type}-{club_or_tournament}-{top_n}-{min_sessions}-{rating_method}-{elo_rating_type}-{date_range}-{online_filter}-{st.session_state.get('masterpoints_filter','All')}-{st.session_state.get('player_name_filter','')}"
                 
-                try:
-                    grid_response = AgGrid(
-                        display_df,
-                        gridOptions=gridOptions,
-                        height=exact_height,
-                        theme=AgGridTheme.BALHAM,
-                        custom_css=custom_css,
-                        key=dynamic_key
-                    )
-                except Exception as ag_exc:
-                    st.error(f"AgGrid rendering failed: {ag_exc}")
-                    st.dataframe(display_df, height=400)
-                    grid_response = {}
+                grid_response = AgGrid(
+                    display_df,
+                    gridOptions=gridOptions,
+                    height=exact_height,
+                    theme=AgGridTheme.BALHAM,
+                    key=dynamic_key,
+                    update_mode="SELECTION_CHANGED",
+                )
                 
                 # --- Row-click detail view ---
                 selected_rows = grid_response.get('selected_rows', None)
