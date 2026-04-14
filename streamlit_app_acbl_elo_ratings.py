@@ -799,48 +799,49 @@ def main():
         except Exception as exc:
             st.error(str(exc))
             st.stop()
-            date_range = str(remote_payload.get("date_range", "") or "")
-            generated_sql = str(remote_payload.get("generated_sql", "") or "")
-            perf = remote_payload.get("perf", {}) if isinstance(remote_payload, dict) else {}
-            server = remote_payload.get("server", {}) if isinstance(remote_payload, dict) else {}
-            if isinstance(perf, dict) and perf:
-                if isinstance(server, dict) and server:
-                    source_mtime = server.get("api_source_mtime", "n/a")
-                    uptime_seconds = float(server.get("api_uptime_seconds", 0) or 0)
-                    uptime_minutes = uptime_seconds / 60.0
-                    if server.get("swap_enabled", False):
-                        swap_str = (
-                            f"{server.get('swap_used_gb', 0)}/{server.get('swap_total_gb', 0)} GB "
-                            f"({server.get('swap_percent', 0)}%)"
-                        )
-                    else:
-                        swap_str = "N/A (swap disabled)"
-                    api_meta_str = (
-                    f"api_source_datetime:{source_mtime} • "
-                        f"api_uptime:{uptime_minutes:.1f}m ({uptime_seconds:.1f}s)"
-                    )
-                    server_resources_str = (
-                        f"Memory: RAM {server.get('ram_used_gb', 0)}/{server.get('ram_total_gb', 0)} GB "
-                        f"({server.get('ram_percent', 0)}%) • "
-                        f"Virtual/Pagefile {swap_str} • "
-                        f"CPU/Threads {server.get('cpu_count', 0)}/{server.get('threads', 0)}"
+
+        date_range = str(remote_payload.get("date_range", "") or "")
+        generated_sql = str(remote_payload.get("generated_sql", "") or "")
+        perf = remote_payload.get("perf", {}) if isinstance(remote_payload, dict) else {}
+        server = remote_payload.get("server", {}) if isinstance(remote_payload, dict) else {}
+        if isinstance(perf, dict) and perf:
+            if isinstance(server, dict) and server:
+                source_mtime = server.get("api_source_mtime", "n/a")
+                uptime_seconds = float(server.get("api_uptime_seconds", 0) or 0)
+                uptime_minutes = uptime_seconds / 60.0
+                if server.get("swap_enabled", False):
+                    swap_str = (
+                        f"{server.get('swap_used_gb', 0)}/{server.get('swap_total_gb', 0)} GB "
+                        f"({server.get('swap_percent', 0)}%)"
                     )
                 else:
-                    api_meta_str = "api_source_datetime:n/a • api_uptime:n/a"
-                    server_resources_str = "Memory/CPU unavailable"
-                st.caption(
-                    "API performance — "
-                    f"{api_meta_str} • "
-                    f"source:{perf.get('source', 'unknown')} • "
-                    f"parse:{perf.get('parse_seconds', 0)}s • "
-                    f"load:{perf.get('load_seconds', 0)}s • "
-                    f"filter:{perf.get('filter_seconds', 0)}s • "
-                    f"sql:{perf.get('sql_seconds', 0)}s • "
-                    f"serialize:{perf.get('serialize_seconds', 0)}s • "
-                    f"total:{perf.get('total_seconds', 0)}s • "
-                    f"rows in/out:{perf.get('input_rows', '?')}/{perf.get('output_rows', '?')}"
+                    swap_str = "N/A (swap disabled)"
+                api_meta_str = (
+                    f"api_source_datetime:{source_mtime} • "
+                    f"api_uptime:{uptime_minutes:.1f}m ({uptime_seconds:.1f}s)"
                 )
-                st.caption(f"Server resources — {server_resources_str}")
+                server_resources_str = (
+                    f"Memory: RAM {server.get('ram_used_gb', 0)}/{server.get('ram_total_gb', 0)} GB "
+                    f"({server.get('ram_percent', 0)}%) • "
+                    f"Virtual/Pagefile {swap_str} • "
+                    f"CPU/Threads {server.get('cpu_count', 0)}/{server.get('threads', 0)}"
+                )
+            else:
+                api_meta_str = "api_source_datetime:n/a • api_uptime:n/a"
+                server_resources_str = "Memory/CPU unavailable"
+            st.caption(
+                "API performance — "
+                f"{api_meta_str} • "
+                f"source:{perf.get('source', 'unknown')} • "
+                f"parse:{perf.get('parse_seconds', 0)}s • "
+                f"load:{perf.get('load_seconds', 0)}s • "
+                f"filter:{perf.get('filter_seconds', 0)}s • "
+                f"sql:{perf.get('sql_seconds', 0)}s • "
+                f"serialize:{perf.get('serialize_seconds', 0)}s • "
+                f"total:{perf.get('total_seconds', 0)}s • "
+                f"rows in/out:{perf.get('input_rows', '?')}/{perf.get('output_rows', '?')}"
+            )
+            st.caption(f"Server resources — {server_resources_str}")
 
         # Store online filter and current dataset type for downstream controls
         st.session_state.online_filter = online_filter
