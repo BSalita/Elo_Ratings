@@ -702,29 +702,26 @@ def main():
             st.session_state.enable_custom_queries = enable_custom_queries
             st.session_state.use_sql_engine = True
 
-    # Determine date_from based on selection.
-    # Normalize relative ranges to midnight so reruns don't change the value
-    # every second and inadvertently bust caches / trigger refetch loops.
-    today = datetime.now().date()
+    # Determine date_from based on selection
+    now = datetime.now()
     if date_range_choice == "All time":
         date_from = None
     elif date_range_choice == "Last 3 months":
-        date_from = datetime.combine(today - timedelta(days=90), datetime.min.time())
+        date_from = now - timedelta(days=90)
     elif date_range_choice == "Last 6 months":
-        date_from = datetime.combine(today - timedelta(days=182), datetime.min.time())
+        date_from = now - timedelta(days=182)
     elif date_range_choice == "Last 1 year":
-        date_from = datetime.combine(today - timedelta(days=365), datetime.min.time())
+        date_from = now - timedelta(days=365)
     elif date_range_choice == "Last 2 years":
-        date_from = datetime.combine(today - timedelta(days=365 * 2), datetime.min.time())
+        date_from = now - timedelta(days=365*2)
     elif date_range_choice == "Last 3 years":
-        date_from = datetime.combine(today - timedelta(days=365 * 3), datetime.min.time())
+        date_from = now - timedelta(days=365*3)
     elif date_range_choice == "Last 4 years":
-        date_from = datetime.combine(today - timedelta(days=365 * 4), datetime.min.time())
+        date_from = now - timedelta(days=365*4)
     elif date_range_choice == "Last 5 years":
-        date_from = datetime.combine(today - timedelta(days=365 * 5), datetime.min.time())
+        date_from = now - timedelta(days=365*5)
     else:
-        date_from = None  # Default to all time
-    date_from_key = date_from.strftime("%Y-%m-%d") if date_from is not None else "all"
+        date_from = None # Default to all time
 
     # -------------------------------
     # Report Generation
@@ -789,7 +786,7 @@ def main():
         remote_payload: dict = {}
         remote_table_df: pl.DataFrame | None = None
 
-        api_cache_key = f"api_cache_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_from_key}_{online_filter}"
+        api_cache_key = f"api_cache_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_from}_{online_filter}"
         cached_api = st.session_state.get(api_cache_key)
         if cached_api is not None:
             remote_table_df, remote_payload = cached_api
@@ -941,35 +938,23 @@ def main():
                 # Convert to pandas for AgGrid rendering
                 display_df = work_df.to_pandas()
 
-                from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme
+                from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme, ColumnsAutoSizeMode
 
                 gb = GridOptionsBuilder.from_dataframe(display_df)
-                gb.configure_selection(
-                    selection_mode='single',
-                    use_checkbox=False,
-                    suppressRowClickSelection=False,
-                )
-                gb.configure_default_column(
-                    cellStyle={'color': 'black', 'font-size': '12px'},
-                    suppressMenu=True,
-                    wrapHeaderText=True,
-                    autoHeaderHeight=True,
-                )
+                gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
+                gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
                 for col in display_df.columns:
                     if pd.api.types.is_numeric_dtype(display_df[col]):
                         gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
                 gridOptions = gb.build()
 
-                gridOptions['rowHeight'] = 28
-                gridOptions['domLayout'] = 'normal'
-
                 header_height = 50
-                row_height = gridOptions['rowHeight']
+                row_height = 28
+                gridOptions['rowHeight'] = row_height
                 max_rows_visible = 25
                 total_rows = len(display_df)
                 visible_rows = max(1, min(total_rows, max_rows_visible))
                 if total_rows <= max_rows_visible:
-                    gridOptions['alwaysShowVerticalScroll'] = False
                     exact_height = header_height + visible_rows * row_height + 20
                 else:
                     gridOptions['alwaysShowVerticalScroll'] = True
@@ -982,6 +967,7 @@ def main():
                 grid_response = AgGrid(
                     display_df,
                     gridOptions=gridOptions,
+                    columns_auto_size_mode=ColumnsAutoSizeMode.FIT_CONTENTS,
                     height=exact_height,
                     theme=AgGridTheme.BALHAM,
                     key=dynamic_key,
