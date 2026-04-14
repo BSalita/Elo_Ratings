@@ -702,26 +702,29 @@ def main():
             st.session_state.enable_custom_queries = enable_custom_queries
             st.session_state.use_sql_engine = True
 
-    # Determine date_from based on selection
-    now = datetime.now()
+    # Determine date_from based on selection.
+    # Normalize relative ranges to midnight so reruns don't change the value
+    # every second and inadvertently bust caches / trigger refetch loops.
+    today = datetime.now().date()
     if date_range_choice == "All time":
         date_from = None
     elif date_range_choice == "Last 3 months":
-        date_from = now - timedelta(days=90)
+        date_from = datetime.combine(today - timedelta(days=90), datetime.min.time())
     elif date_range_choice == "Last 6 months":
-        date_from = now - timedelta(days=182)
+        date_from = datetime.combine(today - timedelta(days=182), datetime.min.time())
     elif date_range_choice == "Last 1 year":
-        date_from = now - timedelta(days=365)
+        date_from = datetime.combine(today - timedelta(days=365), datetime.min.time())
     elif date_range_choice == "Last 2 years":
-        date_from = now - timedelta(days=365*2)
+        date_from = datetime.combine(today - timedelta(days=365 * 2), datetime.min.time())
     elif date_range_choice == "Last 3 years":
-        date_from = now - timedelta(days=365*3)
+        date_from = datetime.combine(today - timedelta(days=365 * 3), datetime.min.time())
     elif date_range_choice == "Last 4 years":
-        date_from = now - timedelta(days=365*4)
+        date_from = datetime.combine(today - timedelta(days=365 * 4), datetime.min.time())
     elif date_range_choice == "Last 5 years":
-        date_from = now - timedelta(days=365*5)
+        date_from = datetime.combine(today - timedelta(days=365 * 5), datetime.min.time())
     else:
-        date_from = None # Default to all time
+        date_from = None  # Default to all time
+    date_from_key = date_from.strftime("%Y-%m-%d") if date_from is not None else "all"
 
     # -------------------------------
     # Report Generation
@@ -786,7 +789,7 @@ def main():
         remote_payload: dict = {}
         remote_table_df: pl.DataFrame | None = None
 
-        api_cache_key = f"api_cache_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_from}_{online_filter}"
+        api_cache_key = f"api_cache_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_from_key}_{online_filter}"
         cached_api = st.session_state.get(api_cache_key)
         if cached_api is not None:
             remote_table_df, remote_payload = cached_api
