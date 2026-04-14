@@ -935,52 +935,41 @@ def main():
                         except Exception:
                             pass
                 
-                # Convert to pandas for AgGrid
-                # Convert to pandas for AgGrid rendering
+                # Convert to pandas for table rendering/selection
                 display_df = work_df.to_pandas()
-                
-                from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme
-                
-                gb = GridOptionsBuilder.from_dataframe(display_df)
-                gb.configure_selection(selection_mode='single', use_checkbox=False)
-                gb.configure_default_column(
-                    cellStyle={'color': 'black', 'font-size': '12px'},
-                    suppressMenu=True,
-                    wrapHeaderText=True,
-                    autoHeaderHeight=True,
-                )
-                for col in display_df.columns:
-                    if pd.api.types.is_numeric_dtype(display_df[col]):
-                        gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
-                gb.configure_side_bar()
-                gridOptions = gb.build()
-                
-                gridOptions['rowHeight'] = 28
-                gridOptions['domLayout'] = 'normal'
-                
+
                 max_rows_visible = 25
                 header_height = 50
-                row_height = gridOptions['rowHeight']
+                row_height = 28
                 visible_rows = min(len(display_df), max_rows_visible)
                 exact_height = header_height + max(visible_rows, 1) * row_height + 20
                 
                 st.caption(f"Click a row to view session history details — {len(display_df)} rows")
                 
                 dynamic_key = f"table-{rating_type}-{club_or_tournament}-{top_n}-{min_sessions}-{rating_method}-{elo_rating_type}-{date_range}-{online_filter}-{st.session_state.get('masterpoints_filter','All')}-{st.session_state.get('player_name_filter','')}"
-                
-                grid_response = AgGrid(
+
+                table_state = st.dataframe(
                     display_df,
-                    gridOptions=gridOptions,
                     height=exact_height,
-                    theme=AgGridTheme.BALHAM,
                     key=dynamic_key,
-                    update_mode="SELECTION_CHANGED",
+                    use_container_width=True,
+                    hide_index=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    row_height=row_height,
                 )
                 
                 # --- Row-click detail view ---
-                selected_rows = grid_response.get('selected_rows', None)
-                if selected_rows is not None and len(selected_rows) > 0:
-                    selected_row = selected_rows.iloc[0] if hasattr(selected_rows, 'iloc') else selected_rows[0]
+                selected_indices = []
+                if table_state is not None:
+                    selection = getattr(table_state, "selection", None)
+                    if selection is not None:
+                        selected_indices = list(getattr(selection, "rows", []) or [])
+                    elif isinstance(table_state, dict):
+                        selected_indices = list(table_state.get("selection", {}).get("rows", []) or [])
+
+                if selected_indices:
+                    selected_row = display_df.iloc[selected_indices[0]].to_dict()
                     try:
                         with st.spinner("Loading session history from ACBL API..."):
                             if rating_type == "Players":
