@@ -2,6 +2,8 @@
 # ===================================================
 
 # Core Streamlit web interface
+# KNOWN ISSUE: streamlit >= 1.56.0 breaks streamlit-aggrid (any version).
+# AgGrid DataFrames render as blank. Pin streamlit <= 1.53.1 until resolved.
 streamlit==1.53.1
 streamlit-aggrid==1.1.8.post1
 streamlit-extras

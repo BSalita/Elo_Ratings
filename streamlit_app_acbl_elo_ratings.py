@@ -1,9 +1,16 @@
 # streamlit_app_elo_ratings.py
-
+#
+# KNOWN ISSUE: streamlit >= 1.56.0 breaks streamlit-aggrid (any version).
+# AgGrid DataFrames render as blank. Pin streamlit <= 1.53.1 until resolved.
+#
 # Previous steps:
 # acbl/acbl_elo_ratings_create.py
 
 import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Prevent Intel Fortran runtime (libifcoremd.dll / MKL) from installing its own
 # Ctrl+C handler that crashes with "forrtl: error (200)".

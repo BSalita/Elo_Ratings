@@ -1,4 +1,8 @@
 # streamlit_app_ffbridge_elo.py
+#
+# KNOWN ISSUE: streamlit >= 1.56.0 breaks streamlit-aggrid (any version).
+# AgGrid DataFrames render as blank. Pin streamlit <= 1.53.1 until resolved.
+#
 """
 FFBridge Elo Ratings - Unified Streamlit Application
 
