@@ -941,7 +941,11 @@ def main():
                 from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme
 
                 gb = GridOptionsBuilder.from_dataframe(display_df)
-                gb.configure_selection(selection_mode='single', use_checkbox=False)
+                gb.configure_selection(
+                    selection_mode='single',
+                    use_checkbox=False,
+                    suppressRowClickSelection=False,
+                )
                 gb.configure_default_column(
                     cellStyle={'color': 'black', 'font-size': '12px'},
                     suppressMenu=True,
@@ -951,12 +955,9 @@ def main():
                 for col in display_df.columns:
                     if pd.api.types.is_numeric_dtype(display_df[col]):
                         gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
-                gb.configure_side_bar()
                 gridOptions = gb.build()
 
                 gridOptions['rowHeight'] = 28
-                gridOptions['suppressPaginationPanel'] = True
-                gridOptions['suppressHorizontalScroll'] = False
                 gridOptions['domLayout'] = 'normal'
 
                 header_height = 50
@@ -971,19 +972,6 @@ def main():
                     gridOptions['alwaysShowVerticalScroll'] = True
                     exact_height = header_height + max_rows_visible * row_height + 20
 
-                custom_css = {
-                    ".ag-theme-balham .ag-body-viewport": {
-                        "overflow-y": "auto !important",
-                        "overflow-x": "auto !important"
-                    },
-                    ".ag-theme-balham .ag-body-horizontal-scroll": {
-                        "display": "block !important"
-                    },
-                    ".ag-theme-balham .ag-body-vertical-scroll": {
-                        "display": "block !important"
-                    }
-                }
-                
                 st.caption("Click a row to view session history details")
                 
                 dynamic_key = f"table-{rating_type}-{club_or_tournament}-{top_n}-{min_sessions}-{rating_method}-{elo_rating_type}-{date_range}-{online_filter}-{st.session_state.get('masterpoints_filter','All')}-{st.session_state.get('player_name_filter','')}"
@@ -994,7 +982,6 @@ def main():
                     height=exact_height,
                     theme=AgGridTheme.BALHAM,
                     key=dynamic_key,
-                    custom_css=custom_css,
                 )
                 
                 # --- Row-click detail view ---
