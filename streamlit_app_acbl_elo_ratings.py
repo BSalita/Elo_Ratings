@@ -754,9 +754,6 @@ def main():
         # Clear previous results immediately when settings change
         import gc
         _clear_table_cache()
-        for k in list(st.session_state.keys()):
-            if k.startswith("api_cache_"):
-                del st.session_state[k]
         if 'sql_query_history' in st.session_state:
             st.session_state.sql_query_history = []
         gc.collect()
@@ -781,76 +778,69 @@ def main():
         if 'sql_query_history' in st.session_state:
             st.session_state.sql_query_history = st.session_state.sql_query_history[-5:]
         
-        # Get data from remote API (skip if cached from a previous rerun with same params)
+        # Get data from remote API
         dataset_type = club_or_tournament.lower()
         remote_payload: dict = {}
         remote_table_df: pl.DataFrame | None = None
 
-        api_cache_key = f"api_cache_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_from}_{online_filter}"
-        cached_api = st.session_state.get(api_cache_key)
-        if cached_api is not None:
-            remote_table_df, remote_payload = cached_api
-        else:
-            try:
-                with st.spinner("Fetching data from API server (takes up to 30 seconds)..."):
-                    remote_table_df, remote_payload = _fetch_remote_report_table(
-                        club_or_tournament=club_or_tournament,
-                        rating_type=rating_type,
-                        top_n=int(top_n),
-                        min_sessions=int(min_sessions),
-                        rating_method=rating_method,
-                        moving_avg_days=int(moving_avg_days),
-                        elo_rating_type=elo_rating_type,
-                        date_from=date_from,
-                        online_filter=online_filter,
+        try:
+            with st.spinner("Fetching data from API server (takes up to 30 seconds)..."):
+                remote_table_df, remote_payload = _fetch_remote_report_table(
+                    club_or_tournament=club_or_tournament,
+                    rating_type=rating_type,
+                    top_n=int(top_n),
+                    min_sessions=int(min_sessions),
+                    rating_method=rating_method,
+                    moving_avg_days=int(moving_avg_days),
+                    elo_rating_type=elo_rating_type,
+                    date_from=date_from,
+                    online_filter=online_filter,
+                )
+        except Exception as exc:
+            st.error(str(exc))
+            st.stop()
+            date_range = str(remote_payload.get("date_range", "") or "")
+            generated_sql = str(remote_payload.get("generated_sql", "") or "")
+            perf = remote_payload.get("perf", {}) if isinstance(remote_payload, dict) else {}
+            server = remote_payload.get("server", {}) if isinstance(remote_payload, dict) else {}
+            if isinstance(perf, dict) and perf:
+                if isinstance(server, dict) and server:
+                    source_mtime = server.get("api_source_mtime", "n/a")
+                    uptime_seconds = float(server.get("api_uptime_seconds", 0) or 0)
+                    uptime_minutes = uptime_seconds / 60.0
+                    if server.get("swap_enabled", False):
+                        swap_str = (
+                            f"{server.get('swap_used_gb', 0)}/{server.get('swap_total_gb', 0)} GB "
+                            f"({server.get('swap_percent', 0)}%)"
+                        )
+                    else:
+                        swap_str = "N/A (swap disabled)"
+                    api_meta_str = (
+                    f"api_source_datetime:{source_mtime} • "
+                        f"api_uptime:{uptime_minutes:.1f}m ({uptime_seconds:.1f}s)"
                     )
-            except Exception as exc:
-                st.error(str(exc))
-                st.stop()
-            st.session_state[api_cache_key] = (remote_table_df, remote_payload)
-
-        date_range = str(remote_payload.get("date_range", "") or "")
-        generated_sql = str(remote_payload.get("generated_sql", "") or "")
-        perf = remote_payload.get("perf", {}) if isinstance(remote_payload, dict) else {}
-        server = remote_payload.get("server", {}) if isinstance(remote_payload, dict) else {}
-        if isinstance(perf, dict) and perf:
-            if isinstance(server, dict) and server:
-                source_mtime = server.get("api_source_mtime", "n/a")
-                uptime_seconds = float(server.get("api_uptime_seconds", 0) or 0)
-                uptime_minutes = uptime_seconds / 60.0
-                if server.get("swap_enabled", False):
-                    swap_str = (
-                        f"{server.get('swap_used_gb', 0)}/{server.get('swap_total_gb', 0)} GB "
-                        f"({server.get('swap_percent', 0)}%)"
+                    server_resources_str = (
+                        f"Memory: RAM {server.get('ram_used_gb', 0)}/{server.get('ram_total_gb', 0)} GB "
+                        f"({server.get('ram_percent', 0)}%) • "
+                        f"Virtual/Pagefile {swap_str} • "
+                        f"CPU/Threads {server.get('cpu_count', 0)}/{server.get('threads', 0)}"
                     )
                 else:
-                    swap_str = "N/A (swap disabled)"
-                api_meta_str = (
-                    f"api_source_datetime:{source_mtime} • "
-                    f"api_uptime:{uptime_minutes:.1f}m ({uptime_seconds:.1f}s)"
+                    api_meta_str = "api_source_datetime:n/a • api_uptime:n/a"
+                    server_resources_str = "Memory/CPU unavailable"
+                st.caption(
+                    "API performance — "
+                    f"{api_meta_str} • "
+                    f"source:{perf.get('source', 'unknown')} • "
+                    f"parse:{perf.get('parse_seconds', 0)}s • "
+                    f"load:{perf.get('load_seconds', 0)}s • "
+                    f"filter:{perf.get('filter_seconds', 0)}s • "
+                    f"sql:{perf.get('sql_seconds', 0)}s • "
+                    f"serialize:{perf.get('serialize_seconds', 0)}s • "
+                    f"total:{perf.get('total_seconds', 0)}s • "
+                    f"rows in/out:{perf.get('input_rows', '?')}/{perf.get('output_rows', '?')}"
                 )
-                server_resources_str = (
-                    f"Memory: RAM {server.get('ram_used_gb', 0)}/{server.get('ram_total_gb', 0)} GB "
-                    f"({server.get('ram_percent', 0)}%) • "
-                    f"Virtual/Pagefile {swap_str} • "
-                    f"CPU/Threads {server.get('cpu_count', 0)}/{server.get('threads', 0)}"
-                )
-            else:
-                api_meta_str = "api_source_datetime:n/a • api_uptime:n/a"
-                server_resources_str = "Memory/CPU unavailable"
-            st.caption(
-                "API performance — "
-                f"{api_meta_str} • "
-                f"source:{perf.get('source', 'unknown')} • "
-                f"parse:{perf.get('parse_seconds', 0)}s • "
-                f"load:{perf.get('load_seconds', 0)}s • "
-                f"filter:{perf.get('filter_seconds', 0)}s • "
-                f"sql:{perf.get('sql_seconds', 0)}s • "
-                f"serialize:{perf.get('serialize_seconds', 0)}s • "
-                f"total:{perf.get('total_seconds', 0)}s • "
-                f"rows in/out:{perf.get('input_rows', '?')}/{perf.get('output_rows', '?')}"
-            )
-            st.caption(f"Server resources — {server_resources_str}")
+                st.caption(f"Server resources — {server_resources_str}")
 
         # Store online filter and current dataset type for downstream controls
         st.session_state.online_filter = online_filter
@@ -935,42 +925,73 @@ def main():
                         except Exception:
                             pass
                 
+                # Convert to pandas for AgGrid
                 # Convert to pandas for AgGrid rendering
                 display_df = work_df.to_pandas()
-
-                from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme, ColumnsAutoSizeMode
-
+                
+                # Use AgGrid directly with precise height control for exactly 25 rows
+                from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme
+                
                 gb = GridOptionsBuilder.from_dataframe(display_df)
-                gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
-                gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
+                gb.configure_selection(selection_mode='single', use_checkbox=False)  # Enable single row selection
+                gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True, wrapHeaderText=True, autoHeaderHeight=True)
+                
+                # Configure numeric columns for proper sorting
                 for col in display_df.columns:
                     if pd.api.types.is_numeric_dtype(display_df[col]):
                         gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
+                
+                # Don't configure pagination - we want scrolling instead
+                gb.configure_side_bar()
                 gridOptions = gb.build()
+                
+                # Configure for scrolling with adjustable height
+                gridOptions['rowHeight'] = 28
+                gridOptions['suppressPaginationPanel'] = True
+                gridOptions['suppressHorizontalScroll'] = False  # Allow horizontal scrollbar if needed
+                gridOptions['domLayout'] = 'normal'  # Use normal layout (not autoHeight)
 
+                # Dynamically size height: show up to 25 rows; if fewer, shrink to fit
                 header_height = 50
-                row_height = 28
-                gridOptions['rowHeight'] = row_height
+                row_height = gridOptions['rowHeight']
                 max_rows_visible = 25
                 total_rows = len(display_df)
                 visible_rows = max(1, min(total_rows, max_rows_visible))
                 if total_rows <= max_rows_visible:
+                    # No vertical scrollbar needed; fit exactly to number of rows
+                    gridOptions['alwaysShowVerticalScroll'] = False
                     exact_height = header_height + visible_rows * row_height + 20
                 else:
+                    # Use fixed height with vertical scrollbar
                     gridOptions['alwaysShowVerticalScroll'] = True
                     exact_height = header_height + max_rows_visible * row_height + 20
-
+                
+                # Custom CSS to ensure scrollbars are visible
+                custom_css = {
+                    ".ag-theme-balham .ag-body-viewport": {
+                        "overflow-y": "auto !important",
+                        "overflow-x": "auto !important"
+                    },
+                    ".ag-theme-balham .ag-body-horizontal-scroll": {
+                        "display": "block !important"
+                    },
+                    ".ag-theme-balham .ag-body-vertical-scroll": {
+                        "display": "block !important"
+                    }
+                }
+                
                 st.caption("Click a row to view session history details")
                 
+                # Create dynamic key that resets selection when data/filters change
                 dynamic_key = f"table-{rating_type}-{club_or_tournament}-{top_n}-{min_sessions}-{rating_method}-{elo_rating_type}-{date_range}-{online_filter}-{st.session_state.get('masterpoints_filter','All')}-{st.session_state.get('player_name_filter','')}"
-
+                
                 grid_response = AgGrid(
                     display_df,
                     gridOptions=gridOptions,
-                    columns_auto_size_mode=ColumnsAutoSizeMode.FIT_CONTENTS,
                     height=exact_height,
                     theme=AgGridTheme.BALHAM,
-                    key=dynamic_key,
+                    custom_css=custom_css,
+                    key=dynamic_key
                 )
                 
                 # --- Row-click detail view ---

@@ -3,7 +3,7 @@
 
 # Core Streamlit web interface
 streamlit
-streamlit-aggrid==1.1.8.post1
+streamlit-aggrid==1.2.1.post2
 streamlit-extras
 python-dotenv
 
