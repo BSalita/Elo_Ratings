@@ -754,6 +754,9 @@ def main():
         # Clear previous results immediately when settings change
         import gc
         _clear_table_cache()
+        for k in list(st.session_state.keys()):
+            if k.startswith("api_cache_"):
+                del st.session_state[k]
         if 'sql_query_history' in st.session_state:
             st.session_state.sql_query_history = []
         gc.collect()
@@ -778,27 +781,33 @@ def main():
         if 'sql_query_history' in st.session_state:
             st.session_state.sql_query_history = st.session_state.sql_query_history[-5:]
         
-        # Get data from remote API
+        # Get data from remote API (skip if cached from a previous rerun with same params)
         dataset_type = club_or_tournament.lower()
         remote_payload: dict = {}
         remote_table_df: pl.DataFrame | None = None
 
-        try:
-            with st.spinner("Fetching data from API server (takes up to 30 seconds)..."):
-                remote_table_df, remote_payload = _fetch_remote_report_table(
-                    club_or_tournament=club_or_tournament,
-                    rating_type=rating_type,
-                    top_n=int(top_n),
-                    min_sessions=int(min_sessions),
-                    rating_method=rating_method,
-                    moving_avg_days=int(moving_avg_days),
-                    elo_rating_type=elo_rating_type,
-                    date_from=date_from,
-                    online_filter=online_filter,
-                )
-        except Exception as exc:
-            st.error(str(exc))
-            st.stop()
+        api_cache_key = f"api_cache_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_from}_{online_filter}"
+        cached_api = st.session_state.get(api_cache_key)
+        if cached_api is not None:
+            remote_table_df, remote_payload = cached_api
+        else:
+            try:
+                with st.spinner("Fetching data from API server (takes up to 30 seconds)..."):
+                    remote_table_df, remote_payload = _fetch_remote_report_table(
+                        club_or_tournament=club_or_tournament,
+                        rating_type=rating_type,
+                        top_n=int(top_n),
+                        min_sessions=int(min_sessions),
+                        rating_method=rating_method,
+                        moving_avg_days=int(moving_avg_days),
+                        elo_rating_type=elo_rating_type,
+                        date_from=date_from,
+                        online_filter=online_filter,
+                    )
+            except Exception as exc:
+                st.error(str(exc))
+                st.stop()
+            st.session_state[api_cache_key] = (remote_table_df, remote_payload)
 
         date_range = str(remote_payload.get("date_range", "") or "")
         generated_sql = str(remote_payload.get("generated_sql", "") or "")
@@ -981,19 +990,24 @@ def main():
                     }
                 }
                 
-                st.caption("Click a row to view session history details")
+                st.caption(f"Click a row to view session history details — {len(display_df)} rows, height={exact_height}px")
                 
                 # Create dynamic key that resets selection when data/filters change
                 dynamic_key = f"table-{rating_type}-{club_or_tournament}-{top_n}-{min_sessions}-{rating_method}-{elo_rating_type}-{date_range}-{online_filter}-{st.session_state.get('masterpoints_filter','All')}-{st.session_state.get('player_name_filter','')}"
                 
-                grid_response = AgGrid(
-                    display_df,
-                    gridOptions=gridOptions,
-                    height=exact_height,
-                    theme=AgGridTheme.BALHAM,
-                    custom_css=custom_css,
-                    key=dynamic_key
-                )
+                try:
+                    grid_response = AgGrid(
+                        display_df,
+                        gridOptions=gridOptions,
+                        height=exact_height,
+                        theme=AgGridTheme.BALHAM,
+                        custom_css=custom_css,
+                        key=dynamic_key
+                    )
+                except Exception as ag_exc:
+                    st.error(f"AgGrid rendering failed: {ag_exc}")
+                    st.dataframe(display_df, height=400)
+                    grid_response = {}
                 
                 # --- Row-click detail view ---
                 selected_rows = grid_response.get('selected_rows', None)
