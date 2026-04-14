@@ -127,6 +127,8 @@ def _acbl_api_base_url() -> str | None:
     raw = os.getenv("ACBL_API_BASE_URL", "").strip()
     if not raw:
         return None
+    if not raw.startswith(("http://", "https://")):
+        raw = f"http://{raw}"
     return raw.rstrip("/")
 
 
