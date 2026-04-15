@@ -147,8 +147,8 @@ def _fetch_remote_report_table(
     base_url = _acbl_api_base_url()
     if base_url is None:
         raise ValueError("ACBL_API_BASE_URL is not configured")
-    if int(top_n) > 500:
-        raise ValueError("Top N must be <= 500 for /acbl/report")
+    if int(top_n) > 250:
+        raise ValueError("Top N must be <= 250 for /acbl/report")
 
     params = {
         "club_or_tournament": club_or_tournament.lower(),
@@ -611,8 +611,8 @@ def main():
         top_n = st.number_input(
             "Top N players or pairs",
             min_value=50,
-            max_value=500,
-            value=500,
+            max_value=250,
+            value=250,
             step=50,
         )
         min_sessions = st.number_input("Minimum sessions played", min_value=1, max_value=200, value=30, step=1)
