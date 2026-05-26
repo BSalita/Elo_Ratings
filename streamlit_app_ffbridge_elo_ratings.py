@@ -213,13 +213,41 @@ def _pair_surnames(pair_name: str) -> Tuple[str, str]:
     return (l[-1] if l else ""), (r[-1] if r else "")
 
 
+def _ffbridge_webpage_url(tournament_id: str, team_id: str, club_id: str) -> str:
+    """Build the public FFBridge "Espace Licencié" results page URL for a row.
+
+    Pattern:
+        https://licencie.ffbridge.fr/#/resultats/simultane/{tournament_id}/details/{team_id}?orgId={club_id}
+
+    Requires all three IDs; returns "" if any is missing.
+    """
+    tid = str(tournament_id or "").strip()
+    teamid = str(team_id or "").strip()
+    cid = str(club_id or "").strip()
+    if not (tid and teamid and cid):
+        return ""
+    return f"https://licencie.ffbridge.fr/#/resultats/simultane/{tid}/details/{teamid}?orgId={cid}"
+
+
+def _ffbridge_api_url(tournament_id: str) -> str:
+    """Build the FFBridge Classic API URL for a tournament (dev reference; needs JWT)."""
+    tid = str(tournament_id or "").strip()
+    if not tid:
+        return ""
+    return f"https://api.ffbridge.fr/api/v1/simultaneous-tournaments/{tid}"
+
+
 def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, use_handicap: bool = True) -> pl.DataFrame:
     """
     For Octopus sessions, try to override Scratch_% / Handicap_% with BridgeInterNet values.
-    Adds a 'Source' column with a clickable link to verify the data source.
-    
+    Adds three URL columns:
+      - 'Source'   : BridgeInterNet results page when reconciliation succeeds (Octopus only).
+      - 'Webpage'  : Public FFBridge "Espace Licencié" results page (requires being signed in).
+      - 'API_URL'  : Raw FFBridge JSON API URL (devs only; returns 401 without JWT).
+
     Args:
-        detail_df: DataFrame with tournament results
+        detail_df: DataFrame with tournament results. Should include hidden helper
+                   columns '_team_id' and '_club_id' so the Webpage URL can be built.
         pair_name: Pair name or player name. If "Partner" column exists, uses that for each row.
         use_handicap: Whether to use handicap percentage for Pct_Used (else scratch)
     """
@@ -231,10 +259,12 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
     
     rows = []
     for r in detail_df.to_dicts():
-        src_url = ""
+        bi_url = ""  # BridgeInterNet URL (only when reconciliation succeeds)
         date_str = str(r.get("Date", "") or "")[:10]
         tournament_label = str(r.get("Tournament", "") or "")
         event_id = str(r.get("Event_ID", "") or "")
+        team_id = str(r.get("_team_id", "") or "")
+        club_id = str(r.get("_club_id", "") or "")
         
         # Use Partner column if available (contains full pair name), otherwise use default
         partner_col = r.get("Partner", "")
@@ -273,14 +303,13 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
                     if s_pct is not None and h_pct is not None:
                         scratch = round(float(s_pct), 2)
                         handicap = round(float(h_pct), 2)
-                        src_url = url_s  # Link to scratch results page
+                        bi_url = url_s  # Link to scratch results page
                 except Exception as e:
                     # Fail fast-ish: just don't override if BridgeInterNet fetch/parsing fails.
                     print(f"[BI Reconcile] Error: {e}", flush=True)
-        
-        # If no BridgeInterNet URL, provide FFBridge API URL for verification
-        if not src_url and event_id:
-            src_url = f"https://api.ffbridge.fr/api/v1/simultaneous-tournaments/{event_id}"
+
+        webpage_url = _ffbridge_webpage_url(event_id, team_id, club_id)
+        api_url = _ffbridge_api_url(event_id)
 
         r["Scratch_%"] = scratch
         r["Handicap_%"] = handicap
@@ -290,8 +319,10 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
             r["Pct_Used"] = handicap
         else:
             r["Pct_Used"] = scratch
-        # Store raw URL - LinkColumn will make it clickable
-        r["Source"] = src_url if src_url else None
+        # User-facing URL columns: cell renderer turns http(s) values into anchors.
+        r["Source"] = bi_url if bi_url else None
+        r["Webpage"] = webpage_url if webpage_url else None
+        r["API_URL"] = api_url if api_url else None
         rows.append(r)
 
     return pl.DataFrame(rows)
@@ -1833,15 +1864,21 @@ def main():
                                 elif 'player1_elo_after' in player_results.columns:
                                     cols_to_select.append(pl.col('player1_elo_after').round(0).alias('Elo_After'))
                                 
-                                # Also keep pair_id for tournament opponent lookup
-                                detail_df = player_results.select(cols_to_select + [pl.col('pair_id').alias('_pair_id')])
+                                # Also keep helper columns for URL construction and opponent lookup.
+                                helper_cols = [pl.col('pair_id').alias('_pair_id')]
+                                if 'team_id' in player_results.columns:
+                                    helper_cols.append(pl.col('team_id').alias('_team_id'))
+                                if 'club_id' in player_results.columns:
+                                    helper_cols.append(pl.col('club_id').alias('_club_id'))
+                                detail_df = player_results.select(cols_to_select + helper_cols)
                                 # Optional reconciliation: for Octopus, prefer BridgeInterNet scratch/handicap when matchable.
                                 detail_df = _maybe_override_octopus_pct_rows(detail_df, pair_name=player_name, use_handicap=use_handicap)
                                 
                                 # Display as selectable AgGrid (click row to see tournament opponents)
                                 st.caption("Click a row to see tournament opponents")
-                                # Hide _pair_id from display
-                                display_detail = detail_df.drop('_pair_id')
+                                # Hide helper columns from display
+                                hidden = [c for c in ('_pair_id', '_team_id', '_club_id') if c in detail_df.columns]
+                                display_detail = detail_df.drop(hidden) if hidden else detail_df
                                 detail_key = f"detail_player_{player_id}_{rating_type}_{use_handicap}"
                                 detail_resp = _render_detail_aggrid_ff(display_detail, key=detail_key, selectable=True)
                                 
@@ -1953,14 +1990,23 @@ def main():
                                 elif 'pair_elo' in pair_results.columns:
                                     cols_to_select.append(pl.col('pair_elo').round(0).alias(pair_elo_alias))
                                 
-                                detail_df = pair_results.select(cols_to_select)
+                                # Keep helper columns for URL construction; hidden from display.
+                                helper_cols = []
+                                if 'team_id' in pair_results.columns:
+                                    helper_cols.append(pl.col('team_id').alias('_team_id'))
+                                if 'club_id' in pair_results.columns:
+                                    helper_cols.append(pl.col('club_id').alias('_club_id'))
+                                detail_df = pair_results.select(cols_to_select + helper_cols)
                                 # Optional reconciliation: for Octopus, prefer BridgeInterNet scratch/handicap when matchable.
                                 detail_df = _maybe_override_octopus_pct_rows(detail_df, pair_name=pair_name, use_handicap=use_handicap)
                                 
                                 # Display as selectable AgGrid (click row to see tournament opponents)
                                 st.caption("Click a row to see tournament opponents")
+                                # Hide helper columns from display
+                                hidden = [c for c in ('_team_id', '_club_id') if c in detail_df.columns]
+                                display_detail = detail_df.drop(hidden) if hidden else detail_df
                                 detail_key = f"detail_pair_{pair_id}_{rating_type}_{use_handicap}"
-                                detail_resp = _render_detail_aggrid_ff(detail_df, key=detail_key, selectable=True)
+                                detail_resp = _render_detail_aggrid_ff(display_detail, key=detail_key, selectable=True)
                                 
                                 # 3rd df: tournament opponents for clicked row
                                 if detail_resp is not None:
@@ -1972,7 +2018,7 @@ def main():
                                             _show_tournament_opponents(results_df, event_id, exclude_pair_id=str(pair_id))
                                 
                                 # 4th df: club aggregation across all tournaments
-                                _show_club_aggregation(detail_df, results_df, str(pair_id), key_suffix=f"pair_{pair_id}")
+                                _show_club_aggregation(display_detail, results_df, str(pair_id), key_suffix=f"pair_{pair_id}")
                                 
                                 # Opponent History Details + Opponent Summary
                                 _show_opponent_history(results_df, pair_results, exclude_id=str(pair_id), exclude_mode='pair', key_suffix=f"pair_{pair_id}")
