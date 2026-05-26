@@ -385,13 +385,44 @@ def app_info() -> None:
     return
 
 
+# JsCode cell renderer used to turn any cell containing an http(s) URL into a
+# clickable anchor that opens in a new tab. Non-URL values render as-is.
+_URL_CELL_RENDERER_JS = """
+function(params) {
+    if (params.value === null || params.value === undefined) return '';
+    var v = String(params.value).trim();
+    if (v === '') return '';
+    if (!/^https?:\\/\\//i.test(v)) return v;
+    var safe = v.replace(/"/g, '&quot;');
+    return '<a href="' + safe + '" target="_blank" rel="noopener noreferrer" title="' + safe + '" style="color:#0066cc; text-decoration:underline;">🔗 link</a>';
+}
+"""
+
+
+def _url_columns_pandas(display_df) -> list:
+    """Return column names whose non-null values look like http(s) URLs."""
+    url_cols: list = []
+    for col in display_df.columns:
+        try:
+            series = display_df[col].dropna()
+        except Exception:
+            continue
+        if series.empty:
+            continue
+        if not (pd.api.types.is_string_dtype(series) or pd.api.types.is_object_dtype(series)):
+            continue
+        sample = series.astype(str).str.strip()
+        if sample.str.match(r"^https?://", case=False).any():
+            url_cols.append(col)
+    return url_cols
+
+
 def _render_detail_aggrid(detail_df: pl.DataFrame, key: str, selectable: bool = False):
     """Render a detail DataFrame as an AgGrid table.
 
     Returns the grid response dict when *selectable* is True, else None.
     """
-    import pandas as pd
-    from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme
+    from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme, JsCode
 
     pdf = detail_df.to_pandas()
 
@@ -408,6 +439,11 @@ def _render_detail_aggrid(detail_df: pl.DataFrame, key: str, selectable: bool = 
     for col in pdf.columns:
         if pd.api.types.is_numeric_dtype(pdf[col]):
             gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
+
+    # Render any column containing http(s) URLs as clickable links.
+    url_renderer = JsCode(_URL_CELL_RENDERER_JS)
+    for col in _url_columns_pandas(pdf):
+        gb.configure_column(col, cellRenderer=url_renderer, width=110)
 
     grid_options = gb.build()
     grid_options['rowHeight'] = 28
@@ -432,6 +468,7 @@ def _render_detail_aggrid(detail_df: pl.DataFrame, key: str, selectable: bool = 
         height=height,
         theme=AgGridTheme.BALHAM,
         key=key,
+        allow_unsafe_jscode=True,
     )
     return response if selectable else None
 
@@ -1064,7 +1101,7 @@ def main():
                 display_df = work_df.to_pandas()
                 
                 # Use AgGrid directly with precise height control for exactly 25 rows
-                from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme
+                from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme, JsCode
                 
                 gb = GridOptionsBuilder.from_dataframe(display_df)
                 gb.configure_selection(selection_mode='single', use_checkbox=False)  # Enable single row selection
@@ -1074,6 +1111,11 @@ def main():
                 for col in display_df.columns:
                     if pd.api.types.is_numeric_dtype(display_df[col]):
                         gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
+                
+                # Render any column containing http(s) URLs as clickable links.
+                url_renderer = JsCode(_URL_CELL_RENDERER_JS)
+                for col in _url_columns_pandas(display_df):
+                    gb.configure_column(col, cellRenderer=url_renderer, width=110)
                 
                 # Don't configure pagination - we want scrolling instead
                 gb.configure_side_bar()
@@ -1125,7 +1167,8 @@ def main():
                     height=exact_height,
                     theme=AgGridTheme.BALHAM,
                     custom_css=custom_css,
-                    key=dynamic_key
+                    key=dynamic_key,
+                    allow_unsafe_jscode=True,
                 )
                 
                 # --- Row-click detail view ---

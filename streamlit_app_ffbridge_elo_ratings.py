@@ -56,7 +56,7 @@ from streamlitlib.streamlitlib import (
     create_pdf,
     widen_scrollbars,
 )
-from st_aggrid import GridOptionsBuilder, AgGrid, ColumnsAutoSizeMode, AgGridTheme
+from st_aggrid import GridOptionsBuilder, AgGrid, ColumnsAutoSizeMode, AgGridTheme, JsCode
 
 # Import common Elo utilities (shared with ACBL app)
 from elo_common import (
@@ -297,9 +297,41 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
     return pl.DataFrame(rows)
 
 
+# JsCode cell renderer used to turn any cell containing an http(s) URL into a
+# clickable anchor that opens in a new tab. Non-URL values render as-is.
+_URL_CELL_RENDERER = JsCode("""
+function(params) {
+    if (params.value === null || params.value === undefined) return '';
+    var v = String(params.value).trim();
+    if (v === '') return '';
+    if (!/^https?:\\/\\//i.test(v)) return v;
+    var safe = v.replace(/"/g, '&quot;');
+    return '<a href="' + safe + '" target="_blank" rel="noopener noreferrer" title="' + safe + '" style="color:#0066cc; text-decoration:underline;">🔗 link</a>';
+}
+""")
+
+
+def _url_columns(display_df: pd.DataFrame) -> List[str]:
+    """Return column names whose non-null values look like http(s) URLs."""
+    url_cols: List[str] = []
+    for col in display_df.columns:
+        try:
+            series = display_df[col].dropna()
+        except Exception:
+            continue
+        if series.empty:
+            continue
+        # Only inspect string-like columns to avoid scanning huge numeric arrays.
+        if not (pd.api.types.is_string_dtype(series) or pd.api.types.is_object_dtype(series)):
+            continue
+        sample = series.astype(str).str.strip()
+        if sample.str.match(r"^https?://", case=False).any():
+            url_cols.append(col)
+    return url_cols
+
+
 def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
     """Build an AgGrid with single-click row selection."""
-    from st_aggrid import JsCode
     
     display_df = df.to_pandas()
     # Ensure Rank column is numeric before passing to AgGrid
@@ -323,6 +355,9 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
     # Configure Games column width to fit column name + icon size
     if 'Games' in display_df.columns:
         gb.configure_column('Games', width=100)  # Width accommodates "Games" text + sort icon
+    # Render any column containing http(s) URLs as clickable links.
+    for col in _url_columns(display_df):
+        gb.configure_column(col, cellRenderer=_URL_CELL_RENDERER, width=110)
     grid_options = gb.build()
     
     return AgGrid(
@@ -346,6 +381,9 @@ def _render_detail_aggrid_ff(detail_df: pl.DataFrame, key: str, selectable: bool
     for col in display_df.columns:
         if pd.api.types.is_numeric_dtype(display_df[col]):
             gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
+    # Render any column containing http(s) URLs as clickable links.
+    for col in _url_columns(display_df):
+        gb.configure_column(col, cellRenderer=_URL_CELL_RENDERER, width=110)
     grid_options = gb.build()
     grid_options['rowHeight'] = 28
     grid_options['domLayout'] = 'normal'
@@ -366,6 +404,7 @@ def _render_detail_aggrid_ff(detail_df: pl.DataFrame, key: str, selectable: bool
         height=height,
         theme=AgGridTheme.BALHAM,
         key=key,
+        allow_unsafe_jscode=True,
     )
     return response if selectable else None
 
