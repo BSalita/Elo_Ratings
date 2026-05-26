@@ -241,9 +241,9 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
     """
     For Octopus sessions, try to override Scratch_% / Handicap_% with BridgeInterNet values.
     Adds three URL columns:
-      - 'Source'   : BridgeInterNet results page when reconciliation succeeds (Octopus only).
-      - 'Webpage'  : Public FFBridge "Espace Licencié" results page (requires being signed in).
-      - 'API_URL'  : Raw FFBridge JSON API URL (devs only; returns 401 without JWT).
+      - 'Organization URL'     : BridgeInterNet results page when reconciliation succeeds (Octopus only).
+      - 'ffbridge Result'      : Public FFBridge "Espace Licencié" results page (requires being signed in).
+      - 'ffbridge API Endpoint': Raw FFBridge JSON API URL (devs only; returns 401 without JWT).
 
     Args:
         detail_df: DataFrame with tournament results. Should include hidden helper
@@ -320,9 +320,9 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
         else:
             r["Pct_Used"] = scratch
         # User-facing URL columns: cell renderer turns http(s) values into anchors.
-        r["Source"] = bi_url if bi_url else None
-        r["Webpage"] = webpage_url if webpage_url else None
-        r["API_URL"] = api_url if api_url else None
+        r["Organization URL"] = bi_url if bi_url else None
+        r["ffbridge Result"] = webpage_url if webpage_url else None
+        r["ffbridge API Endpoint"] = api_url if api_url else None
         rows.append(r)
 
     return pl.DataFrame(rows)
