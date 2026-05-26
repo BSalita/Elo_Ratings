@@ -297,25 +297,40 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
     return pl.DataFrame(rows)
 
 
-# JsCode cell renderer used to turn any cell containing an http(s) URL into a
-# clickable anchor that opens in a new tab. Returns a real <a> DOM element
-# because AgGrid escapes plain HTML strings returned from cellRenderer.
-# Non-URL values render as a plain text node.
+# AG Grid component class used to turn any cell containing an http(s) URL into
+# a clickable anchor that opens in a new tab. Implemented as a JS class with
+# init()/getGui() because streamlit-aggrid renders through React, which cannot
+# accept a raw DOM element or unescaped HTML string returned from a function
+# cellRenderer.
 _URL_CELL_RENDERER = JsCode("""
-function(params) {
-    if (params.value === null || params.value === undefined) return '';
-    var v = String(params.value).trim();
-    if (v === '') return '';
-    if (!/^https?:\\/\\//i.test(v)) return v;
-    var a = document.createElement('a');
-    a.href = v;
-    a.target = '_blank';
-    a.rel = 'noopener noreferrer';
-    a.title = v;
-    a.style.color = '#0066cc';
-    a.style.textDecoration = 'underline';
-    a.textContent = '🔗 link';
-    return a;
+class UrlCellRenderer {
+    init(params) {
+        this.eGui = document.createElement('span');
+        var v = (params.value === null || params.value === undefined)
+            ? '' : String(params.value).trim();
+        if (v === '') {
+            return;
+        }
+        if (!/^https?:\\/\\//i.test(v)) {
+            this.eGui.textContent = v;
+            return;
+        }
+        var a = document.createElement('a');
+        a.href = v;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.title = v;
+        a.style.color = '#0066cc';
+        a.style.textDecoration = 'underline';
+        a.textContent = '🔗 link';
+        this.eGui.appendChild(a);
+    }
+    getGui() {
+        return this.eGui;
+    }
+    refresh(params) {
+        return false;
+    }
 }
 """)
 
