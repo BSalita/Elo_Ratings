@@ -64,7 +64,10 @@ from streamlitlib.streamlitlib import (
 from elo_common import (
     ASSISTANT_LOGO_URL,
     apply_app_theme,
+    coerce_int,
+    init_url_params_to_state,
     render_app_footer,
+    sync_state_to_url_params,
 )
 
 logger = logging.getLogger(__name__)
@@ -534,6 +537,87 @@ ORDER BY Boards DESC;"""
 
 
 
+_ELO_MOMENT_OPTIONS = (
+    "Current Rating (End of Session)",
+    "Rating at Start of Session",
+    "Rating at Event Start",
+    "Rating at Event End",
+    "Expected Rating",
+)
+
+_DATE_RANGE_OPTIONS = (
+    "All time",
+    "Last 3 months",
+    "Last 6 months",
+    "Last 1 year",
+    "Last 2 years",
+    "Last 3 years",
+    "Last 4 years",
+    "Last 5 years",
+)
+
+# URL query param -> sidebar widget session state.
+# Keys are short, URL-friendly names; session_key matches the widget's `key=...`.
+ACBL_URL_PARAMS = {
+    "event": {
+        "session_key": "event_type",
+        "parser": str,
+        "valid_values": ("Club", "Tournament"),
+        "default": "Club",
+    },
+    "rating": {
+        "session_key": "rating_type",
+        "parser": str,
+        "valid_values": ("Players", "Pairs"),
+        "default": "Players",
+    },
+    "top_n": {
+        "session_key": "acbl_top_n",
+        "parser": coerce_int(50, 250, 50),
+        "default": 250,
+    },
+    "min_sessions": {
+        "session_key": "acbl_min_sessions",
+        "parser": coerce_int(1, 200),
+        "default": 30,
+    },
+    "method": {
+        "session_key": "acbl_rating_method",
+        "parser": str,
+        "valid_values": ("Avg", "Max", "Latest"),
+        "default": "Avg",
+    },
+    "elo_moment": {
+        "session_key": "elo_rating_type",
+        "parser": str,
+        "valid_values": _ELO_MOMENT_OPTIONS,
+        "default": "Current Rating (End of Session)",
+    },
+    "name": {
+        "session_key": "player_name_filter",
+        "parser": str,
+        "default": "",
+    },
+    "date_range": {
+        "session_key": "acbl_date_range",
+        "parser": str,
+        "valid_values": _DATE_RANGE_OPTIONS,
+        "default": "All time",
+    },
+    "game_type": {
+        "session_key": "acbl_online_filter",
+        "parser": str,
+        "valid_values": ("All", "Local Only", "Online Only"),
+        "default": "Local Only",
+    },
+    "mp": {
+        "session_key": "acbl_masterpoints",
+        "parser": str,
+        "default": "All",
+    },
+}
+
+
 def main():
     """Main application function."""
     # UI Configuration - must be first Streamlit command
@@ -546,6 +630,9 @@ def main():
     
     # Initialize session state
     initialize_session_state()
+
+    # Apply URL query params -> session state BEFORE widgets render (first run only).
+    init_url_params_to_state(st, ACBL_URL_PARAMS)
 
     # API-only mode: require remote API base URL.
     api_base_url = _acbl_api_base_url()
@@ -614,9 +701,22 @@ def main():
             max_value=250,
             value=250,
             step=50,
+            key="acbl_top_n",
         )
-        min_sessions = st.number_input("Minimum sessions played", min_value=1, max_value=200, value=30, step=1)
-        rating_method = st.selectbox("Elo Rating statistic", options=["Avg", "Max", "Latest"], index=0)
+        min_sessions = st.number_input(
+            "Minimum sessions played",
+            min_value=1,
+            max_value=200,
+            value=30,
+            step=1,
+            key="acbl_min_sessions",
+        )
+        rating_method = st.selectbox(
+            "Elo Rating statistic",
+            options=["Avg", "Max", "Latest"],
+            index=0,
+            key="acbl_rating_method",
+        )
         
         # Moving average days - not used anymore (Moving Avg disabled due to memory issues)
         moving_avg_days = 10  # Default value
@@ -640,6 +740,15 @@ def main():
                 "Expected Rating"
             ]
         
+        # Guard: if session state holds a value that is no longer valid for the
+        # current rating_type (e.g. Pairs->Players removes "Expected Rating"),
+        # reset to default so the widget doesn't raise.
+        if (
+            "elo_rating_type" in st.session_state
+            and st.session_state.elo_rating_type not in elo_options
+        ):
+            st.session_state.elo_rating_type = elo_options[0]
+
         elo_rating_type = st.selectbox(
             "Elo rating moment",
             options=elo_options,
@@ -666,8 +775,9 @@ def main():
         # Date range quick filter (default All time)
         date_range_choice = st.selectbox(
             "Date range",
-            options=["All time", "Last 3 months", "Last 6 months", "Last 1 year", "Last 2 years", "Last 3 years", "Last 4 years", "Last 5 years"],
+            options=list(_DATE_RANGE_OPTIONS),
             index=0,
+            key="acbl_date_range",
         )
         
         # Game type filter (Local / Online / All)
@@ -675,18 +785,31 @@ def main():
             "Game type",
             options=["All", "Local Only", "Online Only"],
             index=1,
+            key="acbl_online_filter",
             help="Filter by game type: Local (in-person), Online (virtual), or All games"
         )
         
         # Masterpoints range filter (Players only)
+        masterpoints_options = ["All"] + [format_masterpoints_label(lo, hi) for (lo, hi) in MASTERPOINT_RANGES]
+        # Guard against stale session value (e.g. options changed) before widget render
+        if (
+            "acbl_masterpoints" in st.session_state
+            and st.session_state.acbl_masterpoints not in masterpoints_options
+        ):
+            st.session_state.acbl_masterpoints = "All"
+
         masterpoints_filter = "All"
         if rating_type == "Players":
             masterpoints_filter = st.selectbox(
                 "Masterpoints Range",
-                options=["All"] + [format_masterpoints_label(lo, hi) for (lo, hi) in MASTERPOINT_RANGES],
+                options=masterpoints_options,
                 index=0,
+                key="acbl_masterpoints",
                 help="Filter players by ACBL MasterPoints range"
             )
+        # When Pairs is selected, the widget is hidden and downstream filtering
+        # is skipped; the widget's session value (acbl_masterpoints) is kept
+        # around so URL state and the next Players switch preserve user intent.
         st.session_state.masterpoints_filter = masterpoints_filter
         
         generate_pdf = st.button("Generate PDF", type="primary")
@@ -709,6 +832,9 @@ def main():
             )
             st.session_state.enable_custom_queries = enable_custom_queries
             st.session_state.use_sql_engine = True
+
+    # Persist current sidebar state to URL query params for shareable links.
+    sync_state_to_url_params(st, ACBL_URL_PARAMS)
 
     # Determine date_from based on selection
     now = datetime.now()

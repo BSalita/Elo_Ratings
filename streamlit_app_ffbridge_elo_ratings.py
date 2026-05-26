@@ -73,7 +73,10 @@ from elo_common import (
     get_elo_title,
     apply_app_theme,
     calculate_aggrid_height,
+    coerce_int,
+    init_url_params_to_state,
     render_app_footer,
+    sync_state_to_url_params,
 )
 
 # Import FFBridge-specific utilities
@@ -1200,6 +1203,54 @@ def initialize_session_state():
         st.session_state.first_time = False
 
 
+# URL query param -> sidebar widget session state.
+# Keys are short, URL-friendly names; session_key matches the widget's `key=...`.
+FFBRIDGE_URL_PARAMS = {
+    "api": {
+        "session_key": "selected_api_widget",
+        "parser": str,
+        "valid_values": tuple(API_BACKENDS.keys()),
+    },
+    "tournament": {
+        "session_key": "elo_tournament_selectbox",
+        "parser": str,
+        "default": "All Tournaments",
+    },
+    "club": {
+        "session_key": "elo_club_selectbox",
+        "parser": str,
+        "default": "All Clubs",
+    },
+    "name": {
+        "session_key": "elo_name_filter",
+        "parser": str,
+        "default": "",
+    },
+    "rating": {
+        "session_key": "elo_rating_type",
+        "parser": str,
+        "valid_values": ("Players", "Pairs"),
+        "default": "Players",
+    },
+    "score": {
+        "session_key": "elo_score_type",
+        "parser": str,
+        "valid_values": ("Scratch", "Handicap"),
+        "default": "Scratch",
+    },
+    "top_n": {
+        "session_key": "elo_top_n",
+        "parser": coerce_int(50, 1000, 50),
+        "default": 250,
+    },
+    "min_games": {
+        "session_key": "elo_min_games",
+        "parser": coerce_int(1, 100),
+        "default": 10,
+    },
+}
+
+
 # -------------------------------
 # Main UI
 # -------------------------------
@@ -1212,7 +1263,18 @@ def main():
     )
     
     initialize_session_state()
-    
+
+    # Apply URL query params -> session state BEFORE widgets render (first run only).
+    init_url_params_to_state(st, FFBRIDGE_URL_PARAMS)
+
+    # If a URL-provided club is not yet in the available list (which is populated
+    # only after data loads), seed it so the selectbox doesn't reset it to default.
+    url_club = st.session_state.get("elo_club_selectbox")
+    if url_club and url_club != "All Clubs":
+        existing_clubs = st.session_state.get("elo_available_clubs", ["All Clubs"])
+        if url_club not in existing_clubs:
+            st.session_state.elo_available_clubs = existing_clubs + [url_club]
+
     # Apply common theme
     apply_app_theme(st)
     widen_scrollbars()
@@ -1371,6 +1433,9 @@ def main():
         st.sidebar.markdown("🔗 [ACBL Postmortem](https://acbl.postmortem.chat)")
         st.sidebar.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
         #st.sidebar.markdown("🔗 [BridgeWebs Postmortem](https://bridgewebs.postmortem.chat)")
+
+    # Persist current sidebar state to URL query params for shareable links.
+    sync_state_to_url_params(st, FFBRIDGE_URL_PARAMS)
 
     # Header
     st.markdown(f"""

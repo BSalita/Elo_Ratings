@@ -250,6 +250,94 @@ def calculate_aggrid_height(row_count: int) -> int:
 
 
 # -------------------------------
+# URL Query Parameter Sync Helpers
+# -------------------------------
+def coerce_int(min_value: int | None = None, max_value: int | None = None, step: int | None = None):
+    """Build a parser that coerces a string to int, optionally clamped and snapped to step.
+
+    Snapping is anchored at ``min_value`` (or 0 if not provided).
+    """
+    def _parse(raw: str) -> int:
+        v = int(raw)
+        if min_value is not None:
+            v = max(min_value, v)
+        if max_value is not None:
+            v = min(max_value, v)
+        if step is not None and step > 0:
+            anchor = min_value if min_value is not None else 0
+            v = anchor + round((v - anchor) / step) * step
+            if min_value is not None:
+                v = max(min_value, v)
+            if max_value is not None:
+                v = min(max_value, v)
+        return v
+    return _parse
+
+
+def init_url_params_to_state(
+    st_module,
+    params_config: dict,
+    init_flag_key: str = "_url_params_initialized",
+) -> None:
+    """Read URL query params into ``st.session_state`` on first script run only.
+
+    On subsequent runs, widgets are the source of truth and
+    ``sync_state_to_url_params`` pushes their values back into the URL.
+
+    ``params_config`` maps URL keys to dicts with:
+      - ``session_key`` (required): the ``st.session_state`` key used by the widget.
+      - ``parser`` (optional): callable to convert the URL string (default: ``str``).
+      - ``valid_values`` (optional): iterable; the parsed value must be in it.
+    """
+    if st_module.session_state.get(init_flag_key, False):
+        return
+    qp = st_module.query_params
+    for url_key, cfg in params_config.items():
+        if url_key not in qp:
+            continue
+        session_key = cfg["session_key"]
+        parser = cfg.get("parser", str)
+        try:
+            parsed = parser(qp[url_key])
+        except (ValueError, TypeError):
+            continue
+        valid_values = cfg.get("valid_values")
+        if valid_values is not None and parsed not in valid_values:
+            continue
+        st_module.session_state[session_key] = parsed
+    st_module.session_state[init_flag_key] = True
+
+
+def sync_state_to_url_params(
+    st_module,
+    params_config: dict,
+) -> None:
+    """Write current session_state values to URL query params after widgets render.
+
+    A param is omitted from the URL when its session_state value equals the
+    configured ``default`` (or is empty/None), keeping shareable URLs concise.
+    """
+    qp = st_module.query_params
+    for url_key, cfg in params_config.items():
+        session_key = cfg["session_key"]
+        default = cfg.get("default")
+        if session_key not in st_module.session_state:
+            if url_key in qp:
+                del qp[url_key]
+            continue
+        val = st_module.session_state[session_key]
+        is_empty = (val is None) or (isinstance(val, str) and val == "")
+        is_default = (default is not None) and (val == default)
+        if is_empty or is_default:
+            if url_key in qp:
+                del qp[url_key]
+            continue
+        str_val = str(val)
+        if qp.get(url_key) != str_val:
+            qp[url_key] = str_val
+
+
+# -------------------------------
 # Common Theme CSS
 # -------------------------------
 APP_THEME_CSS = """
