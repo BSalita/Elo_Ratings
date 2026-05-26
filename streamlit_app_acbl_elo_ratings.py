@@ -410,7 +410,7 @@ class UrlCellRenderer {
         a.title = v;
         a.style.color = '#0066cc';
         a.style.textDecoration = 'underline';
-        a.textContent = '🔗 link';
+        a.textContent = v;
         this.eGui.appendChild(a);
     }
     getGui() {
@@ -467,7 +467,7 @@ def _render_detail_aggrid(detail_df: pl.DataFrame, key: str, selectable: bool = 
     # Render any column containing http(s) URLs as clickable links.
     url_renderer = JsCode(_URL_CELL_RENDERER_JS)
     for col in _url_columns_pandas(pdf):
-        gb.configure_column(col, cellRenderer=url_renderer, width=110)
+        gb.configure_column(col, cellRenderer=url_renderer, minWidth=240, width=360)
 
     grid_options = gb.build()
     grid_options['rowHeight'] = 28
@@ -1139,7 +1139,7 @@ def main():
                 # Render any column containing http(s) URLs as clickable links.
                 url_renderer = JsCode(_URL_CELL_RENDERER_JS)
                 for col in _url_columns_pandas(display_df):
-                    gb.configure_column(col, cellRenderer=url_renderer, width=110)
+                    gb.configure_column(col, cellRenderer=url_renderer, minWidth=240, width=360)
                 
                 # Don't configure pagination - we want scrolling instead
                 gb.configure_side_bar()

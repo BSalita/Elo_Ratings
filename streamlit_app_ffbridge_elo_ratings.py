@@ -322,7 +322,7 @@ class UrlCellRenderer {
         a.title = v;
         a.style.color = '#0066cc';
         a.style.textDecoration = 'underline';
-        a.textContent = '🔗 link';
+        a.textContent = v;
         this.eGui.appendChild(a);
     }
     getGui() {
@@ -381,7 +381,7 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
         gb.configure_column('Games', width=100)  # Width accommodates "Games" text + sort icon
     # Render any column containing http(s) URLs as clickable links.
     for col in _url_columns(display_df):
-        gb.configure_column(col, cellRenderer=_URL_CELL_RENDERER, width=110)
+        gb.configure_column(col, cellRenderer=_URL_CELL_RENDERER, minWidth=240, width=360)
     grid_options = gb.build()
     
     return AgGrid(
@@ -407,7 +407,7 @@ def _render_detail_aggrid_ff(detail_df: pl.DataFrame, key: str, selectable: bool
             gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
     # Render any column containing http(s) URLs as clickable links.
     for col in _url_columns(display_df):
-        gb.configure_column(col, cellRenderer=_URL_CELL_RENDERER, width=110)
+        gb.configure_column(col, cellRenderer=_URL_CELL_RENDERER, minWidth=240, width=360)
     grid_options = gb.build()
     grid_options['rowHeight'] = 28
     grid_options['domLayout'] = 'normal'
