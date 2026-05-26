@@ -298,15 +298,24 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
 
 
 # JsCode cell renderer used to turn any cell containing an http(s) URL into a
-# clickable anchor that opens in a new tab. Non-URL values render as-is.
+# clickable anchor that opens in a new tab. Returns a real <a> DOM element
+# because AgGrid escapes plain HTML strings returned from cellRenderer.
+# Non-URL values render as a plain text node.
 _URL_CELL_RENDERER = JsCode("""
 function(params) {
     if (params.value === null || params.value === undefined) return '';
     var v = String(params.value).trim();
     if (v === '') return '';
     if (!/^https?:\\/\\//i.test(v)) return v;
-    var safe = v.replace(/"/g, '&quot;');
-    return '<a href="' + safe + '" target="_blank" rel="noopener noreferrer" title="' + safe + '" style="color:#0066cc; text-decoration:underline;">🔗 link</a>';
+    var a = document.createElement('a');
+    a.href = v;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.title = v;
+    a.style.color = '#0066cc';
+    a.style.textDecoration = 'underline';
+    a.textContent = '🔗 link';
+    return a;
 }
 """)
 
