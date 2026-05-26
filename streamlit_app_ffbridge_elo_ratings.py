@@ -1297,6 +1297,16 @@ def initialize_session_state():
         st.session_state.first_time = False
 
 
+# Default API depends on whether a Classic bearer token is present in the
+# environment. Computed at module load (env vars already loaded by elo_ffbridge_classic).
+# Used as the URL-param default so ``?api=`` is only written when the user picks
+# a non-default API.
+_FFBRIDGE_DEFAULT_API = (
+    "FFBridge Classic API"
+    if bool(os.getenv("FFBRIDGE_BEARER_TOKEN", "").strip())
+    else "FFBridge Lancelot API"
+)
+
 # URL query param -> sidebar widget session state.
 # Keys are short, URL-friendly names; session_key matches the widget's `key=...`.
 FFBRIDGE_URL_PARAMS = {
@@ -1304,6 +1314,7 @@ FFBRIDGE_URL_PARAMS = {
         "session_key": "selected_api_widget",
         "parser": str,
         "valid_values": tuple(API_BACKENDS.keys()),
+        "default": _FFBRIDGE_DEFAULT_API,
     },
     "tournament": {
         "session_key": "elo_tournament_selectbox",
