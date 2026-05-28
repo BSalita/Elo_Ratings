@@ -140,6 +140,23 @@ _SHRINKAGE_META_CACHE: dict[str, dict | None] = {}
 SHRINKAGE_DEFAULT_PRIOR_SESSIONS = 50
 
 
+def _shrinkage_sidecar_search_paths(filename: str) -> list[pathlib.Path]:
+    """Return ordered search paths for the shrinkage sidecar JSON.
+
+    Looks in (a) the API's bundled ``data/`` directory (where deployment
+    artifacts live alongside the parquets), then (b) the canonical
+    ``e:/bridge/data/acbl/`` source of truth used by
+    ``acbl_elo_ratings_create.py``. An optional ``ACBL_SHRINKAGE_DIR``
+    environment variable can override the second location.
+    """
+    candidates = [DATA_ROOT / filename]
+    override = os.getenv("ACBL_SHRINKAGE_DIR", "").strip()
+    if override:
+        candidates.append(pathlib.Path(override) / filename)
+    candidates.append(pathlib.Path("e:/bridge/data/acbl") / filename)
+    return candidates
+
+
 def _load_shrinkage_meta(club_or_tournament: str) -> dict | None:
     """Load the shrinkage sidecar JSON written by acbl_elo_ratings_create.py.
 
@@ -148,6 +165,11 @@ def _load_shrinkage_meta(club_or_tournament: str) -> dict | None:
     rebuilt the lookup parquets). In that case the report falls back to
     Published == Raw so the API still works.
 
+    Tries multiple search paths so the server works whether the sidecars
+    live next to the parquets in ``DATA_ROOT`` (deployment) or in
+    ``e:/bridge/data/acbl/`` (local dev where the OneDrive sync may not
+    have copied the latest JSON yet).
+
     Cached at module level.
     """
     key = club_or_tournament.lower()
@@ -155,18 +177,18 @@ def _load_shrinkage_meta(club_or_tournament: str) -> dict | None:
         return _SHRINKAGE_META_CACHE[key]
 
     filename = f"acbl_{key}_elo_shrinkage.json"
-    # Local-only for now; R2 deployments can add a fetch path next iteration.
-    path = DATA_ROOT / filename
-    if not path.exists():
-        _SHRINKAGE_META_CACHE[key] = None
-        return None
-    try:
-        meta = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        _SHRINKAGE_META_CACHE[key] = None
-        return None
-    _SHRINKAGE_META_CACHE[key] = meta
-    return meta
+    for path in _shrinkage_sidecar_search_paths(filename):
+        if not path.exists():
+            continue
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        _SHRINKAGE_META_CACHE[key] = meta
+        return meta
+
+    _SHRINKAGE_META_CACHE[key] = None
+    return None
 
 
 def _shrinkage_anchor(meta: dict | None, kind: str) -> float | None:
