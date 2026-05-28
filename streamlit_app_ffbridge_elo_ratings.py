@@ -1086,17 +1086,56 @@ def process_tournaments_to_elo(
     return results_df, players_df, current_ratings, cache_stats
 
 
-def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5, use_handicap: bool = False) -> Tuple[pl.DataFrame, str]:
-    """Get top players sorted by Elo rating using SQL."""
+def show_top_players(
+    players_df: pl.DataFrame,
+    top_n: int,
+    min_games: int = 5,
+    use_handicap: bool = False,
+    prior_sessions: int = 0,
+) -> Tuple[pl.DataFrame, str, Optional[float]]:
+    """Get top players sorted by Elo rating using SQL.
+
+    When ``prior_sessions > 0`` and a prior anchor (median Elo of the
+    qualifying subset) is available, the headline Elo is the Bayesian-shrunk
+    "Published" Elo:
+
+        Published = (games * Raw + prior_sessions * prior_anchor)
+                    / (games + prior_sessions)
+
+    Both the Published and Raw values are returned in the table; the
+    leaderboard is ordered by Published. Returns ``(df, sql, prior_anchor)``.
+    """
     if players_df.is_empty():
-        return players_df, ""
-    
-    # Build SELECT clause - conditionally include Title column
-    # Title is always based on scratch Elo, regardless of use_handicap setting
-    # Determine column names based on handicap setting
+        return players_df, "", None
+
     elo_col_name = "HC_Player_Elo" if use_handicap else "Player_Elo"
     title_col_name = "Scratch_Title" if use_handicap else "Title"
-    
+
+    anchor_query = f"""
+        SELECT MEDIAN(elo_rating) AS anchor
+        FROM players_df
+        WHERE games_played >= {min_games}
+    """
+    anchor_df = duckdb.sql(anchor_query).pl()
+    if anchor_df.is_empty():
+        prior_anchor: Optional[float] = None
+    else:
+        val = anchor_df.item(0, 0)
+        prior_anchor = float(val) if val is not None else None
+
+    if prior_sessions > 0 and prior_anchor is not None:
+        ps_lit = f"CAST({float(prior_sessions)!r} AS DOUBLE)"
+        anchor_lit = f"CAST({float(prior_anchor)!r} AS DOUBLE)"
+        published_expr = (
+            f"CAST(ROUND(LEAST(GREATEST("
+            f"(CAST(games_played AS DOUBLE) * CAST(elo_rating AS DOUBLE) "
+            f"+ {ps_lit} * {anchor_lit}) "
+            f"/ NULLIF(CAST(games_played AS DOUBLE) + {ps_lit}, 0)"
+            f", 0), 3500), 0) AS INTEGER)"
+        )
+    else:
+        published_expr = "CAST(ROUND(LEAST(GREATEST(elo_rating, 0), 3500), 0) AS INTEGER)"
+
     title_col = f""",
             CASE 
                 WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 2600 THEN 'SGM'
@@ -1110,16 +1149,24 @@ def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5, u
                 WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 1400 THEN 'Novice'
                 ELSE 'Beginner'
             END AS {title_col_name}"""
-    
+
     query = f"""
         WITH filtered AS (
             SELECT *
             FROM players_df
             WHERE games_played >= {min_games}
+        ),
+        ranked AS (
+            SELECT
+                *,
+                CAST(ROUND(LEAST(GREATEST(elo_rating, 0), 3500), 0) AS INTEGER) AS raw_elo_int,
+                {published_expr} AS published_elo_int
+            FROM filtered
         )
         SELECT 
-            CAST(ROW_NUMBER() OVER (ORDER BY elo_rating DESC, games_played DESC, player_name ASC, player_id ASC) AS INTEGER) AS Rank,
-            CAST(ROUND(LEAST(GREATEST(elo_rating, 0), 3500), 0) AS INTEGER) AS {elo_col_name}{title_col},
+            CAST(ROW_NUMBER() OVER (ORDER BY published_elo_int DESC, games_played DESC, player_name ASC, player_id ASC) AS INTEGER) AS Rank,
+            published_elo_int AS {elo_col_name},
+            raw_elo_int AS {elo_col_name}_Raw{title_col},
             player_id AS Player_ID,
             player_name AS Player_Name,
             ROUND(avg_scratch_pct, 1) AS Avg_Scratch,
@@ -1127,28 +1174,73 @@ def show_top_players(players_df: pl.DataFrame, top_n: int, min_games: int = 5, u
             ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,
             ROUND(stdev_percentage, 1) AS Pct_Stdev,
             CAST(games_played AS INTEGER) AS Games
-        FROM filtered
+        FROM ranked
         ORDER BY Rank ASC
         LIMIT {top_n}
     """
-    
+
     result = duckdb.sql(query).pl()
-    return result, query
+    return result, query, prior_anchor
 
 
-def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5, use_handicap: bool = False, players_df: Optional[pl.DataFrame] = None) -> Tuple[pl.DataFrame, str]:
-    """Get top pairs sorted by Elo rating using SQL."""
+def show_top_pairs(
+    results_df: pl.DataFrame,
+    top_n: int,
+    min_games: int = 5,
+    use_handicap: bool = False,
+    players_df: Optional[pl.DataFrame] = None,
+    prior_sessions: int = 0,
+) -> Tuple[pl.DataFrame, str, Optional[float]]:
+    """Get top pairs sorted by Elo rating using SQL.
+
+    When ``prior_sessions > 0`` and a prior anchor (median pair Elo of the
+    qualifying subset) is available, the headline pair Elo is the
+    Bayesian-shrunk "Published" Elo, computed the same way as for players in
+    :func:`show_top_players`. Both Published and Raw are returned in the
+    output; the leaderboard is ordered by Published. Returns
+    ``(df, sql, prior_anchor)``.
+    """
     if results_df.is_empty():
-        return results_df, ""
-    
-    # Select appropriate Elo and percentage columns based on use_handicap
+        return results_df, "", None
+
     elo_col = "handicap_pair_elo" if use_handicap else "scratch_pair_elo"
-    # Use COALESCE for handicap to fall back to scratch when handicap is null
     pct_col = "COALESCE(handicap_percentage, scratch_percentage)" if use_handicap else "scratch_percentage"
-    
-    # Determine column names based on handicap setting
+
     pair_elo_col_name = "HC_Pair_Elo" if use_handicap else "Pair_Elo"
     title_col_name = "Scratch_Title" if use_handicap else "Title"
+
+    anchor_query = f"""
+        WITH pair_anchor AS (
+            SELECT
+                pair_id,
+                AVG({elo_col}) AS avg_pair_elo,
+                COUNT(*) AS games_played
+            FROM results_df
+            GROUP BY pair_id
+        )
+        SELECT MEDIAN(avg_pair_elo) AS anchor
+        FROM pair_anchor
+        WHERE games_played >= {min_games}
+    """
+    anchor_df = duckdb.sql(anchor_query).pl()
+    if anchor_df.is_empty():
+        prior_anchor: Optional[float] = None
+    else:
+        val = anchor_df.item(0, 0)
+        prior_anchor = float(val) if val is not None else None
+
+    if prior_sessions > 0 and prior_anchor is not None:
+        ps_lit = f"CAST({float(prior_sessions)!r} AS DOUBLE)"
+        anchor_lit = f"CAST({float(prior_anchor)!r} AS DOUBLE)"
+        published_expr = (
+            f"CAST(ROUND(LEAST(GREATEST("
+            f"(CAST(games_played AS DOUBLE) * CAST(avg_pair_elo AS DOUBLE) "
+            f"+ {ps_lit} * {anchor_lit}) "
+            f"/ NULLIF(CAST(games_played AS DOUBLE) + {ps_lit}, 0)"
+            f", 0), 3500), 0) AS INTEGER)"
+        )
+    else:
+        published_expr = "CAST(ROUND(LEAST(GREATEST(avg_pair_elo, 0), 3500), 0) AS INTEGER)"
     
     # Build Title column - use lower title of the two players based on their scratch Elo
     if players_df is not None and not players_df.is_empty():
@@ -1236,20 +1328,28 @@ def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5, use
             SELECT *
             FROM pair_stats
             WHERE games_played >= {min_games}
+        ),
+        ranked AS (
+            SELECT
+                *,
+                CAST(ROUND(LEAST(GREATEST(avg_pair_elo, 0), 3500), 0) AS INTEGER) AS raw_pair_elo_int,
+                {published_expr} AS published_pair_elo_int
+            FROM filtered
         )"""
-    
+
     if players_df is not None and not players_df.is_empty():
         query += f""",
         with_player_titles AS (
             SELECT 
                 f.*{title_col}
-            FROM filtered f
+            FROM ranked f
             LEFT JOIN players_df p1 ON f.player1_id = p1.player_id
             LEFT JOIN players_df p2 ON f.player2_id = p2.player_id
         )
         SELECT 
-            CAST(ROW_NUMBER() OVER (ORDER BY avg_pair_elo DESC, games_played DESC, pair_name ASC, pair_id ASC) AS INTEGER) AS Rank,
-            CAST(ROUND(LEAST(GREATEST(avg_pair_elo, 0), 3500), 0) AS INTEGER) AS {pair_elo_col_name}{title_select},
+            CAST(ROW_NUMBER() OVER (ORDER BY published_pair_elo_int DESC, games_played DESC, pair_name ASC, pair_id ASC) AS INTEGER) AS Rank,
+            published_pair_elo_int AS {pair_elo_col_name},
+            raw_pair_elo_int AS {pair_elo_col_name}_Raw{title_select},
             pair_id AS Pair_ID,
             pair_name AS Pair_Name,
             ROUND(avg_scratch_pct, 1) AS Avg_Scratch,
@@ -1264,8 +1364,9 @@ def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5, use
     else:
         query += f"""
         SELECT 
-            CAST(ROW_NUMBER() OVER (ORDER BY avg_pair_elo DESC, games_played DESC, pair_name ASC, pair_id ASC) AS INTEGER) AS Rank,
-            CAST(ROUND(LEAST(GREATEST(avg_pair_elo, 0), 3500), 0) AS INTEGER) AS {pair_elo_col_name}{title_col},
+            CAST(ROW_NUMBER() OVER (ORDER BY published_pair_elo_int DESC, games_played DESC, pair_name ASC, pair_id ASC) AS INTEGER) AS Rank,
+            published_pair_elo_int AS {pair_elo_col_name},
+            raw_pair_elo_int AS {pair_elo_col_name}_Raw{title_col},
             pair_id AS Pair_ID,
             pair_name AS Pair_Name,
             ROUND(avg_scratch_pct, 1) AS Avg_Scratch,
@@ -1273,13 +1374,13 @@ def show_top_pairs(results_df: pl.DataFrame, top_n: int, min_games: int = 5, use
             ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,
             ROUND(stdev_percentage, 1) AS Pct_Stdev,
             CAST(games_played AS INTEGER) AS Games
-        FROM filtered
+        FROM ranked
         ORDER BY Rank ASC
         LIMIT {top_n}
     """
-    
+
     result = duckdb.sql(query).pl()
-    return result, query
+    return result, query, prior_anchor
 
 
 # -------------------------------
@@ -1352,6 +1453,11 @@ FFBRIDGE_URL_PARAMS = {
         "session_key": "elo_min_games",
         "parser": coerce_int(1, 100),
         "default": 10,
+    },
+    "prior_sessions": {
+        "session_key": "elo_prior_sessions",
+        "parser": coerce_int(0, 1000),
+        "default": 50,
     },
 }
 
@@ -1531,7 +1637,22 @@ def main():
             key="elo_min_games",
             help="Minimum tournaments played to appear in rankings"
         )
-        
+
+        prior_sessions = st.slider(
+            "Shrinkage Prior (sessions)",
+            min_value=0,
+            max_value=200,
+            value=50,
+            step=5,
+            key="elo_prior_sessions",
+            help=(
+                "Bayesian shrinkage prior weight in 'sessions equivalent'. "
+                "Higher values pull less-played players/pairs toward the "
+                "global median rating, dampening leaderboard noise from "
+                "small-sample outliers. 0 disables shrinkage (headline shows Raw Elo)."
+            ),
+        )
+
         # PDF Export
         generate_pdf = st.button("Export Report to PDF File", width='stretch')
         st.sidebar.markdown('<p style="color: #ffc107; font-weight: 600;">Morty\'s Automated Postmortem Apps</p>', unsafe_allow_html=True)
@@ -1802,8 +1923,22 @@ def main():
     if rating_type == "Players":
         st.markdown(f"### 🏆 Top {top_n} Players (Min. {min_games} games)")
         if not players_df.is_empty():
-            top_players, sql_query = show_top_players(players_df, top_n, min_games, use_handicap)
-            
+            top_players, sql_query, prior_anchor = show_top_players(
+                players_df, top_n, min_games, use_handicap, prior_sessions=int(prior_sessions),
+            )
+
+            if prior_sessions > 0 and prior_anchor is not None:
+                st.caption(
+                    f"📐 Headline shows **Published Elo** (Bayesian-shrunk toward "
+                    f"median of qualifying players ≈ {prior_anchor:.0f}, "
+                    f"prior_sessions={prior_sessions}). `{'HC_' if use_handicap else ''}Player_Elo_Raw` "
+                    f"column shown alongside."
+                )
+            elif prior_sessions > 0:
+                st.caption("📐 Shrinkage unavailable: no qualifying players to anchor the prior. Headline shows Raw Elo.")
+            else:
+                st.caption("📐 Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo.")
+
             if sql_query:
                 with st.expander("📝 SQL Query", expanded=False):
                     st.code(sql_query, language="sql")
@@ -1819,7 +1954,7 @@ def main():
                 if not top_players.is_empty():
                     st.caption("💡 Click a row to view player's tournament history")
                     # Create dynamic key based on filter parameters to reset selection when data changes
-                    dynamic_key = f'players_table_selectable_{rating_type}_{simultaneous_type}_{selected_club}_{top_n}_{min_games}_{use_handicap}_{name_filter}'
+                    dynamic_key = f'players_table_selectable_{rating_type}_{simultaneous_type}_{selected_club}_{top_n}_{min_games}_{use_handicap}_{name_filter}_prior{prior_sessions}'
                     grid_response = build_selectable_aggrid(top_players, dynamic_key)
                     
                     selected_rows = grid_response.get('selected_rows', None)
@@ -1929,8 +2064,22 @@ def main():
     else:
         st.markdown(f"### 🏆 Top {top_n} Pairs (Min. {min_games} games)")
         if not results_df.is_empty():
-            top_pairs, sql_query = show_top_pairs(results_df, top_n, min_games, use_handicap, players_df)
-            
+            top_pairs, sql_query, prior_anchor = show_top_pairs(
+                results_df, top_n, min_games, use_handicap, players_df, prior_sessions=int(prior_sessions),
+            )
+
+            if prior_sessions > 0 and prior_anchor is not None:
+                st.caption(
+                    f"📐 Headline shows **Published Elo** (Bayesian-shrunk toward "
+                    f"median of qualifying pairs ≈ {prior_anchor:.0f}, "
+                    f"prior_sessions={prior_sessions}). `{'HC_' if use_handicap else ''}Pair_Elo_Raw` "
+                    f"column shown alongside."
+                )
+            elif prior_sessions > 0:
+                st.caption("📐 Shrinkage unavailable: no qualifying pairs to anchor the prior. Headline shows Raw Elo.")
+            else:
+                st.caption("📐 Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo.")
+
             if sql_query:
                 with st.expander("📝 SQL Query", expanded=False):
                     st.code(sql_query, language="sql")
@@ -1946,7 +2095,7 @@ def main():
                 if not top_pairs.is_empty():
                     st.caption("💡 Click a row to view pair's tournament history")
                     # Create dynamic key based on filter parameters to reset selection when data changes
-                    dynamic_key = f'pairs_table_selectable_{rating_type}_{simultaneous_type}_{selected_club}_{top_n}_{min_games}_{use_handicap}_{name_filter}'
+                    dynamic_key = f'pairs_table_selectable_{rating_type}_{simultaneous_type}_{selected_club}_{top_n}_{min_games}_{use_handicap}_{name_filter}_prior{prior_sessions}'
                     grid_response = build_selectable_aggrid(top_pairs, dynamic_key)
                     
                     selected_rows = grid_response.get('selected_rows', None)
