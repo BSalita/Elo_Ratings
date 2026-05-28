@@ -470,10 +470,22 @@ def _render_detail_aggrid(detail_df: pl.DataFrame, key: str, selectable: bool = 
         wrapHeaderText=True,
         autoHeaderHeight=True,
     )
-    # Configure numeric columns for proper sorting
+    # Configure numeric columns for proper sorting. The explicit JsCode
+    # comparator is required because streamlit-aggrid serializes cell values
+    # as strings to the JS side; type=['numericColumn'] alone would not
+    # force numeric sort.
+    numeric_comparator = JsCode("""
+        function(valueA, valueB, nodeA, nodeB, isDescending) {
+            return Number(valueA) - Number(valueB);
+        }
+    """)
     for col in pdf.columns:
         if pd.api.types.is_numeric_dtype(pdf[col]):
-            gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
+            gb.configure_column(
+                col,
+                type=['numericColumn', 'numberColumnFilter'],
+                comparator=numeric_comparator,
+            )
 
     # Render any column containing http(s) URLs as clickable links.
     url_renderer = JsCode(_URL_CELL_RENDERER_JS)
@@ -1213,11 +1225,25 @@ def main():
                 gb = GridOptionsBuilder.from_dataframe(display_df)
                 gb.configure_selection(selection_mode='single', use_checkbox=False)  # Enable single row selection
                 gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True, wrapHeaderText=True, autoHeaderHeight=True)
-                
-                # Configure numeric columns for proper sorting
+
+                # Configure numeric columns for proper sorting.
+                # IMPORTANT: streamlit-aggrid 1.1.x serializes the DataFrame to
+                # the JS side in a way that delivers cell values as STRINGS,
+                # so `type=['numericColumn']` alone is not enough (it only
+                # right-aligns + sets the number filter); without an explicit
+                # numeric comparator AgGrid would sort "10" before "2".
+                numeric_comparator = JsCode("""
+                    function(valueA, valueB, nodeA, nodeB, isDescending) {
+                        return Number(valueA) - Number(valueB);
+                    }
+                """)
                 for col in display_df.columns:
                     if pd.api.types.is_numeric_dtype(display_df[col]):
-                        gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
+                        gb.configure_column(
+                            col,
+                            type=['numericColumn', 'numberColumnFilter'],
+                            comparator=numeric_comparator,
+                        )
                 
                 # Render any column containing http(s) URLs as clickable links.
                 url_renderer = JsCode(_URL_CELL_RENDERER_JS)

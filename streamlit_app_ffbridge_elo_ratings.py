@@ -450,9 +450,21 @@ def _render_detail_aggrid_ff(detail_df: pl.DataFrame, key: str, selectable: bool
     if selectable:
         gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
     gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
+    # Explicit numeric comparator required because streamlit-aggrid 1.1.x
+    # delivers cell values to the JS side as strings; without this, columns
+    # like Pair_Elo / Rank would sort as "10, 2, 20, 3" alphabetically.
+    numeric_comparator = JsCode("""
+        function(valueA, valueB, nodeA, nodeB, isDescending) {
+            return Number(valueA) - Number(valueB);
+        }
+    """)
     for col in display_df.columns:
         if pd.api.types.is_numeric_dtype(display_df[col]):
-            gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
+            gb.configure_column(
+                col,
+                type=['numericColumn', 'numberColumnFilter'],
+                comparator=numeric_comparator,
+            )
     # Render any column containing http(s) URLs as clickable links.
     for col in _url_columns(display_df):
         gb.configure_column(col, cellRenderer=_URL_CELL_RENDERER, minWidth=240, width=360)
