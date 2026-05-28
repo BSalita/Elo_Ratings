@@ -1251,16 +1251,21 @@ def show_top_players(
     title_col_name = "Scratch_Title" if use_handicap else "Title"
 
     anchor_query = f"""
-        SELECT MEDIAN(elo_rating) AS anchor
+        SELECT
+            MEDIAN(elo_rating) AS anchor,
+            MEDIAN(scratch_elo) AS scratch_anchor
         FROM players_df
         WHERE games_played >= {min_games}
     """
     anchor_df = duckdb.sql(anchor_query).pl()
     if anchor_df.is_empty():
         prior_anchor: Optional[float] = None
+        scratch_anchor: Optional[float] = None
     else:
         val = anchor_df.item(0, 0)
         prior_anchor = float(val) if val is not None else None
+        sval = anchor_df.item(0, 1)
+        scratch_anchor = float(sval) if sval is not None else None
 
     if prior_sessions > 0 and prior_anchor is not None:
         ps_lit = f"CAST({float(prior_sessions)!r} AS DOUBLE)"
@@ -1275,17 +1280,34 @@ def show_top_players(
     else:
         published_expr = "CAST(ROUND(LEAST(GREATEST(elo_rating, 0), 3500), 0) AS INTEGER)"
 
+    # Titles derive from the *published* (Bayesian-shrunk) SCRATCH Elo so they
+    # always agree with the shrunk headline and never show an inflated title for
+    # a low-sample player. In scratch view this equals the headline; in handicap
+    # view it is the shrunk scratch rating (the "Scratch_Title" skill indicator).
+    if prior_sessions > 0 and scratch_anchor is not None:
+        ps_lit_s = f"CAST({float(prior_sessions)!r} AS DOUBLE)"
+        sanchor_lit = f"CAST({float(scratch_anchor)!r} AS DOUBLE)"
+        published_scratch_expr = (
+            f"CAST(ROUND(LEAST(GREATEST("
+            f"(CAST(games_played AS DOUBLE) * CAST(scratch_elo AS DOUBLE) "
+            f"+ {ps_lit_s} * {sanchor_lit}) "
+            f"/ NULLIF(CAST(games_played AS DOUBLE) + {ps_lit_s}, 0)"
+            f", 0), 3500), 0) AS INTEGER)"
+        )
+    else:
+        published_scratch_expr = "CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER)"
+
     title_col = f""",
             CASE 
-                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 2600 THEN 'SGM'
-                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 2500 THEN 'GM'
-                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 2400 THEN 'IM'
-                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 2300 THEN 'FM'
-                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 2200 THEN 'CM'
-                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 2000 THEN 'Expert'
-                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 1800 THEN 'Advanced'
-                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 1600 THEN 'Intermediate'
-                WHEN CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER) >= 1400 THEN 'Novice'
+                WHEN published_scratch_int >= 2600 THEN 'SGM'
+                WHEN published_scratch_int >= 2500 THEN 'GM'
+                WHEN published_scratch_int >= 2400 THEN 'IM'
+                WHEN published_scratch_int >= 2300 THEN 'FM'
+                WHEN published_scratch_int >= 2200 THEN 'CM'
+                WHEN published_scratch_int >= 2000 THEN 'Expert'
+                WHEN published_scratch_int >= 1800 THEN 'Advanced'
+                WHEN published_scratch_int >= 1600 THEN 'Intermediate'
+                WHEN published_scratch_int >= 1400 THEN 'Novice'
                 ELSE 'Beginner'
             END AS {title_col_name}"""
 
@@ -1299,7 +1321,8 @@ def show_top_players(
             SELECT
                 *,
                 CAST(ROUND(LEAST(GREATEST(elo_rating, 0), 3500), 0) AS INTEGER) AS raw_elo_int,
-                {published_expr} AS published_elo_int
+                {published_expr} AS published_elo_int,
+                {published_scratch_expr} AS published_scratch_int
             FROM filtered
         )
         SELECT 
@@ -1381,34 +1404,68 @@ def show_top_pairs(
     else:
         published_expr = "CAST(ROUND(LEAST(GREATEST(avg_pair_elo, 0), 3500), 0) AS INTEGER)"
     
-    # Build Title column - use lower title of the two players based on their scratch Elo
+    # Build Title column - use lower title of the two players based on their
+    # *published* (Bayesian-shrunk) scratch Elo, so a pair never inherits an
+    # inflated title from a low-sample partner. Each player's scratch Elo is
+    # shrunk toward the population scratch median using their own games count,
+    # mirroring the headline shrinkage.
+    scratch_anchor: Optional[float] = None
     if players_df is not None and not players_df.is_empty():
+        sa_df = duckdb.sql(
+            f"""
+            SELECT MEDIAN(scratch_elo) AS scratch_anchor
+            FROM players_df
+            WHERE games_played >= {min_games}
+            """
+        ).pl()
+        if not sa_df.is_empty():
+            sv = sa_df.item(0, 0)
+            scratch_anchor = float(sv) if sv is not None else None
+
+    def _pub_scratch_sql(alias: str) -> str:
+        """Shrunk, chess-clamped scratch Elo for a joined player alias."""
+        if prior_sessions > 0 and scratch_anchor is not None:
+            ps_lit_s = f"CAST({float(prior_sessions)!r} AS DOUBLE)"
+            sanchor_lit = f"CAST({float(scratch_anchor)!r} AS DOUBLE)"
+            return (
+                f"CAST(ROUND(LEAST(GREATEST("
+                f"(CAST(COALESCE({alias}.games_played, 0) AS DOUBLE) "
+                f"* CAST(COALESCE({alias}.scratch_elo, 0) AS DOUBLE) "
+                f"+ {ps_lit_s} * {sanchor_lit}) "
+                f"/ NULLIF(CAST(COALESCE({alias}.games_played, 0) AS DOUBLE) + {ps_lit_s}, 0)"
+                f", 0), 3500), 0) AS INTEGER)"
+            )
+        return f"CAST(ROUND(LEAST(GREATEST(COALESCE({alias}.scratch_elo, 0), 0), 3500), 0) AS INTEGER)"
+
+    if players_df is not None and not players_df.is_empty():
+        p1_pub = _pub_scratch_sql("p1")
+        p2_pub = _pub_scratch_sql("p2")
         # Join with players_df to get individual player scratch Elo and calculate lower title
         title_col = """,
             CASE 
                 -- Calculate title rank for player1 (1=SGM, 10=Beginner)
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2600 THEN 1
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2500 THEN 2
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2400 THEN 3
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2300 THEN 4
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2200 THEN 5
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2000 THEN 6
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 1800 THEN 7
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 1600 THEN 8
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p1.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 1400 THEN 9
+                WHEN p1_pub_scratch >= 2600 THEN 1
+                WHEN p1_pub_scratch >= 2500 THEN 2
+                WHEN p1_pub_scratch >= 2400 THEN 3
+                WHEN p1_pub_scratch >= 2300 THEN 4
+                WHEN p1_pub_scratch >= 2200 THEN 5
+                WHEN p1_pub_scratch >= 2000 THEN 6
+                WHEN p1_pub_scratch >= 1800 THEN 7
+                WHEN p1_pub_scratch >= 1600 THEN 8
+                WHEN p1_pub_scratch >= 1400 THEN 9
                 ELSE 10
             END AS p1_title_rank,
             CASE 
                 -- Calculate title rank for player2 (1=SGM, 10=Beginner)
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2600 THEN 1
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2500 THEN 2
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2400 THEN 3
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2300 THEN 4
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2200 THEN 5
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 2000 THEN 6
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 1800 THEN 7
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 1600 THEN 8
-                WHEN CAST(ROUND(LEAST(GREATEST(COALESCE(p2.scratch_elo, 0), 0), 3500), 0) AS INTEGER) >= 1400 THEN 9
+                WHEN p2_pub_scratch >= 2600 THEN 1
+                WHEN p2_pub_scratch >= 2500 THEN 2
+                WHEN p2_pub_scratch >= 2400 THEN 3
+                WHEN p2_pub_scratch >= 2300 THEN 4
+                WHEN p2_pub_scratch >= 2200 THEN 5
+                WHEN p2_pub_scratch >= 2000 THEN 6
+                WHEN p2_pub_scratch >= 1800 THEN 7
+                WHEN p2_pub_scratch >= 1600 THEN 8
+                WHEN p2_pub_scratch >= 1400 THEN 9
                 ELSE 10
             END AS p2_title_rank"""
         
@@ -1486,12 +1543,19 @@ def show_top_pairs(
 
     if players_df is not None and not players_df.is_empty():
         query += f""",
-        with_player_titles AS (
+        with_player_scratch AS (
             SELECT 
-                f.*{title_col}
+                f.*,
+                {p1_pub} AS p1_pub_scratch,
+                {p2_pub} AS p2_pub_scratch
             FROM ranked f
             LEFT JOIN players_df p1 ON f.player1_id = p1.player_id
             LEFT JOIN players_df p2 ON f.player2_id = p2.player_id
+        ),
+        with_player_titles AS (
+            SELECT 
+                w.*{title_col}
+            FROM with_player_scratch w
         )
         SELECT 
             CAST(ROW_NUMBER() OVER (ORDER BY published_pair_elo_int DESC, games_played DESC, pair_name ASC, pair_id ASC) AS INTEGER) AS Rank,
