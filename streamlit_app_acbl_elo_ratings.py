@@ -1114,16 +1114,17 @@ def main():
                 shrink_msg = "📐 Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo."
             st.caption(shrink_msg)
 
-        # Explain the Quality_Rank composite so users understand the leaderboard
-        # is no longer sorted by pure Elo.
+        # Explain the Quality_Rank sidecar column so users understand what it
+        # measures and when to look at it.
         st.caption(
-            "🎯 Leaderboard is sorted by **Quality_Rank** — the average of "
+            "🎯 Leaderboard is sorted by **Player_Elo_Rank** / "
+            "**Pair_Elo_Rank** (pure Bayesian-shrunk Elo). The "
+            "**Quality_Rank** column (after Sessions) is the average of "
             "`Player_Elo_Rank` (or `Pair_Elo_Rank`), `Par_Suit_Rank`, "
-            "`Par_Contract_Rank`, and `DD_Tricks_Diff_Rank` over the qualifying "
-            "pool. This dampens the failure mode where a high pure-Elo player "
-            "with weak field-independent quality metrics (Par Suit / Par "
-            "Contract / DD Tricks Diff) lands at the top. Sort by any column "
-            "in the grid to re-rank."
+            "`Par_Contract_Rank`, and `DD_Tricks_Diff_Rank` over the "
+            "qualifying pool — when a player's Quality_Rank is much higher "
+            "(worse) than their Elo rank, their Elo is being inflated by "
+            "weak-field play. Click any column header to re-sort."
         )
 
         # Store online filter and current dataset type for downstream controls

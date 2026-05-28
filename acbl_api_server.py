@@ -765,10 +765,13 @@ def generate_top_players_sql(
     The existing ``Player_Elo_Score`` is kept for backward compatibility and
     is aliased to ``Player_Elo_Published``.
 
-    The headline ``Quality_Rank`` is the geometric mean of the player's
-    Player_Elo_Rank and DD_Tricks_Diff_Rank within the qualifying pool, and
-    rows are sorted by it. Pure-Elo rank is preserved as ``Player_Elo_Rank``
-    so the two views are directly comparable.
+    Rows are ordered by ``Player_Elo_Rank`` (pure Bayesian-shrunk Elo).
+    ``Quality_Rank`` — the average of Player_Elo_Rank, Par_Suit_Rank,
+    Par_Contract_Rank, and DD_Tricks_Diff_Rank — is emitted as a sidecar
+    column (after Sessions_Played) so users can spot players whose Elo
+    position significantly outruns their field-independent quality metrics
+    (the Zubatch failure mode); sorting by Quality_Rank in the grid is one
+    click away.
     """
     rating_expr = _rating_agg_expr(rating_method, "Elo_R_Player", has_round=has_round)
     elo_cols = get_elo_column_names(elo_rating_type)
@@ -840,7 +843,6 @@ def generate_top_players_sql(
       FROM player_with_ranks
     )
     SELECT
-      Quality_Rank,
       Player_Elo_Rank,
       Player_Elo_Published AS Player_Elo_Score,
       Player_Elo_Raw,
@@ -848,6 +850,7 @@ def generate_top_players_sql(
       Player_ID, Player_Name, CAST(MasterPoints AS INTEGER) AS MasterPoints,
       MasterPoint_Rank,
       CAST(Sessions_Played AS INTEGER) AS Sessions_Played,
+      Quality_Rank,
       ROUND(Par_Suit_Rate * 100, 1) AS Par_Suit_Rate_Pct,
       Par_Suit_Rank,
       ROUND(Par_Contract_Rate * 100, 1) AS Par_Contract_Rate_Pct,
@@ -857,7 +860,7 @@ def generate_top_players_sql(
       ROUND(DD_Tricks_Diff_Avg, 2) AS DD_Tricks_Diff_Avg,
       DD_Tricks_Diff_Rank
     FROM player_with_quality
-    ORDER BY Quality_Rank ASC, Player_Elo_Rank ASC
+    ORDER BY Player_Elo_Rank ASC
     LIMIT {top_n}
     """.strip()
 
@@ -875,9 +878,10 @@ def generate_top_pairs_sql(
     """Build the top-pairs ranking SQL.
 
     Same Raw / Published / Quality_Rank handling as
-    :func:`generate_top_players_sql`. Rows are ordered by ``Quality_Rank``
-    (geomean of Pair_Elo_Rank and DD_Tricks_Diff_Rank) so weak-field
-    inflation cannot park a low-DD pair at the top.
+    :func:`generate_top_players_sql`. Rows are ordered by ``Pair_Elo_Rank``
+    (pure Bayesian-shrunk Elo); ``Quality_Rank`` is emitted as a sidecar
+    column after Sessions for users who want to spot weak-field-inflated
+    pairs.
     """
     rating_expr = _rating_agg_expr(rating_method, "Elo_R_Pair", has_round=has_round)
     round_col = "Round" if has_round else "NULL AS Round"
@@ -979,19 +983,19 @@ def generate_top_pairs_sql(
       FROM pair_with_ranks
     )
     SELECT
-      Quality_Rank,
       Pair_Elo_Rank,
       Pair_Elo_Published AS Pair_Elo_Score,
       Pair_Elo_Raw,
       Pair_Elo_Published,
       Avg_Elo_Rank, Pair_IDs, Pair_Names,
       CAST(Avg_MPs AS INTEGER) AS Avg_MPs, Avg_MPs_Rank, Geo_MPs_Rank, CAST(Sessions AS INTEGER) AS Sessions,
+      Quality_Rank,
       ROUND(Par_Suit_Rate * 100, 1) AS Par_Suit_Rate_Pct, Par_Suit_Rank,
       ROUND(Par_Contract_Rate * 100, 1) AS Par_Contract_Rate_Pct, Par_Contract_Rank,
       ROUND(Sacrifice_Rate * 100, 1) AS Sacrifice_Rate_Pct, Sacrifice_Rank,
       ROUND(DD_Tricks_Diff_Avg, 2) AS DD_Tricks_Diff_Avg, DD_Tricks_Diff_Rank
     FROM pair_with_quality
-    ORDER BY Quality_Rank ASC, Pair_Elo_Rank ASC
+    ORDER BY Pair_Elo_Rank ASC
     LIMIT {top_n}
     """.strip()
 
