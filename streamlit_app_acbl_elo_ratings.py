@@ -653,7 +653,7 @@ ACBL_URL_PARAMS = {
         "session_key": "acbl_rating_method",
         "parser": str,
         "valid_values": ("Avg", "Max", "Latest"),
-        "default": "Avg",
+        "default": "Latest",
     },
     "elo_moment": {
         "session_key": "elo_rating_type",
@@ -786,9 +786,16 @@ def main():
         )
         rating_method = st.selectbox(
             "Elo Rating statistic",
-            options=["Avg", "Max", "Latest"],
+            options=["Latest", "Avg", "Max"],
             index=0,
             key="acbl_rating_method",
+            help=(
+                "How to aggregate each player/pair's per-session Elo into a "
+                "single headline value. 'Latest' (default) shows the most "
+                "recent end-of-session Elo - what most rating systems publish. "
+                "'Avg' averages every board-level Elo (favors early "
+                "plateauers). 'Max' shows the highest ever reached."
+            ),
         )
         
         # Moving average days - not used anymore (Moving Avg disabled due to memory issues)
@@ -1091,6 +1098,18 @@ def main():
                 shrink_msg = "📐 Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo."
             st.caption(shrink_msg)
 
+        # Explain the Quality_Rank composite so users understand the leaderboard
+        # is no longer sorted by pure Elo.
+        st.caption(
+            "🎯 Leaderboard is sorted by **Quality_Rank** — the average of "
+            "`Player_Elo_Rank` (or `Pair_Elo_Rank`), `Par_Suit_Rank`, "
+            "`Par_Contract_Rank`, and `DD_Tricks_Diff_Rank` over the qualifying "
+            "pool. This dampens the failure mode where a high pure-Elo player "
+            "with weak field-independent quality metrics (Par Suit / Par "
+            "Contract / DD Tricks Diff) lands at the top. Sort by any column "
+            "in the grid to re-rank."
+        )
+
         # Store online filter and current dataset type for downstream controls
         st.session_state.online_filter = online_filter
         st.session_state.current_dataset_type = dataset_type
@@ -1376,7 +1395,7 @@ ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
                     query = st.text_input(
                         "💬 SQL Query (press Enter to execute):",
                         value='',
-                        placeholder="SELECT * FROM self WHERE Player_Elo_Score > 1500 ORDER BY Player_Elo_Rank LIMIT 10",
+                        placeholder="SELECT * FROM self WHERE Player_Elo_Score > 1500 ORDER BY Quality_Rank LIMIT 10",
                         key="sql_query_text_input",
                         on_change=lambda: st.session_state.update({"execute_query_now": True})
                     )

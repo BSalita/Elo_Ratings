@@ -1213,7 +1213,7 @@ def show_top_pairs(
         WITH pair_anchor AS (
             SELECT
                 pair_id,
-                AVG({elo_col}) AS avg_pair_elo,
+                ARG_MAX({elo_col}, date) AS avg_pair_elo,
                 COUNT(*) AS games_played
             FROM results_df
             GROUP BY pair_id
@@ -1312,9 +1312,17 @@ def show_top_pairs(
                 ARG_MAX(pair_name, date) AS pair_name,
                 ARG_MAX(player1_id, date) AS player1_id,
                 ARG_MAX(player2_id, date) AS player2_id,
-                AVG(scratch_pair_elo) AS avg_scratch_elo,
-                AVG(COALESCE(handicap_pair_elo, scratch_pair_elo)) AS avg_handicap_elo,
-                AVG({elo_col}) AS avg_pair_elo,
+                -- Headline Elo uses Latest semantics (ARG_MAX over date) to
+                -- match show_top_players, which already uses ARG_MAX. Avoids
+                -- the early-tournament-lock-in bias that ACBL's AVG method
+                -- exposed: one lucky early session permanently inflating the
+                -- AVG even after later results regress to the pair's real
+                -- skill level. The percentage / IV / stdev aggregates below
+                -- intentionally stay as AVG because users expect "average
+                -- across all my tournaments" for those.
+                ARG_MAX(scratch_pair_elo, date) AS avg_scratch_elo,
+                ARG_MAX(COALESCE(handicap_pair_elo, scratch_pair_elo), date) AS avg_handicap_elo,
+                ARG_MAX({elo_col}, date) AS avg_pair_elo,
                 AVG(scratch_percentage) AS avg_scratch_pct,
                 AVG(COALESCE(handicap_percentage, scratch_percentage)) AS avg_handicap_pct,
                 AVG(iv_bonus) AS avg_iv_bonus,

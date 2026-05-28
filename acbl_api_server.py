@@ -616,6 +616,43 @@ def _build_pair_detail(df: pl.DataFrame, pair_ids: str, elo_rating_type: str) ->
     return detail
 
 
+def _rating_agg_expr(rating_method: str, value_col: str, *, has_round: bool) -> str:
+    """SQL aggregate expression for the chosen rating method.
+
+    ``Latest`` uses ``LAST(... ORDER BY Date, session_id, [Round,] Board)`` so the
+    result is deterministically the player's/pair's most recent end-of-board
+    Elo (DuckDB's bare ``LAST`` is non-deterministic in parallel execution).
+    ``Round`` is dropped from the ordering for parquets that don't have it
+    (the tournament parquet doesn't expose Round).
+    ``Avg`` and ``Max`` are straightforward.
+    """
+    if rating_method == "Avg":
+        return f"AVG({value_col})"
+    if rating_method == "Max":
+        return f"MAX({value_col})"
+    if rating_method == "Latest":
+        order_cols = "Date, session_id, Round, Board" if has_round else "Date, session_id, Board"
+        return f"LAST({value_col} ORDER BY {order_cols})"
+    raise ValueError(f"Invalid rating_method: {rating_method!r}")
+
+
+# Quality_Score composite: arithmetic mean of four rank columns over the
+# qualifying pool — pure Elo plus three field-independent bridge-quality
+# metrics. Pulls down players whose Elo is high but whose actual card play
+# (DD_Tricks_Diff) and bidding (Par_Suit_Rate, Par_Contract_Rate) are weak,
+# which is the Zubatch failure mode. Arithmetic mean (not geometric) so a
+# small-sample specialist with rank=1 in one metric but rank=46K in Elo
+# doesn't get artificially elevated.
+_QUALITY_SCORE_EXPR = (
+    "(CAST(Player_Elo_Rank AS DOUBLE) + CAST(Par_Suit_Rank AS DOUBLE) "
+    "+ CAST(Par_Contract_Rank AS DOUBLE) + CAST(DD_Tricks_Diff_Rank AS DOUBLE)) / 4.0"
+)
+_QUALITY_SCORE_EXPR_PAIR = (
+    "(CAST(Pair_Elo_Rank AS DOUBLE) + CAST(Par_Suit_Rank AS DOUBLE) "
+    "+ CAST(Par_Contract_Rank AS DOUBLE) + CAST(DD_Tricks_Diff_Rank AS DOUBLE)) / 4.0"
+)
+
+
 def generate_top_players_sql(
     top_n: int,
     min_sessions: int,
@@ -624,28 +661,32 @@ def generate_top_players_sql(
     *,
     prior_anchor: float | None = None,
     prior_sessions: int = 0,
+    has_round: bool = True,
 ) -> str:
     """Build the top-players ranking SQL.
 
     Emits ``Player_Elo_Raw`` (the original aggregate) and ``Player_Elo_Published``
     (Bayesian-shrunk toward ``prior_anchor`` with weight ``prior_sessions``).
     The existing ``Player_Elo_Score`` is kept for backward compatibility and
-    is aliased to ``Player_Elo_Published`` — rankings therefore sort by the
-    Published value, matching the headline behaviour.
+    is aliased to ``Player_Elo_Published``.
+
+    The headline ``Quality_Rank`` is the geometric mean of the player's
+    Player_Elo_Rank and DD_Tricks_Diff_Rank within the qualifying pool, and
+    rows are sorted by it. Pure-Elo rank is preserved as ``Player_Elo_Rank``
+    so the two views are directly comparable.
     """
-    rating_agg = {"Avg": "AVG", "Max": "MAX", "Latest": "LAST"}.get(rating_method)
-    if rating_agg is None:
-        raise ValueError("Invalid rating_method")
+    rating_expr = _rating_agg_expr(rating_method, "Elo_R_Player", has_round=has_round)
     elo_cols = get_elo_column_names(elo_rating_type)
     player_pattern = elo_cols.get("player_pattern")
     if not player_pattern:
         raise ValueError(f"Player ratings not available for {elo_rating_type}")
+    round_col = "Round" if has_round else "NULL AS Round"
     union_parts = []
     for pos in "NESW":
         elo_col = player_pattern.format(pos=pos)
         union_parts.append(
             f"""
-            SELECT Date, session_id, Player_ID_{pos} AS Player_ID, Player_Name_{pos} AS Player_Name,
+            SELECT Date, session_id, {round_col}, Board, Player_ID_{pos} AS Player_ID, Player_Name_{pos} AS Player_Name,
                    MasterPoints_{pos} AS MasterPoints, {elo_col} AS Elo_R_Player,
                    Is_Par_Suit, Is_Par_Contract, Is_Sacrifice, DD_Tricks_Diff
             FROM self
@@ -665,9 +706,9 @@ def generate_top_players_sql(
     player_aggregates AS (
       SELECT
         Player_ID,
-        LAST(Player_Name) AS Player_Name,
+        LAST(Player_Name ORDER BY Date, session_id) AS Player_Name,
         MAX(MasterPoints) AS MasterPoints,
-        {rating_agg}(Elo_R_Player) AS Player_Elo_Raw_Float,
+        {rating_expr} AS Player_Elo_Raw_Float,
         COUNT(DISTINCT session_id) AS Sessions_Played,
         AVG(CAST(Is_Par_Suit AS INTEGER)) AS Par_Suit_Rate,
         AVG(CAST(Is_Par_Contract AS INTEGER)) AS Par_Contract_Rate,
@@ -684,25 +725,44 @@ def generate_top_players_sql(
         {published_sql} AS Player_Elo_Published,
         Sessions_Played, Par_Suit_Rate, Par_Contract_Rate, Sacrifice_Rate, DD_Tricks_Diff_Avg
       FROM player_aggregates
+    ),
+    player_with_ranks AS (
+      SELECT
+        *,
+        CAST(ROW_NUMBER() OVER (ORDER BY Player_Elo_Published DESC, MasterPoints DESC, Player_ID ASC) AS INTEGER) AS Player_Elo_Rank,
+        CAST(RANK() OVER (ORDER BY MasterPoints DESC) AS INTEGER) AS MasterPoint_Rank,
+        CAST(RANK() OVER (ORDER BY Par_Suit_Rate DESC) AS INTEGER) AS Par_Suit_Rank,
+        CAST(RANK() OVER (ORDER BY Par_Contract_Rate DESC) AS INTEGER) AS Par_Contract_Rank,
+        CAST(RANK() OVER (ORDER BY Sacrifice_Rate DESC) AS INTEGER) AS Sacrifice_Rank,
+        CAST(RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC NULLS LAST) AS INTEGER) AS DD_Tricks_Diff_Rank
+      FROM player_with_published
+    ),
+    player_with_quality AS (
+      SELECT
+        *,
+        {_QUALITY_SCORE_EXPR} AS Quality_Score,
+        CAST(RANK() OVER (ORDER BY {_QUALITY_SCORE_EXPR} ASC) AS INTEGER) AS Quality_Rank
+      FROM player_with_ranks
     )
     SELECT
-      CAST(ROW_NUMBER() OVER (ORDER BY Player_Elo_Published DESC, MasterPoints DESC, Player_ID ASC) AS INTEGER) AS Player_Elo_Rank,
+      Quality_Rank,
+      Player_Elo_Rank,
       Player_Elo_Published AS Player_Elo_Score,
       Player_Elo_Raw,
       Player_Elo_Published,
       Player_ID, Player_Name, CAST(MasterPoints AS INTEGER) AS MasterPoints,
-      CAST(RANK() OVER (ORDER BY MasterPoints DESC) AS INTEGER) AS MasterPoint_Rank,
+      MasterPoint_Rank,
       CAST(Sessions_Played AS INTEGER) AS Sessions_Played,
       ROUND(Par_Suit_Rate * 100, 1) AS Par_Suit_Rate_Pct,
-      CAST(RANK() OVER (ORDER BY Par_Suit_Rate DESC) AS INTEGER) AS Par_Suit_Rank,
+      Par_Suit_Rank,
       ROUND(Par_Contract_Rate * 100, 1) AS Par_Contract_Rate_Pct,
-      CAST(RANK() OVER (ORDER BY Par_Contract_Rate DESC) AS INTEGER) AS Par_Contract_Rank,
+      Par_Contract_Rank,
       ROUND(Sacrifice_Rate * 100, 1) AS Sacrifice_Rate_Pct,
-      CAST(RANK() OVER (ORDER BY Sacrifice_Rate DESC) AS INTEGER) AS Sacrifice_Rank,
+      Sacrifice_Rank,
       ROUND(DD_Tricks_Diff_Avg, 2) AS DD_Tricks_Diff_Avg,
-      CAST(RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC) AS INTEGER) AS DD_Tricks_Diff_Rank
-    FROM player_with_published
-    ORDER BY Player_Elo_Published DESC, MasterPoints DESC, Player_ID ASC
+      DD_Tricks_Diff_Rank
+    FROM player_with_quality
+    ORDER BY Quality_Rank ASC, Player_Elo_Rank ASC
     LIMIT {top_n}
     """.strip()
 
@@ -715,14 +775,17 @@ def generate_top_pairs_sql(
     *,
     prior_anchor: float | None = None,
     prior_sessions: int = 0,
+    has_round: bool = True,
 ) -> str:
     """Build the top-pairs ranking SQL.
 
-    Same Raw / Published handling as :func:`generate_top_players_sql`.
+    Same Raw / Published / Quality_Rank handling as
+    :func:`generate_top_players_sql`. Rows are ordered by ``Quality_Rank``
+    (geomean of Pair_Elo_Rank and DD_Tricks_Diff_Rank) so weak-field
+    inflation cannot park a low-DD pair at the top.
     """
-    rating_agg = {"Avg": "AVG", "Max": "MAX", "Latest": "LAST"}.get(rating_method)
-    if rating_agg is None:
-        raise ValueError("Invalid rating_method")
+    rating_expr = _rating_agg_expr(rating_method, "Elo_R_Pair", has_round=has_round)
+    round_col = "Round" if has_round else "NULL AS Round"
     elo_cols = get_elo_column_names(elo_rating_type)
     pair_ns_col = elo_cols.get("pair_ns")
     pair_ew_col = elo_cols.get("pair_ew")
@@ -752,7 +815,7 @@ def generate_top_pairs_sql(
     return f"""
     WITH pair_partnerships AS (
       SELECT
-        Date, session_id,
+        Date, session_id, {round_col}, Board,
         CASE WHEN Player_ID_N < Player_ID_S THEN Player_ID_N || '-' || Player_ID_S ELSE Player_ID_S || '-' || Player_ID_N END AS Pair_IDs,
         CASE WHEN Player_ID_N <= Player_ID_S THEN Player_Name_N || ' - ' || Player_Name_S ELSE Player_Name_S || ' - ' || Player_Name_N END AS Pair_Names,
         {pair_ns_col} AS Elo_R_Pair,
@@ -764,7 +827,7 @@ def generate_top_pairs_sql(
       WHERE {pair_ns_col} IS NOT NULL AND NOT isnan({pair_ns_col})
       UNION ALL
       SELECT
-        Date, session_id,
+        Date, session_id, {round_col}, Board,
         CASE WHEN Player_ID_E < Player_ID_W THEN Player_ID_E || '-' || Player_ID_W ELSE Player_ID_W || '-' || Player_ID_E END AS Pair_IDs,
         CASE WHEN Player_ID_E <= Player_ID_W THEN Player_Name_E || ' - ' || Player_Name_W ELSE Player_Name_W || ' - ' || Player_Name_E END AS Pair_Names,
         {pair_ew_col} AS Elo_R_Pair,
@@ -777,7 +840,7 @@ def generate_top_pairs_sql(
     ),
     pair_aggregates AS (
       SELECT
-        Pair_IDs, LAST(Pair_Names) AS Pair_Names, {rating_agg}(Elo_R_Pair) AS Pair_Elo_Raw_Float,
+        Pair_IDs, LAST(Pair_Names ORDER BY Date, session_id) AS Pair_Names, {rating_expr} AS Pair_Elo_Raw_Float,
         AVG(Avg_MPs) AS Avg_MPs, AVG(Geo_MPs) AS Geo_MPs,
         COUNT(DISTINCT session_id) AS Sessions,
         AVG(Avg_Player_Elo) AS Avg_Player_Elo,
@@ -798,21 +861,31 @@ def generate_top_pairs_sql(
         Par_Suit_Rate, Par_Contract_Rate, Sacrifice_Rate, DD_Tricks_Diff_Avg
       FROM pair_aggregates
     ),
-    pair_aggregates_with_ranks AS (
+    pair_with_ranks AS (
       SELECT
         Pair_IDs, Pair_Names, Pair_Elo_Raw, Pair_Elo_Published,
         Avg_MPs, Geo_MPs, Sessions, Avg_Player_Elo,
+        Par_Suit_Rate, Par_Contract_Rate, Sacrifice_Rate, DD_Tricks_Diff_Avg,
+        CAST(ROW_NUMBER() OVER (ORDER BY Pair_Elo_Published DESC, Avg_MPs DESC, Pair_IDs ASC) AS INTEGER) AS Pair_Elo_Rank,
         CAST(RANK() OVER (ORDER BY Avg_Player_Elo DESC NULLS LAST) AS INTEGER) AS Avg_Elo_Rank,
         CAST(RANK() OVER (ORDER BY Avg_MPs DESC) AS INTEGER) AS Avg_MPs_Rank,
         CAST(RANK() OVER (ORDER BY Geo_MPs DESC) AS INTEGER) AS Geo_MPs_Rank,
-        Par_Suit_Rate, CAST(RANK() OVER (ORDER BY Par_Suit_Rate DESC) AS INTEGER) AS Par_Suit_Rank,
-        Par_Contract_Rate, CAST(RANK() OVER (ORDER BY Par_Contract_Rate DESC) AS INTEGER) AS Par_Contract_Rank,
-        Sacrifice_Rate, CAST(RANK() OVER (ORDER BY Sacrifice_Rate DESC) AS INTEGER) AS Sacrifice_Rank,
-        DD_Tricks_Diff_Avg, CAST(RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC) AS INTEGER) AS DD_Tricks_Diff_Rank
+        CAST(RANK() OVER (ORDER BY Par_Suit_Rate DESC) AS INTEGER) AS Par_Suit_Rank,
+        CAST(RANK() OVER (ORDER BY Par_Contract_Rate DESC) AS INTEGER) AS Par_Contract_Rank,
+        CAST(RANK() OVER (ORDER BY Sacrifice_Rate DESC) AS INTEGER) AS Sacrifice_Rank,
+        CAST(RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC NULLS LAST) AS INTEGER) AS DD_Tricks_Diff_Rank
       FROM pair_with_published
+    ),
+    pair_with_quality AS (
+      SELECT
+        *,
+        {_QUALITY_SCORE_EXPR_PAIR} AS Quality_Score,
+        CAST(RANK() OVER (ORDER BY {_QUALITY_SCORE_EXPR_PAIR} ASC) AS INTEGER) AS Quality_Rank
+      FROM pair_with_ranks
     )
     SELECT
-      CAST(ROW_NUMBER() OVER (ORDER BY Pair_Elo_Published DESC, Avg_MPs DESC) AS INTEGER) AS Pair_Elo_Rank,
+      Quality_Rank,
+      Pair_Elo_Rank,
       Pair_Elo_Published AS Pair_Elo_Score,
       Pair_Elo_Raw,
       Pair_Elo_Published,
@@ -822,8 +895,8 @@ def generate_top_pairs_sql(
       ROUND(Par_Contract_Rate * 100, 1) AS Par_Contract_Rate_Pct, Par_Contract_Rank,
       ROUND(Sacrifice_Rate * 100, 1) AS Sacrifice_Rate_Pct, Sacrifice_Rank,
       ROUND(DD_Tricks_Diff_Avg, 2) AS DD_Tricks_Diff_Avg, DD_Tricks_Diff_Rank
-    FROM pair_aggregates_with_ranks
-    ORDER BY Pair_Elo_Published DESC, Avg_MPs_Rank ASC
+    FROM pair_with_quality
+    ORDER BY Quality_Rank ASC, Pair_Elo_Rank ASC
     LIMIT {top_n}
     """.strip()
 
@@ -839,7 +912,7 @@ def acbl_report(
     rating_type: str = Query(..., pattern="^(Players|Pairs)$"),
     top_n: int = Query(100, ge=1, le=1000),
     min_sessions: int = Query(10, ge=1, le=10000),
-    rating_method: str = Query("Avg"),
+    rating_method: str = Query("Latest"),
     moving_avg_days: int = Query(10, ge=1, le=3650),
     elo_rating_type: str = Query("Current Rating (End of Session)"),
     date_from: str | None = Query(None),
@@ -881,15 +954,18 @@ def acbl_report(
             shrinkage_meta = _load_shrinkage_meta(club_or_tournament)
             anchor_kind = "player" if rating_type == "Players" else "pair"
             prior_anchor = _shrinkage_anchor(shrinkage_meta, anchor_kind)
+            has_round = "Round" in df.columns
             if rating_type == "Players":
                 generated_sql = generate_top_players_sql(
                     top_n, min_sessions, rating_method, elo_rating_type,
                     prior_anchor=prior_anchor, prior_sessions=prior_sessions,
+                    has_round=has_round,
                 )
             else:
                 generated_sql = generate_top_pairs_sql(
                     top_n, min_sessions, rating_method, elo_rating_type,
                     prior_anchor=prior_anchor, prior_sessions=prior_sessions,
+                    has_round=has_round,
                 )
             result_df = con.execute(generated_sql).pl()
         t_sql_end = time.perf_counter()
