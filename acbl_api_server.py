@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import time
@@ -128,6 +129,88 @@ def _r2_storage_options() -> dict:
         "aws_secret_access_key": secret_key,
         "aws_endpoint_url": endpoint,
     }
+
+
+# In-memory cache for shrinkage sidecars (one per club|tournament). Loaded
+# lazily on first /acbl/report request and reused across calls.
+_SHRINKAGE_META_CACHE: dict[str, dict | None] = {}
+
+# Default Bayesian shrinkage prior weight (sessions equivalent). The Streamlit
+# /acbl/report client may override via the prior_sessions query parameter.
+SHRINKAGE_DEFAULT_PRIOR_SESSIONS = 50
+
+
+def _load_shrinkage_meta(club_or_tournament: str) -> dict | None:
+    """Load the shrinkage sidecar JSON written by acbl_elo_ratings_create.py.
+
+    Returns the parsed dict, or None when the sidecar is unavailable (e.g.
+    first deployment after the math change but before the recompute has
+    rebuilt the lookup parquets). In that case the report falls back to
+    Published == Raw so the API still works.
+
+    Cached at module level.
+    """
+    key = club_or_tournament.lower()
+    if key in _SHRINKAGE_META_CACHE:
+        return _SHRINKAGE_META_CACHE[key]
+
+    filename = f"acbl_{key}_elo_shrinkage.json"
+    # Local-only for now; R2 deployments can add a fetch path next iteration.
+    path = DATA_ROOT / filename
+    if not path.exists():
+        _SHRINKAGE_META_CACHE[key] = None
+        return None
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        _SHRINKAGE_META_CACHE[key] = None
+        return None
+    _SHRINKAGE_META_CACHE[key] = meta
+    return meta
+
+
+def _shrinkage_anchor(meta: dict | None, kind: str) -> float | None:
+    """Pull the prior anchor (median Elo of established subset) for ``kind``.
+
+    ``kind`` is "player" or "pair".
+    Returns None when the sidecar is missing or the kind's entry is empty.
+    """
+    if meta is None:
+        return None
+    section = meta.get(kind) if isinstance(meta, dict) else None
+    if not isinstance(section, dict):
+        return None
+    anchor = section.get("prior_anchor")
+    if anchor is None:
+        return None
+    try:
+        return float(anchor)
+    except (TypeError, ValueError):
+        return None
+
+
+def _published_elo_sql(raw_col: str, sessions_col: str,
+                       prior_anchor: float | None, prior_sessions: int) -> str:
+    """Return a SQL expression that wraps ``raw_col`` with Bayesian shrinkage.
+
+    When the prior anchor is unavailable or ``prior_sessions`` is 0, the
+    expression collapses to ``raw_col`` so Published == Raw is preserved.
+    Otherwise:
+
+        Published = (n * raw + prior_sessions * prior_anchor)
+                    / (n + prior_sessions)
+
+    The result is cast to INTEGER (the existing display convention).
+    """
+    if prior_anchor is None or prior_sessions <= 0:
+        return f"CAST(COALESCE({raw_col}, 0) AS INTEGER)"
+    return (
+        f"CAST(ROUND("
+        f"(CAST({sessions_col} AS DOUBLE) * COALESCE({raw_col}, 0) "
+        f"+ {float(prior_sessions)} * {float(prior_anchor)}) "
+        f"/ NULLIF((CAST({sessions_col} AS DOUBLE) + {float(prior_sessions)}), 0)"
+        f") AS INTEGER)"
+    )
 
 
 def _parquet_source_for(club_or_tournament: str) -> tuple[str, dict | None]:
@@ -279,6 +362,9 @@ def _required_columns_for_detail(rating_type: str, elo_rating_type: str) -> list
             for p in "NESW":
                 cols.add(player_pat.format(pos=p))
                 cols.add(f"Elo_R_{p}_Before")
+        # Field-mix indicator for drill-down (added in the field-relative Elo
+        # rewrite; tolerated as missing on legacy parquets).
+        cols.update({"Field_Stdev_NS_Player", "Field_Stdev_EW_Player"})
     else:
         pair_ns = elo_cols.get("pair_ns")
         pair_ew = elo_cols.get("pair_ew")
@@ -287,6 +373,7 @@ def _required_columns_for_detail(rating_type: str, elo_rating_type: str) -> list
         if pair_ew:
             cols.add(pair_ew)
         cols.update({"Elo_R_NS_Before", "Elo_R_EW_Before"})
+        cols.update({"Field_Stdev_NS", "Field_Stdev_EW"})
     return sorted(cols)
 
 
@@ -375,6 +462,11 @@ def _build_player_detail(df: pl.DataFrame, player_id: str, elo_rating_type: str)
         if before_col and before_col in df.columns:
             cols_to_select.append(pl.col(before_col).cast(pl.Float64).round(0).cast(pl.Int32, strict=False).alias("Elo_Before"))
         cols_to_select.append(pl.col(elo_col).cast(pl.Float64).round(0).cast(pl.Int32, strict=False).alias("Elo_After"))
+        # Per-board same-direction field stdev (added in field-relative Elo
+        # rewrite). Tolerated as missing on legacy parquets.
+        field_stdev_col = "Field_Stdev_NS_Player" if is_ns else "Field_Stdev_EW_Player"
+        if field_stdev_col in df.columns:
+            cols_to_select.append(pl.col(field_stdev_col).cast(pl.Float64).round(1).alias("Field_Stdev"))
         frames.append(df.filter(pl.col(f"Player_ID_{pos}") == player_id).select(cols_to_select))
 
     if not frames:
@@ -431,6 +523,11 @@ def _build_pair_detail(df: pl.DataFrame, pair_ids: str, elo_rating_type: str) ->
         if before_col and before_col in df.columns:
             cols_to_select.append(pl.col(before_col).cast(pl.Float64).round(0).cast(pl.Int32, strict=False).alias("Elo_Before"))
         cols_to_select.append(pl.col(pair_elo_col).cast(pl.Float64).round(0).cast(pl.Int32, strict=False).alias("Elo_After"))
+        # Per-board same-direction field stdev (added in field-relative Elo
+        # rewrite). Tolerated as missing on legacy parquets.
+        field_stdev_col = f"Field_Stdev_{side}"
+        if field_stdev_col in df.columns:
+            cols_to_select.append(pl.col(field_stdev_col).cast(pl.Float64).round(1).alias("Field_Stdev"))
         frames.append(side_df.select(cols_to_select))
 
     if not frames:
@@ -450,7 +547,23 @@ def _build_pair_detail(df: pl.DataFrame, pair_ids: str, elo_rating_type: str) ->
     return detail
 
 
-def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, elo_rating_type: str) -> str:
+def generate_top_players_sql(
+    top_n: int,
+    min_sessions: int,
+    rating_method: str,
+    elo_rating_type: str,
+    *,
+    prior_anchor: float | None = None,
+    prior_sessions: int = 0,
+) -> str:
+    """Build the top-players ranking SQL.
+
+    Emits ``Player_Elo_Raw`` (the original aggregate) and ``Player_Elo_Published``
+    (Bayesian-shrunk toward ``prior_anchor`` with weight ``prior_sessions``).
+    The existing ``Player_Elo_Score`` is kept for backward compatibility and
+    is aliased to ``Player_Elo_Published`` — rankings therefore sort by the
+    Published value, matching the headline behaviour.
+    """
     rating_agg = {"Avg": "AVG", "Max": "MAX", "Latest": "LAST"}.get(rating_method)
     if rating_agg is None:
         raise ValueError("Invalid rating_method")
@@ -470,6 +583,12 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
             WHERE Player_ID_{pos} IS NOT NULL AND {elo_col} IS NOT NULL AND NOT isnan({elo_col})
             """
         )
+    published_sql = _published_elo_sql(
+        raw_col="Player_Elo_Raw_Float",
+        sessions_col="Sessions_Played",
+        prior_anchor=prior_anchor,
+        prior_sessions=prior_sessions,
+    )
     return f"""
     WITH player_positions AS (
       {' UNION ALL '.join(union_parts)}
@@ -479,7 +598,7 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
         Player_ID,
         LAST(Player_Name) AS Player_Name,
         MAX(MasterPoints) AS MasterPoints,
-        {rating_agg}(Elo_R_Player) AS Player_Elo_Score,
+        {rating_agg}(Elo_R_Player) AS Player_Elo_Raw_Float,
         COUNT(DISTINCT session_id) AS Sessions_Played,
         AVG(CAST(Is_Par_Suit AS INTEGER)) AS Par_Suit_Rate,
         AVG(CAST(Is_Par_Contract AS INTEGER)) AS Par_Contract_Rate,
@@ -488,10 +607,20 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
       FROM player_positions
       GROUP BY Player_ID
       HAVING COUNT(DISTINCT session_id) >= {min_sessions}
+    ),
+    player_with_published AS (
+      SELECT
+        Player_ID, Player_Name, MasterPoints,
+        CAST(COALESCE(Player_Elo_Raw_Float, 0) AS INTEGER) AS Player_Elo_Raw,
+        {published_sql} AS Player_Elo_Published,
+        Sessions_Played, Par_Suit_Rate, Par_Contract_Rate, Sacrifice_Rate, DD_Tricks_Diff_Avg
+      FROM player_aggregates
     )
     SELECT
-      CAST(ROW_NUMBER() OVER (ORDER BY CAST(COALESCE(Player_Elo_Score, 0) AS INTEGER) DESC, MasterPoints DESC, Player_ID ASC) AS INTEGER) AS Player_Elo_Rank,
-      CAST(COALESCE(Player_Elo_Score, 0) AS INTEGER) AS Player_Elo_Score,
+      CAST(ROW_NUMBER() OVER (ORDER BY Player_Elo_Published DESC, MasterPoints DESC, Player_ID ASC) AS INTEGER) AS Player_Elo_Rank,
+      Player_Elo_Published AS Player_Elo_Score,
+      Player_Elo_Raw,
+      Player_Elo_Published,
       Player_ID, Player_Name, CAST(MasterPoints AS INTEGER) AS MasterPoints,
       CAST(RANK() OVER (ORDER BY MasterPoints DESC) AS INTEGER) AS MasterPoint_Rank,
       CAST(Sessions_Played AS INTEGER) AS Sessions_Played,
@@ -503,13 +632,25 @@ def generate_top_players_sql(top_n: int, min_sessions: int, rating_method: str, 
       CAST(RANK() OVER (ORDER BY Sacrifice_Rate DESC) AS INTEGER) AS Sacrifice_Rank,
       ROUND(DD_Tricks_Diff_Avg, 2) AS DD_Tricks_Diff_Avg,
       CAST(RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC) AS INTEGER) AS DD_Tricks_Diff_Rank
-    FROM player_aggregates
-    ORDER BY Player_Elo_Score DESC, MasterPoints DESC, Player_ID ASC
+    FROM player_with_published
+    ORDER BY Player_Elo_Published DESC, MasterPoints DESC, Player_ID ASC
     LIMIT {top_n}
     """.strip()
 
 
-def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, elo_rating_type: str) -> str:
+def generate_top_pairs_sql(
+    top_n: int,
+    min_sessions: int,
+    rating_method: str,
+    elo_rating_type: str,
+    *,
+    prior_anchor: float | None = None,
+    prior_sessions: int = 0,
+) -> str:
+    """Build the top-pairs ranking SQL.
+
+    Same Raw / Published handling as :func:`generate_top_players_sql`.
+    """
     rating_agg = {"Avg": "AVG", "Max": "MAX", "Latest": "LAST"}.get(rating_method)
     if rating_agg is None:
         raise ValueError("Invalid rating_method")
@@ -567,7 +708,7 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, el
     ),
     pair_aggregates AS (
       SELECT
-        Pair_IDs, LAST(Pair_Names) AS Pair_Names, {rating_agg}(Elo_R_Pair) AS Pair_Elo_Score,
+        Pair_IDs, LAST(Pair_Names) AS Pair_Names, {rating_agg}(Elo_R_Pair) AS Pair_Elo_Raw_Float,
         AVG(Avg_MPs) AS Avg_MPs, AVG(Geo_MPs) AS Geo_MPs,
         COUNT(DISTINCT session_id) AS Sessions,
         AVG(Avg_Player_Elo) AS Avg_Player_Elo,
@@ -579,9 +720,19 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, el
       GROUP BY Pair_IDs
       HAVING COUNT(DISTINCT session_id) >= {min_sessions}
     ),
+    pair_with_published AS (
+      SELECT
+        Pair_IDs, Pair_Names,
+        CAST(COALESCE(Pair_Elo_Raw_Float, 0) AS INTEGER) AS Pair_Elo_Raw,
+        {_published_elo_sql("Pair_Elo_Raw_Float", "Sessions", prior_anchor, prior_sessions)} AS Pair_Elo_Published,
+        Avg_MPs, Geo_MPs, Sessions, Avg_Player_Elo,
+        Par_Suit_Rate, Par_Contract_Rate, Sacrifice_Rate, DD_Tricks_Diff_Avg
+      FROM pair_aggregates
+    ),
     pair_aggregates_with_ranks AS (
       SELECT
-        Pair_IDs, Pair_Names, Pair_Elo_Score, Avg_MPs, Geo_MPs, Sessions, Avg_Player_Elo,
+        Pair_IDs, Pair_Names, Pair_Elo_Raw, Pair_Elo_Published,
+        Avg_MPs, Geo_MPs, Sessions, Avg_Player_Elo,
         CAST(RANK() OVER (ORDER BY Avg_Player_Elo DESC NULLS LAST) AS INTEGER) AS Avg_Elo_Rank,
         CAST(RANK() OVER (ORDER BY Avg_MPs DESC) AS INTEGER) AS Avg_MPs_Rank,
         CAST(RANK() OVER (ORDER BY Geo_MPs DESC) AS INTEGER) AS Geo_MPs_Rank,
@@ -589,11 +740,13 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, el
         Par_Contract_Rate, CAST(RANK() OVER (ORDER BY Par_Contract_Rate DESC) AS INTEGER) AS Par_Contract_Rank,
         Sacrifice_Rate, CAST(RANK() OVER (ORDER BY Sacrifice_Rate DESC) AS INTEGER) AS Sacrifice_Rank,
         DD_Tricks_Diff_Avg, CAST(RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC) AS INTEGER) AS DD_Tricks_Diff_Rank
-      FROM pair_aggregates
+      FROM pair_with_published
     )
     SELECT
-      CAST(ROW_NUMBER() OVER (ORDER BY CAST(Pair_Elo_Score AS INTEGER) DESC, Avg_MPs DESC) AS INTEGER) AS Pair_Elo_Rank,
-      CAST(Pair_Elo_Score AS INTEGER) AS Pair_Elo_Score,
+      CAST(ROW_NUMBER() OVER (ORDER BY Pair_Elo_Published DESC, Avg_MPs DESC) AS INTEGER) AS Pair_Elo_Rank,
+      Pair_Elo_Published AS Pair_Elo_Score,
+      Pair_Elo_Raw,
+      Pair_Elo_Published,
       Avg_Elo_Rank, Pair_IDs, Pair_Names,
       CAST(Avg_MPs AS INTEGER) AS Avg_MPs, Avg_MPs_Rank, Geo_MPs_Rank, CAST(Sessions AS INTEGER) AS Sessions,
       ROUND(Par_Suit_Rate * 100, 1) AS Par_Suit_Rate_Pct, Par_Suit_Rank,
@@ -601,7 +754,7 @@ def generate_top_pairs_sql(top_n: int, min_sessions: int, rating_method: str, el
       ROUND(Sacrifice_Rate * 100, 1) AS Sacrifice_Rate_Pct, Sacrifice_Rank,
       ROUND(DD_Tricks_Diff_Avg, 2) AS DD_Tricks_Diff_Avg, DD_Tricks_Diff_Rank
     FROM pair_aggregates_with_ranks
-    ORDER BY Pair_Elo_Score DESC, Avg_MPs_Rank ASC
+    ORDER BY Pair_Elo_Published DESC, Avg_MPs_Rank ASC
     LIMIT {top_n}
     """.strip()
 
@@ -622,6 +775,11 @@ def acbl_report(
     elo_rating_type: str = Query("Current Rating (End of Session)"),
     date_from: str | None = Query(None),
     online_filter: str = Query("All"),
+    prior_sessions: int = Query(
+        SHRINKAGE_DEFAULT_PRIOR_SESSIONS, ge=0, le=1000,
+        description="Bayesian shrinkage prior weight (in 'sessions equivalent'). "
+                    "0 disables shrinkage (Published == Raw).",
+    ),
 ) -> dict:
     started_at = datetime.now()
     t0 = time.perf_counter()
@@ -651,10 +809,19 @@ def acbl_report(
             except Exception:
                 pass
             con.register("self", df)
+            shrinkage_meta = _load_shrinkage_meta(club_or_tournament)
+            anchor_kind = "player" if rating_type == "Players" else "pair"
+            prior_anchor = _shrinkage_anchor(shrinkage_meta, anchor_kind)
             if rating_type == "Players":
-                generated_sql = generate_top_players_sql(top_n, min_sessions, rating_method, elo_rating_type)
+                generated_sql = generate_top_players_sql(
+                    top_n, min_sessions, rating_method, elo_rating_type,
+                    prior_anchor=prior_anchor, prior_sessions=prior_sessions,
+                )
             else:
-                generated_sql = generate_top_pairs_sql(top_n, min_sessions, rating_method, elo_rating_type)
+                generated_sql = generate_top_pairs_sql(
+                    top_n, min_sessions, rating_method, elo_rating_type,
+                    prior_anchor=prior_anchor, prior_sessions=prior_sessions,
+                )
             result_df = con.execute(generated_sql).pl()
         t_sql_end = time.perf_counter()
 
@@ -690,6 +857,12 @@ def acbl_report(
             "ended_at": ended_at.isoformat(),
             "elapsed_seconds": elapsed,
             "moving_avg_days": moving_avg_days,
+            "shrinkage": {
+                "prior_sessions": int(prior_sessions),
+                "prior_anchor": prior_anchor,
+                "applied": prior_anchor is not None and prior_sessions > 0,
+                "kind": anchor_kind,
+            },
             "perf": perf,
             "server": _server_runtime_info(),
         }

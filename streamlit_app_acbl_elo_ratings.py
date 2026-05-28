@@ -145,8 +145,14 @@ def _fetch_remote_report_table(
     elo_rating_type: str,
     date_from: datetime | None,
     online_filter: str,
+    prior_sessions: int = 50,
 ) -> tuple[pl.DataFrame, dict]:
-    """Fetch pre-aggregated report rows from the ACBL API service."""
+    """Fetch pre-aggregated report rows from the ACBL API service.
+
+    ``prior_sessions`` is the Bayesian shrinkage prior weight passed through
+    to the API; 0 disables shrinkage (Published == Raw). Default matches
+    the API server's default.
+    """
     base_url = _acbl_api_base_url()
     if base_url is None:
         raise ValueError("ACBL_API_BASE_URL is not configured")
@@ -163,6 +169,7 @@ def _fetch_remote_report_table(
         "elo_rating_type": elo_rating_type,
         "date_from": None if date_from is None else date_from.isoformat(),
         "online_filter": online_filter,
+        "prior_sessions": int(prior_sessions),
     }
 
     timeout_seconds = int(os.getenv("ACBL_API_TIMEOUT_SECONDS", "180"))
@@ -676,6 +683,11 @@ ACBL_URL_PARAMS = {
         "parser": str,
         "default": "All",
     },
+    "prior_sessions": {
+        "session_key": "acbl_prior_sessions",
+        "parser": coerce_int(0, 1000),
+        "default": 50,
+    },
 }
 
 
@@ -872,7 +884,25 @@ def main():
         # is skipped; the widget's session value (acbl_masterpoints) is kept
         # around so URL state and the next Players switch preserve user intent.
         st.session_state.masterpoints_filter = masterpoints_filter
-        
+
+        # Bayesian shrinkage strength: higher values pull low-evidence ratings
+        # toward the global median, suppressing "hot intermediate with limited
+        # games" surprises in the leaderboard. 0 disables shrinkage entirely.
+        prior_sessions = st.slider(
+            "Shrinkage prior (sessions)",
+            min_value=0,
+            max_value=200,
+            value=50,
+            step=5,
+            key="acbl_prior_sessions",
+            help=(
+                "Bayesian shrinkage prior weight in 'sessions equivalent'. "
+                "Higher values pull less-played players/pairs toward the "
+                "global median rating, dampening leaderboard noise from "
+                "small-sample outliers. 0 disables shrinkage."
+            ),
+        )
+
         generate_pdf = st.button("Generate PDF", type="primary")
         
         
@@ -990,6 +1020,7 @@ def main():
                     elo_rating_type=elo_rating_type,
                     date_from=date_from,
                     online_filter=online_filter,
+                    prior_sessions=int(st.session_state.get("acbl_prior_sessions", 50)),
                 )
         except Exception as exc:
             st.error(str(exc))
@@ -1037,6 +1068,29 @@ def main():
             )
             st.caption(f"Server resources — {server_resources_str}")
 
+        # Surface the shrinkage state the API actually applied so users see
+        # the headline as Published Elo, with the prior they chose.
+        shrinkage_info = remote_payload.get("shrinkage", {}) if isinstance(remote_payload, dict) else {}
+        if shrinkage_info:
+            anchor = shrinkage_info.get("prior_anchor")
+            applied = shrinkage_info.get("applied", False)
+            ps = shrinkage_info.get("prior_sessions", 0)
+            kind = shrinkage_info.get("kind", "?")
+            if applied:
+                shrink_msg = (
+                    f"📐 Headline shows **Published Elo** (Bayesian-shrunk, {kind} prior_anchor={anchor}, "
+                    f"prior_sessions={ps}). `Player_Elo_Raw` / `Pair_Elo_Raw` available alongside."
+                )
+            elif anchor is None:
+                shrink_msg = (
+                    "📐 Shrinkage unavailable: no `acbl_*_elo_shrinkage.json` sidecar found. "
+                    "Run `acbl_elo_ratings_create.py` after the recompute to generate it. "
+                    "Headline currently shows Raw Elo."
+                )
+            else:
+                shrink_msg = "📐 Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo."
+            st.caption(shrink_msg)
+
         # Store online filter and current dataset type for downstream controls
         st.session_state.online_filter = online_filter
         st.session_state.current_dataset_type = dataset_type
@@ -1067,7 +1121,7 @@ def main():
                     st.code(generated_sql, language='sql')
             
             # 2. Show results from remote API
-            cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}_{st.session_state.get('masterpoints_filter','All')}"
+            cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}_{st.session_state.get('masterpoints_filter','All')}_prior{st.session_state.get('acbl_prior_sessions', 50)}"
             if remote_table_df is not None:
                 st.session_state[cache_key] = remote_table_df
             try:
@@ -1375,7 +1429,7 @@ ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
 
         # PDF generation when in PDF mode
         if st.session_state.get('content_mode') == 'pdf':
-            cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}_{st.session_state.get('masterpoints_filter','All')}"
+            cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}_{st.session_state.get('masterpoints_filter','All')}_prior{st.session_state.get('acbl_prior_sessions', 50)}"
             if remote_table_df is not None:
                 st.session_state[cache_key] = remote_table_df
             try:
