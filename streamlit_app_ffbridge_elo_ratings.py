@@ -74,6 +74,7 @@ from elo_common import (
     apply_app_theme,
     calculate_aggrid_height,
     coerce_int,
+    coerce_numeric_columns,
     init_url_params_to_state,
     render_app_footer,
     sync_state_to_url_params,
@@ -387,26 +388,39 @@ def _url_columns(display_df: pd.DataFrame) -> List[str]:
 
 def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
     """Build an AgGrid with single-click row selection."""
-    
+
     display_df = df.to_pandas()
-    # Ensure Rank column is numeric before passing to AgGrid
-    if 'Rank' in display_df.columns:
-        display_df['Rank'] = pd.to_numeric(display_df['Rank'], errors='coerce').astype(int)
+    # Force columns whose names suggest numeric content (e.g. *_Rank, *_Pct,
+    # Games, Player_Elo, Avg_IV_Bonus) to numeric dtype so AgGrid sorts them
+    # numerically rather than alphabetically. Defensive against JSON-roundtrip
+    # null-int columns ending up as pandas object dtype.
+    coerce_numeric_columns(display_df)
+
     gb = GridOptionsBuilder.from_dataframe(display_df)
     gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
     gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
-    # Configure Rank column for numeric sorting with custom comparator
-    if 'Rank' in display_df.columns:
-        gb.configure_column(
-            'Rank', 
-            type=['numericColumn', 'numberColumnFilter'],
-            sort='asc',
-            comparator=JsCode("""
-                function(valueA, valueB, nodeA, nodeB, isDescending) {
-                    return Number(valueA) - Number(valueB);
-                }
-            """)
-        )
+
+    # Configure every numeric column for numeric sorting + numeric filter.
+    numeric_comparator = JsCode("""
+        function(valueA, valueB, nodeA, nodeB, isDescending) {
+            return Number(valueA) - Number(valueB);
+        }
+    """)
+    for col in display_df.columns:
+        if pd.api.types.is_numeric_dtype(display_df[col]):
+            gb.configure_column(
+                col,
+                type=['numericColumn', 'numberColumnFilter'],
+                comparator=numeric_comparator,
+            )
+    # Default sort: rank ascending (Quality_Rank is the headline if present,
+    # otherwise the plain Rank column).
+    sort_col = 'Quality_Rank' if 'Quality_Rank' in display_df.columns else (
+        'Rank' if 'Rank' in display_df.columns else None
+    )
+    if sort_col is not None:
+        gb.configure_column(sort_col, sort='asc')
+
     # Configure Games column width to fit column name + icon size
     if 'Games' in display_df.columns:
         gb.configure_column('Games', width=100)  # Width accommodates "Games" text + sort icon
@@ -414,7 +428,7 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
     for col in _url_columns(display_df):
         gb.configure_column(col, cellRenderer=_URL_CELL_RENDERER, minWidth=240, width=360)
     grid_options = gb.build()
-    
+
     return AgGrid(
         display_df,
         gridOptions=grid_options,
@@ -429,6 +443,9 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str) -> Dict[str, Any]:
 def _render_detail_aggrid_ff(detail_df: pl.DataFrame, key: str, selectable: bool = False):
     """Render a detail DataFrame as a selectable AgGrid. Returns grid response if selectable."""
     display_df = detail_df.to_pandas()
+    # Force numeric-named columns to numeric dtype so AgGrid sorts them
+    # numerically rather than alphabetically.
+    coerce_numeric_columns(display_df)
     gb = GridOptionsBuilder.from_dataframe(display_df)
     if selectable:
         gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)

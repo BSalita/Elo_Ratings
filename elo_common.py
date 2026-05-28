@@ -250,6 +250,65 @@ def calculate_aggrid_height(row_count: int) -> int:
 
 
 # -------------------------------
+# AgGrid Numeric Column Helper
+# -------------------------------
+
+# Column-name conventions used across the ACBL + FFBridge reports. A column
+# matching one of these patterns is assumed to hold numeric data (integer or
+# float) and must sort numerically in the AgGrid, not alphabetically (which
+# would put "10" before "2"). Defensive against JSON round-trips that leave
+# nullable INTEGER columns as pandas object dtype.
+_NUMERIC_NAME_SUFFIXES: tuple[str, ...] = (
+    "_Rank", "_Score", "_Raw", "_Published",
+    "_Pct", "_Rate", "_Rate_Pct", "_Avg", "_Bonus", "_Stdev",
+    "_Points", "_Played", "_Diff", "_MPs",
+)
+_NUMERIC_NAME_EXACT: frozenset[str] = frozenset({
+    "Rank", "Sessions", "Sessions_Played", "Games",
+    "MasterPoints", "MasterPoint_Rank",
+    "Avg_MPs", "Geo_MPs",
+    "Quality_Rank", "Quality_Score",
+    "Player_Elo", "HC_Player_Elo", "Pair_Elo", "HC_Pair_Elo",
+    "Elo", "Elo_Before", "Elo_After", "Elo_Delta",
+    "DD_Tricks_Diff_Avg",
+})
+
+
+def is_numeric_column_name(col_name: str) -> bool:
+    """True if a column name suggests numeric values (suffix or exact match).
+
+    Used by :func:`coerce_numeric_columns` so we can force numeric dtype before
+    the AgGrid is built. Any column ending in ``_Rank``, ``_Score``, ``_Raw``,
+    ``_Published``, ``_Pct``, ``_Rate``, ``_Avg``, ``_Bonus``, ``_Stdev``,
+    ``_Points``, ``_Played``, ``_Diff``, or ``_MPs`` qualifies, as does the
+    explicit exact-match set above. Column names like ``Player_ID`` /
+    ``Pair_IDs`` / ``Player_Name`` are deliberately excluded — those are
+    sortable as strings.
+    """
+    if col_name in _NUMERIC_NAME_EXACT:
+        return True
+    return col_name.endswith(_NUMERIC_NAME_SUFFIXES)
+
+
+def coerce_numeric_columns(pdf):
+    """Coerce columns whose names suggest numeric values to numeric dtype.
+
+    Mutates ``pdf`` in place AND returns it for chaining. Non-convertible
+    values become NaN. Skips columns that are already numeric. ``pdf`` must
+    be a pandas DataFrame (kept untyped here to avoid forcing pandas as a
+    top-level import for callers that don't need it).
+    """
+    import pandas as _pd  # local import: keep elo_common's top-level deps minimal
+    for col in pdf.columns:
+        if not is_numeric_column_name(col):
+            continue
+        if _pd.api.types.is_numeric_dtype(pdf[col]):
+            continue
+        pdf[col] = _pd.to_numeric(pdf[col], errors="coerce")
+    return pdf
+
+
+# -------------------------------
 # URL Query Parameter Sync Helpers
 # -------------------------------
 def coerce_int(min_value: int | None = None, max_value: int | None = None, step: int | None = None):

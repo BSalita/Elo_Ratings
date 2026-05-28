@@ -65,6 +65,7 @@ from elo_common import (
     ASSISTANT_LOGO_URL,
     apply_app_theme,
     coerce_int,
+    coerce_numeric_columns,
     init_url_params_to_state,
     render_app_footer,
     sync_state_to_url_params,
@@ -456,6 +457,9 @@ def _render_detail_aggrid(detail_df: pl.DataFrame, key: str, selectable: bool = 
     from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme, JsCode
 
     pdf = detail_df.to_pandas()
+    # Force numeric-named columns to numeric dtype so AgGrid sorts them
+    # numerically rather than alphabetically.
+    coerce_numeric_columns(pdf)
 
     gb = GridOptionsBuilder.from_dataframe(pdf)
     if selectable:
@@ -1196,6 +1200,12 @@ def main():
                 # Convert to pandas for AgGrid
                 # Convert to pandas for AgGrid rendering
                 display_df = work_df.to_pandas()
+                # Force columns whose names suggest numeric content (e.g. *_Rank,
+                # *_Score, *_Pct, MasterPoints, Sessions_Played) to numeric
+                # dtype so AgGrid sorts them numerically instead of alphabetically.
+                # Defensive against JSON round-trips that leave nullable INTEGER
+                # columns as pandas object dtype.
+                coerce_numeric_columns(display_df)
                 
                 # Use AgGrid directly with precise height control for exactly 25 rows
                 from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme, JsCode
