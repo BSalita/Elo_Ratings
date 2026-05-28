@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import tempfile
 import time
 from datetime import datetime, timezone
 
@@ -115,6 +116,49 @@ def _recommended_threads() -> int:
         cpu_budget = host_cpus
     # Keep conservative default while respecting container CPU budget.
     return max(4, cpu_budget // 2) if cpu_budget >= 8 else max(1, cpu_budget)
+
+
+def _container_memory_bytes() -> int:
+    """Total memory budget: cgroup limit if present, else host RAM."""
+    limits = _detect_cgroup_limits()
+    if limits["memory_limit_bytes"]:
+        return int(limits["memory_limit_bytes"])
+    return int(psutil.virtual_memory().total)
+
+
+def _duckdb_memory_limit_bytes() -> int:
+    """Hard cap for DuckDB's buffer manager.
+
+    DuckDB defaults its ``memory_limit`` to ~80% of detected RAM. With the
+    resident Polars frame (~13 GB for Club) cached alongside, that default
+    overcommits the container and triggers OOM when the user pages through
+    filters or flips Club<->Tournament (DuckDB retains buffer-pool memory
+    between queries). We instead reserve headroom for the cached frame plus
+    per-request/runtime overhead and give DuckDB the remainder, capped at a
+    fraction of total so we never approach the limit. Override at deploy time
+    with ``DUCKDB_MEMORY_LIMIT_GB`` (e.g. after profiling on a bigger plan).
+    """
+    override = os.getenv("DUCKDB_MEMORY_LIMIT_GB", "").strip()
+    if override:
+        try:
+            return max(int(0.5 * 1024 ** 3), int(float(override) * 1024 ** 3))
+        except ValueError:
+            pass
+    total = _container_memory_bytes()
+    # Reserve for: worst-case resident frame (~13 GB Club) + per-request
+    # column copies + Python/Arrow/R2 client overhead.
+    reserve = 18 * 1024 ** 3
+    budget = min(total - reserve, int(total * 0.45))
+    floor = 2 * 1024 ** 3
+    return max(floor, budget)
+
+
+def _duckdb_temp_dir() -> str:
+    """Writable directory DuckDB can spill to when a query exceeds the cap."""
+    override = os.getenv("DUCKDB_TEMP_DIR", "").strip()
+    if override:
+        return override
+    return str(pathlib.Path(tempfile.gettempdir()) / "acbl_duckdb_spill")
 
 
 def _r2_enabled() -> bool:
@@ -469,6 +513,21 @@ def _get_db_connection() -> duckdb.DuckDBPyConnection:
         con = duckdb.connect()
         con.execute(f"PRAGMA threads={_recommended_threads()};")
         con.execute("PRAGMA preserve_insertion_order=false;")
+        # Cap the buffer manager so DuckDB never overcommits the container
+        # alongside the resident Polars frame, and allow spill-to-disk so a
+        # large aggregation degrades gracefully instead of OOM-killing the
+        # process. See _duckdb_memory_limit_bytes for the budgeting rationale.
+        mem_limit_bytes = _duckdb_memory_limit_bytes()
+        con.execute(f"PRAGMA memory_limit='{mem_limit_bytes}B';")
+        try:
+            temp_dir = _duckdb_temp_dir()
+            pathlib.Path(temp_dir).mkdir(parents=True, exist_ok=True)
+            con.execute(f"PRAGMA temp_directory='{temp_dir}';")
+            con.execute("PRAGMA max_temp_directory_size='32GB';")
+        except Exception:
+            # Spill is a safety net; if the temp dir can't be created we still
+            # run with the in-memory cap (queries just can't exceed it).
+            pass
         _DB_CON = con
     return _DB_CON
 
@@ -600,6 +659,7 @@ def _server_runtime_info() -> dict:
         "swap_percent": round(sm.percent, 1),
         "swap_enabled": bool(sm.total > 0),
         "frame_cache": cached_frames,
+        "duckdb_memory_limit_gb": round(_duckdb_memory_limit_bytes() / (1024 ** 3), 2),
     }
 
 

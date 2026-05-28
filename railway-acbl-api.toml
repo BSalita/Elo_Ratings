@@ -1,5 +1,8 @@
 [deploy]
-startCommand = "uvicorn acbl_api_server:app --host 0.0.0.0 --port $PORT"
+# MALLOC_ARENA_MAX=2 limits glibc's per-thread allocation arenas so freed
+# per-request memory is actually returned to the OS (with malloc_trim) instead
+# of fragmenting across many arenas and inflating RSS over time.
+startCommand = "MALLOC_ARENA_MAX=2 uvicorn acbl_api_server:app --host 0.0.0.0 --port $PORT"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 healthcheckPath = "/health"
