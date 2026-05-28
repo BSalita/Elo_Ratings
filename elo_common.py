@@ -12,6 +12,7 @@ Contains:
 """
 
 import os
+import math
 import pathlib
 import sys
 import threading
@@ -26,6 +27,72 @@ import polars as pl
 DEFAULT_ELO = 1200.0
 K_FACTOR = 32.0
 PERFORMANCE_SCALING = 400  # Standard Elo scaling factor
+
+# -------------------------------
+# Field-strength K-dampening (the "weak-field inflation" fix)
+# -------------------------------
+# FFBridge Elo is already field-relative: the expected score is computed
+# against the field's *current* mean rating, so a player who rises above a
+# weak field gains progressively less. What that does NOT close is the
+# closed-weak-club channel: when every pair in an isolated club starts at
+# DEFAULT_ELO, the field mean tracks the local population (not the global
+# one), so a consistently high-percentage pair can inflate the whole club
+# together. These anchors damp the K-factor when a session's field mean is
+# below the GLOBAL population mean (DEFAULT_ELO), capping per-session gains
+# in absolutely-weak fields.
+#
+# Anchors are in z-score units: z = (field_mean - population_mean) / sigma.
+# Kept deliberately conservative vs. ACBL because FFBridge's IV_Bonus already
+# nudges percentages for field difficulty (avoid double-counting).
+FIELD_STRENGTH_Z_FULL = 0.0     # full K at/above population mean (z >= 0)
+FIELD_STRENGTH_Z_FLOOR = -2.0   # k_min at this many sigmas below population mean
+FIELD_STRENGTH_K_MIN = 0.7      # floor on the K multiplier (conservative)
+# Spread of per-session field-mean ratings around DEFAULT_ELO. Field means are
+# averages of pair ratings (each pair = mean of two player ratings), so their
+# spread is far tighter than individual ratings. Calibrated empirically via
+# calibrate_ffbridge_field_strength.py over the full classic cache (517 sessions,
+# 2026-05): scratch sigma=5.6, handicap sigma=6.0, field means span ~1192-1229.
+# Using the larger (~6) keeps dampening conservative; at this sigma a field mean
+# of ~1188 hits the K floor and ~1194 gives K x0.85 (z_floor=-2). Re-run the
+# calibration script after large data refreshes to confirm.
+FFBRIDGE_FIELD_STRENGTH_SIGMA = 6.0
+
+
+def field_strength_scale(
+    z: float,
+    z_full: float = FIELD_STRENGTH_Z_FULL,
+    z_floor: float = FIELD_STRENGTH_Z_FLOOR,
+    k_min: float = FIELD_STRENGTH_K_MIN,
+) -> float:
+    """K-dampening multiplier in ``[k_min, 1.0]`` given a field-mean z-score.
+
+    ``z = (field_mean_rating - population_mean) / sigma``.
+
+    Fields at or above the population mean (``z >= z_full``) get full K. As the
+    field mean drifts below the population mean the multiplier decays linearly
+    to ``k_min`` by ``z_floor``, capping the Elo a weak-field player can
+    accumulate per session even when routinely scoring above their own (weak)
+    field. NaN input (degenerate field) returns full K.
+    """
+    if math.isnan(z):
+        return 1.0
+    if z >= z_full:
+        return 1.0
+    if z <= z_floor:
+        return k_min
+    return k_min + (1.0 - k_min) * (z - z_floor) / (z_full - z_floor)
+
+
+def field_strength_scale_from_mean(
+    field_mean_rating: float,
+    population_mean: float = DEFAULT_ELO,
+    sigma: float = FFBRIDGE_FIELD_STRENGTH_SIGMA,
+) -> float:
+    """Convenience wrapper: convert a field mean rating to a K multiplier."""
+    if sigma <= 0 or field_mean_rating is None or math.isnan(field_mean_rating):
+        return 1.0
+    z = (field_mean_rating - population_mean) / sigma
+    return field_strength_scale(z)
 
 # Chess federation scaling parameters
 # Target: Top players at ~2800 (Magnus Carlsen level), beginners at ~1200
@@ -70,16 +137,21 @@ def calculate_elo_from_percentage(
     percentage: float,
     field_average_rating: float,
     k_factor: float = K_FACTOR,
+    field_strength_scale: float = 1.0,
 ) -> float:
     """
     Calculate new Elo rating based on percentage score.
 
     Uses percentage as the actual performance and compares to expected
     performance based on rating difference from field average.
+
+    ``field_strength_scale`` (in ``(0, 1]``) damps the effective K-factor when
+    the session field is weak relative to the global population mean; see
+    :func:`field_strength_scale`. Defaults to ``1.0`` (no damping).
     """
     actual_score = percentage / 100.0
     expected_score = calculate_expected_score(current_rating, field_average_rating)
-    return current_rating + k_factor * (actual_score - expected_score)
+    return current_rating + k_factor * field_strength_scale * (actual_score - expected_score)
 
 
 def scale_to_chess_range(rating: float) -> float:
@@ -172,6 +244,65 @@ END"""
 # SQL fragment for scaling an Elo column to chess range.
 # Usage: ELO_SCALE_SQL.format(elo_col="Elo_R_Player")
 ELO_SCALE_SQL = "CAST(LEAST(GREATEST(ROUND({elo_col} * 2.0), 0), 3500) AS INTEGER)"
+
+
+# -------------------------------
+# Unified z-score -> chess scale (aligns ACBL, FFBridge, and chess titles)
+# -------------------------------
+# Each system's native Elo lives on a different center (FFBridge ~1200,
+# ACBL ~1500) with a different spread, so a fixed multiplier cannot make titles
+# mean the same thing across systems. Instead we standardize each leaderboard's
+# ratings to a common chess-anchored normal:  display = MEAN + z * SD, where
+# z = (rating - pop_mean) / pop_sd is computed over that leaderboard's own
+# population. The shared title ladder (ELO_TITLE_SQL_CASE / get_elo_title) then
+# labels identical *percentiles* in every system. SD controls title rarity:
+# at SD=400 with MEAN=1500, IM(2400)~+2.25sd (~top 1%), SGM(2600)~+2.75sd
+# (~top 0.3%). See get_elo_title for the bands.
+CHESS_DISPLAY_MEAN = 1500.0
+CHESS_DISPLAY_SD = 400.0
+
+
+def zscore_to_chess(
+    rating: float,
+    pop_mean: float,
+    pop_sd: float,
+    mean: float = CHESS_DISPLAY_MEAN,
+    sd: float = CHESS_DISPLAY_SD,
+) -> float:
+    """Standardize a native Elo to the common chess-anchored scale, clamped 0-3500.
+
+    ``z = (rating - pop_mean) / pop_sd`` then ``mean + z * sd``. A degenerate
+    population (``pop_sd <= 0``) maps everything to ``mean``.
+    """
+    if rating is None or math.isnan(rating):
+        return mean
+    if pop_sd is None or pop_sd <= 0 or math.isnan(pop_sd):
+        return mean
+    z = (rating - pop_mean) / pop_sd
+    scaled = mean + z * sd
+    return round(max(0.0, min(3500.0, scaled)), 1)
+
+
+def zscore_chess_sql(
+    elo_col: str,
+    pop_mean_sql: str,
+    pop_sd_sql: str,
+    mean: float = CHESS_DISPLAY_MEAN,
+    sd: float = CHESS_DISPLAY_SD,
+) -> str:
+    """SQL expression standardizing ``elo_col`` to the chess scale (integer, 0-3500).
+
+    ``pop_mean_sql`` / ``pop_sd_sql`` are SQL scalar expressions (e.g. references
+    to a CROSS JOINed stats CTE) giving the population mean and population stdev.
+    A non-positive/NULL stdev collapses to ``mean`` so the column never errors.
+    """
+    return (
+        f"CAST(LEAST(GREATEST(ROUND("
+        f"CASE WHEN COALESCE({pop_sd_sql}, 0) <= 0 THEN {mean} "
+        f"ELSE {mean} + ((CAST({elo_col} AS DOUBLE) - ({pop_mean_sql})) "
+        f"/ ({pop_sd_sql})) * {sd} END"
+        f"), 0), 3500) AS INTEGER)"
+    )
 
 
 # -------------------------------

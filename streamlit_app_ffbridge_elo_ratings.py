@@ -69,8 +69,11 @@ from elo_common import (
     ASSISTANT_LOGO_URL,
     calculate_expected_score,
     calculate_elo_from_percentage,
+    field_strength_scale_from_mean,
     scale_to_chess_range,
     get_elo_title,
+    CHESS_DISPLAY_MEAN,
+    CHESS_DISPLAY_SD,
     apply_app_theme,
     calculate_aggrid_height,
     coerce_int,
@@ -720,6 +723,89 @@ def _filter_valid_percentages_ffbridge(df: pl.DataFrame) -> pl.DataFrame:
 # -------------------------------
 # Data Processing (common for both APIs)
 # -------------------------------
+# Activity floor for computing the standardization population. Players below it
+# (one-off / very-low-game accounts clustered near the seed) would compress the
+# stdev and distort titles, so they are excluded from the mean/sd estimate
+# (but still standardized and shown).
+_STANDARDIZE_MIN_GAMES = 5
+
+
+def _standardize_elo_frames(
+    results_df: pl.DataFrame,
+    players_df: pl.DataFrame,
+    use_handicap: bool,
+) -> Tuple[pl.DataFrame, pl.DataFrame]:
+    """Affine-map all Elo columns onto the common chess scale (mean/sd anchored).
+
+    Computes the player population mean/sd separately for scratch and handicap,
+    then applies ``CHESS_DISPLAY_MEAN + z * CHESS_DISPLAY_SD`` (clamped 0-3500)
+    to every stored Elo column. Pair and selected columns reuse the matching
+    scratch/handicap transform so the whole frame stays on one coherent scale.
+    """
+    if players_df.is_empty():
+        return results_df, players_df
+
+    def _stats(col: str) -> Tuple[float, float]:
+        sub = players_df.filter(pl.col('games_played') >= _STANDARDIZE_MIN_GAMES)
+        if sub.height < 10:
+            sub = players_df
+        m = sub.select(pl.col(col).mean()).item()
+        s = sub.select(pl.col(col).std(ddof=0)).item()
+        return (float(m) if m is not None else CHESS_DISPLAY_MEAN,
+                float(s) if s is not None else 0.0)
+
+    def _aff(col: str, mean: float, sd: float) -> pl.Expr:
+        if sd and sd > 0:
+            return (
+                (pl.lit(CHESS_DISPLAY_MEAN) + (pl.col(col) - mean) / sd * CHESS_DISPLAY_SD)
+                .clip(0.0, 3500.0)
+                .round(1)
+                .alias(col)
+            )
+        return pl.lit(CHESS_DISPLAY_MEAN).alias(col)
+
+    s_mean, s_sd = _stats('scratch_elo')
+    h_mean, h_sd = _stats('handicap_elo')
+
+    players_df = players_df.with_columns([
+        _aff('scratch_elo', s_mean, s_sd),
+        _aff('handicap_elo', h_mean, h_sd),
+    ]).with_columns([
+        (pl.col('handicap_elo') if use_handicap else pl.col('scratch_elo')).alias('elo_rating'),
+    ])
+
+    if not results_df.is_empty():
+        scratch_cols = [
+            'player1_scratch_elo_before', 'player1_scratch_elo_after',
+            'player2_scratch_elo_before', 'player2_scratch_elo_after',
+            'scratch_pair_elo',
+        ]
+        handicap_cols = [
+            'player1_handicap_elo_before', 'player1_handicap_elo_after',
+            'player2_handicap_elo_before', 'player2_handicap_elo_after',
+            'handicap_pair_elo',
+        ]
+        results_df = results_df.with_columns(
+            [_aff(c, s_mean, s_sd) for c in scratch_cols if c in results_df.columns]
+            + [_aff(c, h_mean, h_sd) for c in handicap_cols if c in results_df.columns]
+        )
+        # Rebuild the use_handicap-selected display columns from the standardized values.
+        sel = {
+            'player1_elo_before': ('player1_handicap_elo_before', 'player1_scratch_elo_before'),
+            'player1_elo_after': ('player1_handicap_elo_after', 'player1_scratch_elo_after'),
+            'player2_elo_before': ('player2_handicap_elo_before', 'player2_scratch_elo_before'),
+            'player2_elo_after': ('player2_handicap_elo_after', 'player2_scratch_elo_after'),
+            'pair_elo': ('handicap_pair_elo', 'scratch_pair_elo'),
+        }
+        results_df = results_df.with_columns([
+            pl.col(h if use_handicap else s).alias(dst)
+            for dst, (h, s) in sel.items()
+            if (h if use_handicap else s) in results_df.columns
+        ])
+
+    return results_df, players_df
+
+
 def process_tournaments_to_elo(
     tournaments: List[Dict[str, Any]],
     api_module,
@@ -816,6 +902,13 @@ def process_tournaments_to_elo(
         
         scratch_field_avg = sum(scratch_field_ratings) / len(scratch_field_ratings) if scratch_field_ratings else DEFAULT_ELO
         handicap_field_avg = sum(handicap_field_ratings) / len(handicap_field_ratings) if handicap_field_ratings else DEFAULT_ELO
+
+        # Field-strength K-dampening: damp Elo gains when this session's field is
+        # weak relative to the global population mean (closed-weak-club channel).
+        # Conservative anchors live in elo_common; IV_Bonus already handles part
+        # of this so we avoid over-correcting.
+        scratch_field_strength = field_strength_scale_from_mean(scratch_field_avg)
+        handicap_field_strength = field_strength_scale_from_mean(handicap_field_avg)
         
         # Update ratings for each result
         for result in results:
@@ -918,6 +1011,8 @@ def process_tournaments_to_elo(
                 'pe_bonus': str(pe_bonus) if pe_bonus is not None else '',
                 'scratch_field_avg': float(scratch_field_avg),
                 'handicap_field_avg': float(handicap_field_avg),
+                'scratch_field_strength': float(scratch_field_strength),
+                'handicap_field_strength': float(handicap_field_strength),
                 'club_id': str(club_id),
                 'club_name': str(club_name),
                 'club_code': str(club_code),
@@ -930,14 +1025,15 @@ def process_tournaments_to_elo(
             if p1_id:
                 # Scratch Elo - calculate in original range, don't scale during calculation
                 scratch_r1_before = scratch_ratings.get(p1_id, DEFAULT_ELO)
-                scratch_r1_after = calculate_elo_from_percentage(scratch_r1_before, scratch_pct, scratch_field_avg)
+                scratch_r1_after = calculate_elo_from_percentage(scratch_r1_before, scratch_pct, scratch_field_avg, field_strength_scale=scratch_field_strength)
                 scratch_ratings[p1_id] = scratch_r1_after
                 
                 # Handicap Elo (use scratch if handicap not available)
                 handicap_r1_before = handicap_ratings.get(p1_id, DEFAULT_ELO)
                 h_pct_for_elo = handicap_pct if handicap_pct is not None else scratch_pct
                 h_field_for_elo = handicap_field_avg if handicap_pct is not None else scratch_field_avg
-                handicap_r1_after = calculate_elo_from_percentage(handicap_r1_before, h_pct_for_elo, h_field_for_elo)
+                h_strength_for_elo = handicap_field_strength if handicap_pct is not None else scratch_field_strength
+                handicap_r1_after = calculate_elo_from_percentage(handicap_r1_before, h_pct_for_elo, h_field_for_elo, field_strength_scale=h_strength_for_elo)
                 handicap_ratings[p1_id] = handicap_r1_after
                 
                 # Scale Elo values for display (calculations done in original range)
@@ -968,14 +1064,15 @@ def process_tournaments_to_elo(
             if p2_id:
                 # Scratch Elo - calculate in original range, don't scale during calculation
                 scratch_r2_before = scratch_ratings.get(p2_id, DEFAULT_ELO)
-                scratch_r2_after = calculate_elo_from_percentage(scratch_r2_before, scratch_pct, scratch_field_avg)
+                scratch_r2_after = calculate_elo_from_percentage(scratch_r2_before, scratch_pct, scratch_field_avg, field_strength_scale=scratch_field_strength)
                 scratch_ratings[p2_id] = scratch_r2_after
                 
                 # Handicap Elo (use scratch if handicap not available)
                 handicap_r2_before = handicap_ratings.get(p2_id, DEFAULT_ELO)
                 h_pct_for_elo = handicap_pct if handicap_pct is not None else scratch_pct
                 h_field_for_elo = handicap_field_avg if handicap_pct is not None else scratch_field_avg
-                handicap_r2_after = calculate_elo_from_percentage(handicap_r2_before, h_pct_for_elo, h_field_for_elo)
+                h_strength_for_elo = handicap_field_strength if handicap_pct is not None else scratch_field_strength
+                handicap_r2_after = calculate_elo_from_percentage(handicap_r2_before, h_pct_for_elo, h_field_for_elo, field_strength_scale=h_strength_for_elo)
                 handicap_ratings[p2_id] = handicap_r2_after
                 
                 # Scale Elo values for display (calculations done in original range)
@@ -1044,6 +1141,8 @@ def process_tournaments_to_elo(
             'pe_bonus': pl.Utf8,
             'scratch_field_avg': pl.Float64,
             'handicap_field_avg': pl.Float64,
+            'scratch_field_strength': pl.Float64,
+            'handicap_field_strength': pl.Float64,
             'club_id': pl.Utf8,
             'club_name': pl.Utf8,
             'club_code': pl.Utf8,
@@ -1109,7 +1208,18 @@ def process_tournaments_to_elo(
         })
     else:
         players_df = pl.DataFrame()
-    
+
+    # --- Unified z-score -> chess scale (aligns FFBridge with ACBL + chess) ---
+    # Standardize every stored Elo column to mean CHESS_DISPLAY_MEAN, sd
+    # CHESS_DISPLAY_SD using the player population's own mean/sd. z-score is
+    # scale-invariant, so the prior x2 chess scaling cancels out and the result
+    # is identical to standardizing the raw ratings. Scratch and handicap are
+    # standardized against their own populations; pair / selected columns reuse
+    # the player-level transform so an average pair lands near the anchor and
+    # the chess-title ladder (>=2400 IM, >=2500 GM, >=2600 SGM) labels the same
+    # percentile in FFBridge as in ACBL.
+    results_df, players_df = _standardize_elo_frames(results_df, players_df, use_handicap)
+
     # Return selected type ratings dict for backward compatibility
     current_ratings = handicap_ratings if use_handicap else scratch_ratings
     return results_df, players_df, current_ratings, cache_stats
@@ -1976,6 +2086,13 @@ def main():
             else:
                 st.caption("📐 Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo.")
 
+            st.caption(
+                "♟️ Elo is standardized to a chess-style scale (mean **1500**, "
+                "sd **400**) so it lines up with the ACBL app and chess; the "
+                "**Title** column uses standard bands (≥2400 IM, ≥2500 GM, "
+                "≥2600 SGM). A given title means the same percentile everywhere."
+            )
+
             if sql_query:
                 with st.expander("📝 SQL Query", expanded=False):
                     st.code(sql_query, language="sql")
@@ -2016,6 +2133,7 @@ def main():
                                     (pl.col('scratch_percentage') if 'scratch_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Scratch_%'),
                                     (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_%'),
                                     (pl.col('iv_bonus') if 'iv_bonus' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(1).alias('IV_Bonus'),
+                                    ((pl.col('handicap_field_strength') if use_handicap else pl.col('scratch_field_strength')) if (('handicap_field_strength' if use_handicap else 'scratch_field_strength') in player_results.columns) else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(3).alias('Field_Strength'),
                                 ]
                                 # Pct_Used: use handicap if requested AND not null, otherwise scratch
                                 if use_handicap and 'handicap_percentage' in player_results.columns:
@@ -2117,6 +2235,13 @@ def main():
             else:
                 st.caption("📐 Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo.")
 
+            st.caption(
+                "♟️ Elo is standardized to a chess-style scale (mean **1500**, "
+                "sd **400**) so it lines up with the ACBL app and chess; the "
+                "**Title** column uses standard bands (≥2400 IM, ≥2500 GM, "
+                "≥2600 SGM). A given title means the same percentile everywhere."
+            )
+
             if sql_query:
                 with st.expander("📝 SQL Query", expanded=False):
                     st.code(sql_query, language="sql")
@@ -2155,6 +2280,7 @@ def main():
                                     (pl.col('scratch_percentage') if 'scratch_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Scratch_%'),
                                     (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_%'),
                                     (pl.col('iv_bonus') if 'iv_bonus' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(1).alias('IV_Bonus'),
+                                    ((pl.col('handicap_field_strength') if use_handicap else pl.col('scratch_field_strength')) if (('handicap_field_strength' if use_handicap else 'scratch_field_strength') in pair_results.columns) else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(3).alias('Field_Strength'),
                                 ]
                                 # Pct_Used: use handicap if requested AND not null, otherwise scratch
                                 if use_handicap and 'handicap_percentage' in pair_results.columns:

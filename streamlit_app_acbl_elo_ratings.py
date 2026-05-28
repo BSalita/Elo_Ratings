@@ -1127,6 +1127,16 @@ def main():
             "weak-field play. Click any column header to re-sort."
         )
 
+        # Explain the unified chess-anchored Elo scale + titles.
+        st.caption(
+            "♟️ **Elo** is standardized to a chess-style scale (mean **1500**, "
+            "sd **400**) so it is directly comparable with the FFBridge app and "
+            "chess: the **Title** column uses standard bands "
+            "(≥2400 IM, ≥2500 GM, ≥2600 SGM; 1400–1599 Novice, etc.). Because "
+            "it is a z-score over the qualifying pool, a given title means the "
+            "same percentile in ACBL, FFBridge, and chess."
+        )
+
         # Store online filter and current dataset type for downstream controls
         st.session_state.online_filter = online_filter
         st.session_state.current_dataset_type = dataset_type

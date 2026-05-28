@@ -9,6 +9,14 @@ from datetime import datetime, timezone
 import duckdb
 import polars as pl
 import psutil
+
+from elo_common import (
+    CHESS_DISPLAY_MEAN,
+    CHESS_DISPLAY_SD,
+    ELO_TITLE_SQL_CASE,
+    title_from_elo_expr,
+    zscore_chess_sql,
+)
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -596,6 +604,55 @@ def _server_runtime_info() -> dict:
 
 
 
+def _detail_chess_calibration(df: pl.DataFrame, cols: list[str]) -> tuple[float | None, float | None]:
+    """Population mean / stdev over the per-board running-Elo columns.
+
+    Used to z-score the detail grids onto the same chess scale as the
+    leaderboards. The basis here is the per-board running rating (all seats /
+    sides, full frame) rather than the leaderboard's per-entity Latest, so a
+    given entity's number can differ slightly between the two views; both are
+    anchored at CHESS_DISPLAY_MEAN with the same title bands.
+    """
+    present = [c for c in cols if c in df.columns]
+    if not present:
+        return (None, None)
+    stacked = pl.concat([df.get_column(c).cast(pl.Float64) for c in present])
+    stacked = stacked.drop_nulls().drop_nans()
+    if stacked.len() < 2:
+        return (None, None)
+    sd = float(stacked.std(ddof=0))
+    return (float(stacked.mean()), sd if sd > 0 else None)
+
+
+def _standardize_detail(detail: pl.DataFrame, pop_mean: float | None, pop_sd: float | None) -> pl.DataFrame:
+    """Z-score Elo_Before/After onto the chess scale and add a Title column.
+
+    No-op (leaves native values) when calibration is unavailable so the grid
+    never errors on legacy parquets.
+    """
+    if detail.is_empty() or pop_mean is None or pop_sd is None or pop_sd <= 0:
+        return detail
+
+    def _aff(col: str) -> pl.Expr:
+        return (
+            (pl.lit(CHESS_DISPLAY_MEAN) + (pl.col(col).cast(pl.Float64) - pop_mean) / pop_sd * CHESS_DISPLAY_SD)
+            .clip(0.0, 3500.0)
+            .round(0)
+            .cast(pl.Int32, strict=False)
+            .alias(col)
+        )
+
+    elo_cols = [c for c in ("Elo_Before", "Elo_After") if c in detail.columns]
+    if not elo_cols:
+        return detail
+    detail = detail.with_columns([_aff(c) for c in elo_cols])
+    if "Elo_After" in detail.columns:
+        detail = detail.with_columns(title_from_elo_expr("Elo_After", "Title"))
+    if "Elo_Before" in detail.columns and "Elo_After" in detail.columns:
+        detail = detail.with_columns((pl.col("Elo_After") - pl.col("Elo_Before")).alias("Elo_Delta"))
+    return detail
+
+
 def _build_player_detail(df: pl.DataFrame, player_id: str, elo_rating_type: str) -> pl.DataFrame:
     elo_columns = get_elo_column_names(elo_rating_type)
     frames: list[pl.DataFrame] = []
@@ -647,6 +704,10 @@ def _build_player_detail(df: pl.DataFrame, player_id: str, elo_rating_type: str)
     detail = detail.sort(sort_cols, descending=sort_desc)
     if "Elo_Before" in detail.columns and "Elo_After" in detail.columns:
         detail = detail.with_columns((pl.col("Elo_After") - pl.col("Elo_Before")).alias("Elo_Delta"))
+    pattern = elo_columns["player_pattern"]
+    after_cols = [pattern.format(pos=p) for p in "NESW"] if pattern else []
+    pop_mean, pop_sd = _detail_chess_calibration(df, after_cols)
+    detail = _standardize_detail(detail, pop_mean, pop_sd)
     return detail
 
 
@@ -708,6 +769,9 @@ def _build_pair_detail(df: pl.DataFrame, pair_ids: str, elo_rating_type: str) ->
     detail = detail.sort(sort_cols, descending=sort_desc)
     if "Elo_Before" in detail.columns and "Elo_After" in detail.columns:
         detail = detail.with_columns((pl.col("Elo_After") - pl.col("Elo_Before")).alias("Elo_Delta"))
+    after_cols = [c for c in (elo_columns.get("pair_ns"), elo_columns.get("pair_ew")) if c]
+    pop_mean, pop_sd = _detail_chess_calibration(df, after_cols)
+    detail = _standardize_detail(detail, pop_mean, pop_sd)
     return detail
 
 
@@ -841,12 +905,24 @@ def generate_top_players_sql(
         {_QUALITY_SCORE_EXPR} AS Quality_Score,
         CAST(RANK() OVER (ORDER BY {_QUALITY_SCORE_EXPR} ASC) AS INTEGER) AS Quality_Rank
       FROM player_with_ranks
+    ),
+    elo_stats AS (
+      SELECT AVG(CAST(Player_Elo_Published AS DOUBLE)) AS elo_mean,
+             STDDEV_POP(CAST(Player_Elo_Published AS DOUBLE)) AS elo_sd
+      FROM player_with_published
+    ),
+    player_scaled AS (
+      SELECT pwq.*,
+        {zscore_chess_sql("Player_Elo_Published", "elo_mean", "elo_sd")} AS Player_Elo_Pub_Chess,
+        {zscore_chess_sql("Player_Elo_Raw", "elo_mean", "elo_sd")} AS Player_Elo_Raw_Chess
+      FROM player_with_quality pwq CROSS JOIN elo_stats
     )
     SELECT
       Player_Elo_Rank,
-      Player_Elo_Published AS Player_Elo_Score,
-      Player_Elo_Raw,
-      Player_Elo_Published,
+      Player_Elo_Pub_Chess AS Player_Elo_Score,
+      Player_Elo_Raw_Chess AS Player_Elo_Raw,
+      Player_Elo_Pub_Chess AS Player_Elo_Published,
+      {ELO_TITLE_SQL_CASE.format(elo_col="Player_Elo_Pub_Chess")} AS Title,
       Player_ID, Player_Name, CAST(MasterPoints AS INTEGER) AS MasterPoints,
       MasterPoint_Rank,
       CAST(Sessions_Played AS INTEGER) AS Sessions_Played,
@@ -859,7 +935,7 @@ def generate_top_players_sql(
       Sacrifice_Rank,
       ROUND(DD_Tricks_Diff_Avg, 2) AS DD_Tricks_Diff_Avg,
       DD_Tricks_Diff_Rank
-    FROM player_with_quality
+    FROM player_scaled
     ORDER BY Player_Elo_Rank ASC
     LIMIT {top_n}
     """.strip()
@@ -981,12 +1057,24 @@ def generate_top_pairs_sql(
         {_QUALITY_SCORE_EXPR_PAIR} AS Quality_Score,
         CAST(RANK() OVER (ORDER BY {_QUALITY_SCORE_EXPR_PAIR} ASC) AS INTEGER) AS Quality_Rank
       FROM pair_with_ranks
+    ),
+    elo_stats AS (
+      SELECT AVG(CAST(Pair_Elo_Published AS DOUBLE)) AS elo_mean,
+             STDDEV_POP(CAST(Pair_Elo_Published AS DOUBLE)) AS elo_sd
+      FROM pair_with_published
+    ),
+    pair_scaled AS (
+      SELECT pwq.*,
+        {zscore_chess_sql("Pair_Elo_Published", "elo_mean", "elo_sd")} AS Pair_Elo_Pub_Chess,
+        {zscore_chess_sql("Pair_Elo_Raw", "elo_mean", "elo_sd")} AS Pair_Elo_Raw_Chess
+      FROM pair_with_quality pwq CROSS JOIN elo_stats
     )
     SELECT
       Pair_Elo_Rank,
-      Pair_Elo_Published AS Pair_Elo_Score,
-      Pair_Elo_Raw,
-      Pair_Elo_Published,
+      Pair_Elo_Pub_Chess AS Pair_Elo_Score,
+      Pair_Elo_Raw_Chess AS Pair_Elo_Raw,
+      Pair_Elo_Pub_Chess AS Pair_Elo_Published,
+      {ELO_TITLE_SQL_CASE.format(elo_col="Pair_Elo_Pub_Chess")} AS Title,
       Avg_Elo_Rank, Pair_IDs, Pair_Names,
       CAST(Avg_MPs AS INTEGER) AS Avg_MPs, Avg_MPs_Rank, Geo_MPs_Rank, CAST(Sessions AS INTEGER) AS Sessions,
       Quality_Rank,
@@ -994,7 +1082,7 @@ def generate_top_pairs_sql(
       ROUND(Par_Contract_Rate * 100, 1) AS Par_Contract_Rate_Pct, Par_Contract_Rank,
       ROUND(Sacrifice_Rate * 100, 1) AS Sacrifice_Rate_Pct, Sacrifice_Rank,
       ROUND(DD_Tricks_Diff_Avg, 2) AS DD_Tricks_Diff_Avg, DD_Tricks_Diff_Rank
-    FROM pair_with_quality
+    FROM pair_scaled
     ORDER BY Pair_Elo_Rank ASC
     LIMIT {top_n}
     """.strip()
