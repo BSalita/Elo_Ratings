@@ -305,11 +305,101 @@ def load_elo_ratings_schema_map(club_or_tournament: str) -> dict:
     return df0.schema
 
 
+def _evict_other_frames(keep_source_path: str) -> None:
+    """Drop any cached frames other than the one we're about to use.
+
+    The ACBL UI only ever queries one dataset at a time (Club OR Tournament),
+    yet the old code kept both frames resident permanently, doubling the
+    cache footprint (~15.7 GB + ~4.4 GB on real data). Evicting the other
+    one on dataset switch keeps the live cache to a single frame.
+    """
+    for old_path in list(_FRAME_CACHE.keys()):
+        if old_path == keep_source_path:
+            continue
+        _FRAME_CACHE.pop(old_path, None)
+        _FRAME_CACHE_TIMES.pop(old_path, None)
+    _malloc_trim()
+
+
+def _dtype_shrink_exprs(schema: dict) -> list[pl.Expr]:
+    """Polars expressions that down-cast wasteful dtypes.
+
+    Three categories of waste live in the raw parquet:
+
+    1. ``Player_Name_*`` and ``Player_ID_*`` are String columns whose values
+       repeat across millions of board-level rows (the same ~500K names and
+       ~1M ids appear over and over in 58M rows on the club parquet).
+       Converting to Categorical (dictionary-encoded) collapses them to
+       roughly one Int32 code per row plus a small dictionary.
+    2. ``session_id`` is Int64 on club (down-casts to Int32) and a compound
+       String on tournament (down-casts to Categorical).
+    3. The float columns are already Float32 so we leave them alone.
+
+    DuckDB consumes polars Categorical columns natively (dictionary-encoded
+    VARCHAR), so existing SQL such as ``Player_ID_N || '-' || Player_ID_S``
+    and ``WHERE Player_ID_{pos} IS NOT NULL`` keep working unchanged.
+
+    Net effect: club parquet drops from ~15.7 GB to ~13.1 GB in-memory;
+    tournament parquet from ~4.4 GB to ~3.6 GB. Returned as expressions so
+    callers can splice them into a lazy plan and avoid materializing the
+    bigger pre-cast frame during the streaming collect.
+    """
+    exprs: list[pl.Expr] = []
+    for p in "NESW":
+        name_col = f"Player_Name_{p}"
+        id_col = f"Player_ID_{p}"
+        if name_col in schema and schema[name_col] == pl.Utf8:
+            exprs.append(pl.col(name_col).cast(pl.Categorical))
+        if id_col in schema and schema[id_col] == pl.Utf8:
+            exprs.append(pl.col(id_col).cast(pl.Categorical))
+    if "session_id" in schema:
+        sid_dtype = schema["session_id"]
+        if sid_dtype == pl.Utf8:
+            exprs.append(pl.col("session_id").cast(pl.Categorical))
+        elif sid_dtype == pl.Int64:
+            exprs.append(pl.col("session_id").cast(pl.Int32, strict=False))
+    return exprs
+
+
+def _shrink_frame_dtypes(df: pl.DataFrame) -> pl.DataFrame:
+    """Eager variant of :func:`_dtype_shrink_exprs` for already-materialized
+    frames (used by the smoke-test harness; the production load path applies
+    the casts inside the lazy plan)."""
+    exprs = _dtype_shrink_exprs(df.schema)
+    return df.with_columns(exprs) if exprs else df
+
+
+def _malloc_trim() -> None:
+    """Prod glibc to return freed pages to the OS.
+
+    On Linux/Railway this releases per-request allocation slack that the
+    allocator otherwise keeps in its arenas forever. No-ops on Windows
+    (no libc.so.6) and on platforms whose malloc lacks malloc_trim.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 def _load_full_frame(club_or_tournament: str) -> pl.DataFrame:
-    """Load the full parquet once and cache it at module level."""
+    """Load the full parquet once and cache it at module level.
+
+    On first access for a given dataset (Club or Tournament), evicts any
+    other cached frame (single-frame LRU) and down-casts wasteful String /
+    Int64 columns to Categorical / Int32 to keep RAM usage bounded. The
+    dtype casts are spliced into the lazy plan so the streaming collect
+    materializes the already-shrunk frame and peak load memory stays close
+    to the post-cast size, not the raw String size.
+    """
     source_path, storage_options = _parquet_source_for(club_or_tournament)
     if source_path in _FRAME_CACHE:
         return _FRAME_CACHE[source_path]
+
+    # Single-frame LRU: drop the other dataset before loading the new one so
+    # we never hold both ~15 GB Club + ~4 GB Tournament frames at once.
+    _evict_other_frames(source_path)
 
     schema_map = load_elo_ratings_schema_map(club_or_tournament)
     lf = pl.scan_parquet(source_path, storage_options=storage_options)
@@ -329,9 +419,14 @@ def _load_full_frame(club_or_tournament: str) -> pl.DataFrame:
         else:
             lf = lf.with_columns(pl.col("Date").cast(pl.Datetime, strict=False).alias("Date"))
 
+    shrink_exprs = _dtype_shrink_exprs(dict(schema_map))
+    if shrink_exprs:
+        lf = lf.with_columns(shrink_exprs)
+
     full_df = lf.collect(engine="streaming")
     _FRAME_CACHE[source_path] = full_df
     _FRAME_CACHE_TIMES[source_path] = time.time()
+    _malloc_trim()
     return full_df
 
 
@@ -1011,7 +1106,11 @@ def acbl_report(
             "perf": perf,
             "server": _server_runtime_info(),
         }
-        del result_df
+        del result_df, df
+        # Per-request memory hygiene: return per-query slack to the OS so
+        # process RSS doesn't climb forever as the user pages through
+        # different filters. No-op on Windows; real win on Railway/Linux.
+        _malloc_trim()
         response_payload["perf"]["total_seconds"] = round(time.perf_counter() - t0, 3)
         return response_payload
     except HTTPException:
@@ -1088,7 +1187,9 @@ def acbl_detail(
             "perf": perf,
             "server": _server_runtime_info(),
         }
-        del detail
+        del detail, df
+        # Per-request memory hygiene: return per-query slack to the OS.
+        _malloc_trim()
         response_payload["perf"]["total_seconds"] = round(time.perf_counter() - t0, 3)
         return response_payload
     except HTTPException:
