@@ -141,7 +141,7 @@ SHRINKAGE_DEFAULT_PRIOR_SESSIONS = 50
 
 
 def _shrinkage_sidecar_search_paths(filename: str) -> list[pathlib.Path]:
-    """Return ordered search paths for the shrinkage sidecar JSON.
+    """Return ordered local filesystem search paths for the shrinkage sidecar JSON.
 
     Looks in (a) the API's bundled ``data/`` directory (where deployment
     artifacts live alongside the parquets), then (b) the canonical
@@ -157,6 +157,43 @@ def _shrinkage_sidecar_search_paths(filename: str) -> list[pathlib.Path]:
     return candidates
 
 
+def _load_shrinkage_meta_from_r2(filename: str) -> dict | None:
+    """Fetch the shrinkage sidecar JSON from R2 (S3-compatible) storage.
+
+    Uses the same ``R2_*`` env vars as :func:`_r2_storage_options`. Returns
+    ``None`` on any failure (missing key, network error, JSON parse error,
+    missing optional dependency) so the caller can fall back to local paths.
+    """
+    if not _r2_enabled():
+        return None
+
+    try:
+        import boto3
+        from botocore.config import Config as _BotoConfig
+        from botocore.exceptions import BotoCoreError, ClientError
+    except ImportError:
+        return None
+
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    prefix = os.getenv("R2_PREFIX", "data").strip().strip("/")
+    key = f"{prefix}/{filename}" if prefix else filename
+
+    try:
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=os.getenv("R2_ENDPOINT", "").strip() or None,
+            aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID", "").strip() or None,
+            aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", "").strip() or None,
+            region_name=os.getenv("R2_REGION", "auto").strip() or "auto",
+            config=_BotoConfig(signature_version="s3v4"),
+        )
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        body = obj["Body"].read()
+        return json.loads(body.decode("utf-8"))
+    except (BotoCoreError, ClientError, json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+
+
 def _load_shrinkage_meta(club_or_tournament: str) -> dict | None:
     """Load the shrinkage sidecar JSON written by acbl_elo_ratings_create.py.
 
@@ -165,10 +202,13 @@ def _load_shrinkage_meta(club_or_tournament: str) -> dict | None:
     rebuilt the lookup parquets). In that case the report falls back to
     Published == Raw so the API still works.
 
-    Tries multiple search paths so the server works whether the sidecars
-    live next to the parquets in ``DATA_ROOT`` (deployment) or in
-    ``e:/bridge/data/acbl/`` (local dev where the OneDrive sync may not
-    have copied the latest JSON yet).
+    Lookup order:
+
+    1. R2 (S3-compatible) at ``s3://$R2_BUCKET/$R2_PREFIX/<filename>`` when
+       ``R2_BUCKET`` is set. This is the canonical source on Railway
+       deployments where parquets also live in R2.
+    2. Local filesystem candidates (DATA_ROOT, ACBL_SHRINKAGE_DIR override,
+       e:/bridge/data/acbl) for local dev.
 
     Cached at module level.
     """
@@ -177,6 +217,13 @@ def _load_shrinkage_meta(club_or_tournament: str) -> dict | None:
         return _SHRINKAGE_META_CACHE[key]
 
     filename = f"acbl_{key}_elo_shrinkage.json"
+
+    if _r2_enabled():
+        meta = _load_shrinkage_meta_from_r2(filename)
+        if meta is not None:
+            _SHRINKAGE_META_CACHE[key] = meta
+            return meta
+
     for path in _shrinkage_sidecar_search_paths(filename):
         if not path.exists():
             continue
