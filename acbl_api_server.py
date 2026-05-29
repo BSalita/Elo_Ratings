@@ -1024,7 +1024,7 @@ def generate_top_players_sql(
       FROM player_with_quality pwq CROSS JOIN elo_stats CROSS JOIN skill_stats ss
     )
     SELECT
-      Player_Elo_Rank,
+      CAST(ROW_NUMBER() OVER (ORDER BY Player_Elo_Rank ASC) AS INTEGER) AS Player_Elo_Rank,
       Player_Elo_Pub_Chess AS Player_Elo_Score,
       Player_Elo_Raw_Chess AS Player_Elo_Raw,
       Player_Elo_Pub_Chess AS Player_Elo_Published,
@@ -1180,7 +1180,7 @@ def generate_top_pairs_sql(
       FROM pair_with_quality pwq CROSS JOIN elo_stats CROSS JOIN skill_stats ss
     )
     SELECT
-      Pair_Elo_Rank,
+      CAST(ROW_NUMBER() OVER (ORDER BY Pair_Elo_Rank ASC) AS INTEGER) AS Pair_Elo_Rank,
       Pair_Elo_Pub_Chess AS Pair_Elo_Score,
       Pair_Elo_Raw_Chess AS Pair_Elo_Raw,
       Pair_Elo_Pub_Chess AS Pair_Elo_Published,
