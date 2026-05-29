@@ -191,6 +191,50 @@ _SHRINKAGE_META_CACHE: dict[str, dict | None] = {}
 # /acbl/report client may override via the prior_sessions query parameter.
 SHRINKAGE_DEFAULT_PRIOR_SESSIONS = 50
 
+# Elite skill gate. The leaderboard's headline Elo is a strong *within-field*
+# predictor, but a player/pair who only dominates weak fields can still reach
+# the top ranks (the "Zubatch" failure mode). We therefore gate the top ranks
+# by a field-INDEPENDENT skill signal: the pool z-score of card play
+# (DD_Tricks_Diff) + par bidding (Par_Suit, Par_Contract). Players/pairs below
+# ``SKILL_GATE_DEFAULT_Z`` are excluded from the leaderboard (their Elo can't
+# be trusted as 'elite' because their absolute card play is only average).
+# A field-relative "tested against stronger cohorts" gate was prototyped and
+# rejected: a strong individual is by construction rated above their field
+# mean, so it is structurally unobservable from this data. Set the
+# ``min_skill_z`` query param <= SKILL_GATE_DISABLED to turn the gate off.
+SKILL_GATE_DEFAULT_Z = 0.5
+SKILL_GATE_DISABLED = -90.0
+
+
+def _skill_gate_clause(min_skill_z: float, *, col: str = "Skill_Z") -> str:
+    """WHERE clause body for the skill gate (empty string if disabled).
+
+    NULL skill (no card-play data) fails the gate by design: no evidence of
+    competitiveness => not elite."""
+    if min_skill_z is None or min_skill_z <= SKILL_GATE_DISABLED:
+        return ""
+    return f"WHERE {col} >= {float(min_skill_z)!r}"
+
+
+def _skill_z_sql(prefix: str, stats_alias: str = "ss") -> str:
+    """Mean of per-metric pool z-scores: card play + two par-bidding rates.
+
+    ``prefix`` is the CTE alias holding the per-entity aggregates (e.g. pwq)."""
+    return (
+        f"( ({prefix}.DD_Tricks_Diff_Avg - {stats_alias}.m_dd) / NULLIF({stats_alias}.s_dd, 0)"
+        f" + ({prefix}.Par_Suit_Rate - {stats_alias}.m_ps) / NULLIF({stats_alias}.s_ps, 0)"
+        f" + ({prefix}.Par_Contract_Rate - {stats_alias}.m_pc) / NULLIF({stats_alias}.s_pc, 0) ) / 3.0"
+    )
+
+
+_SKILL_STATS_CTE_TEMPLATE = """
+    {name} AS (
+      SELECT AVG(DD_Tricks_Diff_Avg) AS m_dd, STDDEV_POP(DD_Tricks_Diff_Avg) AS s_dd,
+             AVG(Par_Suit_Rate) AS m_ps, STDDEV_POP(Par_Suit_Rate) AS s_ps,
+             AVG(Par_Contract_Rate) AS m_pc, STDDEV_POP(Par_Contract_Rate) AS s_pc
+      FROM {source}
+    )"""
+
 
 def _shrinkage_sidecar_search_paths(filename: str) -> list[pathlib.Path]:
     """Return ordered local filesystem search paths for the shrinkage sidecar JSON.
@@ -881,6 +925,7 @@ def generate_top_players_sql(
     prior_anchor: float | None = None,
     prior_sessions: int = 0,
     has_round: bool = True,
+    min_skill_z: float = SKILL_GATE_DEFAULT_Z,
 ) -> str:
     """Build the top-players ranking SQL.
 
@@ -970,12 +1015,13 @@ def generate_top_players_sql(
       SELECT AVG(CAST(Player_Elo_Published AS DOUBLE)) AS elo_mean,
              STDDEV_POP(CAST(Player_Elo_Published AS DOUBLE)) AS elo_sd
       FROM player_with_published
-    ),
+    ),{_SKILL_STATS_CTE_TEMPLATE.format(name="skill_stats", source="player_with_published")},
     player_scaled AS (
       SELECT pwq.*,
         {zscore_chess_sql("Player_Elo_Published", "elo_mean", "elo_sd")} AS Player_Elo_Pub_Chess,
-        {zscore_chess_sql("Player_Elo_Raw", "elo_mean", "elo_sd")} AS Player_Elo_Raw_Chess
-      FROM player_with_quality pwq CROSS JOIN elo_stats
+        {zscore_chess_sql("Player_Elo_Raw", "elo_mean", "elo_sd")} AS Player_Elo_Raw_Chess,
+        {_skill_z_sql("pwq")} AS Skill_Z
+      FROM player_with_quality pwq CROSS JOIN elo_stats CROSS JOIN skill_stats ss
     )
     SELECT
       Player_Elo_Rank,
@@ -983,6 +1029,7 @@ def generate_top_players_sql(
       Player_Elo_Raw_Chess AS Player_Elo_Raw,
       Player_Elo_Pub_Chess AS Player_Elo_Published,
       {ELO_TITLE_SQL_CASE.format(elo_col="Player_Elo_Pub_Chess")} AS Title,
+      ROUND(Skill_Z, 3) AS Skill_Z,
       Player_ID, Player_Name, CAST(MasterPoints AS INTEGER) AS MasterPoints,
       MasterPoint_Rank,
       CAST(Sessions_Played AS INTEGER) AS Sessions_Played,
@@ -996,6 +1043,7 @@ def generate_top_players_sql(
       ROUND(DD_Tricks_Diff_Avg, 2) AS DD_Tricks_Diff_Avg,
       DD_Tricks_Diff_Rank
     FROM player_scaled
+    {_skill_gate_clause(min_skill_z)}
     ORDER BY Player_Elo_Rank ASC
     LIMIT {top_n}
     """.strip()
@@ -1010,6 +1058,7 @@ def generate_top_pairs_sql(
     prior_anchor: float | None = None,
     prior_sessions: int = 0,
     has_round: bool = True,
+    min_skill_z: float = SKILL_GATE_DEFAULT_Z,
 ) -> str:
     """Build the top-pairs ranking SQL.
 
@@ -1122,12 +1171,13 @@ def generate_top_pairs_sql(
       SELECT AVG(CAST(Pair_Elo_Published AS DOUBLE)) AS elo_mean,
              STDDEV_POP(CAST(Pair_Elo_Published AS DOUBLE)) AS elo_sd
       FROM pair_with_published
-    ),
+    ),{_SKILL_STATS_CTE_TEMPLATE.format(name="skill_stats", source="pair_with_published")},
     pair_scaled AS (
       SELECT pwq.*,
         {zscore_chess_sql("Pair_Elo_Published", "elo_mean", "elo_sd")} AS Pair_Elo_Pub_Chess,
-        {zscore_chess_sql("Pair_Elo_Raw", "elo_mean", "elo_sd")} AS Pair_Elo_Raw_Chess
-      FROM pair_with_quality pwq CROSS JOIN elo_stats
+        {zscore_chess_sql("Pair_Elo_Raw", "elo_mean", "elo_sd")} AS Pair_Elo_Raw_Chess,
+        {_skill_z_sql("pwq")} AS Skill_Z
+      FROM pair_with_quality pwq CROSS JOIN elo_stats CROSS JOIN skill_stats ss
     )
     SELECT
       Pair_Elo_Rank,
@@ -1135,6 +1185,7 @@ def generate_top_pairs_sql(
       Pair_Elo_Raw_Chess AS Pair_Elo_Raw,
       Pair_Elo_Pub_Chess AS Pair_Elo_Published,
       {ELO_TITLE_SQL_CASE.format(elo_col="Pair_Elo_Pub_Chess")} AS Title,
+      ROUND(Skill_Z, 3) AS Skill_Z,
       Avg_Elo_Rank, Pair_IDs, Pair_Names,
       CAST(Avg_MPs AS INTEGER) AS Avg_MPs, Avg_MPs_Rank, Geo_MPs_Rank, CAST(Sessions AS INTEGER) AS Sessions,
       Quality_Rank,
@@ -1143,6 +1194,7 @@ def generate_top_pairs_sql(
       ROUND(Sacrifice_Rate * 100, 1) AS Sacrifice_Rate_Pct, Sacrifice_Rank,
       ROUND(DD_Tricks_Diff_Avg, 2) AS DD_Tricks_Diff_Avg, DD_Tricks_Diff_Rank
     FROM pair_scaled
+    {_skill_gate_clause(min_skill_z)}
     ORDER BY Pair_Elo_Rank ASC
     LIMIT {top_n}
     """.strip()
@@ -1168,6 +1220,13 @@ def acbl_report(
         SHRINKAGE_DEFAULT_PRIOR_SESSIONS, ge=0, le=1000,
         description="Bayesian shrinkage prior weight (in 'sessions equivalent'). "
                     "0 disables shrinkage (Published == Raw).",
+    ),
+    min_skill_z: float = Query(
+        SKILL_GATE_DEFAULT_Z, ge=-100.0, le=5.0,
+        description="Elite skill gate: exclude players/pairs whose field-"
+                    "independent card-play+bidding z-score (over the qualifying "
+                    "pool) is below this. Higher = stricter. Set <= -90 to "
+                    "disable (show all qualifying entities).",
     ),
 ) -> dict:
     started_at = datetime.now()
@@ -1206,13 +1265,13 @@ def acbl_report(
                 generated_sql = generate_top_players_sql(
                     top_n, min_sessions, rating_method, elo_rating_type,
                     prior_anchor=prior_anchor, prior_sessions=prior_sessions,
-                    has_round=has_round,
+                    has_round=has_round, min_skill_z=min_skill_z,
                 )
             else:
                 generated_sql = generate_top_pairs_sql(
                     top_n, min_sessions, rating_method, elo_rating_type,
                     prior_anchor=prior_anchor, prior_sessions=prior_sessions,
-                    has_round=has_round,
+                    has_round=has_round, min_skill_z=min_skill_z,
                 )
             result_df = con.execute(generated_sql).pl()
         t_sql_end = time.perf_counter()
@@ -1254,6 +1313,11 @@ def acbl_report(
                 "prior_anchor": prior_anchor,
                 "applied": prior_anchor is not None and prior_sessions > 0,
                 "kind": anchor_kind,
+            },
+            "skill_gate": {
+                "min_skill_z": float(min_skill_z),
+                "applied": min_skill_z > SKILL_GATE_DISABLED,
+                "metric": "pool z-score of DD_Tricks_Diff + Par_Suit + Par_Contract",
             },
             "perf": perf,
             "server": _server_runtime_info(),
