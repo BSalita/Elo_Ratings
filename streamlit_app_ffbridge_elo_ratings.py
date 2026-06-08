@@ -329,7 +329,19 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
         r["ffbridge API Endpoint"] = api_url if api_url else None
         rows.append(r)
 
-    return pl.DataFrame(rows)
+    # The URL columns are None for most (non-Octopus) rows and only get a string
+    # on reconciled Octopus days, which can appear after the default 100-row
+    # schema-inference window -> Polars would lock the column to Null and then
+    # fail to append the late URL string. Force them to Utf8 and scan all rows.
+    return pl.DataFrame(
+        rows,
+        schema_overrides={
+            "Organization URL": pl.Utf8,
+            "ffbridge Result": pl.Utf8,
+            "ffbridge API Endpoint": pl.Utf8,
+        },
+        infer_schema_length=None,
+    )
 
 
 # AG Grid component class used to turn any cell containing an http(s) URL into
