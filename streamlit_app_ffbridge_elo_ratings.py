@@ -2178,7 +2178,7 @@ def main():
                 if name_filter and name_filter.strip():
                     name_filter_lower = name_filter.strip().lower()
                     top_players = top_players.filter(
-                        pl.col('Player_Name').str.to_lowercase().str.contains(name_filter_lower, literal=False)
+                        pl.col('Player_Name').str.to_lowercase().str.contains(name_filter_lower, literal=True)
                     )
                 
                 if not top_players.is_empty():
@@ -2327,7 +2327,7 @@ def main():
                 if name_filter and name_filter.strip():
                     name_filter_lower = name_filter.strip().lower()
                     top_pairs = top_pairs.filter(
-                        pl.col('Pair_Name').str.to_lowercase().str.contains(name_filter_lower, literal=False)
+                        pl.col('Pair_Name').str.to_lowercase().str.contains(name_filter_lower, literal=True)
                     )
                 
                 if not top_pairs.is_empty():
