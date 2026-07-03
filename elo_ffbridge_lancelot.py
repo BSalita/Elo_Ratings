@@ -130,13 +130,16 @@ def lancelot_get(endpoint: str, params: Optional[Dict] = None, add_delay: bool =
 # -------------------------------
 # API Functions
 # -------------------------------
-def fetch_tournament_list(series_id: Any = "all", limit: Optional[int] = None) -> List[Dict[str, Any]]:
+def fetch_tournament_list(series_id: Any = "all", limit: Optional[int] = None, force_refresh: bool = False) -> List[Dict[str, Any]]:
     """
     Fetch list of sessions (tournaments) from Lancelot API.
     
     Args:
         series_id: Tournament series ID (migration ID) or "all" for all series
         limit: Maximum number of sessions per series
+        force_refresh: If True, bypass the (no-expiry) disk cache and re-fetch
+            from the API so newly published sessions are discovered. The fresh
+            list is written back to the cache.
     
     Returns:
         List of session dictionaries with normalized structure
@@ -146,28 +149,29 @@ def fetch_tournament_list(series_id: Any = "all", limit: Optional[int] = None) -
         for migration_id in VALID_SERIES_IDS:
             lancelot_id = MIGRATION_TO_LANCELOT.get(migration_id)
             if lancelot_id:
-                sessions = _fetch_sessions_for_series(lancelot_id, migration_id, limit)
+                sessions = _fetch_sessions_for_series(lancelot_id, migration_id, limit, force_refresh)
                 all_sessions.extend(sessions)
         return all_sessions
     
     lancelot_id = MIGRATION_TO_LANCELOT.get(series_id)
     if lancelot_id:
-        return _fetch_sessions_for_series(lancelot_id, series_id, limit)
+        return _fetch_sessions_for_series(lancelot_id, series_id, limit, force_refresh)
     return []
 
 
-def _fetch_sessions_for_series(lancelot_id: int, migration_id: int, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+def _fetch_sessions_for_series(lancelot_id: int, migration_id: int, limit: Optional[int] = None, force_refresh: bool = False) -> List[Dict[str, Any]]:
     """Fetch all sessions for a series from Lancelot API."""
     series_name = SERIES_NAMES.get(migration_id, f"series_{lancelot_id}")
     friendly_name = f"sessions_list_{series_name.replace(' ', '_')}"
     
-    # Check disk cache
-    cached_data = load_from_disk_cache(CACHE_DIR, friendly_name, max_age_hours=None, series_id=migration_id)
-    if cached_data:
-        # Ensure series_id is set on each session
-        for s in cached_data:
-            s['series_id'] = migration_id
-        return cached_data[:limit] if limit else cached_data
+    # Check disk cache (unless forcing a refresh to discover new sessions)
+    if not force_refresh:
+        cached_data = load_from_disk_cache(CACHE_DIR, friendly_name, max_age_hours=None, series_id=migration_id)
+        if cached_data:
+            # Ensure series_id is set on each session
+            for s in cached_data:
+                s['series_id'] = migration_id
+            return cached_data[:limit] if limit else cached_data
     
     all_sessions = []
     page = 1

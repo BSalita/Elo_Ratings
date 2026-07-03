@@ -2,14 +2,23 @@
 builder = "NIXPACKS"
 
 [deploy]
-# Precompute the FFBridge Elo dataset parquets before the app starts. This runs
-# in the app container (same filesystem, env vars, and mounted volume as the
-# start command), so it reads the raw tournament JSON from the /data/ffbridge
-# volume cache and writes the ready-to-load parquet that the Streamlit boot
-# loader (load_ffbridge_elo_dataset) reads — avoiding the in-process history
-# rebuild that caused the OOM/restart loop. Fresh each deploy = always current.
-preDeployCommand = "python build_ffbridge_elo_parquets.py"
-startCommand = "streamlit run streamlit_app_ffbridge_elo_ratings.py --server.port $PORT --server.address 0.0.0.0"
+# Build the FFBridge Elo parquet on the mounted volume *before* launching
+# Streamlit, then start the app. This must happen in the start command (not a
+# preDeployCommand): Railway does NOT mount volumes during pre-deploy, so only
+# the runtime container can read the raw tournament cache and write the parquet.
+#
+# The builder runs as a short-lived process that exits (freeing its memory)
+# before Streamlit starts, keeping the memory-heavy history build out of the
+# long-running app process (the OOM/restart-loop cause). ``--if-stale`` makes it
+# a ~1s no-op on ordinary restarts/redeploys (parquet already fresh) and a full
+# refresh only when the cache is older than the threshold — i.e. on the daily
+# scheduled redeploy (see .github/workflows/ffbridge-daily-rebuild.yml). The
+# ``|| true`` ensures a build hiccup never blocks startup; the app has its own
+# in-process rebuild fallback.
+startCommand = "python build_ffbridge_elo_parquets.py --if-stale || true; streamlit run streamlit_app_ffbridge_elo_ratings.py --server.port $PORT --server.address 0.0.0.0"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 healthcheckPath = "/"
+# Generous timeout so the daily full rebuild (fetch new events + recompute,
+# ~1-3 min) completes before Streamlit must answer the health check.
+healthcheckTimeout = 900

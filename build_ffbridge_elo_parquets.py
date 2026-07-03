@@ -1,37 +1,98 @@
 """Offline builder for the FFBridge Elo dataset parquets.
 
 Precomputes the full multi-tournament Elo history for each FFBridge API backend
-and writes it to ``data/ffbridge/elo_cache/`` in the exact layout the Streamlit
-app's boot loader (`load_ffbridge_elo_dataset`) expects. Run this before/at
-deploy so the container loads a ready parquet at boot instead of rebuilding the
-whole history in RAM (the cause of the OOM/restart loop on Railway).
+and writes it to ``FFBRIDGE_CACHE_DIR/elo_cache/`` (the mounted Railway volume in
+production, or ``data/ffbridge/elo_cache/`` locally) in the exact layout the
+Streamlit boot loader (`load_ffbridge_elo_dataset`) expects.
+
+Where this runs on Railway
+--------------------------
+The volume is ONLY mounted in the runtime (start) container — Railway pre-deploy
+commands run in a separate container with the volume *unmounted*. So this builder
+is invoked from the service ``startCommand`` (before Streamlit launches), as a
+short-lived process that builds the parquet on the volume and then exits, freeing
+its memory before the long-running Streamlit process starts. That keeps the
+memory-heavy history build out of the Streamlit process (the OOM/restart cause).
+
+Staleness gate (--if-stale)
+---------------------------
+On every container start the builder runs, but with ``--if-stale`` it rebuilds a
+backend only when its persisted parquet is missing or older than
+``--max-age-hours`` (default 20h). So ordinary restarts/redeploys are a ~1s no-op
+(the app just loads the existing parquet), while a daily scheduled redeploy
+crosses the threshold and does a full refresh. When it does rebuild, the tournament
+list is force-refreshed from the API so newly published events are discovered.
 
 Usage:
-    python build_ffbridge_elo_parquets.py                 # all backends
+    python build_ffbridge_elo_parquets.py                 # force build all backends
+    python build_ffbridge_elo_parquets.py --if-stale      # build only stale/missing
     python build_ffbridge_elo_parquets.py --api "FFBridge Lancelot API"
     python build_ffbridge_elo_parquets.py --fetch-iv      # include IV (slower)
-
-The app filenames are keyed by (api, tournament_count, fetch_iv); if the live
-tournament count changes, the app will rebuild once and re-persist. Rerun this
-builder to refresh the committed parquet.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Optional
 
 # Importing the app module is side-effect free (main() is guarded and
 # set_page_config lives inside main()), so we can reuse its pipeline directly.
 import streamlit_app_ffbridge_elo_ratings as app
 
 
-def build_one(api_name: str, fetch_iv: bool) -> int:
-    """Build and persist the dataset for a single API backend. Returns row count."""
+def _newest_persisted_age_hours(api_key: str, fetch_iv: bool) -> Optional[float]:
+    """Age (hours) of the newest complete persisted parquet set for a backend.
+
+    Returns None if no complete set (results + players + meta with built_at)
+    exists, meaning the backend must be built.
+    """
+    cache_dir = app._FFBRIDGE_ELO_CACHE_DIR
+    prefix = f"elo_full_v3_{api_key}_"
+    suffix = f"_iv_{int(fetch_iv)}"
+    newest: Optional[datetime] = None
+    for meta_path in cache_dir.glob(f"{prefix}*{suffix}.meta.json"):
+        results_path = meta_path.with_name(meta_path.name.replace(".meta.json", ".results.parquet"))
+        players_path = meta_path.with_name(meta_path.name.replace(".meta.json", ".players.parquet"))
+        if not (results_path.exists() and players_path.exists()):
+            continue
+        try:
+            built_at = json.loads(meta_path.read_text(encoding="utf-8")).get("built_at")
+            if not built_at:
+                continue
+            dt = datetime.fromisoformat(built_at)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if newest is None or dt > newest:
+                newest = dt
+        except Exception:
+            continue
+    if newest is None:
+        return None
+    return (datetime.now(timezone.utc) - newest).total_seconds() / 3600.0
+
+
+def build_one(api_name: str, fetch_iv: bool, if_stale: bool = False, max_age_hours: float = 20.0) -> int:
+    """Build and persist the dataset for a single API backend.
+
+    Returns the result row count, or -1 if skipped because the cache is fresh.
+    """
     api_module = app.API_BACKENDS[api_name]
     api_key = api_name.replace(" ", "_")
-    print(f"[builder] {api_name}: fetching tournament list…", flush=True)
-    all_tournaments = api_module.fetch_tournament_list(series_id="all", limit=None)
+
+    if if_stale:
+        age = _newest_persisted_age_hours(api_key, fetch_iv)
+        if age is not None and age < max_age_hours:
+            print(f"[builder] {api_name}: cache fresh ({age:.1f}h < {max_age_hours}h); skipping", flush=True)
+            return -1
+        reason = "missing" if age is None else f"stale ({age:.1f}h)"
+        print(f"[builder] {api_name}: cache {reason}; rebuilding", flush=True)
+
+    # Force-refresh the tournament list so newly published events are discovered
+    # (the on-disk list cache never expires by design).
+    print(f"[builder] {api_name}: refreshing tournament list…", flush=True)
+    all_tournaments = api_module.fetch_tournament_list(series_id="all", limit=None, force_refresh=True)
     if not all_tournaments:
         print(f"[builder] {api_name}: no tournaments returned; skipping", flush=True)
         return 0
@@ -55,24 +116,40 @@ def main() -> int:
         "--fetch-iv", action="store_true",
         help="Fetch current IV values (slower). Must match the app's fetch_iv setting.",
     )
+    parser.add_argument(
+        "--if-stale", action="store_true",
+        help="Rebuild a backend only if its persisted parquet is missing or older "
+             "than --max-age-hours (default). Otherwise skip (fast no-op).",
+    )
+    parser.add_argument(
+        "--max-age-hours", type=float, default=20.0,
+        help="Staleness threshold in hours for --if-stale (default: 20).",
+    )
     args = parser.parse_args()
 
     started = datetime.now()
     print(f"[builder] start {started.isoformat(timespec='seconds')} "
-          f"(cache dir: {app._FFBRIDGE_ELO_CACHE_DIR})", flush=True)
+          f"(cache dir: {app._FFBRIDGE_ELO_CACHE_DIR}, if_stale={args.if_stale})", flush=True)
 
     api_names = [args.api] if args.api else list(app.API_BACKENDS.keys())
     total_rows = 0
+    built = 0
     for api_name in api_names:
         try:
-            total_rows += build_one(api_name, args.fetch_iv)
+            rows = build_one(api_name, args.fetch_iv, if_stale=args.if_stale, max_age_hours=args.max_age_hours)
+            if rows >= 0:
+                built += 1
+                total_rows += rows
         except Exception as exc:
+            # Don't fail the container start over a build error; the app has its
+            # own in-process rebuild fallback and can serve the last parquet.
             print(f"[builder] ERROR building {api_name}: {exc}", flush=True)
-            return 1
+            if not args.if_stale:
+                return 1
 
     elapsed = (datetime.now() - started).total_seconds()
     print(f"[builder] done {datetime.now().isoformat(timespec='seconds')} "
-          f"({total_rows} total result rows, {elapsed:.1f}s)", flush=True)
+          f"({built} backend(s) built, {total_rows} total result rows, {elapsed:.1f}s)", flush=True)
     return 0
 
 

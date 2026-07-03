@@ -183,13 +183,16 @@ Please ensure you have a valid Bearer token in your `.env` file:
 # -------------------------------
 # API Functions
 # -------------------------------
-def fetch_tournament_list(series_id: Any = "all", limit: Optional[int] = None) -> List[Dict[str, Any]]:
+def fetch_tournament_list(series_id: Any = "all", limit: Optional[int] = None, force_refresh: bool = False) -> List[Dict[str, Any]]:
     """
     Fetch list of tournaments from FFBridge.
     
     Args:
         series_id: Tournament series ID or "all" for all series
         limit: Maximum number of tournaments to fetch per series
+        force_refresh: If True, bypass the (no-expiry) disk cache and re-fetch
+            from the API so newly published events are discovered. The fresh
+            list is written back to the cache.
     
     Returns:
         List of tournament dictionaries with normalized structure
@@ -201,17 +204,18 @@ def fetch_tournament_list(series_id: Any = "all", limit: Optional[int] = None) -
     if series_id == "all":
         all_tournaments = []
         for s_id in VALID_SERIES_IDS:
-            all_tournaments.extend(_fetch_tournament_list_single(session, s_id, limit))
+            all_tournaments.extend(_fetch_tournament_list_single(session, s_id, limit, force_refresh))
         return all_tournaments
     
-    return _fetch_tournament_list_single(session, series_id, limit)
+    return _fetch_tournament_list_single(session, series_id, limit, force_refresh)
 
 
-def _fetch_tournament_list_single(session: requests.Session, series_id: int, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+def _fetch_tournament_list_single(session: requests.Session, series_id: int, limit: Optional[int] = None, force_refresh: bool = False) -> List[Dict[str, Any]]:
     """Fetch tournament list for a single series."""
-    cached_data = load_from_disk_cache(CACHE_DIR, "tournament_list", {"limit": limit}, max_age_hours=None, series_id=series_id)
-    if cached_data:
-        return cached_data
+    if not force_refresh:
+        cached_data = load_from_disk_cache(CACHE_DIR, "tournament_list", {"limit": limit}, max_age_hours=None, series_id=series_id)
+        if cached_data:
+            return cached_data
     
     url = f"{API_BASE}/api/v1/simultaneous/{series_id}/tournaments"
     

@@ -1,0 +1,42 @@
+name: FFBridge daily Elo rebuild
+
+# Triggers a daily Railway redeploy of the FFBridge service. On redeploy the
+# service start command runs `build_ffbridge_elo_parquets.py --if-stale`, which
+# (because the cache is now >20h old) force-refreshes the tournament list,
+# fetches newly published events, rebuilds the Elo parquet on the mounted
+# volume, and then starts Streamlit serving the fresh data.
+#
+# Why a redeploy (not a separate cron service): Railway volumes attach to a
+# single service and are not mounted during pre-deploy, so the only place that
+# can rebuild data on the volume is the FFBridge service's own runtime
+# container. A redeploy restarts that container and re-runs the start command.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   RAILWAY_TOKEN             - a Railway *project* token scoped to the FFBridge
+#                               project + environment (Project -> Settings ->
+#                               Tokens). Project tokens don't need `railway login`.
+#   RAILWAY_FFBRIDGE_SERVICE  - the FFBridge service name (or id) as shown in Railway.
+
+on:
+  schedule:
+    # 03:00 UTC = 04:00 CET (winter). During CEST (summer) this is 05:00 local;
+    # GitHub cron has no DST support. Adjust to "0 2 * * *" if you prefer 04:00
+    # local during summer.
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}   # allow manual "Run workflow" from the Actions tab
+
+concurrency:
+  group: ffbridge-daily-rebuild
+  cancel-in-progress: false
+
+jobs:
+  redeploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Railway CLI
+        run: npm i -g @railway/cli
+
+      - name: Redeploy FFBridge service
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway redeploy --service "${{ secrets.RAILWAY_FFBRIDGE_SERVICE }}" --yes
