@@ -23,6 +23,34 @@ backend only when its persisted parquet is missing or older than
 crosses the threshold and does a full refresh. When it does rebuild, the tournament
 list is force-refreshed from the API so newly published events are discovered.
 
+What a rebuild does (and does NOT) refresh
+------------------------------------------
+- Tournament LIST: fully re-fetched from the API (``force_refresh=True``) to
+  discover new event IDs.
+- Event RESULTS (raw data): INCREMENTAL. ``fetch_tournament_results`` reads the
+  on-disk cache first (``max_age_hours=None`` — never expires), so only new/
+  uncached events hit the API; previously fetched events are served from the
+  volume cache and are never re-downloaded.
+- Elo ratings: FULL recompute from scratch over the entire history every time
+  (``initial_players=None``). Elo is order-dependent, so a newly inserted event
+  can shift the whole downstream chain — ratings are replayed, not appended.
+- Parquet output: fully regenerated (new tournament-count key) and the old set
+  is pruned.
+
+NUANCE — revised/corrected past events are NOT picked up. Because event results
+are cached with no expiry, if FFBridge later re-scores or amends an event we
+already fetched, a normal rebuild will not notice it (only genuinely new event
+IDs are pulled). To force a full re-fetch of results, delete the raw results
+cache on the volume so they are re-downloaded on the next rebuild, e.g.:
+
+    # remove cached per-event results (keeps the elo_cache parquet):
+    #   Classic:  $FFBRIDGE_CACHE_DIR/cache/**/results_v3_*.json
+    #   Lancelot: $FFBRIDGE_CACHE_DIR/lancelot_cache/**/results_*.json
+    # then trigger a rebuild (redeploy, or run this builder without --if-stale).
+
+There is no per-results expiry/force flag today; add one to
+``fetch_tournament_results`` if periodic re-fetching of amended events is needed.
+
 Usage:
     python build_ffbridge_elo_parquets.py                 # force build all backends
     python build_ffbridge_elo_parquets.py --if-stale      # build only stale/missing
