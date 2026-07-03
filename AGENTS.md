@@ -28,8 +28,10 @@ Start commands mirror the `railway-*.toml` files (substitute a local port for
 
 - **ACBL API needs parquet data.** With no `R2_BUCKET` set, the API reads local
   files `./data/acbl_club_elo_ratings.parquet` and
-  `./data/acbl_tournament_elo_ratings.parquet` (the `data/` dir is gitignored
-  and absent by default). Without them, `/health` still returns ok but
+  `./data/acbl_tournament_elo_ratings.parquet` (the `data/` dir is absent from
+  the repo by default and is **not** currently in `.gitignore`, so avoid
+  committing it — it holds large generated parquet + API-cache artifacts).
+  Without them, `/health` still returns ok but
   `/acbl/report` and `/acbl/detail` raise `FileNotFoundError`. To exercise the
   ACBL data path locally without R2 credentials, place parquet files at those
   paths. Expected columns (per `_required_columns_for_mode` /
@@ -49,7 +51,8 @@ Start commands mirror the `railway-*.toml` files (substitute a local port for
   control to limit this; tournament/club filters are applied *after* the full
   fetch). Results are cached under `FFBRIDGE_CACHE_DIR` (default
   `data/ffbridge/…`), so subsequent loads are fast; the first load can take
-  many minutes. The cache is not committed (gitignored).
+  many minutes. This cache lives under `data/` (see note above) and should not
+  be committed — it can grow to ~1 GB.
 - Streamlit apps only execute their script (and thus fetch/compute) once a
   browser/websocket connects — a plain `curl /` returns 200 without triggering
   data processing.
