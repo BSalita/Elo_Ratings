@@ -33,6 +33,26 @@ jobs:
   redeploy:
     runs-on: ubuntu-latest
     steps:
+      - name: Verify required secrets are set
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_FFBRIDGE_SERVICE: ${{ secrets.RAILWAY_FFBRIDGE_SERVICE }}
+        run: |
+          missing=0
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "::error::Secret RAILWAY_TOKEN is empty. Set a Railway project token (Project -> Settings -> Tokens)."
+            missing=1
+          fi
+          if [ -z "$RAILWAY_FFBRIDGE_SERVICE" ]; then
+            echo "::error::Secret RAILWAY_FFBRIDGE_SERVICE is empty. Set it to the FFBridge service name shown in Railway."
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo "Aborting: fill the empty secret(s) above under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "Required secrets present."
+
       - name: Install Railway CLI
         run: npm i -g @railway/cli
 

@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import pathlib
 import sys
 from datetime import datetime, timezone
 from typing import Optional
@@ -40,6 +42,84 @@ from typing import Optional
 # Importing the app module is side-effect free (main() is guarded and
 # set_page_config lives inside main()), so we can reuse its pipeline directly.
 import streamlit_app_ffbridge_elo_ratings as app
+
+
+def _preflight() -> int:
+    """Validate deploy-critical configuration; return 0 if OK, else nonzero.
+
+    Only enforced on Railway (detected via RAILWAY_* env vars) so local/offline
+    runs are unaffected. Because the service ``startCommand`` chains this with
+    ``&&``, a nonzero return blocks Streamlit from starting — turning a silent
+    misconfiguration (e.g. unset FFBRIDGE_CACHE_DIR → app writes to ephemeral
+    disk and loses the volume) into a loud, immediate deploy failure.
+    """
+    on_railway = any(
+        os.environ.get(k)
+        for k in ("RAILWAY_ENVIRONMENT", "RAILWAY_SERVICE_ID", "RAILWAY_PROJECT_ID")
+    )
+    if not on_railway:
+        return 0
+
+    problems = []
+    # Railway injects RAILWAY_VOLUME_MOUNT_PATH only when a volume is attached to
+    # this service. We can't rely on "does the dir exist" because the API modules
+    # auto-create the cache dir at import (on ephemeral disk if no volume).
+    volume_mount = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    cache_dir = os.environ.get("FFBRIDGE_CACHE_DIR", "").strip()
+
+    if not cache_dir:
+        problems.append(
+            "FFBRIDGE_CACHE_DIR is not set — set it to the volume mount path "
+            "(e.g. /data/ffbridge)."
+        )
+
+    if not volume_mount:
+        # Can't positively confirm a volume; warn rather than hard-fail to avoid
+        # false positives if Railway ever omits the var on a valid deploy.
+        print(
+            "[preflight] WARN: RAILWAY_VOLUME_MOUNT_PATH is not set — no volume "
+            "appears attached to this service. The cache/parquet will live on "
+            "ephemeral disk and be lost on redeploy. Attach a volume (e.g. /data).",
+            flush=True,
+        )
+    elif cache_dir:
+        cache_p = pathlib.Path(cache_dir)
+        mount_p = pathlib.Path(volume_mount)
+        is_within = cache_p == mount_p or mount_p in cache_p.parents
+        if not is_within:
+            problems.append(
+                f"FFBRIDGE_CACHE_DIR={cache_dir} is not inside the mounted volume "
+                f"({volume_mount}) — data would be lost on redeploy. Set it under {volume_mount}."
+            )
+
+    if cache_dir:
+        p = pathlib.Path(cache_dir)
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            problems.append(f"FFBRIDGE_CACHE_DIR={cache_dir} could not be created: {exc}")
+        else:
+            if not os.access(p, os.W_OK):
+                problems.append(f"FFBRIDGE_CACHE_DIR={cache_dir} is not writable.")
+
+    # Classic backend needs a bearer token for live fetches; Lancelot is public.
+    if not os.environ.get("FFBRIDGE_BEARER_TOKEN", "").strip():
+        print(
+            "[preflight] WARN: FFBRIDGE_BEARER_TOKEN not set — the Classic backend "
+            "cannot fetch new events (Lancelot is public and unaffected).",
+            flush=True,
+        )
+
+    if problems:
+        for pr in problems:
+            print(f"[preflight] FATAL: {pr}", flush=True)
+        return 2
+    print(
+        f"[preflight] OK: Railway config validated "
+        f"(volume={volume_mount or 'NONE'}, FFBRIDGE_CACHE_DIR={cache_dir}).",
+        flush=True,
+    )
+    return 0
 
 
 def _newest_persisted_age_hours(api_key: str, fetch_iv: bool) -> Optional[float]:
@@ -126,6 +206,10 @@ def main() -> int:
         help="Staleness threshold in hours for --if-stale (default: 20).",
     )
     args = parser.parse_args()
+
+    rc = _preflight()
+    if rc != 0:
+        return rc
 
     started = datetime.now()
     print(f"[builder] start {started.isoformat(timespec='seconds')} "

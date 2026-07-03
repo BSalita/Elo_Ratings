@@ -12,10 +12,14 @@ builder = "NIXPACKS"
 # long-running app process (the OOM/restart-loop cause). ``--if-stale`` makes it
 # a ~1s no-op on ordinary restarts/redeploys (parquet already fresh) and a full
 # refresh only when the cache is older than the threshold — i.e. on the daily
-# scheduled redeploy (see .github/workflows/ffbridge-daily-rebuild.yml). The
-# ``|| true`` ensures a build hiccup never blocks startup; the app has its own
-# in-process rebuild fallback.
-startCommand = "python build_ffbridge_elo_parquets.py --if-stale || true; streamlit run streamlit_app_ffbridge_elo_ratings.py --server.port $PORT --server.address 0.0.0.0"
+# scheduled redeploy (see .github/workflows/ffbridge-daily-rebuild.yml).
+#
+# ``&&`` (not ``;``): the builder returns 0 even on a network/build hiccup (the
+# app then falls back to its in-process rebuild), but returns nonzero if the
+# startup preflight fails — i.e. a real deploy misconfiguration such as an unset
+# or unmounted FFBRIDGE_CACHE_DIR. In that case Streamlit is intentionally NOT
+# started so the bad deploy fails loudly instead of silently using ephemeral disk.
+startCommand = "python build_ffbridge_elo_parquets.py --if-stale && streamlit run streamlit_app_ffbridge_elo_ratings.py --server.port $PORT --server.address 0.0.0.0"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 healthcheckPath = "/"
