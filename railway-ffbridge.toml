@@ -2,6 +2,13 @@
 builder = "NIXPACKS"
 
 [deploy]
+# Precompute the FFBridge Elo dataset parquets before the app starts. This runs
+# in the app container (same filesystem, env vars, and mounted volume as the
+# start command), so it reads the raw tournament JSON from the /data/ffbridge
+# volume cache and writes the ready-to-load parquet that the Streamlit boot
+# loader (load_ffbridge_elo_dataset) reads — avoiding the in-process history
+# rebuild that caused the OOM/restart loop. Fresh each deploy = always current.
+preDeployCommand = "python build_ffbridge_elo_parquets.py"
 startCommand = "streamlit run streamlit_app_ffbridge_elo_ratings.py --server.port $PORT --server.address 0.0.0.0"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10

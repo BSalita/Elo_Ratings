@@ -14,6 +14,7 @@ Supports both:
 - Lancelot API (api-lancelot.ffbridge.fr) - public access
 """
 
+import json
 import math
 import os
 
@@ -102,6 +103,29 @@ API_BACKENDS = {
     "FFBridge Classic API": classic_api,
     "FFBridge Lancelot API": lancelot_api,
 }
+
+# Directory for the persisted (precomputed) Elo dataset parquets. Building the
+# full multi-tournament Elo history is expensive and memory-heavy; we compute it
+# once, persist it here, and reload on subsequent (cold) starts so a restarted
+# container does not rebuild everything in RAM (the OOM/restart-loop cause).
+#
+# On Railway the parquet MUST live on the mounted volume (FFBRIDGE_CACHE_DIR,
+# e.g. /data/ffbridge), NOT the app dir: the preDeployCommand builder runs in a
+# separate one-off container whose only shared surface with the runtime
+# container is that volume. Writing to the app dir would be discarded before the
+# app starts. Locally (FFBRIDGE_CACHE_DIR unset) we fall back to the app dir.
+_FFBRIDGE_SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+_FFBRIDGE_CACHE_DIR_ENV = os.environ.get("FFBRIDGE_CACHE_DIR", "").strip()
+if _FFBRIDGE_CACHE_DIR_ENV:
+    _FFBRIDGE_ELO_CACHE_DIR = pathlib.Path(_FFBRIDGE_CACHE_DIR_ENV).resolve() / "elo_cache"
+else:
+    _FFBRIDGE_ELO_CACHE_DIR = _FFBRIDGE_SCRIPT_DIR / "data" / "ffbridge" / "elo_cache"
+
+# Console-logging throttle. Railway drops logs above 500 lines/sec, so the old
+# 4-lines-per-tournament firehose (~2,300 lines) tripped the limit and hid real
+# errors. Log a heartbeat every N tournaments plus a final summary instead.
+_PROCESSING_LOG_EVERY = max(1, int(os.environ.get("FFBRIDGE_LOG_EVERY", "50")))
+_FFBRIDGE_DEBUG = os.environ.get("FFBRIDGE_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 # -------------------------------
@@ -825,6 +849,7 @@ def process_tournaments_to_elo(
     use_handicap: bool = False,
     fetch_iv: bool = False,
     sort_ascending: bool = True,
+    show_progress: bool = True,
 ) -> Tuple[pl.DataFrame, pl.DataFrame, Dict[str, float], Dict[str, int]]:
     """
     Process tournament list and calculate Elo ratings.
@@ -866,41 +891,47 @@ def process_tournaments_to_elo(
     today = datetime.now().strftime('%Y-%m-%d')
     sorted_tournaments = [t for t in sorted_tournaments if t.get('date', '')[:10] <= today]
     
-    # Progress tracking
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    # Progress tracking. UI widgets only when show_progress (avoids Streamlit
+    # widget calls inside cached/offline contexts).
+    progress_bar = st.progress(0) if show_progress else None
+    status_text = st.empty() if show_progress else None
     cache_stats = {"cached": 0, "fetched": 0, "missing_ids": []}
-    
+
     total_t = len(sorted_tournaments)
+    _t_start = datetime.now()
+    print(f"[Processing] start: {total_t} tournaments (fetch_iv={fetch_iv})", flush=True)
     for i, tournament in enumerate(sorted_tournaments):
         t_id = str(tournament.get('id', ''))
         t_series = normalize_series_id(tournament.get('series_id'))
         t_name = tournament.get('name') or tournament.get('label') or tournament.get('moment_label') or f"Tournament {t_id}"
         t_date = tournament.get('date', '')
-        
-        missing_count = len(cache_stats['missing_ids'])
-        cache_info = f"[Cached: {cache_stats['cached']}, Fetched: {cache_stats['fetched']}, Missing results: {missing_count}]"
-        status_text.markdown(f"<span style='color: white;'>Processing {i+1}/{total_t}: {t_name[:35]} (ID:{t_id})... {cache_info}</span>", unsafe_allow_html=True)
-        progress_bar.progress((i + 1) / total_t)
-        
-        # Log to console for debugging hung requests
-        print(f"[Processing] {i+1}/{total_t}: ID={t_id}, date={t_date[:10] if t_date else 'N/A'}, name={t_name[:40]}", flush=True)
-        
+
+        if show_progress:
+            missing_count = len(cache_stats['missing_ids'])
+            cache_info = f"[Cached: {cache_stats['cached']}, Fetched: {cache_stats['fetched']}, Missing results: {missing_count}]"
+            status_text.markdown(f"<span style='color: white;'>Processing {i+1}/{total_t}: {t_name[:35]} (ID:{t_id})... {cache_info}</span>", unsafe_allow_html=True)
+            progress_bar.progress((i + 1) / total_t)
+
+        # Throttled console heartbeat (Railway caps at 500 logs/sec).
+        if _FFBRIDGE_DEBUG or i == 0 or (i + 1) % _PROCESSING_LOG_EVERY == 0 or (i + 1) == total_t:
+            print(f"[Processing] {i+1}/{total_t}: cached={cache_stats['cached']} "
+                  f"fetched={cache_stats['fetched']} missing={len(cache_stats['missing_ids'])}", flush=True)
+
         # Fetch results using the appropriate API module
         results, was_cached = api_module.fetch_tournament_results(t_id, tournament_date=t_date, series_id=t_series, fetch_iv=fetch_iv)
-        print(f"[Processing] {i+1}/{total_t}: ID={t_id} - fetch returned, cached={was_cached}, count={len(results) if results else 0}", flush=True)
-        
+
         if was_cached:
             cache_stats["cached"] += 1
         else:
             cache_stats["fetched"] += 1
-        
+            # Live network fetches are rare and worth surfacing individually.
+            print(f"[Processing] {i+1}/{total_t}: ID={t_id} fetched from API (count={len(results) if results else 0})", flush=True)
+
         if not results:
             cache_stats["missing_ids"].append(t_id)
-            print(f"[Processing] {i+1}/{total_t}: ID={t_id} - no results, skipping (missing: {len(cache_stats['missing_ids'])})", flush=True)
+            if _FFBRIDGE_DEBUG:
+                print(f"[Processing] {i+1}/{total_t}: ID={t_id} - no results, skipping", flush=True)
             continue
-        
-        print(f"[Processing] {i+1}/{total_t}: ID={t_id} - processing {len(results)} results...", flush=True)
         
         # Calculate field average rating for both scratch and handicap
         scratch_field_ratings = []
@@ -1121,11 +1152,16 @@ def process_tournaments_to_elo(
                 result_record['pair_elo'] = result_record['handicap_pair_elo'] if use_handicap else result_record['scratch_pair_elo']
             
             all_results.append(result_record)
-        
-        print(f"[Processing] {i+1}/{total_t}: ID={t_id} - done", flush=True)
-    
-    progress_bar.empty()
-    status_text.empty()
+
+    _elapsed = (datetime.now() - _t_start).total_seconds()
+    print(f"[Processing] done: {total_t} tournaments in {_elapsed:.1f}s "
+          f"(cached={cache_stats['cached']} fetched={cache_stats['fetched']} "
+          f"missing={len(cache_stats['missing_ids'])}, rows={len(all_results)})", flush=True)
+
+    if progress_bar is not None:
+        progress_bar.empty()
+    if status_text is not None:
+        status_text.empty()
     
     # Convert to DataFrames with explicit schema to handle None values
     if all_results:
@@ -1235,6 +1271,177 @@ def process_tournaments_to_elo(
     # Return selected type ratings dict for backward compatibility
     current_ratings = handicap_ratings if use_handicap else scratch_ratings
     return results_df, players_df, current_ratings, cache_stats
+
+
+def _apply_club_name_mapping(
+    results_df: pl.DataFrame, api_module, all_tournaments: List[Dict[str, Any]]
+) -> pl.DataFrame:
+    """Backfill club names for APIs (e.g. Lancelot) that only return club codes."""
+    if results_df.is_empty() or 'club_code' not in results_df.columns:
+        return results_df
+    non_empty_names = results_df.filter(pl.col('club_name') != '').height
+    if non_empty_names >= results_df.height * 0.1:  # already mostly populated
+        return results_df
+    unique_codes = [str(c) for c in results_df.select('club_code').unique().to_series().to_list() if c]
+    if not hasattr(api_module, 'build_club_name_mapping'):
+        return results_df
+    club_mapping = api_module.build_club_name_mapping(unique_codes, all_tournaments, results_df)
+    if not club_mapping:
+        return results_df
+    return results_df.with_columns(
+        pl.col('club_code').map_elements(
+            lambda c: club_mapping.get(str(c).lstrip('0') if c else '', str(c)),
+            return_dtype=pl.Utf8,
+        ).alias('club_name')
+    )
+
+
+def _elo_cache_key(api_key: str, fetch_iv: bool, n_tournaments: int) -> str:
+    return f"elo_full_v3_{api_key}_{n_tournaments}_iv_{int(fetch_iv)}"
+
+
+def _elo_cache_paths(key: str) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    return (
+        _FFBRIDGE_ELO_CACHE_DIR / f"{key}.results.parquet",
+        _FFBRIDGE_ELO_CACHE_DIR / f"{key}.players.parquet",
+        _FFBRIDGE_ELO_CACHE_DIR / f"{key}.meta.json",
+    )
+
+
+def _prune_old_elo_cache(api_key: str, fetch_iv: bool, keep_key: str) -> None:
+    """Delete persisted parquet sets for this backend except ``keep_key``.
+
+    Files are keyed by (api_key, tournament_count, fetch_iv). As the live
+    tournament count grows, stale-count parquet sets would otherwise pile up on
+    the volume. Keep only the just-written set per backend/fetch_iv. Best-effort:
+    pruning failures never block the deploy.
+    """
+    prefix = f"elo_full_v3_{api_key}_"
+    suffix = f"_iv_{int(fetch_iv)}"
+    try:
+        for results_path in _FFBRIDGE_ELO_CACHE_DIR.glob(f"{prefix}*{suffix}.results.parquet"):
+            key = results_path.name[: -len(".results.parquet")]
+            if key == keep_key:
+                continue
+            # Only prune sets whose variable middle segment is the tournament
+            # count (all digits); guards against deleting unrelated files.
+            middle = key[len(prefix): -len(suffix)]
+            if not middle.isdigit():
+                continue
+            for path in _elo_cache_paths(key):
+                path.unlink(missing_ok=True)
+            print(f"[ffbridge] pruned stale Elo cache '{key}'", flush=True)
+    except Exception as exc:
+        print(f"[ffbridge] elo cache prune skipped ({exc})", flush=True)
+
+
+def _read_persisted_elo_dataset(key: str) -> Optional[Dict[str, Any]]:
+    """Return the persisted dataset for ``key`` if present and readable, else None."""
+    results_path, players_path, meta_path = _elo_cache_paths(key)
+    if not (results_path.exists() and players_path.exists() and meta_path.exists()):
+        return None
+    try:
+        results_df = pl.read_parquet(results_path)
+        players_df = pl.read_parquet(players_path)
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        print(f"[ffbridge] loaded persisted Elo dataset '{key}' "
+              f"({results_df.height} result rows) from parquet", flush=True)
+        return {
+            "results_df": results_df,
+            "players_df": players_df,
+            "scratch_ratings": meta.get("scratch_ratings", {}),
+            "handicap_ratings": meta.get("handicap_ratings", {}),
+            "processing_stats": meta.get(
+                "processing_stats", {"cached": 0, "fetched": 0, "missing_ids": []}
+            ),
+        }
+    except Exception as exc:  # corrupt/partial cache -> caller rebuilds
+        print(f"[ffbridge] persisted Elo dataset load failed ({exc}); rebuilding", flush=True)
+        return None
+
+
+def compute_and_persist_elo_dataset(
+    api_module,
+    all_tournaments: List[Dict[str, Any]],
+    api_key: str,
+    fetch_iv: bool,
+    show_progress: bool = False,
+) -> Dict[str, Any]:
+    """Compute the full FFBridge Elo dataset and persist it to parquet.
+
+    Not cached — used both by the Streamlit boot loader (on a cold cache) and by
+    the offline builder script. Both scratch and handicap Elo columns are stored
+    so the ``use_handicap`` toggle is derived downstream.
+    """
+    key = _elo_cache_key(api_key, fetch_iv, len(all_tournaments))
+    results_path, players_path, meta_path = _elo_cache_paths(key)
+
+    results_df, players_df, _ratings, stats = process_tournaments_to_elo(
+        all_tournaments, api_module, initial_players=None,
+        use_handicap=False, fetch_iv=fetch_iv, sort_ascending=True, show_progress=show_progress,
+    )
+    results_df = _apply_club_name_mapping(results_df, api_module, all_tournaments)
+
+    scratch_ratings_dict: Dict[str, float] = {}
+    handicap_ratings_dict: Dict[str, float] = {}
+    if not players_df.is_empty():
+        for row in players_df.iter_rows(named=True):
+            scratch_ratings_dict[row['player_id']] = row['scratch_elo']
+            handicap_ratings_dict[row['player_id']] = row['handicap_elo']
+
+    # Persist for the next cold start (best-effort; ephemeral FS is fine).
+    try:
+        _FFBRIDGE_ELO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        results_df.write_parquet(results_path)
+        players_df.write_parquet(players_path)
+        meta_path.write_text(json.dumps({
+            "scratch_ratings": scratch_ratings_dict,
+            "handicap_ratings": handicap_ratings_dict,
+            "processing_stats": stats,
+            "built_at": datetime.now(timezone.utc).isoformat(),
+        }), encoding="utf-8")
+        print(f"[ffbridge] persisted Elo dataset '{key}' to parquet", flush=True)
+        _prune_old_elo_cache(api_key, fetch_iv, key)
+    except Exception as exc:
+        print(f"[ffbridge] parquet persist failed ({exc}); continuing without persistence", flush=True)
+
+    return {
+        "results_df": results_df,
+        "players_df": players_df,
+        "scratch_ratings": scratch_ratings_dict,
+        "handicap_ratings": handicap_ratings_dict,
+        "processing_stats": stats,
+    }
+
+
+@st.cache_resource(show_spinner="Building FFBridge Elo ratings (first load may take ~1 minute)…")
+def load_ffbridge_elo_dataset(
+    _api_module,
+    _all_tournaments: List[Dict[str, Any]],
+    api_key: str,
+    fetch_iv: bool,
+    n_tournaments: int,
+) -> Dict[str, Any]:
+    """Load the full FFBridge Elo dataset once per process, shared across sessions.
+
+    ``@st.cache_resource`` keeps a single copy in the process (not per browser
+    session, unlike ``st.session_state``) — this removes the per-session /
+    concurrent-session memory multiplication that was OOM-killing the container.
+
+    On a cold cache it prefers a parquet persisted by an earlier run or the
+    offline builder (``build_ffbridge_elo_parquets.py``); only if none exists
+    does it rebuild the history in RAM and persist it.
+
+    Underscore-prefixed args (``_api_module``, ``_all_tournaments``) are excluded
+    from Streamlit's cache key; identity is ``(api_key, fetch_iv, n_tournaments)``.
+    """
+    key = _elo_cache_key(api_key, fetch_iv, n_tournaments)
+    persisted = _read_persisted_elo_dataset(key)
+    if persisted is not None:
+        return persisted
+    return compute_and_persist_elo_dataset(
+        _api_module, _all_tournaments, api_key, fetch_iv, show_progress=False
+    )
 
 
 def show_top_players(
@@ -1917,74 +2124,17 @@ def main():
             st.error("Failed to retrieve tournament data. Please check your connection or authentication.")
             return
     
-    # Cache key for full dataset - only depends on API and fetch_iv
-    # Both scratch and handicap Elo are computed in one pass and stored in the DataFrame
-    # Tournaments are always sorted ascending (oldest first) for Elo calculations
-    cache_key = f"elo_full_v3_{api_key}_{len(all_tournaments)}_iv_{int(fetch_iv)}"
-    
-    if 'elo_full_cache' not in st.session_state:
-        st.session_state.elo_full_cache = {}
-    
-    full_cache = st.session_state.elo_full_cache
-    
-    if cache_key in full_cache:
-        # Use cached data - both scratch and handicap Elo are already computed
-        cached = full_cache[cache_key]
-        full_results_df = cached['results_df']
-        full_players_df = cached['players_df']
-        current_ratings = cached['scratch_ratings'] if not use_handicap else cached['handicap_ratings']
-        processing_stats = cached.get('processing_stats', {"cached": 0, "fetched": 0, "missing_ids": []})
-    else:
-        # Clear old cache entries for different API
-        keys_to_remove = [k for k in full_cache.keys() if not k.startswith(f"elo_full_v3_{api_key}_")]
-        for k in keys_to_remove:
-            del full_cache[k]
-        
-        # Process all tournaments - computes BOTH scratch and handicap Elo in one pass
-        # Always sort ascending (oldest first) for proper Elo calculation chronology
-        full_results_df, full_players_df, current_ratings, processing_stats = process_tournaments_to_elo(
-            all_tournaments, api_module, initial_players=None, use_handicap=use_handicap, fetch_iv=fetch_iv, sort_ascending=True
-        )
-        
-        # Apply club name mapping for APIs that don't provide club names directly (e.g., Lancelot)
-        if not full_results_df.is_empty() and 'club_code' in full_results_df.columns:
-            # Check if club_name column is mostly empty
-            non_empty_names = full_results_df.filter(pl.col('club_name') != '').height
-            if non_empty_names < full_results_df.height * 0.1:  # Less than 10% have names
-                # Get unique club codes
-                unique_codes = full_results_df.select('club_code').unique().to_series().to_list()
-                unique_codes = [str(c) for c in unique_codes if c]
-                
-                # Build mapping using API's club name mapping function
-                if hasattr(api_module, 'build_club_name_mapping'):
-                    club_mapping = api_module.build_club_name_mapping(unique_codes, all_tournaments, full_results_df)
-                    
-                    # Apply mapping to DataFrame
-                    if club_mapping:
-                        full_results_df = full_results_df.with_columns(
-                            pl.col('club_code').map_elements(
-                                lambda c: club_mapping.get(str(c).lstrip('0') if c else '', str(c)),
-                                return_dtype=pl.Utf8
-                            ).alias('club_name')
-                        )
-        
-        # Extract both scratch and handicap ratings from players_df for caching
-        scratch_ratings_dict = {}
-        handicap_ratings_dict = {}
-        if not full_players_df.is_empty():
-            for row in full_players_df.iter_rows(named=True):
-                pid = row['player_id']
-                scratch_ratings_dict[pid] = row['scratch_elo']
-                handicap_ratings_dict[pid] = row['handicap_elo']
-        
-        full_cache[cache_key] = {
-            'results_df': full_results_df,
-            'players_df': full_players_df,
-            'scratch_ratings': scratch_ratings_dict,
-            'handicap_ratings': handicap_ratings_dict,
-            'processing_stats': processing_stats,
-        }
-    
+    # Load the full dataset once per process (shared across all sessions and
+    # persisted to parquet). Both scratch and handicap Elo columns are stored;
+    # the use_handicap-specific view is derived downstream.
+    dataset = load_ffbridge_elo_dataset(
+        api_module, all_tournaments, api_key, fetch_iv, len(all_tournaments)
+    )
+    full_results_df = dataset['results_df']
+    full_players_df = dataset['players_df']
+    current_ratings = dataset['scratch_ratings'] if not use_handicap else dataset['handicap_ratings']
+    processing_stats = dataset['processing_stats']
+
     # Display processing stats using the placeholder (avoids duplicates)
     missing_ids = processing_stats.get('missing_ids', [])
     missing_str = str(missing_ids) if missing_ids else "none"
