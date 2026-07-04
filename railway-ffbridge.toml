@@ -26,7 +26,13 @@ builder = "NIXPACKS"
 # app never finds the prebuilt parquet and rebuilds in-process. Keep in sync with
 # streamlit_app_ffbridge_elo_ratings.py's fetch_iv.
 startCommand = "python build_ffbridge_elo_parquets.py --if-stale --fetch-iv && streamlit run streamlit_app_ffbridge_elo_ratings.py --server.port $PORT --server.address 0.0.0.0"
-restartPolicyType = "ON_FAILURE"
+# ALWAYS (not ON_FAILURE): Railway periodically recycles/migrates volume-backed
+# containers. When it does, it sends SIGTERM and Streamlit shuts down *gracefully*
+# (exit code 0). ON_FAILURE only restarts on a non-zero exit, so a graceful stop
+# left the app permanently down (edge router then returns 404 "Application not
+# found"). ALWAYS restarts after any exit so the app self-heals from platform
+# recycles. maxRetries still bounds a genuine crash/preflight-failure loop.
+restartPolicyType = "ALWAYS"
 restartPolicyMaxRetries = 10
 healthcheckPath = "/"
 # Generous timeout so the daily full rebuild (fetch new events + recompute,

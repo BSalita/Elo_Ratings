@@ -1,5 +1,10 @@
 [deploy]
 startCommand = "streamlit run streamlit_app_acbl_elo_ratings.py --server.port $PORT --server.address 0.0.0.0"
-restartPolicyType = "ON_FAILURE"
+# ALWAYS (not ON_FAILURE): Railway periodically recycles containers, sending
+# SIGTERM. Streamlit shuts down gracefully (exit 0), which ON_FAILURE does not
+# treat as a failure, so the app stays down and the edge router returns 404
+# "Application not found". ALWAYS restarts after any exit so the app self-heals;
+# maxRetries still bounds a genuine crash loop.
+restartPolicyType = "ALWAYS"
 restartPolicyMaxRetries = 10
 healthcheckPath = "/"
