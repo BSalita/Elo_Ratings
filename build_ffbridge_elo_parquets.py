@@ -181,6 +181,31 @@ def _newest_persisted_age_hours(api_key: str, fetch_iv: bool) -> Optional[float]
     return (datetime.now(timezone.utc) - newest).total_seconds() / 3600.0
 
 
+def _prune_other_fetch_iv(api_key: str, fetch_iv: bool) -> None:
+    """Delete orphaned elo_cache sets for this backend with the opposite fetch_iv.
+
+    The app hardcodes fetch_iv=True, so ``..._iv_0`` sets left behind by earlier
+    mis-keyed builds are never read. Remove them to reclaim volume space. Only the
+    opposite-iv variant is ever touched — never the current one — so this is safe
+    to run on every deploy (it is a no-op once the volume is clean).
+    """
+    other = int(not fetch_iv)
+    cache_dir = app._FFBRIDGE_ELO_CACHE_DIR
+    prefix = f"elo_full_v3_{api_key}_"
+    suffix = f"_iv_{other}"
+    try:
+        for results_path in cache_dir.glob(f"{prefix}*{suffix}.results.parquet"):
+            key = results_path.name[: -len(".results.parquet")]
+            middle = key[len(prefix): -len(suffix)]
+            if not middle.isdigit():  # guard: only tournament-count-keyed sets
+                continue
+            for path in app._elo_cache_paths(key):
+                path.unlink(missing_ok=True)
+            print(f"[builder] pruned orphaned Elo cache '{key}' (opposite fetch_iv)", flush=True)
+    except Exception as exc:
+        print(f"[builder] orphan prune skipped for {api_key}: {exc}", flush=True)
+
+
 def build_one(api_name: str, fetch_iv: bool, if_stale: bool = False, max_age_hours: float = 20.0) -> int:
     """Build and persist the dataset for a single API backend.
 
@@ -188,6 +213,10 @@ def build_one(api_name: str, fetch_iv: bool, if_stale: bool = False, max_age_hou
     """
     api_module = app.API_BACKENDS[api_name]
     api_key = api_name.replace(" ", "_")
+
+    # Clean up orphaned opposite-fetch_iv parquet sets (runs even when the build
+    # itself is skipped as fresh, so leftovers get reclaimed on the next deploy).
+    _prune_other_fetch_iv(api_key, fetch_iv)
 
     if if_stale:
         age = _newest_persisted_age_hours(api_key, fetch_iv)
