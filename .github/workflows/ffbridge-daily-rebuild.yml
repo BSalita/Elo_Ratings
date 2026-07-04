@@ -1,8 +1,8 @@
 name: FFBridge daily Elo rebuild
 
 # Triggers a daily Railway redeploy of the FFBridge service. On redeploy the
-# service start command runs `build_ffbridge_elo_parquets.py --if-stale`, which
-# (because the cache is now >20h old) force-refreshes the tournament list,
+# service start command runs `build_ffbridge_elo_parquets.py --if-stale --fetch-iv`,
+# which (because the cache is now >20h old) force-refreshes the tournament list,
 # fetches newly published events, rebuilds the Elo parquet on the mounted
 # volume, and then starts Streamlit serving the fresh data.
 #

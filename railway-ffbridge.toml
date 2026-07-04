@@ -19,7 +19,13 @@ builder = "NIXPACKS"
 # startup preflight fails — i.e. a real deploy misconfiguration such as an unset
 # or unmounted FFBRIDGE_CACHE_DIR. In that case Streamlit is intentionally NOT
 # started so the bad deploy fails loudly instead of silently using ephemeral disk.
-startCommand = "python build_ffbridge_elo_parquets.py --if-stale && streamlit run streamlit_app_ffbridge_elo_ratings.py --server.port $PORT --server.address 0.0.0.0"
+#
+# ``--fetch-iv`` MUST match the app, which hardcodes ``fetch_iv = True``. The
+# parquet cache key includes the fetch_iv flag (..._iv_1 vs ..._iv_0); if the
+# builder omits this it writes ..._iv_0 while the app looks for ..._iv_1, so the
+# app never finds the prebuilt parquet and rebuilds in-process. Keep in sync with
+# streamlit_app_ffbridge_elo_ratings.py's fetch_iv.
+startCommand = "python build_ffbridge_elo_parquets.py --if-stale --fetch-iv && streamlit run streamlit_app_ffbridge_elo_ratings.py --server.port $PORT --server.address 0.0.0.0"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 healthcheckPath = "/"
