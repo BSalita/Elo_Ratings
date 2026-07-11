@@ -825,9 +825,13 @@ def _build_pair_detail(df: pl.DataFrame, pair_ids: str, elo_rating_type: str) ->
         pair_elo_col = elo_columns.get(f"pair_{side.lower()}")
         if not pair_elo_col or pair_elo_col not in df.columns:
             continue
+        # Order-independent match: min_horizontal/max_horizontal on Categorical
+        # columns compare by physical dictionary code, not string value, so they
+        # disagree with the lexical CASE WHEN ordering used to build Pair_IDs in
+        # the leaderboard SQL and return zero rows.
         side_df = df.filter(
-            (pl.min_horizontal(pl.col(id1_col), pl.col(id2_col)) == player_a)
-            & (pl.max_horizontal(pl.col(id1_col), pl.col(id2_col)) == player_b)
+            ((pl.col(id1_col) == player_a) & (pl.col(id2_col) == player_b))
+            | ((pl.col(id1_col) == player_b) & (pl.col(id2_col) == player_a))
         )
         if side_df.is_empty():
             continue
