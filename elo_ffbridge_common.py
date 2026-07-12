@@ -10,9 +10,18 @@ Used by both the Classic and Lancelot API adapters.
 import json
 import logging
 import re
+import sys
 import pathlib
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
+
+# Shared FFBridge API client + converters (the mlBridge folder is a junction to
+# src\mlBridge, shared with ffbridge-postmortem). Imported as a top-level module
+# to avoid the mlBridge package __init__, which needs deps this project doesn't have.
+_MLBRIDGE_DIR = str(pathlib.Path(__file__).resolve().parent / 'mlBridge')
+if _MLBRIDGE_DIR not in sys.path:
+    sys.path.append(_MLBRIDGE_DIR)
+import mlBridgeFFLib  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -199,23 +208,6 @@ def load_from_disk_cache(
 
 
 # -------------------------------
-# Club Code Normalization
+# Club Code Normalization (shared implementation)
 # -------------------------------
-def normalize_club_code(code: Any) -> str:
-    """
-    Normalize club codes by stripping leading zeros and handling edge cases.
-    
-    Args:
-        code: Raw club code (string, int, or None)
-    
-    Returns:
-        Normalized code as string
-    """
-    if code is None:
-        return ""
-    s = str(code).strip()
-    if not s or s.lower() == 'none':
-        return ""
-    # Remove leading zeros but keep at least one digit if it's all zeros
-    norm = s.lstrip('0')
-    return norm if norm else '0'
+normalize_club_code = mlBridgeFFLib.normalize_club_code

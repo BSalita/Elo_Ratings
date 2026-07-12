@@ -1,9 +1,11 @@
 # FFBridge Lancelot API Documentation
 
 **Base URL:** `https://api-lancelot.ffbridge.fr`  
-**Authentication:** Most endpoints are public. User-specific endpoints require separate auth (not the same token as api.ffbridge.fr).  
+**Authentication:** Most endpoints are public. User-specific endpoints require a Firebase bearer token (not the same token as api.ffbridge.fr); see "Authenticated Endpoints" below.  
 **Version:** 2.0.8  
-**Used by:** `elo_ffbridge_lancelot.py` adapter
+**Used by:** the shared `mlBridge/mlBridgeFFLib.py` client, the `ffbridge-postmortem` app, and the Elo Ratings `elo_ffbridge_lancelot.py` adapter
+
+> **Keep in sync:** this file exists in both the `ffbridge-postmortem` and `Elo_Ratings` projects; edit both copies together.
 
 > **Note:** The Lancelot API appears to be an older/legacy system but contains more detailed historical data and board-level information including full deal records in PBN format. It provides 620+ sessions for Rondes de France alone vs ~100 in the Classic API.
 
@@ -57,11 +59,11 @@
 **Parameters:**
 | Parameter | Description |
 |-----------|-------------|
-| `searchCompetitionType` | `clubSimultaneous`, `club`, etc. |
+| `competitionType` | `clubSimultaneous`, `club`, etc. (**not** `searchCompetitionType`, which returns HTTP 422) |
 | `searchSeason` | `current` or season ID |
 | `currentPage` | Page number |
 
-**Example:** `/results/search/?searchCompetitionType=clubSimultaneous&searchSeason=current&currentPage=1`
+**Example:** `/results/search/?competitionType=clubSimultaneous&searchSeason=current&currentPage=1`
 
 **Response:**
 | Field | Description |
@@ -256,6 +258,13 @@ Where:
 | `nsNote`, `ewNote` | Matchpoint percentage |
 | `count` | Number of tables with this result |
 
+**Gotchas (observed 2026):**
+- Lineup players (`lineup.northPlayer` etc.) expose only `id` (Lancelot person id) and `migrationId` - **no `ffbId`**. Get license numbers from the ranking's team players instead.
+- `lineup.segment.game.homeTeam.startTableNumber` is null; get table numbers from the ranking's `tableNumber`.
+- Passed-out boards use French `contract: "PASSE"` (not "PASS"); scores may also contain `"PASSE"`.
+- `declarer` may be `O` (French Ouest) for West.
+- Some events (e.g. certain Roy René sessions) return all-empty `contract` fields: detailed results are simply not available through Lancelot for them.
+
 ---
 
 ## 6. Board/Deal APIs
@@ -360,11 +369,35 @@ These endpoints require Lancelot-specific authentication (different from api.ffb
 | Endpoint | Description |
 |----------|-------------|
 | `GET /users/whoami` | Current user info |
-| `GET /persons/me` | Current person profile |
-| `GET /users/me/easi-token` | Get EASI token |
+| `GET /persons/me` | Current person profile (`id`, `migrationId`, `ffbId`, names) |
+| `GET /users/me/easi-token` | Get EASI token (used by the Classic API) |
 | `POST /persons/check` | Validate person |
-| `GET /results/search/me` | Personal results history |
+| `GET /persons/search` | Search persons (see below) |
+| `GET /results/search/me` | Personal results history (paginated; **logged-in user only** - the `personId` param is ignored) |
 | `GET /results/sessions/{id}/ranking/{person_id}` | Personal ranking |
+
+### Getting a token
+
+The bearer token is a Firebase `idToken`, obtained the same way the www.ffbridge.fr SPA does:
+
+```
+POST https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=AIzaSyBjiLwewyM5PhXhfDSir5Cxvut0Yg4lYFQ
+{"returnSecureToken": true, "email": ..., "password": ..., "clientType": "CLIENT_TYPE_WEB"}
+```
+
+The response's `idToken` is passed as `Authorization: Bearer {idToken}`. Tokens expire (~1 hour); refresh by signing in again. Implemented in `mlBridgeFFLib.firebase_sign_in()`.
+
+### `GET /persons/search`
+
+**Parameters (use exactly one):**
+| Parameter | Description |
+|-----------|-------------|
+| `ffbId` | Exact license-number lookup (strip leading zeros) |
+| `name` | Name search (first and/or last name, case-insensitive) |
+
+> **Warning:** the `search` parameter is **silently ignored** - it returns an unfiltered list of unrelated persons. Use `ffbId` or `name`.
+
+**Response:** `{"items": [{"id", "migrationId", "ffbId", "firstName", "lastName", ...}], "pagination": {...}}`
 
 ---
 
@@ -450,6 +483,15 @@ urls = {
    GET /results/scores/board/7404537
    → Returns every result achieved on this board
    ```
+
+---
+
+## Shared Client
+
+Low-level access (URL builders, `lancelot_get` with 429 retry, Firebase sign-in, person
+search, ranking/scores/sessions wrappers, the Lancelot-to-migration series map) lives in
+the shared `mlBridge/mlBridgeFFLib.py`, which both projects reach through their `mlBridge`
+junctions.
 
 ---
 

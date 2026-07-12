@@ -8,7 +8,6 @@ No authentication required - public access.
 
 import os
 import re
-import time
 import pathlib
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -25,13 +24,14 @@ from elo_ffbridge_common import (
     get_cache_path,
     save_to_disk_cache,
     load_from_disk_cache,
+    mlBridgeFFLib,
 )
 
 # -------------------------------
 # Constants
 # -------------------------------
 API_NAME = "FFBridge (Lancelot)"
-API_BASE = "https://api-lancelot.ffbridge.fr"
+API_BASE = mlBridgeFFLib.LANCELOT_API_BASE
 REQUIRES_AUTH = False
 
 # Cache root can be redirected to a persistent Railway Volume, e.g. /data/ffbridge
@@ -50,19 +50,9 @@ print(
 REQUEST_TIMEOUT = 10  # seconds (reduced from 30 to fail faster on hung requests)
 REQUEST_DELAY = 0.1  # seconds between API requests
 
-# Lancelot ID to Migration ID (FFBridge series ID) mapping
-LANCELOT_TO_MIGRATION = {
-    1: 3,    # Rondes de France
-    2: 4,    # Trophées du Voyage
-    3: 5,    # Roy René
-    17: 140,  # Amour du Bridge
-    25: 384,  # Simultanet
-    27: 386,  # Simultané Octopus
-    47: 604,  # Atout Simultané
-    62: 868,  # Festival des Simultanés
-}
-
-MIGRATION_TO_LANCELOT = {v: k for k, v in LANCELOT_TO_MIGRATION.items()}
+# Lancelot ID to Migration ID (FFBridge series ID) mapping (shared)
+LANCELOT_TO_MIGRATION = mlBridgeFFLib.LANCELOT_TO_MIGRATION
+MIGRATION_TO_LANCELOT = mlBridgeFFLib.MIGRATION_TO_LANCELOT
 
 
 # -------------------------------
@@ -94,35 +84,28 @@ def get_auth_error_message() -> str:
 # API Helpers
 # -------------------------------
 def lancelot_get(endpoint: str, params: Optional[Dict] = None, add_delay: bool = True, verbose: bool = True) -> Optional[Any]:
-    """Make a GET request to Lancelot API with rate limiting."""
-    import sys
-    session = get_session()
-    url = f"{API_BASE}{endpoint}"
-    
-    if verbose:
-        print(f"[Lancelot] Fetching: {url}", flush=True)
-    
-    if add_delay:
-        time.sleep(REQUEST_DELAY)
-    
+    """Make a GET request to Lancelot API with rate limiting.
+
+    Thin wrapper over the shared mlBridgeFFLib client: keeps this app's
+    return-None-on-error contract and Streamlit warnings.
+    """
     try:
-        response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        if response.status_code == 200:
-            if verbose:
-                print(f"[Lancelot] OK: {url}", flush=True)
-            return response.json()
-        elif response.status_code == 429:
-            st.warning("Rate limited by Lancelot API. Waiting 5 seconds...")
-            time.sleep(5)
-            return lancelot_get(endpoint, params, add_delay=False, verbose=verbose)
-        else:
-            if verbose:
-                print(f"[Lancelot] HTTP {response.status_code}: {url}", flush=True)
+        return mlBridgeFFLib.lancelot_get(
+            endpoint,
+            params=params,
+            session=get_session(),
+            timeout=REQUEST_TIMEOUT,
+            rate_limit_delay=REQUEST_DELAY if add_delay else 0.0,
+            verbose=verbose,
+        )
     except requests.exceptions.Timeout:
-        print(f"[Lancelot] TIMEOUT after {REQUEST_TIMEOUT}s: {url}", flush=True)
+        print(f"[Lancelot] TIMEOUT after {REQUEST_TIMEOUT}s: {endpoint}", flush=True)
         st.warning(f"Timeout fetching {endpoint} after {REQUEST_TIMEOUT}s - skipping")
+    except requests.exceptions.HTTPError as e:
+        if verbose:
+            print(f"[Lancelot] HTTP {e.response.status_code}: {endpoint}", flush=True)
     except Exception as e:
-        print(f"[Lancelot] ERROR: {e} for {url}", flush=True)
+        print(f"[Lancelot] ERROR: {e} for {endpoint}", flush=True)
         st.warning(f"Lancelot API error: {e}")
     return None
 
