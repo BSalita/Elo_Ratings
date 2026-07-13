@@ -263,6 +263,7 @@ Where:
 - `lineup.segment.game.homeTeam.startTableNumber` is null; get table numbers from the ranking's `tableNumber`.
 - Passed-out boards use French `contract: "PASSE"` (not "PASS"); scores may also contain `"PASSE"`.
 - `declarer` may be `O` (French Ouest) for West.
+- **Trick scores (`nsScore`/`ewScore`)**: Lancelot stores the absolute trick-score magnitude in *either* field; the populated column name does **not** reliably indicate which side made. Use `nsNote` vs `ewNote` (higher note = side that got the good matchpoint score) to assign the sign when deriving `Score_NS`/`Score_EW`. Getting this wrong swaps NS/EW in the field score distribution and breaks optimal/par declarer percentages.
 - Some events (e.g. certain Roy René sessions) return all-empty `contract` fields: detailed results are simply not available through Lancelot for them.
 
 ---
