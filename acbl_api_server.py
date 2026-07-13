@@ -1206,7 +1206,13 @@ def generate_top_pairs_sql(
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "acbl-api"}
+    from streamlitlib.memory_usage import get_memory_usage_dict
+
+    return {
+        "status": "ok",
+        "service": "acbl-api",
+        "memory": get_memory_usage_dict(),
+    }
 
 
 @app.get("/acbl/report")

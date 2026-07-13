@@ -683,63 +683,17 @@ def apply_app_theme(st_module) -> None:
 
 
 def get_memory_usage_line() -> str:
-    """
-    Return a formatted memory usage line for footer display.
+    """Return a formatted memory usage line for footer display."""
+    from streamlitlib.memory_usage import get_memory_usage_line as _line
 
-    Prefers Linux cgroup limits/usage (useful in containers like Railway),
-    then falls back to psutil host metrics when cgroup values are unavailable.
-    """
-    try:
-        import psutil
+    return _line()
 
-        def _gb(v: int) -> float:
-            return v / (1024 ** 3)
 
-        ram_used = ram_total = None
-        swap_used = swap_total = None
+def render_memory_sidebar_caption(st_module) -> None:
+    """Show live cgroup/process memory in the sidebar."""
+    from streamlitlib.streamlitlib import render_memory_sidebar_caption as _render
 
-        # Linux cgroup v2 paths (container-aware)
-        try:
-            if os.path.exists("/sys/fs/cgroup/memory.current") and os.path.exists("/sys/fs/cgroup/memory.max"):
-                with open("/sys/fs/cgroup/memory.current", "r", encoding="utf-8") as f:
-                    ram_used = int(f.read().strip())
-                with open("/sys/fs/cgroup/memory.max", "r", encoding="utf-8") as f:
-                    max_raw = f.read().strip()
-                ram_total = None if max_raw == "max" else int(max_raw)
-
-                if os.path.exists("/sys/fs/cgroup/memory.swap.current"):
-                    with open("/sys/fs/cgroup/memory.swap.current", "r", encoding="utf-8") as f:
-                        swap_used = int(f.read().strip())
-                if os.path.exists("/sys/fs/cgroup/memory.swap.max"):
-                    with open("/sys/fs/cgroup/memory.swap.max", "r", encoding="utf-8") as f:
-                        smax_raw = f.read().strip()
-                    swap_total = None if smax_raw == "max" else int(smax_raw)
-        except Exception:
-            ram_used = ram_total = swap_used = swap_total = None
-
-        if ram_used is None or ram_total is None or ram_total <= 0:
-            vm = psutil.virtual_memory()
-            ram_used, ram_total = vm.used, vm.total
-        ram_pct = (ram_used / ram_total * 100.0) if ram_total else 0.0
-
-        if swap_used is None or swap_total is None:
-            sm = psutil.swap_memory()
-            swap_used, swap_total = sm.used, sm.total
-
-        if swap_total and swap_total > 0:
-            swap_pct = (swap_used / swap_total * 100.0)
-            swap_text = f"Virtual/Pagefile {_gb(swap_used):.2f}/{_gb(swap_total):.2f} GB ({swap_pct:.1f}%)"
-        else:
-            swap_text = "Virtual/Pagefile N/A (swap disabled)"
-
-        cpu_count = os.cpu_count() or 0
-        thread_count = threading.active_count()
-        return (
-            f"Memory: RAM {_gb(ram_used):.2f}/{_gb(ram_total):.2f} GB ({ram_pct:.1f}%) • "
-            f"{swap_text} • CPU/Threads {cpu_count}/{thread_count}"
-        )
-    except Exception:
-        return "Memory: RAM/Virtual usage unavailable"
+    _render(st_module)
 
 
 def get_cache_diagnostic_line(cache_dir_env_var: str = "FFBRIDGE_CACHE_DIR") -> str:

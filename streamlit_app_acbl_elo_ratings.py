@@ -68,6 +68,7 @@ from elo_common import (
     coerce_numeric_columns,
     init_url_params_to_state,
     render_app_footer,
+    render_memory_sidebar_caption,
     sync_state_to_url_params,
 )
 
@@ -781,6 +782,7 @@ def main():
             unsafe_allow_html=True,
         )
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
+        render_memory_sidebar_caption(st)
         st.sidebar.markdown("🔗 [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
         club_or_tournament = st.radio("Event type", options=["Club", "Tournament"], index=0, horizontal=True, key="event_type")
         rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=True, key="rating_type")

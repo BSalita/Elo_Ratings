@@ -615,3 +615,17 @@ def create_pdf(pdf_assets, title, output_filename=None, max_rows: int | None = N
     #return buffer.getvalue()
     return buffer.getvalue() # works for st.download() otherwise use base64.b64encode(buffer.getvalue()) # return buffer.getvalue() or base64.b64encode(buffer.getvalue())?
 
+try:
+    from .memory_usage import format_memory_metrics, update_session_peak_memory
+except ImportError:
+    from memory_usage import format_memory_metrics, update_session_peak_memory
+
+
+def render_memory_sidebar_caption(st_module) -> None:
+    """Show live cgroup/process memory in the sidebar (updates each rerun)."""
+    metrics = update_session_peak_memory(st_module.session_state)
+    peak = st_module.session_state.get("_peak_cgroup_bytes")
+    st_module.sidebar.caption(
+        format_memory_metrics(metrics, peak_cgroup_bytes=peak or None)
+    )
+

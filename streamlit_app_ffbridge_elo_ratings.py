@@ -81,6 +81,7 @@ from elo_common import (
     coerce_numeric_columns,
     init_url_params_to_state,
     render_app_footer,
+    render_memory_sidebar_caption,
     sync_state_to_url_params,
 )
 
@@ -1925,6 +1926,7 @@ def main():
     # -------------------------------
     with st.sidebar:
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
+        render_memory_sidebar_caption(st)
         st.sidebar.markdown("🔗 [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
         
         # API Backend selection
