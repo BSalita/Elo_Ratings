@@ -26,6 +26,7 @@ os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
 import pathlib
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -135,6 +136,56 @@ else:
 # tournaments plus a final summary instead of per-tournament spam.
 _PROCESSING_LOG_EVERY = max(1, int(os.environ.get("FFBRIDGE_LOG_EVERY", "50")))
 _FFBRIDGE_DEBUG = os.environ.get("FFBRIDGE_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+_FFBRIDGE_LOAD_DEBUG = (
+    os.environ.get("FFBRIDGE_LOAD_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+    or _FFBRIDGE_DEBUG
+    or os.environ.get("STREAMLIT_ENV", "").strip().lower() == "production"
+)
+
+
+def _load_debug_cgroup_summary() -> str:
+    """Short cgroup memory snippet for load-phase console logs."""
+    try:
+        used = int(pathlib.Path("/sys/fs/cgroup/memory.current").read_text(encoding="utf-8"))
+        limit_raw = pathlib.Path("/sys/fs/cgroup/memory.max").read_text(encoding="utf-8").strip()
+        if limit_raw.isdigit():
+            limit = int(limit_raw)
+            if limit > 0:
+                return f"mem {used / 1024 ** 3:.2f}/{limit / 1024 ** 3:.2f} GB ({100 * used / limit:.0f}%)"
+        return f"mem {used / 1024 ** 3:.2f} GB"
+    except Exception:
+        return "mem n/a"
+
+
+def _load_debug_log(message: str, *, reset: bool = False) -> None:
+    """Timestamped load-phase log line (enabled in production via STREAMLIT_ENV)."""
+    if not _FFBRIDGE_LOAD_DEBUG:
+        return
+    ss = st.session_state
+    now = time.perf_counter()
+    if reset or "_load_debug_t0" not in ss:
+        ss["_load_debug_t0"] = now
+        ss["_load_debug_phase_t0"] = now
+    phase_s = now - ss["_load_debug_phase_t0"]
+    total_s = now - ss["_load_debug_t0"]
+    print(
+        f"[ffbridge][load] {message} "
+        f"(+{phase_s:.1f}s, total {total_s:.1f}s, {_load_debug_cgroup_summary()})",
+        flush=True,
+    )
+    ss["_load_debug_phase_t0"] = now
+
+
+def _load_debug_log_standalone(message: str, t0: float) -> None:
+    """Load log outside Streamlit session state (cache_resource / parquet read)."""
+    if not _FFBRIDGE_LOAD_DEBUG:
+        return
+    elapsed = time.perf_counter() - t0
+    print(
+        f"[ffbridge][load] {message} "
+        f"(+{elapsed:.1f}s, {_load_debug_cgroup_summary()})",
+        flush=True,
+    )
 
 
 # -------------------------------
@@ -1459,8 +1510,18 @@ def _read_persisted_elo_dataset(api_key: str, fetch_iv: bool) -> Optional[Dict[s
     if not (results_path.exists() and players_path.exists() and meta_path.exists()):
         return None
     try:
+        t0 = time.perf_counter()
+        _load_debug_log_standalone(f"reading results parquet {results_path.name}", t0)
         results_df = pl.read_parquet(results_path)
+        _load_debug_log_standalone(
+            f"results parquet loaded ({results_df.height} rows, {results_df.width} cols)",
+            t0,
+        )
         players_df = pl.read_parquet(players_path)
+        _load_debug_log_standalone(
+            f"players parquet loaded ({players_df.height} rows)",
+            t0,
+        )
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         print(f"[ffbridge] loaded persisted Elo dataset '{key}' "
               f"({results_df.height} result rows) from parquet", flush=True)
@@ -1688,9 +1749,16 @@ def load_ffbridge_elo_dataset(
     Underscore-prefixed args (``_api_module``, ``_all_tournaments``) are excluded
     from Streamlit's cache key; identity is ``(api_key, fetch_iv)``.
     """
+    t0 = time.perf_counter()
+    _load_debug_log_standalone(
+        f"load_ffbridge_elo_dataset cache lookup api_key={api_key} fetch_iv={fetch_iv}",
+        t0,
+    )
     persisted = _read_persisted_elo_dataset(api_key, fetch_iv)
     if persisted is not None:
+        _load_debug_log_standalone("load_ffbridge_elo_dataset returning persisted parquet", t0)
         return persisted
+    _load_debug_log_standalone("load_ffbridge_elo_dataset no parquet; inline compute", t0)
     return compute_and_persist_elo_dataset(
         _api_module, _all_tournaments, api_key, fetch_iv, show_progress=False
     )
@@ -2334,12 +2402,18 @@ FFBRIDGE_URL_PARAMS = {
 
 @st.fragment
 def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
+    _load_debug_log("leaderboard fragment started")
     ctx = st.session_state.get("_ff_lb_ctx")
     if not ctx:
+        _load_debug_log("leaderboard fragment: no _ff_lb_ctx; skipping")
         return
     use_handicap = st.session_state.get("elo_score_type", "Scratch") == "Handicap"
     results_df = ctx["results_df"]
     players_df = _aggregate_players_from_results_cached(results_df, use_handicap)
+    _load_debug_log(
+        f"leaderboard fragment: aggregated players ({players_df.height} rows, "
+        f"handicap={use_handicap})"
+    )
     rating_type = ctx["rating_type"]
     simultaneous_type = ctx["simultaneous_type"]
     club_filter = ctx["club_filter"]
@@ -2375,8 +2449,13 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
     # Display tables
     if rating_type == "Players":
         if not players_df.is_empty():
+            _load_debug_log("leaderboard fragment: running top players SQL (hc+sc)")
             hc_players, sc_players, sql_h, sql_s, anchor_h, anchor_s = _cached_top_players_both(
                 players_df, top_n, min_games, int(prior_sessions),
+            )
+            _load_debug_log(
+                f"leaderboard fragment: top players ready "
+                f"(hc={hc_players.height}, sc={sc_players.height} rows)"
             )
             top_players = hc_players if use_handicap else sc_players
             sql_query = sql_h if use_handicap else sql_s
@@ -2420,7 +2499,9 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                         "players", rating_type, simultaneous_type,
                         club_filter, top_n, min_games, name_filter, int(prior_sessions),
                     )
+                    _load_debug_log(f"leaderboard fragment: rendering AgGrid ({top_players.height} rows)")
                     grid_response = build_selectable_aggrid(top_players, dynamic_key, render_links=False)
+                    _load_debug_log("leaderboard fragment: AgGrid render returned")
 
                     selected_rows = grid_response.get('selected_rows', None)
                     if selected_rows is not None and len(selected_rows) > 0:
@@ -2529,8 +2610,13 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                 st.info(f"No players match the minimum requirement of {min_games} games.")
     else:
         if not results_df.is_empty():
+            _load_debug_log("leaderboard fragment: running top pairs SQL (hc+sc)")
             hc_pairs, sc_pairs, sql_h, sql_s, anchor_h, anchor_s = _cached_top_pairs_both(
                 results_df, top_n, min_games, int(prior_sessions),
+            )
+            _load_debug_log(
+                f"leaderboard fragment: top pairs ready "
+                f"(hc={hc_pairs.height}, sc={sc_pairs.height} rows)"
             )
             top_pairs = hc_pairs if use_handicap else sc_pairs
             sql_query = sql_h if use_handicap else sql_s
@@ -2574,7 +2660,9 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                         "pairs", rating_type, simultaneous_type,
                         club_filter, top_n, min_games, name_filter, int(prior_sessions),
                     )
+                    _load_debug_log(f"leaderboard fragment: rendering AgGrid ({top_pairs.height} rows)")
                     grid_response = build_selectable_aggrid(top_pairs, dynamic_key, render_links=False)
+                    _load_debug_log("leaderboard fragment: AgGrid render returned")
 
                     selected_rows = grid_response.get('selected_rows', None)
                     if selected_rows is not None and len(selected_rows) > 0:
@@ -2674,6 +2762,8 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                         st.info(f"No pairs match the minimum requirement of {min_games} games.")
             else:
                 st.info(f"No pairs match the minimum requirement of {min_games} games.")
+
+    _load_debug_log("leaderboard fragment complete")
 
 
 # -------------------------------
@@ -2891,7 +2981,51 @@ def main():
     # -------------------------------
     # Main Content
     # -------------------------------
-    
+    _load_debug_log("main content started", reset=True)
+
+    try:
+        _load_main_content(
+            stats_placeholder=stats_placeholder,
+            selected_api_name=selected_api_name,
+            api_module=api_module,
+            selected_tournament_label=selected_tournament_label,
+            simultaneous_type=simultaneous_type,
+            club_filter=club_filter,
+            name_filter=name_filter,
+            rating_type=rating_type,
+            top_n=top_n,
+            min_games=min_games,
+            prior_sessions=prior_sessions,
+            fetch_iv=fetch_iv,
+            generate_pdf=generate_pdf,
+        )
+        _load_debug_log("main content complete")
+    except Exception as exc:
+        _load_debug_log(f"FAILED: {type(exc).__name__}: {exc}")
+        if _FFBRIDGE_LOAD_DEBUG:
+            import traceback
+            traceback.print_exc()
+        raise
+
+
+def _load_main_content(
+    *,
+    stats_placeholder,
+    selected_api_name: str,
+    api_module,
+    selected_tournament_label: str,
+    simultaneous_type,
+    club_filter: str,
+    name_filter: str,
+    rating_type: str,
+    top_n: int,
+    min_games: int,
+    prior_sessions: int,
+    fetch_iv: bool,
+    generate_pdf: bool,
+) -> None:
+    """Load dataset, prepare leaderboard context, and render the main panel."""
+
     # Cache key includes API name to separate caches
     api_key = selected_api_name.replace(" ", "_")
     
@@ -2903,6 +3037,10 @@ def main():
     # forcing a live API fetch on cold start caused "Failed to retrieve tournament
     # data" in production when outbound API access was slow or unavailable.
     force_list_refresh = cache_age is not None and cache_age >= max_age_hours
+    _load_debug_log(
+        f"tournament list fetch (force_refresh={force_list_refresh}, "
+        f"parquet_age={cache_age if cache_age is not None else 'none'})"
+    )
 
     with st.spinner("Loading tournament data..."):
         all_tournaments, list_source = _fetch_tournament_list_resilient(
@@ -2940,6 +3078,7 @@ def main():
                 "outbound access to the selected FFBridge API."
             )
             return
+    _load_debug_log(f"tournament list ready ({len(all_tournaments)} tournaments, source={list_source})")
     list_fallback_note = ""
     if list_source == "disk" and force_list_refresh:
         list_fallback_note = "live API refresh returned empty; using disk tournament list"
@@ -2956,6 +3095,7 @@ def main():
     rebuild, rebuild_reason = _needs_elo_rebuild(
         api_key, fetch_iv, n_tournaments, all_tournaments, max_age_hours,
     )
+    _load_debug_log(f"elo dataset path: rebuild={rebuild} reason={rebuild_reason or 'none'}")
     if rebuild:
         print(f"[ffbridge] rebuilding Elo dataset: {rebuild_reason}", flush=True)
         load_ffbridge_elo_dataset.clear()
@@ -2967,9 +3107,11 @@ def main():
         # Load the full dataset once per process (shared across all sessions and
         # persisted to parquet). Both scratch and handicap Elo columns are stored;
         # the use_handicap-specific view is derived downstream.
+        _load_debug_log("calling load_ffbridge_elo_dataset (cache_resource)")
         dataset = load_ffbridge_elo_dataset(
             api_module, all_tournaments, api_key, fetch_iv, n_tournaments
         )
+        _load_debug_log("load_ffbridge_elo_dataset returned")
     st.session_state._ffbridge_loaded_api_key = api_key
     full_results_df = dataset['results_df']
     processing_stats = dataset['processing_stats']
@@ -2987,7 +3129,9 @@ def main():
     )
 
     # Exclude invalid percentage rows before any downstream filtering/aggregation
+    _load_debug_log(f"filtering results ({full_results_df.height} rows before pct filter)")
     full_results_df = _filter_valid_percentages_ffbridge(full_results_df)
+    _load_debug_log(f"pct filter done ({full_results_df.height} rows)")
 
     # Apply filters
     results_df = full_results_df
@@ -2998,6 +3142,7 @@ def main():
     
     if club_filter and not results_df.is_empty() and "club_name" in results_df.columns:
         results_df = results_df.filter(pl.col("club_name") == club_filter)
+    _load_debug_log(f"sidebar filters applied ({results_df.height} rows)")
 
     if not full_results_df.is_empty() and "club_name" in full_results_df.columns:
         unique_clubs = sorted(
@@ -3011,16 +3156,20 @@ def main():
         prev = st.session_state.get("elo_available_clubs")
         st.session_state.elo_available_clubs = new_clubs
         if unique_clubs and (not prev or len(prev) <= 1):
+            _load_debug_log("club list initialized; rerunning")
             st.rerun()
 
+    _load_debug_log("aggregating players (handicap)")
     players_df_hc = (
         _aggregate_players_from_results_cached(results_df, True)
         if not results_df.is_empty() else pl.DataFrame()
     )
+    _load_debug_log(f"aggregating players (scratch); hc={players_df_hc.height} rows")
     players_df_sc = (
         _aggregate_players_from_results_cached(results_df, False)
         if not results_df.is_empty() else pl.DataFrame()
     )
+    _load_debug_log(f"computing metric triples; sc={players_df_sc.height} player rows")
     st.session_state["_ff_lb_ctx"] = {
         "results_df": results_df,
         "rating_type": rating_type,
@@ -3036,6 +3185,7 @@ def main():
         "pair_metrics_sc": _pair_metric_triple(results_df, min_games, False),
     }
     del players_df_hc, players_df_sc
+    _load_debug_log("leaderboard context ready; rendering panel")
 
     
     
