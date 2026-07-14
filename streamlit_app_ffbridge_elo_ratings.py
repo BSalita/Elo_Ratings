@@ -590,7 +590,7 @@ def _show_tournament_opponents(results_df: pl.DataFrame, tournament_id: str, exc
 
     t_name = tourney_results.select('tournament_name').row(0)[0] if 'tournament_name' in tourney_results.columns else tournament_id
     t_date = tourney_results.select(pl.col('date').str.slice(0, 10)).row(0)[0] if 'date' in tourney_results.columns else ''
-    st.markdown(f"#### Tournament Opponents ΓÇö {t_name} ({t_date})")
+    st.markdown(f"#### Tournament Opponents — {t_name} ({t_date})")
     st.caption(f"{len(opp_df)} pairs in this tournament")
     _render_detail_aggrid_ff(opp_df, key=f"ff_topp_{tournament_id}")
 
@@ -599,7 +599,7 @@ def _show_partner_aggregation(detail_df: pl.DataFrame, key_suffix: str) -> None:
     """4th df for Players: Aggregate tournament results by Partner across all tournaments."""
     if detail_df.is_empty() or 'Partner' not in detail_df.columns:
         return
-    st.markdown("#### Partner Summary ΓÇö All Tournaments")
+    st.markdown("#### Partner Summary — All Tournaments")
     agg_cols = [
         pl.len().alias('Tournaments'),
     ]
@@ -628,7 +628,7 @@ def _show_club_aggregation(detail_df: pl.DataFrame, results_df: pl.DataFrame, pa
     pair_data = results_df.filter(pl.col('pair_id') == pair_id)
     if pair_data.is_empty() or 'club_name' not in pair_data.columns:
         return
-    st.markdown("#### Club Summary ΓÇö All Tournaments")
+    st.markdown("#### Club Summary — All Tournaments")
     agg_cols = [
         pl.len().alias('Tournaments'),
     ]
@@ -698,7 +698,7 @@ def _show_opponent_history(results_df: pl.DataFrame, entity_tournaments: pl.Data
     if opp_detail.is_empty():
         return
     n_events = opp_detail.select('Event_ID').n_unique()
-    st.markdown("#### Opponent History Details ΓÇö All Tournaments")
+    st.markdown("#### Opponent History Details — All Tournaments")
     st.caption(f"{len(opp_detail)} opponent results across {n_events} tournaments")
     _render_detail_aggrid_ff(opp_detail, key=f"ff_opp_hist_{key_suffix}")
 
@@ -736,7 +736,7 @@ def _show_opponent_summary(results_df: pl.DataFrame, entity_tournaments: pl.Data
     # Join entity's stats onto each opponent row by Event_ID
     opp_joined = opp_detail.join(entity_per_tourney, on='Event_ID', how='left')
 
-    st.markdown("#### Opponent Summary ΓÇö All Tournaments")
+    st.markdown("#### Opponent Summary — All Tournaments")
 
     agg_cols = [pl.len().alias('Events')]
 
@@ -1196,8 +1196,8 @@ def process_tournaments_to_elo(
         progress_bar.progress(1.0)
     if status_text is not None:
         status_text.markdown(
-            "<span style='color: white;'>Tournaments loaded ΓÇö building tables "
-            f"({len(all_results):,} rows)ΓÇª</span>",
+            "<span style='color: white;'>Tournaments loaded — building tables "
+            f"({len(all_results):,} rows)…</span>",
             unsafe_allow_html=True,
         )
 
@@ -1258,7 +1258,7 @@ def process_tournaments_to_elo(
     if status_text is not None:
         status_text.markdown(
             "<span style='color: white;'>Building player summary "
-            f"({len(scratch_ratings):,} players)ΓÇª</span>",
+            f"({len(scratch_ratings):,} players)…</span>",
             unsafe_allow_html=True,
         )
 
@@ -1304,7 +1304,7 @@ def process_tournaments_to_elo(
 
     if status_text is not None:
         status_text.markdown(
-            "<span style='color: white;'>Standardizing Elo ratingsΓÇª</span>",
+            "<span style='color: white;'>Standardizing Elo ratings…</span>",
             unsafe_allow_html=True,
         )
 
@@ -1500,7 +1500,7 @@ def _past_tournament_ids(all_tournaments: List[Dict[str, Any]]) -> set[str]:
 
     Must match the future-tournament filter in ``process_tournaments_to_elo``.
     The Lancelot list includes hundreds of scheduled future sessions that are
-    intentionally skipped during Elo replay ΓÇö they must not count as "missing".
+    intentionally skipped during Elo replay — they must not count as "missing".
     """
     today = datetime.now().strftime("%Y-%m-%d")
     return {
@@ -1598,7 +1598,7 @@ def compute_and_persist_elo_dataset(
 ) -> Dict[str, Any]:
     """Compute the full FFBridge Elo dataset and persist it to parquet.
 
-    Not cached ΓÇö used both by the Streamlit boot loader (on a cold cache) and by
+    Not cached — used both by the Streamlit boot loader (on a cold cache) and by
     the offline builder script. Both scratch and handicap Elo columns are stored
     so the ``use_handicap`` toggle is derived downstream.
     """
@@ -1613,7 +1613,7 @@ def compute_and_persist_elo_dataset(
     finalize_status = st.empty() if show_progress else None
     if finalize_status is not None:
         finalize_status.markdown(
-            "<span style='color: white;'>Mapping club namesΓÇª</span>",
+            "<span style='color: white;'>Mapping club names…</span>",
             unsafe_allow_html=True,
         )
     results_df = _apply_club_name_mapping(results_df, api_module, all_tournaments)
@@ -1629,7 +1629,7 @@ def compute_and_persist_elo_dataset(
     try:
         if finalize_status is not None:
             finalize_status.markdown(
-                "<span style='color: white;'>Writing parquet cacheΓÇª</span>",
+                "<span style='color: white;'>Writing parquet cache…</span>",
                 unsafe_allow_html=True,
             )
         _FFBRIDGE_ELO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1659,7 +1659,7 @@ def compute_and_persist_elo_dataset(
     }
 
 
-@st.cache_resource(show_spinner="Building FFBridge Elo ratings (first load may take ~1 minute)ΓÇª")
+@st.cache_resource(show_spinner="Building FFBridge Elo ratings (first load may take ~1 minute)…")
 def load_ffbridge_elo_dataset(
     _api_module,
     _all_tournaments: List[Dict[str, Any]],
@@ -1670,7 +1670,7 @@ def load_ffbridge_elo_dataset(
     """Load the full FFBridge Elo dataset once per process, shared across sessions.
 
     ``@st.cache_resource`` keeps a single copy in the process (not per browser
-    session, unlike ``st.session_state``) ΓÇö this removes the per-session /
+    session, unlike ``st.session_state``) — this removes the per-session /
     concurrent-session memory multiplication that was OOM-killing the container.
 
     On a cold cache it prefers a parquet persisted by an earlier run or the
@@ -2321,7 +2321,6 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
     st.session_state.full_results_df = results_df
     # Display tables
     if rating_type == "Players":
-        st.markdown(f"### ≡ƒÅå Top {top_n} Players (Min. {min_games} games)")
         if not players_df.is_empty():
             hc_players, sc_players, sql_h, sql_s, anchor_h, anchor_s = _cached_top_players_both(
                 players_df, top_n, min_games, int(prior_sessions),
@@ -2332,25 +2331,25 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
 
             if prior_sessions > 0 and prior_anchor is not None:
                 st.caption(
-                    f"≡ƒôÉ Headline shows **Published Elo** (Bayesian-shrunk toward "
-                    f"median of qualifying players Γëê {prior_anchor:.0f}, "
+                    f"Headline shows **Published Elo** (Bayesian-shrunk toward "
+                    f"median of qualifying players ≈ {prior_anchor:.0f}, "
                     f"prior_sessions={prior_sessions}). `{'HC_' if use_handicap else ''}Player_Elo_Raw` "
                     f"column shown alongside."
                 )
             elif prior_sessions > 0:
-                st.caption("≡ƒôÉ Shrinkage unavailable: no qualifying players to anchor the prior. Headline shows Raw Elo.")
+                st.caption("Shrinkage unavailable: no qualifying players to anchor the prior. Headline shows Raw Elo.")
             else:
-                st.caption("≡ƒôÉ Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo.")
+                st.caption("Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo.")
 
             st.caption(
-                "ΓÖƒ∩╕Å Elo is standardized to a chess-style scale (mean **1500**, "
+                " Elo is standardized to a chess-style scale (mean **1500**, "
                 "sd **400**) so it lines up with the ACBL app and chess; the "
-                "**Title** column uses standard bands (ΓëÑ2400 IM, ΓëÑ2500 GM, "
-                "ΓëÑ2600 SGM). A given title means the same percentile everywhere."
+                "**Title** column uses standard bands (≥2400 IM, ≥2500 GM, "
+                "≥2600 SGM). A given title means the same percentile everywhere."
             )
 
             if sql_query:
-                with st.expander("≡ƒô¥ SQL Query", expanded=False):
+                with st.expander("SQL Query", expanded=False):
                     st.code(sql_query, language="sql")
 
             if not top_players.is_empty():
@@ -2362,7 +2361,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                     )
 
                 if not top_players.is_empty():
-                    st.caption("≡ƒÆí Click a row to view player's tournament history")
+                    st.caption("Click a row to view player's tournament history")
                     # Create dynamic key based on filter parameters to reset selection when data changes
                     dynamic_key = _leaderboard_aggrid_key(
                         "players", rating_type, simultaneous_type,
@@ -2378,7 +2377,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
 
                         if player_id and not results_df.is_empty():
                             # Show tournament history
-                            st.markdown(f"#### ≡ƒôè Tournament History Details: **{player_name}**")
+                            st.markdown(f"#### Tournament History Details: **{player_name}**")
                             player_results = results_df.filter(
                                 (pl.col('player1_id') == str(player_id)) | 
                                 (pl.col('player2_id') == str(player_id))
@@ -2476,7 +2475,6 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
             else:
                 st.info(f"No players match the minimum requirement of {min_games} games.")
     else:
-        st.markdown(f"### ≡ƒÅå Top {top_n} Pairs (Min. {min_games} games)")
         if not results_df.is_empty():
             hc_pairs, sc_pairs, sql_h, sql_s, anchor_h, anchor_s = _cached_top_pairs_both(
                 results_df, top_n, min_games, int(prior_sessions),
@@ -2487,25 +2485,25 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
 
             if prior_sessions > 0 and prior_anchor is not None:
                 st.caption(
-                    f"≡ƒôÉ Headline shows **Published Elo** (Bayesian-shrunk toward "
-                    f"median of qualifying pairs Γëê {prior_anchor:.0f}, "
+                    f"Headline shows **Published Elo** (Bayesian-shrunk toward "
+                    f"median of qualifying pairs ≈ {prior_anchor:.0f}, "
                     f"prior_sessions={prior_sessions}). `{'HC_' if use_handicap else ''}Pair_Elo_Raw` "
                     f"column shown alongside."
                 )
             elif prior_sessions > 0:
-                st.caption("≡ƒôÉ Shrinkage unavailable: no qualifying pairs to anchor the prior. Headline shows Raw Elo.")
+                st.caption("Shrinkage unavailable: no qualifying pairs to anchor the prior. Headline shows Raw Elo.")
             else:
-                st.caption("≡ƒôÉ Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo.")
+                st.caption("Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo.")
 
             st.caption(
-                "ΓÖƒ∩╕Å Elo is standardized to a chess-style scale (mean **1500**, "
+                " Elo is standardized to a chess-style scale (mean **1500**, "
                 "sd **400**) so it lines up with the ACBL app and chess; the "
-                "**Title** column uses standard bands (ΓëÑ2400 IM, ΓëÑ2500 GM, "
-                "ΓëÑ2600 SGM). A given title means the same percentile everywhere."
+                "**Title** column uses standard bands (≥2400 IM, ≥2500 GM, "
+                "≥2600 SGM). A given title means the same percentile everywhere."
             )
 
             if sql_query:
-                with st.expander("≡ƒô¥ SQL Query", expanded=False):
+                with st.expander("SQL Query", expanded=False):
                     st.code(sql_query, language="sql")
 
             if not top_pairs.is_empty():
@@ -2517,7 +2515,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                     )
 
                 if not top_pairs.is_empty():
-                    st.caption("≡ƒÆí Click a row to view pair's tournament history")
+                    st.caption("Click a row to view pair's tournament history")
                     # Create dynamic key based on filter parameters to reset selection when data changes
                     dynamic_key = _leaderboard_aggrid_key(
                         "pairs", rating_type, simultaneous_type,
@@ -2532,7 +2530,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                         pair_name = selected_row.get('Pair_Name', 'Unknown')
 
                         if pair_id and not results_df.is_empty():
-                            st.markdown(f"### ≡ƒôï Tournament History Details for **{pair_name}**")
+                            st.markdown(f"### Tournament History Details for **{pair_name}**")
 
                             pair_results = results_df.filter(
                                 pl.col('pair_id') == str(pair_id)
@@ -2652,7 +2650,7 @@ def main():
     with st.sidebar:
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
         render_memory_sidebar_caption(st)
-        st.sidebar.markdown("≡ƒöù [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
+        st.sidebar.markdown("[What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
         
         # API Backend selection
         # Keep widget state and canonical state separate so explicit reruns do not
@@ -2692,7 +2690,7 @@ def main():
                 selected_api_name = fallback_api
                 api_module = API_BACKENDS[selected_api_name]
             else:
-                st.error("Γ¥î **Authentication Error**")
+                st.error("**Authentication Error**")
                 st.markdown(api_module.get_auth_error_message())
                 return
         
@@ -2795,9 +2793,9 @@ def main():
         # PDF Export
         generate_pdf = st.button("Export Report to PDF File", width='stretch')
         st.sidebar.markdown('<p style="color: #ffc107; font-weight: 600;">Morty\'s Automated Postmortem Apps</p>', unsafe_allow_html=True)
-        st.sidebar.markdown("≡ƒöù [ACBL Postmortem](https://acbl.postmortem.chat)")
-        st.sidebar.markdown("≡ƒöù [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
-        #st.sidebar.markdown("≡ƒöù [BridgeWebs Postmortem](https://bridgewebs.postmortem.chat)")
+        st.sidebar.markdown("[ACBL Postmortem](https://acbl.postmortem.chat)")
+        st.sidebar.markdown("[French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
+        #st.sidebar.markdown("[BridgeWebs Postmortem](https://bridgewebs.postmortem.chat)")
 
     # Persist current sidebar state to URL query params for shareable links.
     sync_state_to_url_params(st, FFBRIDGE_URL_PARAMS)
@@ -2890,7 +2888,7 @@ def main():
     if rebuild:
         print(f"[ffbridge] rebuilding Elo dataset: {rebuild_reason}", flush=True)
         load_ffbridge_elo_dataset.clear()
-        with st.spinner(f"Refreshing Elo ratings ({rebuild_reason})ΓÇª"):
+        with st.spinner(f"Refreshing Elo ratings ({rebuild_reason})…"):
             dataset = compute_and_persist_elo_dataset(
                 api_module, all_tournaments, api_key, fetch_iv, show_progress=True,
             )
@@ -2965,6 +2963,8 @@ def main():
     metric_m2 = m2.empty()
     metric_m3 = m3.empty()
     metric_m4 = m4.empty()
+    lb_entity = "Players" if rating_type == "Players" else "Pairs"
+    st.markdown(f"### Top {top_n} {lb_entity} (Min. {min_games} games)")
     _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4)
 
     # PDF Export
@@ -2979,7 +2979,7 @@ def main():
                     shrink_to_fit=True
                 )
                 st.download_button(
-                    label="≡ƒôÑ Download PDF Report",
+                    label="Download PDF Report",
                     data=pdf_bytes,
                     file_name=f"FFBridge_Elo_{datetime.now().strftime('%Y%m%d')}.pdf",
                     mime="application/pdf"
@@ -2988,7 +2988,7 @@ def main():
     render_app_footer(
         st,
         ENDPLAY_VERSION,
-        source_line=f"Data sourced using {selected_api_name} ΓÇó {selected_tournament_label}",
+        source_line=f"Data sourced using {selected_api_name} • {selected_tournament_label}",
         dependency_versions={
             "pandas": pd.__version__,
             "polars": pl.__version__,
