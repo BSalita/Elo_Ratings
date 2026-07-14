@@ -2246,19 +2246,29 @@ def _pair_metric_triple(results_df: pl.DataFrame, min_games: int, use_handicap: 
     if results_df.is_empty():
         return 0, 0.0, 0.0
     elo_col = "handicap_pair_elo" if use_handicap else "scratch_pair_elo"
-    pair_stats = duckdb.sql(f"""
-        SELECT pair_id, COUNT(*) as games, AVG({elo_col}) as elo
-        FROM results_df
-        GROUP BY pair_id
-        HAVING games >= {min_games}
-    """).pl()
+    pair_stats = (
+        results_df.group_by("pair_id")
+        .agg(
+            pl.len().alias("games"),
+            pl.col(elo_col).mean().alias("elo"),
+        )
+        .filter(pl.col("games") >= min_games)
+    )
     if pair_stats.is_empty():
         return 0, 0.0, 0.0
     return (
-        len(pair_stats),
-        pair_stats.select(pl.col('games').mean()).item(),
-        pair_stats.select(pl.col('elo').max()).item(),
+        pair_stats.height,
+        pair_stats.select(pl.col("games").mean()).item(),
+        pair_stats.select(pl.col("elo").max()).item(),
     )
+
+
+@st.cache_data(show_spinner=False)
+def _cached_pair_metric_triple(
+    results_df: pl.DataFrame, min_games: int, use_handicap: bool,
+) -> Tuple[int, float, float]:
+    """Cached pair leaderboard metrics (expensive on full result history)."""
+    return _pair_metric_triple(results_df, min_games, use_handicap)
 
 
 # -------------------------------
@@ -2291,6 +2301,8 @@ def _default_ffbridge_api() -> str:
 
 _FFBRIDGE_DEFAULT_API = _default_ffbridge_api()
 _ALL_CLUBS_LABEL = "All Clubs"
+# Process-level club dropdown cache (shared across Streamlit sessions in one container).
+_FFBRIDGE_CLUB_OPTIONS: list[str] | None = None
 
 
 def _ffbridge_club_select_options() -> list[str]:
@@ -2782,6 +2794,9 @@ def main():
     # Apply URL query params -> session state BEFORE widgets render (first run only).
     init_url_params_to_state(st, FFBRIDGE_URL_PARAMS)
 
+    if _FFBRIDGE_CLUB_OPTIONS and len(_ffbridge_club_select_options()) <= 1:
+        st.session_state.elo_available_clubs = _FFBRIDGE_CLUB_OPTIONS
+
     url_club = st.session_state.get("elo_club_selectbox")
     if url_club and url_club != _ALL_CLUBS_LABEL:
         existing = _ffbridge_club_select_options()
@@ -3144,6 +3159,7 @@ def _load_main_content(
         results_df = results_df.filter(pl.col("club_name") == club_filter)
     _load_debug_log(f"sidebar filters applied ({results_df.height} rows)")
 
+    global _FFBRIDGE_CLUB_OPTIONS
     if not full_results_df.is_empty() and "club_name" in full_results_df.columns:
         unique_clubs = sorted(
             {
@@ -3153,11 +3169,9 @@ def _load_main_content(
             }
         )
         new_clubs = [_ALL_CLUBS_LABEL] + unique_clubs
+        _FFBRIDGE_CLUB_OPTIONS = new_clubs
         st.session_state.elo_available_clubs = new_clubs
-        if unique_clubs and not st.session_state.get("_ffbridge_clubs_seeded"):
-            st.session_state._ffbridge_clubs_seeded = True
-            _load_debug_log(f"club list seeded ({len(unique_clubs)} clubs); rerunning once")
-            st.rerun()
+        _load_debug_log(f"club list updated ({len(unique_clubs)} clubs, no rerun)")
 
     _load_debug_log("aggregating players (handicap)")
     players_df_hc = (
@@ -3174,10 +3188,15 @@ def _load_main_content(
     _load_debug_log("player metrics (handicap) done")
     player_metrics_sc = _player_metric_triple(players_df_sc, min_games)
     _load_debug_log("player metrics (scratch) done")
-    pair_metrics_hc = _pair_metric_triple(results_df, min_games, True)
-    _load_debug_log(f"pair metrics (handicap) done ({results_df.height} result rows scanned)")
-    pair_metrics_sc = _pair_metric_triple(results_df, min_games, False)
-    _load_debug_log("pair metrics (scratch) done")
+    if rating_type == "Pairs":
+        pair_metrics_hc = _cached_pair_metric_triple(results_df, min_games, True)
+        _load_debug_log(f"pair metrics (handicap) done ({results_df.height} result rows scanned)")
+        pair_metrics_sc = _cached_pair_metric_triple(results_df, min_games, False)
+        _load_debug_log("pair metrics (scratch) done")
+    else:
+        pair_metrics_hc = (0, 0.0, 0.0)
+        pair_metrics_sc = (0, 0.0, 0.0)
+        _load_debug_log("pair metrics skipped (Players view)")
     st.session_state["_ff_lb_ctx"] = {
         "results_df": results_df,
         "rating_type": rating_type,
