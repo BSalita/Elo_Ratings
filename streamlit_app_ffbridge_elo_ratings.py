@@ -1953,15 +1953,20 @@ def initialize_session_state():
         st.session_state.first_time = False
 
 
-# Default API depends on whether a Classic bearer token is present in the
-# environment. Computed at module load (env vars already loaded by elo_ffbridge_classic).
-# Used as the URL-param default so ``?api=`` is only written when the user picks
-# a non-default API.
-_FFBRIDGE_DEFAULT_API = (
-    "FFBridge Classic API"
-    if bool(os.getenv("FFBRIDGE_BEARER_TOKEN", "").strip())
-    else "FFBridge Lancelot API"
-)
+# Default API: Lancelot is public and currently the reliable source. Classic
+# requires a bearer token and has been intermittently unavailable; set
+# FFBRIDGE_PREFER_CLASSIC_API=1 once Classic is healthy again to default to it
+# when FFBRIDGE_BEARER_TOKEN is present.
+def _default_ffbridge_api() -> str:
+    prefer_classic = os.getenv("FFBRIDGE_PREFER_CLASSIC_API", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+    if prefer_classic and os.getenv("FFBRIDGE_BEARER_TOKEN", "").strip():
+        return "FFBridge Classic API"
+    return "FFBridge Lancelot API"
+
+
+_FFBRIDGE_DEFAULT_API = _default_ffbridge_api()
 
 # URL query param -> sidebar widget session state.
 # Keys are short, URL-friendly names; session_key matches the widget's `key=...`.
@@ -2057,8 +2062,7 @@ def main():
         # Keep widget state and canonical state separate so explicit reruns do not
         # unexpectedly reset the selected API.
         api_options = list(API_BACKENDS.keys())
-        has_classic_token = bool(os.getenv("FFBRIDGE_BEARER_TOKEN", "").strip())
-        default_api = "FFBridge Classic API" if has_classic_token else "FFBridge Lancelot API"
+        default_api = _default_ffbridge_api()
         if "selected_api" not in st.session_state:
             st.session_state.selected_api = default_api
         if st.session_state.selected_api not in api_options:
@@ -2072,7 +2076,10 @@ def main():
             "Bridge API",
             options=api_options,
             key="selected_api_widget",
-            help="Select which API to use for data"
+            help=(
+                "Lancelot is the public API and the default while Classic is "
+                "unavailable. Classic requires FFBRIDGE_BEARER_TOKEN."
+            ),
         )
         st.session_state.selected_api = selected_api_name
         
@@ -2255,14 +2262,36 @@ def main():
         all_tournaments, list_source = _fetch_tournament_list_resilient(
             api_module, force_list_refresh,
         )
+
+        # Classic has been down for extended periods while tokens remain valid.
+        # Fall back to Lancelot rather than erroring or triggering a doomed rebuild.
+        if (
+            not all_tournaments
+            and selected_api_name == "FFBridge Classic API"
+            and "FFBridge Lancelot API" in API_BACKENDS
+        ):
+            st.warning(
+                "Classic API returned no tournaments (service may be unavailable). "
+                "Falling back to Lancelot API."
+            )
+            selected_api_name = "FFBridge Lancelot API"
+            api_module = API_BACKENDS[selected_api_name]
+            api_key = selected_api_name.replace(" ", "_")
+            st.session_state.selected_api = selected_api_name
+            st.session_state.selected_api_widget = selected_api_name
+            cache_age = _newest_persisted_age_hours(api_key, fetch_iv)
+            force_list_refresh = cache_age is not None and cache_age >= max_age_hours
+            all_tournaments, list_source = _fetch_tournament_list_resilient(
+                api_module, force_list_refresh,
+            )
         
         if not all_tournaments:
             age_label = "none" if cache_age is None else f"{cache_age:.1f}h"
             st.error(
-                "Failed to retrieve tournament data. The on-disk Lancelot session "
+                "Failed to retrieve tournament data. The on-disk session "
                 f"cache and live API both returned empty (elo parquet age={age_label}, "
                 f"force_refresh={force_list_refresh}). Check FFBRIDGE_CACHE_DIR and "
-                "outbound access to api-lancelot.ffbridge.fr."
+                "outbound access to the selected FFBridge API."
             )
             return
     if list_source == "disk" and force_list_refresh:
@@ -2279,7 +2308,7 @@ def main():
         load_ffbridge_elo_dataset.clear()
         with st.spinner(f"Refreshing Elo ratings ({rebuild_reason})…"):
             compute_and_persist_elo_dataset(
-                api_module, all_tournaments, api_key, fetch_iv, show_progress=False,
+                api_module, all_tournaments, api_key, fetch_iv, show_progress=True,
             )
 
     # Load the full dataset once per process (shared across all sessions and
