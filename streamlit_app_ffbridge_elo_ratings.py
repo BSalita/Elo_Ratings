@@ -1163,9 +1163,13 @@ def process_tournaments_to_elo(
           f"missing={len(cache_stats['missing_ids'])}, rows={len(all_results)})", flush=True)
 
     if progress_bar is not None:
-        progress_bar.empty()
+        progress_bar.progress(1.0)
     if status_text is not None:
-        status_text.empty()
+        status_text.markdown(
+            "<span style='color: white;'>Tournaments loaded — building tables "
+            f"({len(all_results):,} rows)…</span>",
+            unsafe_allow_html=True,
+        )
     
     # Convert to DataFrames with explicit schema to handle None values
     if all_results:
@@ -1504,6 +1508,12 @@ def compute_and_persist_elo_dataset(
         all_tournaments, api_module, initial_players=None,
         use_handicap=False, fetch_iv=fetch_iv, sort_ascending=True, show_progress=show_progress,
     )
+    finalize_status = st.empty() if show_progress else None
+    if finalize_status is not None:
+        finalize_status.markdown(
+            "<span style='color: white;'>Mapping club names…</span>",
+            unsafe_allow_html=True,
+        )
     results_df = _apply_club_name_mapping(results_df, api_module, all_tournaments)
 
     scratch_ratings_dict: Dict[str, float] = {}
@@ -1515,6 +1525,11 @@ def compute_and_persist_elo_dataset(
 
     # Persist for the next cold start (best-effort; ephemeral FS is fine).
     try:
+        if finalize_status is not None:
+            finalize_status.markdown(
+                "<span style='color: white;'>Writing parquet cache…</span>",
+                unsafe_allow_html=True,
+            )
         _FFBRIDGE_ELO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         results_df.write_parquet(results_path)
         players_df.write_parquet(players_path)
@@ -1529,6 +1544,9 @@ def compute_and_persist_elo_dataset(
         _prune_old_elo_cache(api_key, fetch_iv, key)
     except Exception as exc:
         print(f"[ffbridge] parquet persist failed ({exc}); continuing without persistence", flush=True)
+    finally:
+        if finalize_status is not None:
+            finalize_status.empty()
 
     return {
         "results_df": results_df,
@@ -2307,16 +2325,16 @@ def main():
         print(f"[ffbridge] rebuilding Elo dataset: {rebuild_reason}", flush=True)
         load_ffbridge_elo_dataset.clear()
         with st.spinner(f"Refreshing Elo ratings ({rebuild_reason})…"):
-            compute_and_persist_elo_dataset(
+            dataset = compute_and_persist_elo_dataset(
                 api_module, all_tournaments, api_key, fetch_iv, show_progress=True,
             )
-
-    # Load the full dataset once per process (shared across all sessions and
-    # persisted to parquet). Both scratch and handicap Elo columns are stored;
-    # the use_handicap-specific view is derived downstream.
-    dataset = load_ffbridge_elo_dataset(
-        api_module, all_tournaments, api_key, fetch_iv, n_tournaments
-    )
+    else:
+        # Load the full dataset once per process (shared across all sessions and
+        # persisted to parquet). Both scratch and handicap Elo columns are stored;
+        # the use_handicap-specific view is derived downstream.
+        dataset = load_ffbridge_elo_dataset(
+            api_module, all_tournaments, api_key, fetch_iv, n_tournaments
+        )
     full_results_df = dataset['results_df']
     full_players_df = dataset['players_df']
     current_ratings = dataset['scratch_ratings'] if not use_handicap else dataset['handicap_ratings']
