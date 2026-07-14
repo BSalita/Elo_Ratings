@@ -1406,6 +1406,31 @@ def _past_tournament_ids(all_tournaments: List[Dict[str, Any]]) -> set[str]:
     }
 
 
+def _fetch_tournament_list_resilient(
+    api_module,
+    force_refresh: bool,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Load the tournament list, falling back between disk cache and live API."""
+    tournaments = api_module.fetch_tournament_list(
+        series_id="all", limit=None, force_refresh=force_refresh,
+    )
+    if tournaments:
+        return tournaments, "api" if force_refresh else "disk"
+
+    fallback_refresh = not force_refresh
+    print(
+        f"[ffbridge] tournament list empty (force_refresh={force_refresh}); "
+        f"retrying with force_refresh={fallback_refresh}",
+        flush=True,
+    )
+    tournaments = api_module.fetch_tournament_list(
+        series_id="all", limit=None, force_refresh=fallback_refresh,
+    )
+    if tournaments:
+        return tournaments, "api" if fallback_refresh else "disk"
+    return [], "none"
+
+
 def _needs_elo_rebuild(
     api_key: str,
     fetch_iv: bool,
@@ -2220,17 +2245,31 @@ def main():
     # Fetch all tournaments
     max_age_hours = float(os.environ.get("FFBRIDGE_ELO_MAX_AGE_HOURS", "20"))
     cache_age = _newest_persisted_age_hours(api_key, fetch_iv)
-    force_list_refresh = cache_age is None or cache_age >= max_age_hours
+    # Refresh the session list from the API only when persisted Elo parquet is
+    # stale. Missing parquet must still use the on-disk Lancelot session-list cache;
+    # forcing a live API fetch on cold start caused "Failed to retrieve tournament
+    # data" in production when outbound API access was slow or unavailable.
+    force_list_refresh = cache_age is not None and cache_age >= max_age_hours
 
     with st.spinner("Loading tournament data..."):
-        all_tournaments = api_module.fetch_tournament_list(
-            series_id="all", limit=None, force_refresh=force_list_refresh,
+        all_tournaments, list_source = _fetch_tournament_list_resilient(
+            api_module, force_list_refresh,
         )
         
         if not all_tournaments:
-            st.error("Failed to retrieve tournament data. Please check your connection or authentication.")
+            age_label = "none" if cache_age is None else f"{cache_age:.1f}h"
+            st.error(
+                "Failed to retrieve tournament data. The on-disk Lancelot session "
+                f"cache and live API both returned empty (elo parquet age={age_label}, "
+                f"force_refresh={force_list_refresh}). Check FFBRIDGE_CACHE_DIR and "
+                "outbound access to api-lancelot.ffbridge.fr."
+            )
             return
-    
+    if list_source == "disk" and force_list_refresh:
+        stats_placeholder.caption(
+            "Using cached tournament list (live API refresh returned empty)."
+        )
+
     n_tournaments = len(all_tournaments)
     rebuild, rebuild_reason = _needs_elo_rebuild(
         api_key, fetch_iv, n_tournaments, all_tournaments, max_age_hours,
