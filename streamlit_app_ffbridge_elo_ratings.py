@@ -1155,6 +1155,9 @@ def process_tournaments_to_elo(
             all_results.append(result_record)
 
     _elapsed = (datetime.now() - _t_start).total_seconds()
+    cache_stats["processed_tournament_ids"] = [
+        str(t.get("id")) for t in sorted_tournaments if t.get("id") is not None
+    ]
     print(f"[Processing] done: {total_t} tournaments in {_elapsed:.1f}s "
           f"(cached={cache_stats['cached']} fetched={cache_stats['fetched']} "
           f"missing={len(cache_stats['missing_ids'])}, rows={len(all_results)})", flush=True)
@@ -1388,6 +1391,21 @@ def _newest_persisted_age_hours(api_key: str, fetch_iv: bool) -> Optional[float]
     return (datetime.now(timezone.utc) - newest).total_seconds() / 3600.0
 
 
+def _past_tournament_ids(all_tournaments: List[Dict[str, Any]]) -> set[str]:
+    """Session IDs that should have been processed (date on or before today).
+
+    Must match the future-tournament filter in ``process_tournaments_to_elo``.
+    The Lancelot list includes hundreds of scheduled future sessions that are
+    intentionally skipped during Elo replay — they must not count as "missing".
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    return {
+        str(t.get("id"))
+        for t in all_tournaments
+        if t.get("id") is not None and str(t.get("date", ""))[:10] <= today
+    }
+
+
 def _needs_elo_rebuild(
     api_key: str,
     fetch_iv: bool,
@@ -1407,20 +1425,37 @@ def _needs_elo_rebuild(
     if age >= max_age_hours:
         return True, f"cache stale ({age:.1f}h >= {max_age_hours:g}h)"
 
-    list_ids = {str(t.get("id")) for t in all_tournaments if t.get("id") is not None}
-    if not persisted["results_df"].is_empty():
-        parquet_ids = set(
-            persisted["results_df"]
-            .select(pl.col("tournament_id").cast(pl.Utf8))
-            .unique()
-            .to_series()
-            .to_list()
-        )
+    eligible_ids = _past_tournament_ids(all_tournaments)
+    meta_path = _elo_cache_paths(key)[2]
+    meta: Dict[str, Any] = {}
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        built_ids = {str(x) for x in meta.get("processed_tournament_ids", [])}
+    except Exception:
+        built_ids = set()
+
+    if built_ids:
+        missing = eligible_ids - built_ids
     else:
-        parquet_ids = set()
-    missing = list_ids - parquet_ids
+        # Backward compat for parquets written before processed_tournament_ids existed.
+        if not persisted["results_df"].is_empty():
+            parquet_ids = set(
+                persisted["results_df"]
+                .select(pl.col("tournament_id").cast(pl.Utf8))
+                .unique()
+                .to_series()
+                .to_list()
+            )
+        else:
+            parquet_ids = set()
+        skipped_ids = {
+            str(x)
+            for x in (meta.get("processing_stats") or {}).get("missing_ids", [])
+            if x is not None
+        }
+        missing = eligible_ids - parquet_ids - skipped_ids
     if missing:
-        return True, f"{len(missing)} new tournament(s) not in parquet"
+        return True, f"{len(missing)} new past tournament(s) not in parquet"
     return False, ""
 
 
@@ -1462,6 +1497,7 @@ def compute_and_persist_elo_dataset(
             "scratch_ratings": scratch_ratings_dict,
             "handicap_ratings": handicap_ratings_dict,
             "processing_stats": stats,
+            "processed_tournament_ids": stats.get("processed_tournament_ids", []),
             "built_at": datetime.now(timezone.utc).isoformat(),
         }), encoding="utf-8")
         print(f"[ffbridge] persisted Elo dataset '{key}' to parquet", flush=True)
