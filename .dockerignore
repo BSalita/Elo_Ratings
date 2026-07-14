@@ -1,0 +1,22 @@
+# Data is bind-mounted at runtime, never baked into the image (GB-scale).
+data/
+**/elo_cache/
+
+# Secrets: never bake into the image; passed at runtime via --env-file
+.env
+.env.*
+
+# Local scratch, tooling, and non-runtime files
+.tmp/
+old/
+terminals/
+.vscode/
+.git/
+__pycache__/
+*.pyc
+*.zip
+*.bat
+*.md
+t.txt
+$null
+local_hosting/
