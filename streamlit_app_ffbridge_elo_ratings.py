@@ -1355,10 +1355,73 @@ def _read_persisted_elo_dataset(key: str) -> Optional[Dict[str, Any]]:
             "processing_stats": meta.get(
                 "processing_stats", {"cached": 0, "fetched": 0, "missing_ids": []}
             ),
+            "built_at": meta.get("built_at"),
         }
     except Exception as exc:  # corrupt/partial cache -> caller rebuilds
         print(f"[ffbridge] persisted Elo dataset load failed ({exc}); rebuilding", flush=True)
         return None
+
+
+def _newest_persisted_age_hours(api_key: str, fetch_iv: bool) -> Optional[float]:
+    """Age in hours of the newest persisted parquet set for this backend, or None."""
+    prefix = f"elo_full_v3_{api_key}_"
+    suffix = f"_iv_{int(fetch_iv)}"
+    newest: Optional[datetime] = None
+    for meta_path in _FFBRIDGE_ELO_CACHE_DIR.glob(f"{prefix}*{suffix}.meta.json"):
+        results_path = meta_path.with_name(meta_path.name.replace(".meta.json", ".results.parquet"))
+        players_path = meta_path.with_name(meta_path.name.replace(".meta.json", ".players.parquet"))
+        if not (results_path.exists() and players_path.exists()):
+            continue
+        try:
+            built_at = json.loads(meta_path.read_text(encoding="utf-8")).get("built_at")
+            if not built_at:
+                continue
+            dt = datetime.fromisoformat(built_at)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if newest is None or dt > newest:
+                newest = dt
+        except Exception:
+            continue
+    if newest is None:
+        return None
+    return (datetime.now(timezone.utc) - newest).total_seconds() / 3600.0
+
+
+def _needs_elo_rebuild(
+    api_key: str,
+    fetch_iv: bool,
+    n_tournaments: int,
+    all_tournaments: List[Dict[str, Any]],
+    max_age_hours: float,
+) -> Tuple[bool, str]:
+    """Return (True, reason) when the persisted parquet must be recomputed."""
+    key = _elo_cache_key(api_key, fetch_iv, n_tournaments)
+    persisted = _read_persisted_elo_dataset(key)
+    if persisted is None:
+        return True, "missing or unreadable parquet"
+
+    age = _newest_persisted_age_hours(api_key, fetch_iv)
+    if age is None:
+        return True, "incomplete parquet metadata"
+    if age >= max_age_hours:
+        return True, f"cache stale ({age:.1f}h >= {max_age_hours:g}h)"
+
+    list_ids = {str(t.get("id")) for t in all_tournaments if t.get("id") is not None}
+    if not persisted["results_df"].is_empty():
+        parquet_ids = set(
+            persisted["results_df"]
+            .select(pl.col("tournament_id").cast(pl.Utf8))
+            .unique()
+            .to_series()
+            .to_list()
+        )
+    else:
+        parquet_ids = set()
+    missing = list_ids - parquet_ids
+    if missing:
+        return True, f"{len(missing)} new tournament(s) not in parquet"
+    return False, ""
 
 
 def compute_and_persist_elo_dataset(
@@ -2119,18 +2182,36 @@ def main():
     api_key = selected_api_name.replace(" ", "_")
     
     # Fetch all tournaments
+    max_age_hours = float(os.environ.get("FFBRIDGE_ELO_MAX_AGE_HOURS", "20"))
+    cache_age = _newest_persisted_age_hours(api_key, fetch_iv)
+    force_list_refresh = cache_age is None or cache_age >= max_age_hours
+
     with st.spinner("Loading tournament data..."):
-        all_tournaments = api_module.fetch_tournament_list(series_id="all", limit=None)
+        all_tournaments = api_module.fetch_tournament_list(
+            series_id="all", limit=None, force_refresh=force_list_refresh,
+        )
         
         if not all_tournaments:
             st.error("Failed to retrieve tournament data. Please check your connection or authentication.")
             return
     
+    n_tournaments = len(all_tournaments)
+    rebuild, rebuild_reason = _needs_elo_rebuild(
+        api_key, fetch_iv, n_tournaments, all_tournaments, max_age_hours,
+    )
+    if rebuild:
+        print(f"[ffbridge] rebuilding Elo dataset: {rebuild_reason}", flush=True)
+        load_ffbridge_elo_dataset.clear()
+        with st.spinner(f"Refreshing Elo ratings ({rebuild_reason})…"):
+            compute_and_persist_elo_dataset(
+                api_module, all_tournaments, api_key, fetch_iv, show_progress=False,
+            )
+
     # Load the full dataset once per process (shared across all sessions and
     # persisted to parquet). Both scratch and handicap Elo columns are stored;
     # the use_handicap-specific view is derived downstream.
     dataset = load_ffbridge_elo_dataset(
-        api_module, all_tournaments, api_key, fetch_iv, len(all_tournaments)
+        api_module, all_tournaments, api_key, fetch_iv, n_tournaments
     )
     full_results_df = dataset['results_df']
     full_players_df = dataset['players_df']

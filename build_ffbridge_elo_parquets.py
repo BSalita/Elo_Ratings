@@ -151,34 +151,8 @@ def _preflight() -> int:
 
 
 def _newest_persisted_age_hours(api_key: str, fetch_iv: bool) -> Optional[float]:
-    """Age (hours) of the newest complete persisted parquet set for a backend.
-
-    Returns None if no complete set (results + players + meta with built_at)
-    exists, meaning the backend must be built.
-    """
-    cache_dir = app._FFBRIDGE_ELO_CACHE_DIR
-    prefix = f"elo_full_v3_{api_key}_"
-    suffix = f"_iv_{int(fetch_iv)}"
-    newest: Optional[datetime] = None
-    for meta_path in cache_dir.glob(f"{prefix}*{suffix}.meta.json"):
-        results_path = meta_path.with_name(meta_path.name.replace(".meta.json", ".results.parquet"))
-        players_path = meta_path.with_name(meta_path.name.replace(".meta.json", ".players.parquet"))
-        if not (results_path.exists() and players_path.exists()):
-            continue
-        try:
-            built_at = json.loads(meta_path.read_text(encoding="utf-8")).get("built_at")
-            if not built_at:
-                continue
-            dt = datetime.fromisoformat(built_at)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            if newest is None or dt > newest:
-                newest = dt
-        except Exception:
-            continue
-    if newest is None:
-        return None
-    return (datetime.now(timezone.utc) - newest).total_seconds() / 3600.0
+    """Delegate to the Streamlit app module (single source of truth)."""
+    return app._newest_persisted_age_hours(api_key, fetch_iv)
 
 
 def _prune_other_fetch_iv(api_key: str, fetch_iv: bool) -> None:
