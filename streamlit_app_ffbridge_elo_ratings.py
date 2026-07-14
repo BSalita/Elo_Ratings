@@ -3153,10 +3153,10 @@ def _load_main_content(
             }
         )
         new_clubs = [_ALL_CLUBS_LABEL] + unique_clubs
-        prev = st.session_state.get("elo_available_clubs")
         st.session_state.elo_available_clubs = new_clubs
-        if unique_clubs and (not prev or len(prev) <= 1):
-            _load_debug_log("club list initialized; rerunning")
+        if unique_clubs and not st.session_state.get("_ffbridge_clubs_seeded"):
+            st.session_state._ffbridge_clubs_seeded = True
+            _load_debug_log(f"club list seeded ({len(unique_clubs)} clubs); rerunning once")
             st.rerun()
 
     _load_debug_log("aggregating players (handicap)")
@@ -3170,6 +3170,14 @@ def _load_main_content(
         if not results_df.is_empty() else pl.DataFrame()
     )
     _load_debug_log(f"computing metric triples; sc={players_df_sc.height} player rows")
+    player_metrics_hc = _player_metric_triple(players_df_hc, min_games)
+    _load_debug_log("player metrics (handicap) done")
+    player_metrics_sc = _player_metric_triple(players_df_sc, min_games)
+    _load_debug_log("player metrics (scratch) done")
+    pair_metrics_hc = _pair_metric_triple(results_df, min_games, True)
+    _load_debug_log(f"pair metrics (handicap) done ({results_df.height} result rows scanned)")
+    pair_metrics_sc = _pair_metric_triple(results_df, min_games, False)
+    _load_debug_log("pair metrics (scratch) done")
     st.session_state["_ff_lb_ctx"] = {
         "results_df": results_df,
         "rating_type": rating_type,
@@ -3179,10 +3187,10 @@ def _load_main_content(
         "top_n": top_n,
         "min_games": min_games,
         "prior_sessions": prior_sessions,
-        "player_metrics_hc": _player_metric_triple(players_df_hc, min_games),
-        "player_metrics_sc": _player_metric_triple(players_df_sc, min_games),
-        "pair_metrics_hc": _pair_metric_triple(results_df, min_games, True),
-        "pair_metrics_sc": _pair_metric_triple(results_df, min_games, False),
+        "player_metrics_hc": player_metrics_hc,
+        "player_metrics_sc": player_metrics_sc,
+        "pair_metrics_hc": pair_metrics_hc,
+        "pair_metrics_sc": pair_metrics_sc,
     }
     del players_df_hc, players_df_sc
     _load_debug_log("leaderboard context ready; rendering panel")
