@@ -39,7 +39,7 @@ API_NAME = "FFBridge (Classic)"
 API_BASE = "https://api.ffbridge.fr"
 REQUIRES_AUTH = True
 
-# Cache root can be redirected to a persistent Railway Volume, e.g. /data/ffbridge
+# Cache root can be redirected to a persistent data mount, e.g. /data/ffbridge
 DATA_ROOT = pathlib.Path(os.getenv("FFBRIDGE_CACHE_DIR", "data/ffbridge")).resolve()
 CACHE_DIR = DATA_ROOT / 'cache'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)

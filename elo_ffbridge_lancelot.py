@@ -34,7 +34,7 @@ API_NAME = "FFBridge (Lancelot)"
 API_BASE = mlBridgeFFLib.LANCELOT_API_BASE
 REQUIRES_AUTH = False
 
-# Cache root can be redirected to a persistent Railway Volume, e.g. /data/ffbridge
+# Cache root can be redirected to a persistent data mount, e.g. /data/ffbridge
 DATA_ROOT = pathlib.Path(os.getenv("FFBRIDGE_CACHE_DIR", "data/ffbridge")).resolve()
 CACHE_DIR = DATA_ROOT / 'lancelot_cache'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)

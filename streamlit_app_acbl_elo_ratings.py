@@ -198,16 +198,16 @@ def _fetch_remote_report_table(
                 f"Request params were invalid. Details: {detail}"
             ) from exc
         hint = (
-            "If Streamlit and API are in different Railway projects, use the API public URL "
-            "(https://...) for ACBL_API_BASE_URL instead of *.railway.internal."
+            "Check ACBL_API_BASE_URL — in Docker use the service hostname "
+            "(e.g. http://acbl-api:8505), not localhost."
         )
         raise RuntimeError(
             f"ACBL API request failed for {request_url}: {exc}. {hint}"
         ) from exc
     except requests.exceptions.RequestException as exc:
         hint = (
-            "If Streamlit and API are in different Railway projects, use the API public URL "
-            "(https://...) for ACBL_API_BASE_URL instead of *.railway.internal."
+            "Check ACBL_API_BASE_URL — in Docker use the service hostname "
+            "(e.g. http://acbl-api:8505), not localhost."
         )
         raise RuntimeError(
             f"ACBL API request failed for {request_url}: {exc}. {hint}"

@@ -1,27 +1,24 @@
 """Offline builder for the FFBridge Elo dataset parquets.
 
 Precomputes the full multi-tournament Elo history for each FFBridge API backend
-and writes it to ``FFBRIDGE_CACHE_DIR/elo_cache/`` (the mounted Railway volume in
-production, or ``data/ffbridge/elo_cache/`` locally) in the exact layout the
-Streamlit boot loader (`load_ffbridge_elo_dataset`) expects.
+and writes it to ``FFBRIDGE_CACHE_DIR/elo_cache/`` (the production data mount,
+or ``data/ffbridge/elo_cache/`` locally) in the exact layout the Streamlit boot
+loader (`load_ffbridge_elo_dataset`) expects.
 
-Where this runs on Railway
---------------------------
-The volume is ONLY mounted in the runtime (start) container — Railway pre-deploy
-commands run in a separate container with the volume *unmounted*. So this builder
-is invoked from the service ``startCommand`` (before Streamlit launches), as a
-short-lived process that builds the parquet on the volume and then exits, freeing
-its memory before the long-running Streamlit process starts. That keeps the
-memory-heavy history build out of the Streamlit process (the OOM/restart cause).
+Where this runs in production
+-----------------------------
+``elo_ratings_start.ps1`` launches this as a short-lived container before
+Streamlit starts. That keeps the memory-heavy history build out of the
+long-running app process (the OOM/restart cause).
 
 Staleness gate (--if-stale)
 ---------------------------
 On every container start the builder runs, but with ``--if-stale`` it rebuilds a
 backend only when its persisted parquet is missing or older than
 ``--max-age-hours`` (default 20h). So ordinary restarts/redeploys are a ~1s no-op
-(the app just loads the existing parquet), while a daily scheduled redeploy
-crosses the threshold and does a full refresh. When it does rebuild, the tournament
-list is force-refreshed from the API so newly published events are discovered.
+(the app just loads the existing parquet), while a scheduled refresh crosses the
+threshold and does a full rebuild. When it does rebuild, the tournament list is
+force-refreshed from the API so newly published events are discovered.
 
 What a rebuild does (and does NOT) refresh
 ------------------------------------------
@@ -34,8 +31,7 @@ What a rebuild does (and does NOT) refresh
 - Elo ratings: FULL recompute from scratch over the entire history every time
   (``initial_players=None``). Elo is order-dependent, so a newly inserted event
   can shift the whole downstream chain — ratings are replayed, not appended.
-- Parquet output: fully regenerated (new tournament-count key) and the old set
-  is pruned.
+- Parquet output: fully regenerated and legacy count-keyed files are pruned.
 
 NUANCE — revised/corrected past events are NOT picked up. Because event results
 are cached with no expiry, if FFBridge later re-scores or amends an event we
@@ -75,50 +71,20 @@ import streamlit_app_ffbridge_elo_ratings as app
 def _preflight() -> int:
     """Validate deploy-critical configuration; return 0 if OK, else nonzero.
 
-    Only enforced on Railway (detected via RAILWAY_* env vars) so local/offline
-    runs are unaffected. Because the service ``startCommand`` chains this with
-    ``&&``, a nonzero return blocks Streamlit from starting — turning a silent
-    misconfiguration (e.g. unset FFBRIDGE_CACHE_DIR → app writes to ephemeral
-    disk and loses the volume) into a loud, immediate deploy failure.
+    Only enforced when ``STREAMLIT_ENV=production`` so local/offline runs are
+    unaffected.
     """
-    on_railway = any(
-        os.environ.get(k)
-        for k in ("RAILWAY_ENVIRONMENT", "RAILWAY_SERVICE_ID", "RAILWAY_PROJECT_ID")
-    )
-    if not on_railway:
+    if os.environ.get("STREAMLIT_ENV", "").strip().lower() != "production":
         return 0
 
     problems = []
-    # Railway injects RAILWAY_VOLUME_MOUNT_PATH only when a volume is attached to
-    # this service. We can't rely on "does the dir exist" because the API modules
-    # auto-create the cache dir at import (on ephemeral disk if no volume).
-    volume_mount = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
     cache_dir = os.environ.get("FFBRIDGE_CACHE_DIR", "").strip()
 
     if not cache_dir:
         problems.append(
-            "FFBRIDGE_CACHE_DIR is not set — set it to the volume mount path "
+            "FFBRIDGE_CACHE_DIR is not set — set it to the persistent data mount "
             "(e.g. /data/ffbridge)."
         )
-
-    if not volume_mount:
-        # Can't positively confirm a volume; warn rather than hard-fail to avoid
-        # false positives if Railway ever omits the var on a valid deploy.
-        print(
-            "[preflight] WARN: RAILWAY_VOLUME_MOUNT_PATH is not set — no volume "
-            "appears attached to this service. The cache/parquet will live on "
-            "ephemeral disk and be lost on redeploy. Attach a volume (e.g. /data).",
-            flush=True,
-        )
-    elif cache_dir:
-        cache_p = pathlib.Path(cache_dir)
-        mount_p = pathlib.Path(volume_mount)
-        is_within = cache_p == mount_p or mount_p in cache_p.parents
-        if not is_within:
-            problems.append(
-                f"FFBRIDGE_CACHE_DIR={cache_dir} is not inside the mounted volume "
-                f"({volume_mount}) — data would be lost on redeploy. Set it under {volume_mount}."
-            )
 
     if cache_dir:
         p = pathlib.Path(cache_dir)
@@ -143,8 +109,7 @@ def _preflight() -> int:
             print(f"[preflight] FATAL: {pr}", flush=True)
         return 2
     print(
-        f"[preflight] OK: Railway config validated "
-        f"(volume={volume_mount or 'NONE'}, FFBRIDGE_CACHE_DIR={cache_dir}).",
+        f"[preflight] OK: production config validated (FFBRIDGE_CACHE_DIR={cache_dir}).",
         flush=True,
     )
     return 0
@@ -156,26 +121,27 @@ def _newest_persisted_age_hours(api_key: str, fetch_iv: bool) -> Optional[float]
 
 
 def _prune_other_fetch_iv(api_key: str, fetch_iv: bool) -> None:
-    """Delete orphaned elo_cache sets for this backend with the opposite fetch_iv.
-
-    The app hardcodes fetch_iv=True, so ``..._iv_0`` sets left behind by earlier
-    mis-keyed builds are never read. Remove them to reclaim volume space. Only the
-    opposite-iv variant is ever touched — never the current one — so this is safe
-    to run on every deploy (it is a no-op once the volume is clean).
-    """
+    """Delete orphaned elo_cache sets for this backend with the opposite fetch_iv."""
     other = int(not fetch_iv)
     cache_dir = app._FFBRIDGE_ELO_CACHE_DIR
-    prefix = f"elo_full_v3_{api_key}_"
-    suffix = f"_iv_{other}"
+    iv = int(fetch_iv)
+    patterns = (
+        f"elo_full_v3_{api_key}_iv_{other}.results.parquet",
+        f"elo_full_v3_{api_key}_*_iv_{other}.results.parquet",
+    )
     try:
-        for results_path in cache_dir.glob(f"{prefix}*{suffix}.results.parquet"):
-            key = results_path.name[: -len(".results.parquet")]
-            middle = key[len(prefix): -len(suffix)]
-            if not middle.isdigit():  # guard: only tournament-count-keyed sets
-                continue
-            for path in app._elo_cache_paths(key):
-                path.unlink(missing_ok=True)
-            print(f"[builder] pruned orphaned Elo cache '{key}' (opposite fetch_iv)", flush=True)
+        seen: set[pathlib.Path] = set()
+        for pattern in patterns:
+            for results_path in cache_dir.glob(pattern):
+                if results_path in seen:
+                    continue
+                seen.add(results_path)
+                key = results_path.name[: -len(".results.parquet")]
+                if key.endswith(f"_iv_{iv}"):
+                    continue
+                for path in app._elo_cache_paths(key):
+                    path.unlink(missing_ok=True)
+                print(f"[builder] pruned orphaned Elo cache '{key}' (opposite fetch_iv)", flush=True)
     except Exception as exc:
         print(f"[builder] orphan prune skipped for {api_key}: {exc}", flush=True)
 
@@ -212,7 +178,7 @@ def build_one(api_name: str, fetch_iv: bool, if_stale: bool = False, max_age_hou
         api_module, all_tournaments, api_key, fetch_iv, show_progress=False
     )
     rows = dataset["results_df"].height
-    key = app._elo_cache_key(api_key, fetch_iv, len(all_tournaments))
+    key = app._elo_cache_key(api_key, fetch_iv)
     print(f"[builder] {api_name}: wrote '{key}' ({rows} result rows)", flush=True)
     return rows
 
@@ -224,8 +190,10 @@ def main() -> int:
         help="Only build this backend (default: all).",
     )
     parser.add_argument(
-        "--fetch-iv", action="store_true",
-        help="Fetch current IV values (slower). Must match the app's fetch_iv setting.",
+        "--fetch-iv",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fetch current IV values (slower). Default True to match the Streamlit app.",
     )
     parser.add_argument(
         "--if-stale", action="store_true",

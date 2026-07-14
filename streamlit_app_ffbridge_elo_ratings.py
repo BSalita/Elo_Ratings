@@ -110,11 +110,9 @@ API_BACKENDS = {
 # once, persist it here, and reload on subsequent (cold) starts so a restarted
 # container does not rebuild everything in RAM (the OOM/restart-loop cause).
 #
-# On Railway the parquet MUST live on the mounted volume (FFBRIDGE_CACHE_DIR,
-# e.g. /data/ffbridge), NOT the app dir: the preDeployCommand builder runs in a
-# separate one-off container whose only shared surface with the runtime
-# container is that volume. Writing to the app dir would be discarded before the
-# app starts. Locally (FFBRIDGE_CACHE_DIR unset) we fall back to the app dir.
+# In production set FFBRIDGE_CACHE_DIR to a persistent mount (e.g. /data/ffbridge)
+# so the raw tournament cache and elo_cache parquet survive redeploys. Locally
+# (FFBRIDGE_CACHE_DIR unset) we fall back to the app dir.
 _FFBRIDGE_SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _FFBRIDGE_CACHE_DIR_ENV = os.environ.get("FFBRIDGE_CACHE_DIR", "").strip()
 if _FFBRIDGE_CACHE_DIR_ENV:
@@ -122,9 +120,8 @@ if _FFBRIDGE_CACHE_DIR_ENV:
 else:
     _FFBRIDGE_ELO_CACHE_DIR = _FFBRIDGE_SCRIPT_DIR / "data" / "ffbridge" / "elo_cache"
 
-# Console-logging throttle. Railway drops logs above 500 lines/sec, so the old
-# 4-lines-per-tournament firehose (~2,300 lines) tripped the limit and hid real
-# errors. Log a heartbeat every N tournaments plus a final summary instead.
+# Console-logging throttle for long tournament replays. Log a heartbeat every N
+# tournaments plus a final summary instead of per-tournament spam.
 _PROCESSING_LOG_EVERY = max(1, int(os.environ.get("FFBRIDGE_LOG_EVERY", "50")))
 _FFBRIDGE_DEBUG = os.environ.get("FFBRIDGE_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -913,7 +910,7 @@ def process_tournaments_to_elo(
             status_text.markdown(f"<span style='color: white;'>Processing {i+1}/{total_t}: {t_name[:35]} (ID:{t_id})... {cache_info}</span>", unsafe_allow_html=True)
             progress_bar.progress((i + 1) / total_t)
 
-        # Throttled console heartbeat (Railway caps at 500 logs/sec).
+        # Throttled console heartbeat during long replays.
         if _FFBRIDGE_DEBUG or i == 0 or (i + 1) % _PROCESSING_LOG_EVERY == 0 or (i + 1) == total_t:
             print(f"[Processing] {i+1}/{total_t}: cached={cache_stats['cached']} "
                   f"fetched={cache_stats['fetched']} missing={len(cache_stats['missing_ids'])}", flush=True)
@@ -1170,7 +1167,7 @@ def process_tournaments_to_elo(
             f"({len(all_results):,} rows)…</span>",
             unsafe_allow_html=True,
         )
-    
+
     # Convert to DataFrames with explicit schema to handle None values
     if all_results:
         results_schema = {
@@ -1224,7 +1221,14 @@ def process_tournaments_to_elo(
         results_df = pl.DataFrame(all_results, schema=results_schema)
     else:
         results_df = pl.DataFrame()
-    
+
+    if status_text is not None:
+        status_text.markdown(
+            "<span style='color: white;'>Building player summary "
+            f"({len(scratch_ratings):,} players)…</span>",
+            unsafe_allow_html=True,
+        )
+
     # Create player ratings summary with BOTH scratch and handicap Elo
     # Scale ratings for display (calculations done in original range)
     player_summary = []
@@ -1265,6 +1269,12 @@ def process_tournaments_to_elo(
     else:
         players_df = pl.DataFrame()
 
+    if status_text is not None:
+        status_text.markdown(
+            "<span style='color: white;'>Standardizing Elo ratings…</span>",
+            unsafe_allow_html=True,
+        )
+
     # --- Unified z-score -> chess scale (aligns FFBridge with ACBL + chess) ---
     # Standardize every stored Elo column to mean CHESS_DISPLAY_MEAN, sd
     # CHESS_DISPLAY_SD using the player population's own mean/sd. z-score is
@@ -1297,15 +1307,81 @@ def _apply_club_name_mapping(
     if not club_mapping:
         return results_df
     return results_df.with_columns(
-        pl.col('club_code').map_elements(
-            lambda c: club_mapping.get(str(c).lstrip('0') if c else '', str(c)),
-            return_dtype=pl.Utf8,
-        ).alias('club_name')
+        pl.col('club_code')
+        .cast(pl.Utf8)
+        .str.strip_chars_start('0')
+        .replace(club_mapping, default=None)
+        .fill_null(pl.col('club_name'))
+        .alias('club_name')
     )
 
 
-def _elo_cache_key(api_key: str, fetch_iv: bool, n_tournaments: int) -> str:
-    return f"elo_full_v3_{api_key}_{n_tournaments}_iv_{int(fetch_iv)}"
+def _elo_cache_key(api_key: str, fetch_iv: bool, n_tournaments: int = 0) -> str:
+    """Stable parquet identity per backend and IV mode.
+
+    Tournament-list length (including scheduled future sessions) is intentionally
+    excluded: embedding it forced a full rebuild whenever the API added future
+    sessions even when no new past events existed.
+    """
+    del n_tournaments
+    return f"elo_full_v3_{api_key}_iv_{int(fetch_iv)}"
+
+
+def _legacy_elo_cache_keys(api_key: str, fetch_iv: bool) -> List[str]:
+    """Parquet keys from before the stable-key change (middle segment = list length)."""
+    prefix = f"elo_full_v3_{api_key}_"
+    suffix = f"_iv_{int(fetch_iv)}"
+    keys: List[str] = []
+    for meta_path in _FFBRIDGE_ELO_CACHE_DIR.glob(f"{prefix}*{suffix}.meta.json"):
+        key = meta_path.name[: -len(".meta.json")]
+        middle = key[len(prefix): -len(suffix)]
+        if middle.isdigit():
+            keys.append(key)
+    return keys
+
+
+def _resolve_elo_cache_key(api_key: str, fetch_iv: bool) -> Optional[str]:
+    """Best on-disk parquet set: stable key first, else newest legacy count-keyed set."""
+    stable = _elo_cache_key(api_key, fetch_iv)
+    results_path, players_path, meta_path = _elo_cache_paths(stable)
+    if results_path.exists() and players_path.exists() and meta_path.exists():
+        return stable
+
+    newest_key: Optional[str] = None
+    newest_dt: Optional[datetime] = None
+    for key in _legacy_elo_cache_keys(api_key, fetch_iv):
+        results_path, players_path, meta_path = _elo_cache_paths(key)
+        if not (results_path.exists() and players_path.exists() and meta_path.exists()):
+            continue
+        try:
+            built_at = json.loads(meta_path.read_text(encoding="utf-8")).get("built_at")
+            if not built_at:
+                continue
+            dt = datetime.fromisoformat(built_at)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if newest_dt is None or dt > newest_dt:
+                newest_dt = dt
+                newest_key = key
+        except Exception:
+            continue
+    return newest_key
+
+
+def _elo_cache_meta_paths(api_key: str, fetch_iv: bool) -> List[pathlib.Path]:
+    """All meta.json paths for a backend (stable + legacy count-keyed sets)."""
+    iv = int(fetch_iv)
+    seen: set[pathlib.Path] = set()
+    paths: List[pathlib.Path] = []
+    for pattern in (
+        f"elo_full_v3_{api_key}_iv_{iv}.meta.json",
+        f"elo_full_v3_{api_key}_*_iv_{iv}.meta.json",
+    ):
+        for meta_path in _FFBRIDGE_ELO_CACHE_DIR.glob(pattern):
+            if meta_path not in seen:
+                seen.add(meta_path)
+                paths.append(meta_path)
+    return paths
 
 
 def _elo_cache_paths(key: str) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
@@ -1317,24 +1393,14 @@ def _elo_cache_paths(key: str) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path
 
 
 def _prune_old_elo_cache(api_key: str, fetch_iv: bool, keep_key: str) -> None:
-    """Delete persisted parquet sets for this backend except ``keep_key``.
+    """Delete superseded parquet sets for this backend (legacy count-keyed files).
 
-    Files are keyed by (api_key, tournament_count, fetch_iv). As the live
-    tournament count grows, stale-count parquet sets would otherwise pile up on
-    the volume. Keep only the just-written set per backend/fetch_iv. Best-effort:
+    After a rebuild we keep only ``keep_key`` (the stable key). Best-effort:
     pruning failures never block the deploy.
     """
-    prefix = f"elo_full_v3_{api_key}_"
-    suffix = f"_iv_{int(fetch_iv)}"
     try:
-        for results_path in _FFBRIDGE_ELO_CACHE_DIR.glob(f"{prefix}*{suffix}.results.parquet"):
-            key = results_path.name[: -len(".results.parquet")]
+        for key in _legacy_elo_cache_keys(api_key, fetch_iv):
             if key == keep_key:
-                continue
-            # Only prune sets whose variable middle segment is the tournament
-            # count (all digits); guards against deleting unrelated files.
-            middle = key[len(prefix): -len(suffix)]
-            if not middle.isdigit():
                 continue
             for path in _elo_cache_paths(key):
                 path.unlink(missing_ok=True)
@@ -1343,8 +1409,11 @@ def _prune_old_elo_cache(api_key: str, fetch_iv: bool, keep_key: str) -> None:
         print(f"[ffbridge] elo cache prune skipped ({exc})", flush=True)
 
 
-def _read_persisted_elo_dataset(key: str) -> Optional[Dict[str, Any]]:
-    """Return the persisted dataset for ``key`` if present and readable, else None."""
+def _read_persisted_elo_dataset(api_key: str, fetch_iv: bool) -> Optional[Dict[str, Any]]:
+    """Return the persisted dataset for this backend if present and readable."""
+    key = _resolve_elo_cache_key(api_key, fetch_iv)
+    if key is None:
+        return None
     results_path, players_path, meta_path = _elo_cache_paths(key)
     if not (results_path.exists() and players_path.exists() and meta_path.exists()):
         return None
@@ -1371,10 +1440,8 @@ def _read_persisted_elo_dataset(key: str) -> Optional[Dict[str, Any]]:
 
 def _newest_persisted_age_hours(api_key: str, fetch_iv: bool) -> Optional[float]:
     """Age in hours of the newest persisted parquet set for this backend, or None."""
-    prefix = f"elo_full_v3_{api_key}_"
-    suffix = f"_iv_{int(fetch_iv)}"
     newest: Optional[datetime] = None
-    for meta_path in _FFBRIDGE_ELO_CACHE_DIR.glob(f"{prefix}*{suffix}.meta.json"):
+    for meta_path in _elo_cache_meta_paths(api_key, fetch_iv):
         results_path = meta_path.with_name(meta_path.name.replace(".meta.json", ".results.parquet"))
         players_path = meta_path.with_name(meta_path.name.replace(".meta.json", ".players.parquet"))
         if not (results_path.exists() and players_path.exists()):
@@ -1443,7 +1510,10 @@ def _needs_elo_rebuild(
     max_age_hours: float,
 ) -> Tuple[bool, str]:
     """Return (True, reason) when the persisted parquet must be recomputed."""
-    key = _elo_cache_key(api_key, fetch_iv, n_tournaments)
+    del n_tournaments
+    key = _resolve_elo_cache_key(api_key, fetch_iv)
+    if key is None:
+        return True, "missing or unreadable parquet"
     results_path, players_path, meta_path = _elo_cache_paths(key)
     if not (results_path.exists() and players_path.exists() and meta_path.exists()):
         return True, "missing or unreadable parquet"
@@ -1499,7 +1569,8 @@ def compute_and_persist_elo_dataset(
     the offline builder script. Both scratch and handicap Elo columns are stored
     so the ``use_handicap`` toggle is derived downstream.
     """
-    key = _elo_cache_key(api_key, fetch_iv, len(all_tournaments))
+    key = _elo_cache_key(api_key, fetch_iv)
+
     results_path, players_path, meta_path = _elo_cache_paths(key)
 
     results_df, players_df, _ratings, stats = process_tournaments_to_elo(
@@ -1574,10 +1645,9 @@ def load_ffbridge_elo_dataset(
     does it rebuild the history in RAM and persist it.
 
     Underscore-prefixed args (``_api_module``, ``_all_tournaments``) are excluded
-    from Streamlit's cache key; identity is ``(api_key, fetch_iv, n_tournaments)``.
+    from Streamlit's cache key; identity is ``(api_key, fetch_iv)``.
     """
-    key = _elo_cache_key(api_key, fetch_iv, n_tournaments)
-    persisted = _read_persisted_elo_dataset(key)
+    persisted = _read_persisted_elo_dataset(api_key, fetch_iv)
     if persisted is not None:
         return persisted
     return compute_and_persist_elo_dataset(

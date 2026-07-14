@@ -301,8 +301,7 @@ def _load_shrinkage_meta(club_or_tournament: str) -> dict | None:
     Lookup order:
 
     1. R2 (S3-compatible) at ``s3://$R2_BUCKET/$R2_PREFIX/<filename>`` when
-       ``R2_BUCKET`` is set. This is the canonical source on Railway
-       deployments where parquets also live in R2.
+       ``R2_BUCKET`` is set. This is the canonical source when parquets live in R2.
     2. Local filesystem candidates (DATA_ROOT, ACBL_SHRINKAGE_DIR override,
        e:/bridge/data/acbl) for local dev.
 
@@ -468,7 +467,7 @@ def _shrink_frame_dtypes(df: pl.DataFrame) -> pl.DataFrame:
 def _malloc_trim() -> None:
     """Prod glibc to return freed pages to the OS.
 
-    On Linux/Railway this releases per-request allocation slack that the
+    On Linux this releases per-request allocation slack that the
     allocator otherwise keeps in its arenas forever. No-ops on Windows
     (no libc.so.6) and on platforms whose malloc lacks malloc_trim.
     """
@@ -687,7 +686,7 @@ def _server_runtime_info() -> dict:
         "api_uptime_seconds": round(time.time() - API_PROCESS_STARTED_AT.timestamp(), 3),
         "api_source_file": str(API_SOURCE_PATH),
         "api_source_mtime": datetime.fromtimestamp(API_SOURCE_PATH.stat().st_mtime, tz=timezone.utc).isoformat(),
-        # Container-aware metrics (preferred for Railway limits)
+        # Container-aware metrics (preferred for cgroup memory limits)
         "ram_used_gb": round(ram_used_bytes / (1024 ** 3), 2),
         "ram_total_gb": round(mem_limit_bytes / (1024 ** 3), 2),
         "ram_percent": round(ram_percent, 1),
@@ -1335,7 +1334,7 @@ def acbl_report(
         del result_df, df
         # Per-request memory hygiene: return per-query slack to the OS so
         # process RSS doesn't climb forever as the user pages through
-        # different filters. No-op on Windows; real win on Railway/Linux.
+        # different filters. No-op on Windows; real win on Linux.
         _malloc_trim()
         response_payload["perf"]["total_seconds"] = round(time.perf_counter() - t0, 3)
         return response_payload

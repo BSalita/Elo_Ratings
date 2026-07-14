@@ -209,8 +209,10 @@ __marimo__/
 # Project data — large parquet/JSON, synced to R2 and/or built at deploy time.
 # Never versioned (GB-scale; would bloat the repo and can exceed GitHub limits).
 data/
-.railway-deploy-acbl/data/
 
 # Precomputed FFBridge Elo dataset cache. Built by build_ffbridge_elo_parquets.py
-# (locally under data/, at predeploy onto the Railway volume) — never versioned.
+# (locally under data/, or on the production data mount) — never versioned.
 **/elo_cache/
+
+# Nested clone used only for historical Railway repro experiments.
+old/railway-repro/.git/
