@@ -1444,8 +1444,8 @@ def _needs_elo_rebuild(
 ) -> Tuple[bool, str]:
     """Return (True, reason) when the persisted parquet must be recomputed."""
     key = _elo_cache_key(api_key, fetch_iv, n_tournaments)
-    persisted = _read_persisted_elo_dataset(key)
-    if persisted is None:
+    results_path, players_path, meta_path = _elo_cache_paths(key)
+    if not (results_path.exists() and players_path.exists() and meta_path.exists()):
         return True, "missing or unreadable parquet"
 
     age = _newest_persisted_age_hours(api_key, fetch_iv)
@@ -1455,28 +1455,26 @@ def _needs_elo_rebuild(
         return True, f"cache stale ({age:.1f}h >= {max_age_hours:g}h)"
 
     eligible_ids = _past_tournament_ids(all_tournaments)
-    meta_path = _elo_cache_paths(key)[2]
-    meta: Dict[str, Any] = {}
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        built_ids = {str(x) for x in meta.get("processed_tournament_ids", [])}
     except Exception:
-        built_ids = set()
+        return True, "incomplete parquet metadata"
+    built_ids = {str(x) for x in meta.get("processed_tournament_ids", [])}
 
     if built_ids:
         missing = eligible_ids - built_ids
     else:
-        # Backward compat for parquets written before processed_tournament_ids existed.
-        if not persisted["results_df"].is_empty():
+        # Backward compat: read only tournament_id column (not the full 700k+ row frame).
+        try:
             parquet_ids = set(
-                persisted["results_df"]
+                pl.read_parquet(results_path, columns=["tournament_id"])
                 .select(pl.col("tournament_id").cast(pl.Utf8))
                 .unique()
                 .to_series()
                 .to_list()
             )
-        else:
-            parquet_ids = set()
+        except Exception:
+            return True, "unreadable parquet"
         skipped_ids = {
             str(x)
             for x in (meta.get("processing_stats") or {}).get("missing_ids", [])
@@ -2415,24 +2413,32 @@ def main():
     
     # Populate club options
     if not full_results_df.is_empty() and 'club_name' in full_results_df.columns:
-        unique_clubs = sorted(set(full_results_df.select('club_name').to_series().to_list()))
-        unique_clubs = [c for c in unique_clubs if c and c.strip()]
+        unique_clubs = (
+            full_results_df
+            .select(pl.col("club_name"))
+            .filter(pl.col("club_name").is_not_null() & (pl.col("club_name").str.strip_chars() != ""))
+            .unique()
+            .to_series()
+            .to_list()
+        )
         
         old_clubs = st.session_state.get('elo_available_clubs', ["All Clubs"])
         merged_names = {c.strip() for c in old_clubs if c != "All Clubs"}
-        merged_names.update(c.strip() for c in unique_clubs if c.strip())
+        merged_names.update(str(c).strip() for c in unique_clubs if str(c).strip())
         
         current_selected = st.session_state.get("elo_club_selectbox", "All Clubs")
         if current_selected and current_selected != "All Clubs":
             merged_names.add(current_selected.strip())
         
         new_clubs = ["All Clubs"] + sorted(merged_names)
-        
-        if len(new_clubs) > len(old_clubs):
-            st.session_state.elo_available_clubs = new_clubs
+        st.session_state.elo_available_clubs = new_clubs
+        # One rerun so the club selectbox picks up the expanded option list.
+        if (
+            len(new_clubs) > len(old_clubs)
+            and not st.session_state.get("_ffbridge_club_options_refreshed")
+        ):
+            st.session_state._ffbridge_club_options_refreshed = True
             st.rerun()
-        else:
-            st.session_state.elo_available_clubs = new_clubs
     
     # Display metrics
     m1, m2, m3, m4 = st.columns(4)
