@@ -62,7 +62,6 @@ from st_aggrid import (
     AgGrid,
     ColumnsAutoSizeMode,
     AgGridTheme,
-    GridUpdateMode,
     DataReturnMode,
     JsCode,
 )
@@ -88,8 +87,12 @@ from elo_common import (
     coerce_int,
     coerce_numeric_columns,
     init_url_params_to_state,
+    leaderboard_aggrid_viewport_height,
+    LEADERBOARD_PAGE_SIZE,
+    LEADERBOARD_ROW_HEIGHT,
     render_app_footer,
-    render_memory_sidebar_caption,
+    footer_streamlit_app_diagnostics_line,
+    get_cache_diagnostic_line,
     sync_state_to_url_params,
 )
 
@@ -462,9 +465,10 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = 
     # null-int columns ending up as pandas object dtype.
     coerce_numeric_columns(display_df)
 
+    page_size = LEADERBOARD_PAGE_SIZE
     gb = GridOptionsBuilder.from_dataframe(display_df)
     gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
-    gb.configure_pagination(enabled=True, paginationAutoPageSize=False, paginationPageSize=25)
+    gb.configure_pagination(enabled=True, paginationAutoPageSize=False, paginationPageSize=page_size)
     gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
 
     # Configure every numeric column for numeric sorting + numeric filter.
@@ -495,14 +499,18 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = 
         for col in _url_columns(display_df):
             gb.configure_column(col, cellRenderer=_URL_CELL_RENDERER, minWidth=240, width=360)
     grid_options = gb.build()
+    grid_options['rowHeight'] = LEADERBOARD_ROW_HEIGHT
+    grid_options['headerHeight'] = 50
+    grid_options['domLayout'] = 'normal'
+    n_rows = len(display_df)
+    height = leaderboard_aggrid_viewport_height(n_rows, page_size, pagination=True)
 
     return AgGrid(
         display_df,
         gridOptions=grid_options,
         columns_auto_size_mode=ColumnsAutoSizeMode.NO_AUTOSIZE,
         theme=AgGridTheme.BALHAM,
-        height=calculate_aggrid_height(min(len(display_df), 25)),
-        update_mode=GridUpdateMode.MODEL_CHANGED,
+        height=height,
         data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
         key=key,
         allow_unsafe_jscode=True,
@@ -2214,6 +2222,60 @@ def _default_ffbridge_api() -> str:
 
 
 _FFBRIDGE_DEFAULT_API = _default_ffbridge_api()
+_ALL_CLUBS_LABEL = "All Clubs"
+
+
+def _ffbridge_club_select_options() -> list[str]:
+    """Club dropdown options; always includes All Clubs (never an empty list)."""
+    raw = st.session_state.get("elo_available_clubs")
+    if not raw:
+        return [_ALL_CLUBS_LABEL]
+    names = [_ALL_CLUBS_LABEL]
+    seen = {_ALL_CLUBS_LABEL}
+    for club in raw:
+        label = str(club).strip()
+        if label and label not in seen:
+            names.append(label)
+            seen.add(label)
+    return names
+
+
+def _ffbridge_dataset_summary_line(
+    *,
+    selected_api_name: str,
+    list_source: str,
+    n_tournaments: int,
+    processing_stats: dict,
+    result_rows: int,
+    list_fallback_note: str = "",
+) -> str:
+    """One-line Elo dataset load summary for the main-page caption."""
+    missing_ids = processing_stats.get("missing_ids", [])
+    missing_str = str(missing_ids) if missing_ids else "none"
+    parts = [
+        f"API {selected_api_name}",
+        f"tournament list {list_source}",
+        f"cached {processing_stats.get('cached', 0)}",
+        f"fetched {processing_stats.get('fetched', 0)}",
+        f"missing results {missing_str}",
+        f"{n_tournaments} tournaments",
+        f"{result_rows:,} result rows",
+    ]
+    if list_fallback_note:
+        parts.append(list_fallback_note)
+    return " • ".join(parts)
+
+
+def _ffbridge_footer_diagnostics_lines(st_module) -> list[str]:
+    """Streamlit container + cache stats for the page footer."""
+    lines = [footer_streamlit_app_diagnostics_line(st_module)]
+
+    cache_line = get_cache_diagnostic_line("FFBRIDGE_CACHE_DIR")
+    if cache_line.startswith("Cache (FFBRIDGE_CACHE_DIR):"):
+        cache_line = "Cache — " + cache_line.split(":", 1)[1].strip()
+    lines.append(cache_line)
+    return lines
+
 
 # URL query param -> sidebar widget session state.
 # Keys are short, URL-friendly names; session_key matches the widget's `key=...`.
@@ -2230,9 +2292,9 @@ FFBRIDGE_URL_PARAMS = {
         "default": "All Tournaments",
     },
     "club": {
-        "session_key": "elo_club_filter",
+        "session_key": "elo_club_selectbox",
         "parser": str,
-        "default": "",
+        "default": _ALL_CLUBS_LABEL,
     },
     "name": {
         "session_key": "elo_name_filter",
@@ -2275,16 +2337,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
     ctx = st.session_state.get("_ff_lb_ctx")
     if not ctx:
         return
-    score_type = st.radio(
-        "Elo Based On",
-        ["Scratch", "Handicap"],
-        index=0,
-        key="elo_score_type",
-        horizontal=True,
-        help="Choose which percentage to use for Elo calculations (rankings always sorted by Elo)",
-    )
-    use_handicap = (score_type == "Handicap")
-    sync_state_to_url_params(st, FFBRIDGE_URL_PARAMS)
+    use_handicap = st.session_state.get("elo_score_type", "Scratch") == "Handicap"
     results_df = ctx["results_df"]
     players_df = _aggregate_players_from_results_cached(results_df, use_handicap)
     rating_type = ctx["rating_type"]
@@ -2639,6 +2692,11 @@ def main():
     # Apply URL query params -> session state BEFORE widgets render (first run only).
     init_url_params_to_state(st, FFBRIDGE_URL_PARAMS)
 
+    url_club = st.session_state.get("elo_club_selectbox")
+    if url_club and url_club != _ALL_CLUBS_LABEL:
+        existing = _ffbridge_club_select_options()
+        if url_club not in existing:
+            st.session_state.elo_available_clubs = existing + [url_club]
 
     # Apply common theme
     apply_app_theme(st)
@@ -2649,7 +2707,6 @@ def main():
     # -------------------------------
     with st.sidebar:
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
-        render_memory_sidebar_caption(st)
         st.sidebar.markdown("[What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
         
         # API Backend selection
@@ -2728,11 +2785,19 @@ def main():
         
         simultaneous_type = tournament_options_list[tournament_labels.index(selected_tournament_label)]
         
-        club_filter = st.text_input(
+        club_options = _ffbridge_club_select_options()
+        if "elo_club_selectbox" not in st.session_state:
+            st.session_state.elo_club_selectbox = _ALL_CLUBS_LABEL
+        if st.session_state.elo_club_selectbox not in club_options:
+            st.session_state.elo_club_selectbox = _ALL_CLUBS_LABEL
+
+        selected_club = st.selectbox(
             "Filter by Club",
-            key="elo_club_filter",
-            help="Partial club name match (leave empty for all clubs)",
+            options=club_options,
+            key="elo_club_selectbox",
+            help="Filter results to show only players/pairs from a specific club",
         )
+        club_filter = "" if selected_club == _ALL_CLUBS_LABEL else selected_club
         
         # Name filter
         name_filter = st.text_input(
@@ -2750,8 +2815,16 @@ def main():
             horizontal=True,
             help="Switch between individual and partnership rankings"
         )
-        
-        
+
+        st.radio(
+            "Elo Based On",
+            ["Scratch", "Handicap"],
+            index=0,
+            key="elo_score_type",
+            horizontal=True,
+            help="Choose which percentage to use for Elo calculations (rankings always sorted by Elo)",
+        )
+
         # IV fetching is always enabled (cached, refreshes monthly on 15th)
         fetch_iv = True
         
@@ -2812,10 +2885,9 @@ def main():
             </p>
         </div>
     """, unsafe_allow_html=True)
-    
-    # Placeholder for processing stats (created once, updated later)
+
     stats_placeholder = st.empty()
-    
+
     # -------------------------------
     # Main Content
     # -------------------------------
@@ -2868,10 +2940,9 @@ def main():
                 "outbound access to the selected FFBridge API."
             )
             return
+    list_fallback_note = ""
     if list_source == "disk" and force_list_refresh:
-        stats_placeholder.caption(
-            "Using cached tournament list (live API refresh returned empty)."
-        )
+        list_fallback_note = "live API refresh returned empty; using disk tournament list"
 
     n_tournaments = len(all_tournaments)
     prev_api_key = st.session_state.get("_ffbridge_loaded_api_key")
@@ -2903,12 +2974,18 @@ def main():
     full_results_df = dataset['results_df']
     processing_stats = dataset['processing_stats']
 
-    # Display processing stats using the placeholder (avoids duplicates)
-    missing_ids = processing_stats.get('missing_ids', [])
-    missing_str = str(missing_ids) if missing_ids else "none"
-    stats_msg = f"Cached: {processing_stats['cached']}, Fetched: {processing_stats['fetched']}, Missing results: {missing_str}"
-    stats_placeholder.caption(stats_msg)
-    
+    stats_placeholder.caption(
+        "Elo dataset — "
+        + _ffbridge_dataset_summary_line(
+            selected_api_name=selected_api_name,
+            list_source=list_source,
+            n_tournaments=n_tournaments,
+            processing_stats=processing_stats,
+            result_rows=full_results_df.height,
+            list_fallback_note=list_fallback_note,
+        )
+    )
+
     # Exclude invalid percentage rows before any downstream filtering/aggregation
     full_results_df = _filter_valid_percentages_ffbridge(full_results_df)
 
@@ -2919,14 +2996,23 @@ def main():
         if 'series_id' in results_df.columns:
             results_df = results_df.filter(pl.col('series_id') == simultaneous_type)
     
-    if club_filter and club_filter.strip() and not results_df.is_empty():
-        if 'club_name' in results_df.columns:
-            club_pat = club_filter.strip().lower()
-            results_df = results_df.filter(
-                pl.col('club_name').str.to_lowercase().str.contains(club_pat, literal=True)
-            )
+    if club_filter and not results_df.is_empty() and "club_name" in results_df.columns:
+        results_df = results_df.filter(pl.col("club_name") == club_filter)
 
-    
+    if not full_results_df.is_empty() and "club_name" in full_results_df.columns:
+        unique_clubs = sorted(
+            {
+                str(c).strip()
+                for c in full_results_df.select("club_name").to_series().to_list()
+                if c is not None and str(c).strip()
+            }
+        )
+        new_clubs = [_ALL_CLUBS_LABEL] + unique_clubs
+        prev = st.session_state.get("elo_available_clubs")
+        st.session_state.elo_available_clubs = new_clubs
+        if unique_clubs and (not prev or len(prev) <= 1):
+            st.rerun()
+
     players_df_hc = (
         _aggregate_players_from_results_cached(results_df, True)
         if not results_df.is_empty() else pl.DataFrame()
@@ -2989,6 +3075,7 @@ def main():
         st,
         ENDPLAY_VERSION,
         source_line=f"Data sourced using {selected_api_name} • {selected_tournament_label}",
+        diagnostics_lines=_ffbridge_footer_diagnostics_lines(st),
         dependency_versions={
             "pandas": pd.__version__,
             "polars": pl.__version__,

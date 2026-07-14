@@ -374,6 +374,32 @@ def post_process_elo_table(table_df: pl.DataFrame, elo_col: str, scale_factor: f
 # -------------------------------
 # AgGrid Height Helper
 # -------------------------------
+LEADERBOARD_PAGE_SIZE = 25
+LEADERBOARD_ROW_HEIGHT = 28
+LEADERBOARD_HEADER_HEIGHT = 50
+LEADERBOARD_VIEWPORT_PADDING = 20
+LEADERBOARD_PAGINATION_BAR = 40
+
+
+def leaderboard_aggrid_viewport_height(
+    row_count: int,
+    page_size: int = LEADERBOARD_PAGE_SIZE,
+    *,
+    row_height: int = LEADERBOARD_ROW_HEIGHT,
+    pagination: bool = False,
+) -> int:
+    """AgGrid height sized to min(row_count, page_size), at least one row."""
+    visible_rows = max(1, min(row_count, page_size))
+    height = (
+        LEADERBOARD_HEADER_HEIGHT
+        + visible_rows * row_height
+        + LEADERBOARD_VIEWPORT_PADDING
+    )
+    if pagination:
+        height += LEADERBOARD_PAGINATION_BAR
+    return height
+
+
 def calculate_aggrid_height(row_count: int) -> int:
     """Calculate AgGrid height based on row count."""
     display_rows = min(AGGRID_MAX_DISPLAY_ROWS, row_count)
@@ -689,6 +715,18 @@ def get_memory_usage_line() -> str:
     return _line()
 
 
+def footer_streamlit_app_diagnostics_line(st_module) -> str:
+    """Streamlit container memory/CPU line for consolidated page footers."""
+    from streamlitlib.memory_usage import format_memory_metrics, update_session_peak_memory
+
+    metrics = update_session_peak_memory(st_module.session_state)
+    peak = st_module.session_state.get("_peak_cgroup_bytes")
+    streamlit_mem = format_memory_metrics(
+        metrics, peak_cgroup_bytes=peak or None
+    ).removeprefix("Memory: ")
+    return f"Streamlit app — {streamlit_mem}"
+
+
 def render_memory_sidebar_caption(st_module) -> None:
     """Show live cgroup/process memory in the sidebar."""
     from streamlitlib.streamlitlib import render_memory_sidebar_caption as _render
@@ -726,14 +764,21 @@ def render_app_footer(
     endplay_version: str,
     source_line: str | None = None,
     dependency_versions: dict[str, str] | None = None,
+    diagnostics_lines: list[str] | None = None,
 ) -> None:
     """Render the common footer used by both Streamlit apps."""
     dependency_versions = dependency_versions or {}
     pandas_version = dependency_versions.get("pandas", "N/A")
     polars_version = dependency_versions.get("polars", pl.__version__)
     duckdb_version = dependency_versions.get("duckdb", "N/A")
-    memory_line = get_memory_usage_line()
+    memory_line = "" if diagnostics_lines else get_memory_usage_line()
     date_str = datetime.now().strftime('%Y-%m-%d')
+
+    diagnostics_html = ""
+    if diagnostics_lines:
+        diagnostics_html = (
+            "<br>".join(html.escape(line) for line in diagnostics_lines) + "<br>"
+        )
 
     # Build the centred info block: project credit + versions + memory + date all in one div.
     source_html = f"{html.escape(source_line)}<br>" if source_line else ""
@@ -741,7 +786,7 @@ def render_app_footer(
         f"""
         <div style="text-align: center; color: #80cbc4; font-size: 0.8rem; opacity: 0.7;">
             Project lead is Robert Salita research@AiPolice.org. Code written in Python by Cursor AI. UI written in streamlit. Data engine is polars. Repo: <a href="https://github.com/BSalita/Elo_Ratings" target="_blank" style="color: #80cbc4;">github.com/BSalita/Elo_Ratings</a><br>
-            Query Params:{st_module.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}<br>
+            {diagnostics_html}Query Params:{st_module.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}<br>
             Streamlit:{st_module.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pandas_version} polars:{polars_version} duckdb:{duckdb_version} endplay:{endplay_version}<br>
             {source_html}{html.escape(memory_line)}<br>
             System Current Date: {html.escape(date_str)}

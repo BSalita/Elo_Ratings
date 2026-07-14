@@ -1,4 +1,4 @@
-# streamlit_app_elo_ratings.py
+﻿# streamlit_app_elo_ratings.py
 #
 # KNOWN ISSUE: streamlit >= 1.56.0 breaks streamlit-aggrid (any version).
 # AgGrid DataFrames render as blank. Pin streamlit <= 1.53.1 until resolved.
@@ -67,8 +67,11 @@ from elo_common import (
     coerce_int,
     coerce_numeric_columns,
     init_url_params_to_state,
+    leaderboard_aggrid_viewport_height,
+    LEADERBOARD_PAGE_SIZE,
+    LEADERBOARD_ROW_HEIGHT,
     render_app_footer,
-    render_memory_sidebar_caption,
+    footer_streamlit_app_diagnostics_line,
     sync_state_to_url_params,
 )
 
@@ -510,13 +513,17 @@ def _render_detail_aggrid(detail_df: pl.DataFrame, key: str, selectable: bool = 
         grid_options['alwaysShowVerticalScroll'] = True
         height = header_height + max_visible * row_height + 20
 
+    from st_aggrid import GridUpdateMode, DataReturnMode
     response = AgGrid(
         pdf,
         gridOptions=grid_options,
         height=height,
         theme=AgGridTheme.BALHAM,
+        update_mode=GridUpdateMode.MODEL_CHANGED,
+        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
         key=key,
         allow_unsafe_jscode=True,
+        update_on=["selectionChanged"],
     )
     return response if selectable else None
 
@@ -641,6 +648,110 @@ _DATE_RANGE_OPTIONS = (
     "Last 5 years",
 )
 
+
+def _acbl_report_cache_key(
+    club_or_tournament: str,
+    rating_type: str,
+    top_n: int,
+    min_sessions: int,
+    rating_method: str,
+    moving_avg_days: int,
+    elo_rating_type: str,
+    date_range: str,
+    online_filter: str,
+    masterpoints_filter: str,
+    prior_sessions: int,
+) -> str:
+    return (
+        f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_"
+        f"{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_"
+        f"{online_filter}_{masterpoints_filter}_prior{prior_sessions}"
+    )
+
+
+def _acbl_leaderboard_aggrid_key(
+    rating_type: str,
+    top_n: int,
+    min_sessions: int,
+    rating_method: str,
+    elo_rating_type: str,
+    online_filter: str,
+    masterpoints_filter: str,
+    name_filter: str,
+) -> str:
+    """Stable AgGrid key — omit club_or_tournament and API date_range so Club/Tournament toggles update in place."""
+    import re as _re
+    nf = _re.sub(r"[^\w\-]", "_", (name_filter or "").strip())[:48]
+    elo_part = _re.sub(r"[^\w\-]", "_", elo_rating_type)[:32]
+    mp_part = _re.sub(r"[^\w\-]", "_", masterpoints_filter)[:24]
+    return (
+        f"acbl_table_{rating_type}_top{top_n}_min{min_sessions}_{rating_method}_"
+        f"{elo_part}_{online_filter}_mp{mp_part}_name_{nf}"
+    )
+
+
+def _store_acbl_api_diagnostics(remote_payload: dict) -> None:
+    """Persist API perf/server stats for the footer (not inline captions)."""
+    if not isinstance(remote_payload, dict):
+        return
+    perf = remote_payload.get("perf", {})
+    server = remote_payload.get("server", {})
+    if not isinstance(perf, dict) or not perf:
+        return
+
+    report_parts: list[str] = []
+    if isinstance(server, dict) and server:
+        source_mtime = server.get("api_source_mtime", "n/a")
+        uptime_seconds = float(server.get("api_uptime_seconds", 0) or 0)
+        uptime_minutes = uptime_seconds / 60.0
+        report_parts.append(
+            f"data {source_mtime} • uptime {uptime_minutes:.1f}m ({uptime_seconds:.0f}s)"
+        )
+    report_parts.extend([
+        f"source {perf.get('source', 'unknown')}",
+        f"parse {perf.get('parse_seconds', 0)}s",
+        f"load {perf.get('load_seconds', 0)}s",
+        f"filter {perf.get('filter_seconds', 0)}s",
+        f"sql {perf.get('sql_seconds', 0)}s",
+        f"serialize {perf.get('serialize_seconds', 0)}s",
+        f"total {perf.get('total_seconds', 0)}s",
+        f"rows {perf.get('input_rows', '?')} → {perf.get('output_rows', '?')}",
+    ])
+
+    server_line = ""
+    if isinstance(server, dict) and server:
+        if server.get("swap_enabled", False):
+            swap_str = (
+                f"pagefile {server.get('swap_used_gb', 0)}/"
+                f"{server.get('swap_total_gb', 0)} GB ({server.get('swap_percent', 0)}%)"
+            )
+        else:
+            swap_str = "pagefile n/a"
+        server_line = (
+            f"RAM {server.get('ram_used_gb', 0)}/{server.get('ram_total_gb', 0)} GB "
+            f"({server.get('ram_percent', 0)}%) • {swap_str} • "
+            f"CPU/threads {server.get('cpu_count', 0)}/{server.get('threads', 0)}"
+        )
+
+    st.session_state.acbl_api_diagnostics = {
+        "server": server_line,
+        "report": " • ".join(report_parts),
+    }
+
+
+def _acbl_footer_diagnostics_lines(st_module) -> list[str]:
+    """Streamlit container + acbl-api stats for the page footer."""
+    lines = [footer_streamlit_app_diagnostics_line(st_module)]
+
+    diag = st_module.session_state.get("acbl_api_diagnostics")
+    if isinstance(diag, dict):
+        if diag.get("server"):
+            lines.append(f"acbl-api server — {diag['server']}")
+        if diag.get("report"):
+            lines.append(f"Last report request — {diag['report']}")
+    return lines
+
+
 # URL query param -> sidebar widget session state.
 # Keys are short, URL-friendly names; session_key matches the widget's `key=...`.
 ACBL_URL_PARAMS = {
@@ -706,6 +817,453 @@ ACBL_URL_PARAMS = {
         "default": 50,
     },
 }
+
+
+
+@st.fragment
+def _acbl_report_panel() -> None:
+    ctx = st.session_state.get("_acbl_sidebar_ctx")
+    if not ctx:
+        return
+    rating_type = ctx["rating_type"]
+    top_n = ctx["top_n"]
+    min_sessions = ctx["min_sessions"]
+    rating_method = ctx["rating_method"]
+    moving_avg_days = ctx["moving_avg_days"]
+    elo_rating_type = ctx["elo_rating_type"]
+    date_from = ctx["date_from"]
+    online_filter = ctx["online_filter"]
+    club_or_tournament = ctx["club_or_tournament"]
+
+    prior_sessions = int(st.session_state.get("acbl_prior_sessions", 50))
+    masterpoints_filter = st.session_state.get("masterpoints_filter", "All")
+    try:
+        with st.spinner("Fetching data from API server (takes up to 30 seconds)..."):
+            remote_table_df, remote_payload = _fetch_remote_report_table(
+                club_or_tournament=club_or_tournament,
+                rating_type=rating_type,
+                top_n=int(top_n),
+                min_sessions=int(min_sessions),
+                rating_method=rating_method,
+                moving_avg_days=int(moving_avg_days),
+                elo_rating_type=elo_rating_type,
+                date_from=date_from,
+                online_filter=online_filter,
+                prior_sessions=prior_sessions,
+            )
+    except Exception as exc:
+        st.error(str(exc))
+        st.stop()
+    dataset_type = club_or_tournament.lower()
+    date_range = str(remote_payload.get("date_range", "") or "")
+    generated_sql = str(remote_payload.get("generated_sql", "") or "")
+    _store_acbl_api_diagnostics(remote_payload)
+
+    # Surface the shrinkage state the API actually applied so users see
+    # the headline as Published Elo, with the prior they chose.
+    shrinkage_info = remote_payload.get("shrinkage", {}) if isinstance(remote_payload, dict) else {}
+    if shrinkage_info:
+        anchor = shrinkage_info.get("prior_anchor")
+        applied = shrinkage_info.get("applied", False)
+        ps = shrinkage_info.get("prior_sessions", 0)
+        kind = shrinkage_info.get("kind", "?")
+        if applied:
+            shrink_msg = (
+                f"📐 Headline shows **Published Elo** (Bayesian-shrunk, {kind} prior_anchor={anchor}, "
+                f"prior_sessions={ps}). `Player_Elo_Raw` / `Pair_Elo_Raw` available alongside."
+            )
+        elif anchor is None:
+            shrink_msg = (
+                "📐 Shrinkage unavailable: no `acbl_*_elo_shrinkage.json` sidecar found. "
+                "Run `acbl_elo_ratings_create.py` after the recompute to generate it. "
+                "Headline currently shows Raw Elo."
+            )
+        else:
+            shrink_msg = "📐 Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo."
+        st.caption(shrink_msg)
+
+    # Explain the Quality_Rank sidecar column so users understand what it
+    # measures and when to look at it.
+    st.caption(
+        "🎯 Leaderboard is sorted by **Player_Elo_Rank** / "
+        "**Pair_Elo_Rank** (pure Bayesian-shrunk Elo). The "
+        "**Quality_Rank** column (after Sessions) is the average of "
+        "`Player_Elo_Rank` (or `Pair_Elo_Rank`), `Par_Suit_Rank`, "
+        "`Par_Contract_Rank`, and `DD_Tricks_Diff_Rank` over the "
+        "qualifying pool — when a player's Quality_Rank is much higher "
+        "(worse) than their Elo rank, their Elo is being inflated by "
+        "weak-field play. Click any column header to re-sort."
+    )
+
+    # Explain the unified chess-anchored Elo scale + titles.
+    st.caption(
+        "♟️ **Elo** is standardized to a chess-style scale (mean **1500**, "
+        "sd **400**) so it is directly comparable with the FFBridge app and "
+        "chess: the **Title** column uses standard bands "
+        "(≥2400 IM, ≥2500 GM, ≥2600 SGM; 1400–1599 Novice, etc.). Because "
+        "it is a z-score over the qualifying pool, a given title means the "
+        "same percentile in ACBL, FFBridge, and chess."
+    )
+
+    # Store online filter and current dataset type for downstream controls
+    st.session_state.online_filter = online_filter
+    st.session_state.current_dataset_type = dataset_type
+
+    method_desc = f"{rating_method} method"
+    if rating_type == "Players":
+        title = f"Top {top_n} ACBL {club_or_tournament} Players by {elo_rating_type} ({method_desc})"
+    elif rating_type == "Pairs":
+        title = f"Top {top_n} ACBL {club_or_tournament} Pairs by {elo_rating_type} ({method_desc})"
+    else:
+        raise ValueError(f"Invalid rating type: {rating_type}")
+
+    # Store the generated SQL for the display table functionality
+    st.session_state.generated_sql = generated_sql
+    st.session_state.report_title = title
+
+    # Show SQL-based interface when in table mode
+    show_table = st.session_state.get('content_mode') == 'table'
+    if show_table:
+        if date_range:
+            st.subheader(f"{title} From {date_range}")
+        else:
+            st.subheader(title)
+    
+        # 1. Show the SQL query used in a compact scrollable container (only if enabled)
+        if st.session_state.get('show_sql_query', False):
+            with st.expander("SQL Query", expanded=False):
+                st.code(generated_sql, language='sql')
+    
+        # 2. Show results from remote API
+        cache_key = _acbl_report_cache_key(
+            club_or_tournament, rating_type, int(top_n), int(min_sessions),
+            rating_method, int(moving_avg_days), elo_rating_type, date_range,
+            online_filter, st.session_state.get('masterpoints_filter', 'All'),
+            int(st.session_state.get('acbl_prior_sessions', 50)),
+        )
+        st.session_state.acbl_report_cache_key = cache_key
+        st.session_state.acbl_club_or_tournament = club_or_tournament
+        st.session_state.acbl_report_title = title
+        st.session_state.acbl_date_range_str = date_range
+        if remote_table_df is not None:
+            st.session_state[cache_key] = remote_table_df
+        try:
+            table_df, _used_cache = _get_cached_report_table_df(cache_key)
+        except KeyError:
+            st.error("Report data not available. Please refresh.")
+            return
+    
+        # Display results with paginated AgGrid (page size = LEADERBOARD_PAGE_SIZE)
+        if 'table_df' in locals():
+            st.markdown(f"### 📊 Query Results ({len(table_df)} rows)")
+            # Standardize on Polars for filtering; convert to pandas only right before AgGrid
+            work_df = table_df
+            try:
+                if not hasattr(work_df, 'select'):
+                    # Convert pandas -> Polars if needed
+                    work_df = pl.from_pandas(work_df)
+            except Exception:
+                pass
+            # Apply player name filter if provided (read from session to handle button click reruns)
+            player_name_filter_value = st.session_state.get('player_name_filter', '').strip()
+            if player_name_filter_value:
+                try:
+                    if hasattr(work_df, 'select'):  # Polars DataFrame
+                        import re
+                        pattern = '(?i)' + re.escape(player_name_filter_value)
+                        original_count = len(work_df)
+                        if 'Player_Name' in work_df.columns:
+                            work_df = work_df.filter(pl.col('Player_Name').cast(pl.Utf8).str.contains(pattern, literal=False))
+                            filtered_count = len(work_df)
+                            st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter_value}'")
+                        elif 'Pair_Names' in work_df.columns:
+                            work_df = work_df.filter(pl.col('Pair_Names').cast(pl.Utf8).str.contains(pattern, literal=False))
+                            filtered_count = len(work_df)
+                            st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter_value}'")
+                        else:
+                            st.warning("⚠️ No Player_Name or Pair_Names column found to filter on")
+                except Exception:
+                    pass
+        
+            # Apply Masterpoints range filter for Players view
+            if rating_type == "Players":
+                mp_filter_label = st.session_state.get('masterpoints_filter', 'All')
+                if mp_filter_label != "All":
+                    try:
+                        original_count = len(work_df)
+                        work_df = apply_masterpoints_filter_polars(work_df, mp_filter_label)
+                        filtered_count = len(work_df)
+                        st.info(f"🎯 Masterpoints {mp_filter_label}: {filtered_count} of {original_count} players")
+                    except Exception:
+                        pass
+        
+            # Convert to pandas for AgGrid
+            # Convert to pandas for AgGrid rendering
+            display_df = work_df.to_pandas()
+            # Force columns whose names suggest numeric content (e.g. *_Rank,
+            # *_Score, *_Pct, MasterPoints, Sessions_Played) to numeric
+            # dtype so AgGrid sorts them numerically instead of alphabetically.
+            # Defensive against JSON round-trips that leave nullable INTEGER
+            # columns as pandas object dtype.
+            coerce_numeric_columns(display_df)
+        
+            # Use AgGrid with pagination (same pattern as FFBridge leaderboard)
+            from st_aggrid import (
+                GridOptionsBuilder,
+                AgGrid,
+                AgGridTheme,
+                ColumnsAutoSizeMode,
+                DataReturnMode,
+                JsCode,
+            )
+
+            page_size = LEADERBOARD_PAGE_SIZE
+            gb = GridOptionsBuilder.from_dataframe(display_df)
+            gb.configure_selection(selection_mode='single', use_checkbox=False)  # Enable single row selection
+            gb.configure_pagination(
+                enabled=True,
+                paginationAutoPageSize=False,
+                paginationPageSize=page_size,
+            )
+            gb.configure_default_column(
+                cellStyle={'color': 'black', 'font-size': '12px'},
+                suppressMenu=True,
+                wrapHeaderText=True,
+                autoHeaderHeight=False,
+            )
+
+            # Configure numeric columns for proper sorting.
+            # IMPORTANT: streamlit-aggrid 1.1.x serializes the DataFrame to
+            # the JS side in a way that delivers cell values as STRINGS,
+            # so `type=['numericColumn']` alone is not enough (it only
+            # right-aligns + sets the number filter); without an explicit
+            # numeric comparator AgGrid would sort "10" before "2".
+            numeric_comparator = JsCode("""
+                function(valueA, valueB, nodeA, nodeB, isDescending) {
+                    return Number(valueA) - Number(valueB);
+                }
+            """)
+            for col in display_df.columns:
+                if pd.api.types.is_numeric_dtype(display_df[col]):
+                    gb.configure_column(
+                        col,
+                        type=['numericColumn', 'numberColumnFilter'],
+                        comparator=numeric_comparator,
+                    )
+
+            # Skip URL cell renderers on the main leaderboard (detail grids still link).
+            gb.configure_side_bar()
+            gridOptions = gb.build()
+
+            gridOptions['rowHeight'] = LEADERBOARD_ROW_HEIGHT
+            gridOptions['headerHeight'] = 50
+            gridOptions['suppressHorizontalScroll'] = False  # Allow horizontal scrollbar if needed
+            gridOptions['domLayout'] = 'normal'
+
+            total_rows = len(display_df)
+            exact_height = leaderboard_aggrid_viewport_height(
+                total_rows, page_size, pagination=True,
+            )
+
+            st.caption("Click a row to view session history details")
+        
+            # Create dynamic key that resets selection when data/filters change
+            dynamic_key = _acbl_leaderboard_aggrid_key(
+                rating_type, int(top_n), int(min_sessions), rating_method,
+                elo_rating_type, online_filter,
+                st.session_state.get('masterpoints_filter', 'All'),
+                st.session_state.get('player_name_filter', ''),
+            )
+        
+            grid_response = AgGrid(
+                display_df,
+                gridOptions=gridOptions,
+                height=exact_height,
+                columns_auto_size_mode=ColumnsAutoSizeMode.NO_AUTOSIZE,
+                theme=AgGridTheme.BALHAM,
+                data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                key=dynamic_key,
+                allow_unsafe_jscode=True,
+                update_on=["selectionChanged"],
+            )
+        
+            # --- Row-click detail view ---
+            selected_rows = grid_response.get('selected_rows', None)
+            if selected_rows is not None and len(selected_rows) > 0:
+                selected_row = selected_rows.iloc[0] if hasattr(selected_rows, 'iloc') else selected_rows[0]
+                try:
+                    with st.spinner("Loading session history from ACBL API..."):
+                        if rating_type == "Players":
+                            player_id = str(selected_row.get("Player_ID", ""))
+                            player_name = selected_row.get("Player_Name", "Unknown")
+                            if not player_id:
+                                st.warning("Missing Player_ID in selected row.")
+                            else:
+                                st.markdown(f"#### Session History: **{player_name}** ({player_id})")
+                                detail = _fetch_remote_detail_table(
+                                    club_or_tournament=club_or_tournament,
+                                    rating_type=rating_type,
+                                    elo_rating_type=elo_rating_type,
+                                    date_from=date_from,
+                                    online_filter=online_filter,
+                                    player_id=player_id,
+                                )
+                                if detail.is_empty():
+                                    st.info("No session data found for this player.")
+                                else:
+                                    n_sessions = detail.select("Session").n_unique()
+                                    st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
+                                    _show_all_opponents_aggregation(detail, key_suffix=f"player_{player_id}")
+                                    _show_sql_query_block(
+                                        f"""SELECT *
+    FROM acbl_detail_api
+    WHERE rating_type = 'Players'
+      AND player_id = '{player_id}'
+    ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
+                                    )
+                                    st.markdown("#### Board-by-Board Detail")
+                                    detail_grid = _render_detail_aggrid(detail, key=f"detail_player_remote_{player_id}", selectable=True)
+                                    if detail_grid is not None:
+                                        sel = detail_grid.get("selected_rows", None)
+                                        if sel is not None and len(sel) > 0:
+                                            sel_row = sel.iloc[0] if hasattr(sel, "iloc") else sel[0]
+                                            _show_opponent_aggregation(detail, sel_row)
+                        else:
+                            pair_ids = str(selected_row.get("Pair_IDs", ""))
+                            pair_names = selected_row.get("Pair_Names", "Unknown")
+                            if not pair_ids:
+                                st.warning("Missing Pair_IDs in selected row.")
+                            else:
+                                st.markdown(f"#### Session History: **{pair_names}**")
+                                detail = _fetch_remote_detail_table(
+                                    club_or_tournament=club_or_tournament,
+                                    rating_type=rating_type,
+                                    elo_rating_type=elo_rating_type,
+                                    date_from=date_from,
+                                    online_filter=online_filter,
+                                    pair_ids=pair_ids,
+                                )
+                                if detail.is_empty():
+                                    st.info("No session data found for this pair.")
+                                else:
+                                    n_sessions = detail.select("Session").n_unique()
+                                    st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
+                                    _show_all_opponents_aggregation(detail, key_suffix=f"pair_{pair_ids}")
+                                    _show_sql_query_block(
+                                        f"""SELECT *
+    FROM acbl_detail_api
+    WHERE rating_type = 'Pairs'
+      AND pair_ids = '{pair_ids}'
+    ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
+                                    )
+                                    st.markdown("#### Board-by-Board Detail")
+                                    detail_grid = _render_detail_aggrid(detail, key=f"detail_pair_remote_{pair_ids}", selectable=True)
+                                    if detail_grid is not None:
+                                        sel = detail_grid.get("selected_rows", None)
+                                        if sel is not None and len(sel) > 0:
+                                            sel_row = sel.iloc[0] if hasattr(sel, "iloc") else sel[0]
+                                            _show_opponent_aggregation(detail, sel_row)
+                except Exception as exc:
+                    st.error(f"Session detail API request failed: {exc}")
+        
+            # Mark that table is displayed (lightweight state only)
+            st.session_state.table_displayed = True
+    
+        # 3. SQL Query Interface for additional queries (only if enabled)
+        if st.session_state.get('show_sql_query', False) and st.session_state.get('enable_custom_queries', False):
+            st.markdown("---")
+            st.markdown("### 🔍 Run Additional SQL Queries")
+            st.caption("Query the results above. Only the displayed columns are available. The results table is available as 'self'.")
+        
+        
+            # Initialize SQL query history if not exists
+            if 'sql_query_history' not in st.session_state:
+                st.session_state.sql_query_history = []
+        
+            # Add the generated query to history automatically (only once)
+            content_is_table = st.session_state.get('content_mode') == 'table'
+            if content_is_table and st.session_state.get('generated_sql'):
+                if not any(h['query'] == st.session_state.generated_sql for h in st.session_state.sql_query_history):
+                    st.session_state.sql_query_history.append({
+                        'query': st.session_state.generated_sql,
+                        'result': table_df,
+                        'timestamp': datetime.now().strftime('%H:%M:%S'),
+                        'auto_generated': True
+                    })
+        
+            # Display additional query results (excluding the auto-generated one already shown above)
+            additional_queries = [q for q in st.session_state.sql_query_history if not q.get('auto_generated', False)]
+            if additional_queries:
+                st.markdown("### 📋 Additional Query Results")
+            
+                # Show results in reverse order (most recent first)
+                for i, query_result in enumerate(reversed(additional_queries)):
+                    query_label = f"Query {len(additional_queries) - i} ({query_result['timestamp']})"
+                
+                    with st.expander(query_label, expanded=(i == 0)):
+                        st.code(query_result['query'], language='sql')
+                        ShowDataFrameTable(
+                            query_result['result'], 
+                            key=f"sql_result_{len(additional_queries) - i}",
+                            output_method='aggrid',
+                            height_rows=25
+                        )
+        
+            # SQL Query input - fixed at bottom using streamlit-extras bottom container
+            with bottom():
+                query = st.text_input(
+                    "💬 SQL Query (press Enter to execute):",
+                    value='',
+                    placeholder="SELECT * FROM self WHERE Player_Elo_Score > 1500 ORDER BY Quality_Rank LIMIT 10",
+                    key="sql_query_text_input",
+                    on_change=lambda: st.session_state.update({"execute_query_now": True})
+                )
+
+            # Execute query when Enter pressed
+            if st.session_state.get('execute_query_now') and st.session_state.get('sql_query_text_input', '').strip():
+                with st.spinner('ΓÅ│ Executing query...'):
+                    try:
+                        # Process query
+                        processed_query = st.session_state.get('sql_query_text_input', '').strip()
+                        if 'from ' not in processed_query.lower():
+                            processed_query = 'FROM self ' + processed_query
+                    
+                        # Show the query being executed
+                        if st.session_state.get('show_sql_query', False):
+                            st.code(processed_query, language='sql')
+                    
+                        # Execute query on the query results table, not the raw dataset
+                        con = get_db_connection()
+                        _db_register(con, 'self', table_df)
+                        result_df = con.execute(processed_query).pl()
+                    
+                        # Store in history
+                        st.session_state.sql_query_history.append({
+                            'query': st.session_state.get('sql_query_text_input', ''),
+                            'result': result_df,
+                            'timestamp': datetime.now().strftime('%H:%M:%S')
+                        })
+                    
+                        st.success(f"✅ Query executed successfully! Returned {len(result_df)} rows.")
+                    
+                        # Display the result immediately
+                        st.markdown("### 📊 Query Result")
+                        st.code(st.session_state.get('sql_query_text_input', ''), language='sql')
+                        ShowDataFrameTable(
+                            result_df, 
+                            key=f"sql_result_current_{datetime.now().strftime('%H%M%S')}",
+                            output_method='aggrid',
+                            height_rows=25
+                        )
+                    
+                    except Exception as e:
+                        st.error(f"❌ SQL Error: {e}")
+                        if 'processed_query' in locals():
+                            st.info(f"📝 Your query was transformed to:")
+                            st.code(processed_query, language='sql')
+                    finally:
+                        # Reset flag so we don't re-run on each rerun
+                        st.session_state.execute_query_now = False
 
 
 def main():
@@ -782,9 +1340,14 @@ def main():
             unsafe_allow_html=True,
         )
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
-        render_memory_sidebar_caption(st)
         st.sidebar.markdown("🔗 [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
-        club_or_tournament = st.radio("Event type", options=["Club", "Tournament"], index=0, horizontal=True, key="event_type")
+        club_or_tournament = st.radio(
+            "Event type",
+            options=["Club", "Tournament"],
+            index=0,
+            horizontal=True,
+            key="event_type",
+        )
         rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=True, key="rating_type")
         top_n = st.number_input(
             "Top N players or pairs",
@@ -973,12 +1536,23 @@ def main():
     else:
         date_from = None # Default to all time
 
+    st.session_state["_acbl_sidebar_ctx"] = {
+        "club_or_tournament": club_or_tournament,
+        "rating_type": rating_type,
+        "top_n": int(top_n),
+        "min_sessions": int(min_sessions),
+        "rating_method": rating_method,
+        "moving_avg_days": int(moving_avg_days),
+        "elo_rating_type": elo_rating_type,
+        "date_from": date_from,
+        "online_filter": online_filter,
+    }
+
     # -------------------------------
     # Report Generation
     # -------------------------------
     # Track current settings to detect changes
     current_settings = {
-        "club_or_tournament": club_or_tournament,
         "rating_type": rating_type,
         "top_n": int(top_n),
         "min_sessions": int(min_sessions),
@@ -1028,478 +1602,14 @@ def main():
         if 'sql_query_history' in st.session_state:
             st.session_state.sql_query_history = st.session_state.sql_query_history[-5:]
         
-        # Get data from remote API
-        dataset_type = club_or_tournament.lower()
-        remote_payload: dict = {}
-        remote_table_df: pl.DataFrame | None = None
-
-        try:
-            with st.spinner("Fetching data from API server (takes up to 30 seconds)..."):
-                remote_table_df, remote_payload = _fetch_remote_report_table(
-                    club_or_tournament=club_or_tournament,
-                    rating_type=rating_type,
-                    top_n=int(top_n),
-                    min_sessions=int(min_sessions),
-                    rating_method=rating_method,
-                    moving_avg_days=int(moving_avg_days),
-                    elo_rating_type=elo_rating_type,
-                    date_from=date_from,
-                    online_filter=online_filter,
-                    prior_sessions=int(st.session_state.get("acbl_prior_sessions", 50)),
-                )
-        except Exception as exc:
-            st.error(str(exc))
-            st.stop()
-        date_range = str(remote_payload.get("date_range", "") or "")
-        generated_sql = str(remote_payload.get("generated_sql", "") or "")
-        perf = remote_payload.get("perf", {}) if isinstance(remote_payload, dict) else {}
-        server = remote_payload.get("server", {}) if isinstance(remote_payload, dict) else {}
-        if isinstance(perf, dict) and perf:
-            if isinstance(server, dict) and server:
-                source_mtime = server.get("api_source_mtime", "n/a")
-                uptime_seconds = float(server.get("api_uptime_seconds", 0) or 0)
-                uptime_minutes = uptime_seconds / 60.0
-                if server.get("swap_enabled", False):
-                    swap_str = (
-                        f"{server.get('swap_used_gb', 0)}/{server.get('swap_total_gb', 0)} GB "
-                        f"({server.get('swap_percent', 0)}%)"
-                    )
-                else:
-                    swap_str = "N/A (swap disabled)"
-                api_meta_str = (
-                    f"api_source_datetime:{source_mtime} • "
-                    f"api_uptime:{uptime_minutes:.1f}m ({uptime_seconds:.1f}s)"
-                )
-                server_resources_str = (
-                    f"Memory: RAM {server.get('ram_used_gb', 0)}/{server.get('ram_total_gb', 0)} GB "
-                    f"({server.get('ram_percent', 0)}%) • "
-                    f"Virtual/Pagefile {swap_str} • "
-                    f"CPU/Threads {server.get('cpu_count', 0)}/{server.get('threads', 0)}"
-                )
-            else:
-                api_meta_str = "api_source_datetime:n/a • api_uptime:n/a"
-                server_resources_str = "Memory/CPU unavailable"
-            st.caption(
-                "API performance — "
-                f"{api_meta_str} • "
-                f"source:{perf.get('source', 'unknown')} • "
-                f"parse:{perf.get('parse_seconds', 0)}s • "
-                f"load:{perf.get('load_seconds', 0)}s • "
-                f"filter:{perf.get('filter_seconds', 0)}s • "
-                f"sql:{perf.get('sql_seconds', 0)}s • "
-                f"serialize:{perf.get('serialize_seconds', 0)}s • "
-                f"total:{perf.get('total_seconds', 0)}s • "
-                f"rows in/out:{perf.get('input_rows', '?')}/{perf.get('output_rows', '?')}"
-            )
-            st.caption(f"Server resources — {server_resources_str}")
-
-        # Surface the shrinkage state the API actually applied so users see
-        # the headline as Published Elo, with the prior they chose.
-        shrinkage_info = remote_payload.get("shrinkage", {}) if isinstance(remote_payload, dict) else {}
-        if shrinkage_info:
-            anchor = shrinkage_info.get("prior_anchor")
-            applied = shrinkage_info.get("applied", False)
-            ps = shrinkage_info.get("prior_sessions", 0)
-            kind = shrinkage_info.get("kind", "?")
-            if applied:
-                shrink_msg = (
-                    f"📐 Headline shows **Published Elo** (Bayesian-shrunk, {kind} prior_anchor={anchor}, "
-                    f"prior_sessions={ps}). `Player_Elo_Raw` / `Pair_Elo_Raw` available alongside."
-                )
-            elif anchor is None:
-                shrink_msg = (
-                    "📐 Shrinkage unavailable: no `acbl_*_elo_shrinkage.json` sidecar found. "
-                    "Run `acbl_elo_ratings_create.py` after the recompute to generate it. "
-                    "Headline currently shows Raw Elo."
-                )
-            else:
-                shrink_msg = "📐 Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo."
-            st.caption(shrink_msg)
-
-        # Explain the Quality_Rank sidecar column so users understand what it
-        # measures and when to look at it.
-        st.caption(
-            "🎯 Leaderboard is sorted by **Player_Elo_Rank** / "
-            "**Pair_Elo_Rank** (pure Bayesian-shrunk Elo). The "
-            "**Quality_Rank** column (after Sessions) is the average of "
-            "`Player_Elo_Rank` (or `Pair_Elo_Rank`), `Par_Suit_Rank`, "
-            "`Par_Contract_Rank`, and `DD_Tricks_Diff_Rank` over the "
-            "qualifying pool — when a player's Quality_Rank is much higher "
-            "(worse) than their Elo rank, their Elo is being inflated by "
-            "weak-field play. Click any column header to re-sort."
-        )
-
-        # Explain the unified chess-anchored Elo scale + titles.
-        st.caption(
-            "♟️ **Elo** is standardized to a chess-style scale (mean **1500**, "
-            "sd **400**) so it is directly comparable with the FFBridge app and "
-            "chess: the **Title** column uses standard bands "
-            "(≥2400 IM, ≥2500 GM, ≥2600 SGM; 1400–1599 Novice, etc.). Because "
-            "it is a z-score over the qualifying pool, a given title means the "
-            "same percentile in ACBL, FFBridge, and chess."
-        )
-
-        # Store online filter and current dataset type for downstream controls
-        st.session_state.online_filter = online_filter
-        st.session_state.current_dataset_type = dataset_type
-
-        method_desc = f"{rating_method} method"
-        if rating_type == "Players":
-            title = f"Top {top_n} ACBL {club_or_tournament} Players by {elo_rating_type} ({method_desc})"
-        elif rating_type == "Pairs":
-            title = f"Top {top_n} ACBL {club_or_tournament} Pairs by {elo_rating_type} ({method_desc})"
-        else:
-            raise ValueError(f"Invalid rating type: {rating_type}")
-
-        # Store the generated SQL for the display table functionality
-        st.session_state.generated_sql = generated_sql
-        st.session_state.report_title = title
-
-        # Show SQL-based interface when in table mode
-        show_table = st.session_state.get('content_mode') == 'table'
-        if show_table:
-            if date_range:
-                st.subheader(f"{title} From {date_range}")
-            else:
-                st.subheader(title)
-            
-            # 1. Show the SQL query used in a compact scrollable container (only if enabled)
-            if st.session_state.get('show_sql_query', False):
-                with st.expander("SQL Query", expanded=False):
-                    st.code(generated_sql, language='sql')
-            
-            # 2. Show results from remote API
-            cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}_{st.session_state.get('masterpoints_filter','All')}_prior{st.session_state.get('acbl_prior_sessions', 50)}"
-            if remote_table_df is not None:
-                st.session_state[cache_key] = remote_table_df
-            try:
-                table_df, _used_cache = _get_cached_report_table_df(cache_key)
-            except KeyError:
-                st.error("Report data not available. Please refresh.")
-                return
-            
-            # Display results with exactly 25 viewable rows (common for both paths)
-            if 'table_df' in locals():
-                st.markdown(f"### 📊 Query Results ({len(table_df)} rows)")
-                # Standardize on Polars for filtering; convert to pandas only right before AgGrid
-                work_df = table_df
-                try:
-                    if not hasattr(work_df, 'select'):
-                        # Convert pandas -> Polars if needed
-                        work_df = pl.from_pandas(work_df)
-                except Exception:
-                    pass
-                # Apply player name filter if provided (read from session to handle button click reruns)
-                player_name_filter_value = st.session_state.get('player_name_filter', '').strip()
-                if player_name_filter_value:
-                    try:
-                        if hasattr(work_df, 'select'):  # Polars DataFrame
-                            import re
-                            pattern = '(?i)' + re.escape(player_name_filter_value)
-                            original_count = len(work_df)
-                            if 'Player_Name' in work_df.columns:
-                                work_df = work_df.filter(pl.col('Player_Name').cast(pl.Utf8).str.contains(pattern, literal=False))
-                                filtered_count = len(work_df)
-                                st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter_value}'")
-                            elif 'Pair_Names' in work_df.columns:
-                                work_df = work_df.filter(pl.col('Pair_Names').cast(pl.Utf8).str.contains(pattern, literal=False))
-                                filtered_count = len(work_df)
-                                st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter_value}'")
-                            else:
-                                st.warning("⚠️ No Player_Name or Pair_Names column found to filter on")
-                    except Exception:
-                        pass
-                
-                # Apply Masterpoints range filter for Players view
-                if rating_type == "Players":
-                    mp_filter_label = st.session_state.get('masterpoints_filter', 'All')
-                    if mp_filter_label != "All":
-                        try:
-                            original_count = len(work_df)
-                            work_df = apply_masterpoints_filter_polars(work_df, mp_filter_label)
-                            filtered_count = len(work_df)
-                            st.info(f"🎯 Masterpoints {mp_filter_label}: {filtered_count} of {original_count} players")
-                        except Exception:
-                            pass
-                
-                # Convert to pandas for AgGrid
-                # Convert to pandas for AgGrid rendering
-                display_df = work_df.to_pandas()
-                # Force columns whose names suggest numeric content (e.g. *_Rank,
-                # *_Score, *_Pct, MasterPoints, Sessions_Played) to numeric
-                # dtype so AgGrid sorts them numerically instead of alphabetically.
-                # Defensive against JSON round-trips that leave nullable INTEGER
-                # columns as pandas object dtype.
-                coerce_numeric_columns(display_df)
-                
-                # Use AgGrid directly with precise height control for exactly 25 rows
-                from st_aggrid import GridOptionsBuilder, AgGrid, AgGridTheme, JsCode
-                
-                gb = GridOptionsBuilder.from_dataframe(display_df)
-                gb.configure_selection(selection_mode='single', use_checkbox=False)  # Enable single row selection
-                gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True, wrapHeaderText=True, autoHeaderHeight=True)
-
-                # Configure numeric columns for proper sorting.
-                # IMPORTANT: streamlit-aggrid 1.1.x serializes the DataFrame to
-                # the JS side in a way that delivers cell values as STRINGS,
-                # so `type=['numericColumn']` alone is not enough (it only
-                # right-aligns + sets the number filter); without an explicit
-                # numeric comparator AgGrid would sort "10" before "2".
-                numeric_comparator = JsCode("""
-                    function(valueA, valueB, nodeA, nodeB, isDescending) {
-                        return Number(valueA) - Number(valueB);
-                    }
-                """)
-                for col in display_df.columns:
-                    if pd.api.types.is_numeric_dtype(display_df[col]):
-                        gb.configure_column(
-                            col,
-                            type=['numericColumn', 'numberColumnFilter'],
-                            comparator=numeric_comparator,
-                        )
-                
-                # Render any column containing http(s) URLs as clickable links.
-                url_renderer = JsCode(_URL_CELL_RENDERER_JS)
-                for col in _url_columns_pandas(display_df):
-                    gb.configure_column(col, cellRenderer=url_renderer, minWidth=240, width=360)
-                
-                # Don't configure pagination - we want scrolling instead
-                gb.configure_side_bar()
-                gridOptions = gb.build()
-                
-                # Configure for scrolling with adjustable height
-                gridOptions['rowHeight'] = 28
-                gridOptions['suppressPaginationPanel'] = True
-                gridOptions['suppressHorizontalScroll'] = False  # Allow horizontal scrollbar if needed
-                gridOptions['domLayout'] = 'normal'  # Use normal layout (not autoHeight)
-
-                # Dynamically size height: show up to 25 rows; if fewer, shrink to fit
-                header_height = 50
-                row_height = gridOptions['rowHeight']
-                max_rows_visible = 25
-                total_rows = len(display_df)
-                visible_rows = max(1, min(total_rows, max_rows_visible))
-                if total_rows <= max_rows_visible:
-                    # No vertical scrollbar needed; fit exactly to number of rows
-                    gridOptions['alwaysShowVerticalScroll'] = False
-                    exact_height = header_height + visible_rows * row_height + 20
-                else:
-                    # Use fixed height with vertical scrollbar
-                    gridOptions['alwaysShowVerticalScroll'] = True
-                    exact_height = header_height + max_rows_visible * row_height + 20
-                
-                # Custom CSS to ensure scrollbars are visible
-                custom_css = {
-                    ".ag-theme-balham .ag-body-viewport": {
-                        "overflow-y": "auto !important",
-                        "overflow-x": "auto !important"
-                    },
-                    ".ag-theme-balham .ag-body-horizontal-scroll": {
-                        "display": "block !important"
-                    },
-                    ".ag-theme-balham .ag-body-vertical-scroll": {
-                        "display": "block !important"
-                    }
-                }
-                
-                st.caption("Click a row to view session history details")
-                
-                # Create dynamic key that resets selection when data/filters change
-                dynamic_key = f"table-{rating_type}-{club_or_tournament}-{top_n}-{min_sessions}-{rating_method}-{elo_rating_type}-{date_range}-{online_filter}-{st.session_state.get('masterpoints_filter','All')}-{st.session_state.get('player_name_filter','')}"
-                
-                grid_response = AgGrid(
-                    display_df,
-                    gridOptions=gridOptions,
-                    height=exact_height,
-                    theme=AgGridTheme.BALHAM,
-                    custom_css=custom_css,
-                    key=dynamic_key,
-                    allow_unsafe_jscode=True,
-                )
-                
-                # --- Row-click detail view ---
-                selected_rows = grid_response.get('selected_rows', None)
-                if selected_rows is not None and len(selected_rows) > 0:
-                    selected_row = selected_rows.iloc[0] if hasattr(selected_rows, 'iloc') else selected_rows[0]
-                    try:
-                        with st.spinner("Loading session history from ACBL API..."):
-                            if rating_type == "Players":
-                                player_id = str(selected_row.get("Player_ID", ""))
-                                player_name = selected_row.get("Player_Name", "Unknown")
-                                if not player_id:
-                                    st.warning("Missing Player_ID in selected row.")
-                                else:
-                                    st.markdown(f"#### Session History: **{player_name}** ({player_id})")
-                                    detail = _fetch_remote_detail_table(
-                                        club_or_tournament=club_or_tournament,
-                                        rating_type=rating_type,
-                                        elo_rating_type=elo_rating_type,
-                                        date_from=date_from,
-                                        online_filter=online_filter,
-                                        player_id=player_id,
-                                    )
-                                    if detail.is_empty():
-                                        st.info("No session data found for this player.")
-                                    else:
-                                        n_sessions = detail.select("Session").n_unique()
-                                        st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
-                                        _show_all_opponents_aggregation(detail, key_suffix=f"player_{player_id}")
-                                        _show_sql_query_block(
-                                            f"""SELECT *
-FROM acbl_detail_api
-WHERE rating_type = 'Players'
-  AND player_id = '{player_id}'
-ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
-                                        )
-                                        st.markdown("#### Board-by-Board Detail")
-                                        detail_grid = _render_detail_aggrid(detail, key=f"detail_player_remote_{player_id}", selectable=True)
-                                        if detail_grid is not None:
-                                            sel = detail_grid.get("selected_rows", None)
-                                            if sel is not None and len(sel) > 0:
-                                                sel_row = sel.iloc[0] if hasattr(sel, "iloc") else sel[0]
-                                                _show_opponent_aggregation(detail, sel_row)
-                            else:
-                                pair_ids = str(selected_row.get("Pair_IDs", ""))
-                                pair_names = selected_row.get("Pair_Names", "Unknown")
-                                if not pair_ids:
-                                    st.warning("Missing Pair_IDs in selected row.")
-                                else:
-                                    st.markdown(f"#### Session History: **{pair_names}**")
-                                    detail = _fetch_remote_detail_table(
-                                        club_or_tournament=club_or_tournament,
-                                        rating_type=rating_type,
-                                        elo_rating_type=elo_rating_type,
-                                        date_from=date_from,
-                                        online_filter=online_filter,
-                                        pair_ids=pair_ids,
-                                    )
-                                    if detail.is_empty():
-                                        st.info("No session data found for this pair.")
-                                    else:
-                                        n_sessions = detail.select("Session").n_unique()
-                                        st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
-                                        _show_all_opponents_aggregation(detail, key_suffix=f"pair_{pair_ids}")
-                                        _show_sql_query_block(
-                                            f"""SELECT *
-FROM acbl_detail_api
-WHERE rating_type = 'Pairs'
-  AND pair_ids = '{pair_ids}'
-ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
-                                        )
-                                        st.markdown("#### Board-by-Board Detail")
-                                        detail_grid = _render_detail_aggrid(detail, key=f"detail_pair_remote_{pair_ids}", selectable=True)
-                                        if detail_grid is not None:
-                                            sel = detail_grid.get("selected_rows", None)
-                                            if sel is not None and len(sel) > 0:
-                                                sel_row = sel.iloc[0] if hasattr(sel, "iloc") else sel[0]
-                                                _show_opponent_aggregation(detail, sel_row)
-                    except Exception as exc:
-                        st.error(f"Session detail API request failed: {exc}")
-                
-                # Mark that table is displayed (lightweight state only)
-                st.session_state.table_displayed = True
-            
-            # 3. SQL Query Interface for additional queries (only if enabled)
-            if st.session_state.get('show_sql_query', False) and st.session_state.get('enable_custom_queries', False):
-                st.markdown("---")
-                st.markdown("### 🔍 Run Additional SQL Queries")
-                st.caption("Query the results above. Only the displayed columns are available. The results table is available as 'self'.")
-                
-                
-                # Initialize SQL query history if not exists
-                if 'sql_query_history' not in st.session_state:
-                    st.session_state.sql_query_history = []
-                
-                # Add the generated query to history automatically (only once)
-                content_is_table = st.session_state.get('content_mode') == 'table'
-                if content_is_table and st.session_state.get('generated_sql'):
-                    if not any(h['query'] == st.session_state.generated_sql for h in st.session_state.sql_query_history):
-                        st.session_state.sql_query_history.append({
-                            'query': st.session_state.generated_sql,
-                            'result': table_df,
-                            'timestamp': datetime.now().strftime('%H:%M:%S'),
-                            'auto_generated': True
-                        })
-                
-                # Display additional query results (excluding the auto-generated one already shown above)
-                additional_queries = [q for q in st.session_state.sql_query_history if not q.get('auto_generated', False)]
-                if additional_queries:
-                    st.markdown("### 📋 Additional Query Results")
-                    
-                    # Show results in reverse order (most recent first)
-                    for i, query_result in enumerate(reversed(additional_queries)):
-                        query_label = f"Query {len(additional_queries) - i} ({query_result['timestamp']})"
-                        
-                        with st.expander(query_label, expanded=(i == 0)):
-                            st.code(query_result['query'], language='sql')
-                            ShowDataFrameTable(
-                                query_result['result'], 
-                                key=f"sql_result_{len(additional_queries) - i}",
-                                output_method='aggrid',
-                                height_rows=25
-                            )
-                
-                # SQL Query input - fixed at bottom using streamlit-extras bottom container
-                with bottom():
-                    query = st.text_input(
-                        "💬 SQL Query (press Enter to execute):",
-                        value='',
-                        placeholder="SELECT * FROM self WHERE Player_Elo_Score > 1500 ORDER BY Quality_Rank LIMIT 10",
-                        key="sql_query_text_input",
-                        on_change=lambda: st.session_state.update({"execute_query_now": True})
-                    )
-
-                # Execute query when Enter pressed
-                if st.session_state.get('execute_query_now') and st.session_state.get('sql_query_text_input', '').strip():
-                    with st.spinner('⏳ Executing query...'):
-                        try:
-                            # Process query
-                            processed_query = st.session_state.get('sql_query_text_input', '').strip()
-                            if 'from ' not in processed_query.lower():
-                                processed_query = 'FROM self ' + processed_query
-                            
-                            # Show the query being executed
-                            if st.session_state.get('show_sql_query', False):
-                                st.code(processed_query, language='sql')
-                            
-                            # Execute query on the query results table, not the raw dataset
-                            con = get_db_connection()
-                            _db_register(con, 'self', table_df)
-                            result_df = con.execute(processed_query).pl()
-                            
-                            # Store in history
-                            st.session_state.sql_query_history.append({
-                                'query': st.session_state.get('sql_query_text_input', ''),
-                                'result': result_df,
-                                'timestamp': datetime.now().strftime('%H:%M:%S')
-                            })
-                            
-                            st.success(f"✅ Query executed successfully! Returned {len(result_df)} rows.")
-                            
-                            # Display the result immediately
-                            st.markdown("### 📊 Query Result")
-                            st.code(st.session_state.get('sql_query_text_input', ''), language='sql')
-                            ShowDataFrameTable(
-                                result_df, 
-                                key=f"sql_result_current_{datetime.now().strftime('%H%M%S')}",
-                                output_method='aggrid',
-                                height_rows=25
-                            )
-                            
-                        except Exception as e:
-                            st.error(f"❌ SQL Error: {e}")
-                            if 'processed_query' in locals():
-                                st.info(f"📝 Your query was transformed to:")
-                                st.code(processed_query, language='sql')
-                        finally:
-                            # Reset flag so we don't re-run on each rerun
-                            st.session_state.execute_query_now = False
+        _acbl_report_panel()
 
         # PDF generation when in PDF mode
         if st.session_state.get('content_mode') == 'pdf':
-            cache_key = f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_{online_filter}_{st.session_state.get('masterpoints_filter','All')}_prior{st.session_state.get('acbl_prior_sessions', 50)}"
-            if remote_table_df is not None:
-                st.session_state[cache_key] = remote_table_df
+            cache_key = st.session_state.get('acbl_report_cache_key')
+            if not cache_key:
+                st.error('Report not loaded yet. View the table first.')
+                return
             try:
                 table_df, _used_cache = _get_cached_report_table_df(cache_key)
                 st.info(f"✅ Using cached {rating_type} report for PDF generation ({len(table_df)} rows)")
@@ -1510,6 +1620,9 @@ ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
             
             created_on = time.strftime("%Y-%m-%d")
             #pdf_title = f"{title} From {date_range}"
+            club_or_tournament = st.session_state.get('acbl_club_or_tournament', 'Club')
+            title = st.session_state.get('acbl_report_title', 'ACBL Report')
+            date_range = st.session_state.get('acbl_date_range_str', '')
             pdf_filename = f"Unofficial Elo Scores for ACBL {club_or_tournament} MatchPoint Games - Top {top_n} {rating_type} {created_on}.pdf"
             # Generate PDF
             try:
@@ -1542,6 +1655,7 @@ ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
     render_app_footer(
         st,
         ENDPLAY_VERSION,
+        diagnostics_lines=_acbl_footer_diagnostics_lines(st),
         dependency_versions={
             "pandas": pd.__version__,
             "polars": pl.__version__,
