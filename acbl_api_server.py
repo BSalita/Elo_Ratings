@@ -61,17 +61,16 @@ def _read_text(path: pathlib.Path) -> str | None:
 
 def _detect_cgroup_limits() -> dict:
     """Best-effort container limits from cgroups (v2 first, then v1)."""
+    from streamlitlib.memory_usage import get_memory_metrics
+
     memory_limit_bytes: int | None = None
     cpu_limit_cores: float | None = None
 
-    # cgroup v2
-    mem_max_v2 = _read_text(pathlib.Path("/sys/fs/cgroup/memory.max"))
-    if mem_max_v2 and mem_max_v2 != "max":
-        try:
-            memory_limit_bytes = int(mem_max_v2)
-        except ValueError:
-            memory_limit_bytes = None
+    metrics = get_memory_metrics()
+    if metrics.cgroup_limit_bytes is not None and metrics.cgroup_limit_bytes > 0:
+        memory_limit_bytes = int(metrics.cgroup_limit_bytes)
 
+    # cgroup v2 cpu
     cpu_max_v2 = _read_text(pathlib.Path("/sys/fs/cgroup/cpu.max"))
     if cpu_max_v2:
         parts = cpu_max_v2.split()
@@ -83,18 +82,6 @@ def _detect_cgroup_limits() -> dict:
                     cpu_limit_cores = quota / period
             except ValueError:
                 cpu_limit_cores = None
-
-    # cgroup v1 fallbacks
-    if memory_limit_bytes is None:
-        mem_v1 = _read_text(pathlib.Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
-        if mem_v1:
-            try:
-                value = int(mem_v1)
-                # Ignore "effectively unlimited" sentinel values.
-                if value < (1 << 60):
-                    memory_limit_bytes = value
-            except ValueError:
-                pass
 
     if cpu_limit_cores is None:
         quota_v1 = _read_text(pathlib.Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"))
@@ -125,12 +112,33 @@ def _recommended_threads() -> int:
     return max(4, cpu_budget // 2) if cpu_budget >= 8 else max(1, cpu_budget)
 
 
-def _container_memory_bytes() -> int:
-    """Total memory budget: cgroup limit if present, else host RAM."""
+def _cgroup_memory_limit_bytes() -> int | None:
+    """Container memory cap from cgroup, or None if unknown/unlimited."""
     limits = _detect_cgroup_limits()
-    if limits["memory_limit_bytes"]:
-        return int(limits["memory_limit_bytes"])
-    return int(psutil.virtual_memory().total)
+    limit = limits.get("memory_limit_bytes")
+    if limit is None or limit <= 0:
+        return None
+    return int(limit)
+
+
+def _memory_budget_bytes() -> int:
+    """Memory budget for cache/DuckDB sizing — never host RAM when cgroup is unknown."""
+    limit = _cgroup_memory_limit_bytes()
+    if limit is not None:
+        return limit
+    env_gb = os.getenv("ACBL_CONTAINER_MEMORY_GB", "").strip()
+    if env_gb:
+        try:
+            return max(int(1 * 1024 ** 3), int(float(env_gb) * 1024 ** 3))
+        except ValueError:
+            pass
+    # Conservative default for unknown limits (Docker without cgroup v2 memory.max).
+    return int(32 * 1024 ** 3)
+
+
+def _container_memory_bytes() -> int:
+    """Total memory budget: cgroup limit if present, else conservative default."""
+    return _memory_budget_bytes()
 
 
 DUAL_FRAME_CACHE_MIN_BYTES = 40 * 1024 ** 3
@@ -138,13 +146,120 @@ _DUAL_FRAME_CACHE_LOGGED = False
 
 
 def _dual_frame_cache_enabled() -> bool:
-    """Keep Club + Tournament frames resident when the container has enough RAM."""
+    """Keep Club + Tournament frames resident when the container has enough RAM.
+
+    Requires a *known* cgroup limit >= 40 GB. Never uses host RAM as a proxy
+    (that mis-detects Docker limits and OOM-kills the process).
+    """
     override = os.getenv("ACBL_DUAL_FRAME_CACHE", "").strip().lower()
-    if override in ("1", "true", "yes", "on"):
-        return True
     if override in ("0", "false", "no", "off"):
         return False
-    return _container_memory_bytes() >= DUAL_FRAME_CACHE_MIN_BYTES
+
+    limit = _cgroup_memory_limit_bytes()
+    if limit is None:
+        if override in ("1", "true", "yes", "on"):
+            print(
+                "[acbl-api] ACBL_DUAL_FRAME_CACHE=1 but cgroup limit unknown; "
+                "using single-frame cache",
+                flush=True,
+            )
+        return False
+
+    if limit < DUAL_FRAME_CACHE_MIN_BYTES:
+        if override in ("1", "true", "yes", "on"):
+            print(
+                f"[acbl-api] ACBL_DUAL_FRAME_CACHE=1 but cgroup limit "
+                f"{limit / 1024 ** 3:.0f} GB < 40 GB; using single-frame cache",
+                flush=True,
+            )
+        return False
+
+    if override in ("1", "true", "yes", "on"):
+        return True
+    return limit >= DUAL_FRAME_CACHE_MIN_BYTES
+
+
+def _estimated_frame_bytes(club_or_tournament: str) -> int:
+    """Conservative in-memory size for a dataset not yet cached."""
+    source_path, _ = _parquet_source_for(club_or_tournament)
+    cached = _FRAME_CACHE.get(source_path)
+    if cached is not None:
+        try:
+            return int(cached.estimated_size())
+        except Exception:
+            pass
+    if club_or_tournament.lower() == "club":
+        return int(20 * 1024 ** 3)
+    return int(5 * 1024 ** 3)
+
+
+def _dual_frame_cache_safe_for_load(club_or_tournament: str) -> bool:
+    """True when dual-frame is on and cgroup has room to load this dataset too."""
+    if not _dual_frame_cache_enabled():
+        return False
+    limit = _cgroup_memory_limit_bytes()
+    if limit is None:
+        return False
+    source_path, _ = _parquet_source_for(club_or_tournament)
+    if source_path in _FRAME_CACHE:
+        return True
+    other_cached = sum(
+        int(f.estimated_size())
+        for p, f in _FRAME_CACHE.items()
+        if p != source_path and f is not None
+    )
+    load_bytes = _estimated_frame_bytes(club_or_tournament)
+    query_headroom = int(4 * 1024 ** 3)
+    projected = other_cached + load_bytes + query_headroom
+    return projected <= int(limit * 0.90)
+
+
+def _evict_frames_except(keep_source_path: str) -> None:
+    evicted: list[str] = []
+    for old_path in list(_FRAME_CACHE.keys()):
+        if old_path == keep_source_path:
+            continue
+        old_frame = _FRAME_CACHE.pop(old_path, None)
+        _FRAME_CACHE_TIMES.pop(old_path, None)
+        _FRAME_DATE_BOUNDS.pop(old_path, None)
+        if old_frame is not None:
+            del old_frame
+        evicted.append(pathlib.Path(old_path).name)
+    if evicted:
+        keep_label = (
+            pathlib.Path(keep_source_path).name if keep_source_path else "(none)"
+        )
+        print(
+            f"[acbl-api] evicted frame cache {evicted} "
+            f"(keeping {keep_label}, mem {_cgroup_mem_summary()})",
+            flush=True,
+        )
+        gc.collect()
+        _reset_duckdb_connection()
+        _malloc_trim()
+        print(
+            f"[acbl-api] post-evict mem {_cgroup_mem_summary()}",
+            flush=True,
+        )
+
+
+def _evict_other_frames(keep_source_path: str, club_or_tournament: str) -> None:
+    """Drop any cached frames other than the one we're about to use.
+
+    When dual-frame caching is enabled and cgroup headroom allows, both Club
+    and Tournament stay resident. If the second frame would exceed ~90% of
+    cgroup limit, fall back to single-frame eviction.
+    """
+    if _dual_frame_cache_enabled() and _dual_frame_cache_safe_for_load(club_or_tournament):
+        return
+    if _dual_frame_cache_enabled() and _FRAME_CACHE:
+        print(
+            f"[acbl-api] dual-frame over budget for {club_or_tournament} "
+            f"(cached {_cached_frame_bytes() / 1024 ** 3:.1f} GB, limit "
+            f"{(_cgroup_memory_limit_bytes() or 0) / 1024 ** 3:.0f} GB); evicting other frames",
+            flush=True,
+        )
+    _evict_frames_except(keep_source_path)
 
 
 def _cached_frame_bytes() -> int:
@@ -176,7 +291,7 @@ def _duckdb_memory_limit_bytes() -> int:
             return max(int(0.5 * 1024 ** 3), int(float(override) * 1024 ** 3))
         except ValueError:
             pass
-    total = _container_memory_bytes()
+    total = _memory_budget_bytes()
     frame_bytes = _cached_frame_bytes()
     if frame_bytes <= 0:
         frame_bytes = int(19.5 * 1024 ** 3)
@@ -484,42 +599,6 @@ def _reset_duckdb_connection() -> None:
     _malloc_trim()
 
 
-def _evict_other_frames(keep_source_path: str) -> None:
-    """Drop any cached frames other than the one we're about to use.
-
-    When ``_dual_frame_cache_enabled()`` (cgroup >= 40 GB or
-    ``ACBL_DUAL_FRAME_CACHE=1``), both Club and Tournament may stay resident
-    so switching back does not reload parquet. On smaller containers we keep a
-    single-frame cache to avoid OOM.
-    """
-    if _dual_frame_cache_enabled():
-        return
-
-    evicted: list[str] = []
-    for old_path in list(_FRAME_CACHE.keys()):
-        if old_path == keep_source_path:
-            continue
-        old_frame = _FRAME_CACHE.pop(old_path, None)
-        _FRAME_CACHE_TIMES.pop(old_path, None)
-        _FRAME_DATE_BOUNDS.pop(old_path, None)
-        if old_frame is not None:
-            del old_frame
-        evicted.append(pathlib.Path(old_path).name)
-    if evicted:
-        print(
-            f"[acbl-api] evicted frame cache {evicted} "
-            f"(keeping {pathlib.Path(keep_source_path).name}, mem {_cgroup_mem_summary()})",
-            flush=True,
-        )
-        gc.collect()
-        _reset_duckdb_connection()
-        _malloc_trim()
-        print(
-            f"[acbl-api] post-evict mem {_cgroup_mem_summary()}",
-            flush=True,
-        )
-
-
 def _dtype_shrink_exprs(schema: dict) -> list[pl.Expr]:
     """Polars expressions that down-cast wasteful dtypes.
 
@@ -604,14 +683,15 @@ def _load_full_frame(club_or_tournament: str) -> pl.DataFrame:
 
         if not _DUAL_FRAME_CACHE_LOGGED:
             mode = "dual-frame" if _dual_frame_cache_enabled() else "single-frame"
+            limit_gb = (_cgroup_memory_limit_bytes() or 0) / 1024 ** 3
             print(
                 f"[acbl-api] frame cache mode={mode} "
-                f"(limit {_container_memory_bytes() / 1024 ** 3:.0f} GB, mem {_cgroup_mem_summary()})",
+                f"(cgroup limit {limit_gb:.0f} GB or unknown, mem {_cgroup_mem_summary()})",
                 flush=True,
             )
             _DUAL_FRAME_CACHE_LOGGED = True
 
-        _evict_other_frames(source_path)
+        _evict_other_frames(source_path, club_or_tournament)
 
         print(
             f"[acbl-api] loading {club_or_tournament} parquet "
@@ -896,6 +976,7 @@ def _server_runtime_info() -> dict:
         "swap_enabled": bool(sm.total > 0),
         "frame_cache": cached_frames,
         "dual_frame_cache": _dual_frame_cache_enabled(),
+        "cgroup_limit_gb": round((_cgroup_memory_limit_bytes() or 0) / (1024 ** 3), 2) or None,
         "cached_frame_gb": round(_cached_frame_bytes() / (1024 ** 3), 2),
         "duckdb_memory_limit_gb": round(_duckdb_memory_limit_bytes() / (1024 ** 3), 2),
     }
@@ -1532,6 +1613,11 @@ def acbl_report(
         except HTTPException:
             raise
         except Exception as exc:
+            print(
+                f"[acbl-api] report failed {club_or_tournament}/{rating_type}: "
+                f"{exc!r} mem {_cgroup_mem_summary()}",
+                flush=True,
+            )
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
