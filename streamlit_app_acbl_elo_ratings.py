@@ -18,6 +18,7 @@ load_dotenv()
 os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
 
 import logging
+import json
 import pathlib
 import sys
 import time
@@ -649,6 +650,35 @@ _DATE_RANGE_OPTIONS = (
 )
 
 
+def _acbl_report_fetch_signature(
+    club_or_tournament: str,
+    rating_type: str,
+    top_n: int,
+    min_sessions: int,
+    rating_method: str,
+    moving_avg_days: int,
+    elo_rating_type: str,
+    date_from: datetime | None,
+    online_filter: str,
+    prior_sessions: int,
+) -> str:
+    return json.dumps(
+        {
+            "club_or_tournament": club_or_tournament.lower(),
+            "rating_type": rating_type,
+            "top_n": int(top_n),
+            "min_sessions": int(min_sessions),
+            "rating_method": rating_method,
+            "moving_avg_days": int(moving_avg_days),
+            "elo_rating_type": elo_rating_type,
+            "date_from": None if date_from is None else date_from.isoformat(),
+            "online_filter": online_filter,
+            "prior_sessions": int(prior_sessions),
+        },
+        sort_keys=True,
+    )
+
+
 def _acbl_report_cache_key(
     club_or_tournament: str,
     rating_type: str,
@@ -837,23 +867,50 @@ def _acbl_report_panel() -> None:
 
     prior_sessions = int(st.session_state.get("acbl_prior_sessions", 50))
     masterpoints_filter = st.session_state.get("masterpoints_filter", "All")
-    try:
-        with st.spinner("Fetching data from API server (takes up to 30 seconds)..."):
-            remote_table_df, remote_payload = _fetch_remote_report_table(
-                club_or_tournament=club_or_tournament,
-                rating_type=rating_type,
-                top_n=int(top_n),
-                min_sessions=int(min_sessions),
-                rating_method=rating_method,
-                moving_avg_days=int(moving_avg_days),
-                elo_rating_type=elo_rating_type,
-                date_from=date_from,
-                online_filter=online_filter,
-                prior_sessions=prior_sessions,
-            )
-    except Exception as exc:
-        st.error(str(exc))
-        st.stop()
+    fetch_sig = _acbl_report_fetch_signature(
+        club_or_tournament=club_or_tournament,
+        rating_type=rating_type,
+        top_n=int(top_n),
+        min_sessions=int(min_sessions),
+        rating_method=rating_method,
+        moving_avg_days=int(moving_avg_days),
+        elo_rating_type=elo_rating_type,
+        date_from=date_from,
+        online_filter=online_filter,
+        prior_sessions=prior_sessions,
+    )
+    cached_fetch = st.session_state.get("_acbl_report_fetch_cache")
+    if (
+        isinstance(cached_fetch, dict)
+        and cached_fetch.get("sig") == fetch_sig
+        and cached_fetch.get("table") is not None
+        and cached_fetch.get("payload") is not None
+    ):
+        remote_table_df = cached_fetch["table"]
+        remote_payload = cached_fetch["payload"]
+    else:
+        try:
+            with st.spinner("Fetching data from API server (takes up to 30 seconds)..."):
+                remote_table_df, remote_payload = _fetch_remote_report_table(
+                    club_or_tournament=club_or_tournament,
+                    rating_type=rating_type,
+                    top_n=int(top_n),
+                    min_sessions=int(min_sessions),
+                    rating_method=rating_method,
+                    moving_avg_days=int(moving_avg_days),
+                    elo_rating_type=elo_rating_type,
+                    date_from=date_from,
+                    online_filter=online_filter,
+                    prior_sessions=prior_sessions,
+                )
+        except Exception as exc:
+            st.error(str(exc))
+            st.stop()
+        st.session_state["_acbl_report_fetch_cache"] = {
+            "sig": fetch_sig,
+            "table": remote_table_df,
+            "payload": remote_payload,
+        }
     dataset_type = club_or_tournament.lower()
     date_range = str(remote_payload.get("date_range", "") or "")
     generated_sql = str(remote_payload.get("generated_sql", "") or "")
@@ -1553,6 +1610,7 @@ def main():
     # -------------------------------
     # Track current settings to detect changes
     current_settings = {
+        "club_or_tournament": club_or_tournament,
         "rating_type": rating_type,
         "top_n": int(top_n),
         "min_sessions": int(min_sessions),
@@ -1578,6 +1636,7 @@ def main():
         # Clear previous results immediately when settings change
         import gc
         _clear_table_cache()
+        st.session_state.pop("_acbl_report_fetch_cache", None)
         if 'sql_query_history' in st.session_state:
             st.session_state.sql_query_history = []
         gc.collect()

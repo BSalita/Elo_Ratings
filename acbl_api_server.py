@@ -131,17 +131,28 @@ def _container_memory_bytes() -> int:
     return int(psutil.virtual_memory().total)
 
 
+def _cached_frame_bytes() -> int:
+    """Best-effort in-memory size of the resident Polars frame cache."""
+    peak = 0
+    for frame in _FRAME_CACHE.values():
+        if frame is None:
+            continue
+        try:
+            peak = max(peak, int(frame.estimated_size()))
+        except Exception:
+            pass
+    return peak
+
+
 def _duckdb_memory_limit_bytes() -> int:
     """Hard cap for DuckDB's buffer manager.
 
     DuckDB defaults its ``memory_limit`` to ~80% of detected RAM. With the
-    resident Polars frame (~13 GB for Club) cached alongside, that default
-    overcommits the container and triggers OOM when the user pages through
-    filters or flips Club<->Tournament (DuckDB retains buffer-pool memory
-    between queries). We instead reserve headroom for the cached frame plus
-    per-request/runtime overhead and give DuckDB the remainder, capped at a
-    fraction of total so we never approach the limit. Override at deploy time
-    with ``DUCKDB_MEMORY_LIMIT_GB`` (e.g. after profiling on a bigger plan).
+    resident Polars frame (~19 GB for Club on prod) cached alongside, that
+    default overcommits the container and triggers OOM on the next query.
+    Budget from cgroup limit minus the live cached frame (or a conservative
+    club estimate before first load). Override at deploy with
+    ``DUCKDB_MEMORY_LIMIT_GB``.
     """
     override = os.getenv("DUCKDB_MEMORY_LIMIT_GB", "").strip()
     if override:
@@ -150,12 +161,18 @@ def _duckdb_memory_limit_bytes() -> int:
         except ValueError:
             pass
     total = _container_memory_bytes()
-    # Reserve for: worst-case resident frame (~13 GB Club) + per-request
-    # column copies + Python/Arrow/R2 client overhead.
-    reserve = 18 * 1024 ** 3
-    budget = min(total - reserve, int(total * 0.45))
-    floor = 2 * 1024 ** 3
-    return max(floor, budget)
+    frame_bytes = _cached_frame_bytes()
+    if frame_bytes <= 0:
+        frame_bytes = int(19.5 * 1024 ** 3)
+    runtime_overhead = int(2 * 1024 ** 3)
+    reserve = frame_bytes + runtime_overhead
+    headroom = total - reserve
+    floor = int(1 * 1024 ** 3)
+    if headroom <= floor:
+        return floor
+    # Give DuckDB at most 40% of remaining headroom, capped at 4 GB.
+    cap = min(int(4 * 1024 ** 3), max(floor, int(headroom * 0.4)))
+    return min(headroom, cap)
 
 
 def _duckdb_temp_dir() -> str:
@@ -645,6 +662,72 @@ def _filter_valid_percentages_acbl(df: pl.DataFrame) -> pl.DataFrame:
         return df
     pct_ns = pl.col("Pct_NS").cast(pl.Float64, strict=False)
     return df.filter(pct_ns.is_null() | ((pct_ns >= 0.0) & (pct_ns <= 1.0)))
+
+
+def _duckdb_timestamp_literal(dt: datetime) -> str:
+    return f"TIMESTAMP '{dt.strftime('%Y-%m-%d %H:%M:%S')}'"
+
+
+def _self_filter_sql_clauses(
+    full_df: pl.DataFrame,
+    date_from: datetime | None,
+    online_filter: str,
+) -> list[str]:
+    clauses: list[str] = []
+    if date_from is not None and "Date" in full_df.columns:
+        clauses.append(f"Date >= {_duckdb_timestamp_literal(date_from)}")
+    if online_filter == "Local Only" and "is_virtual_game" in full_df.columns:
+        clauses.append("is_virtual_game = false")
+    elif online_filter == "Online Only" and "is_virtual_game" in full_df.columns:
+        clauses.append("is_virtual_game IS NULL")
+    if "Pct_NS" in full_df.columns:
+        clauses.append("(Pct_NS IS NULL OR (Pct_NS >= 0 AND Pct_NS <= 1))")
+    return clauses
+
+
+def _prepare_self_view(
+    con: duckdb.DuckDBPyConnection,
+    full_df: pl.DataFrame,
+    date_from: datetime | None,
+    online_filter: str,
+) -> tuple[int, str]:
+    """Register the cached full frame and expose filtered rows as temp view ``self``.
+
+    Avoids per-request Polars ``select``/``filter`` copies of the ~19 GB club
+    frame; DuckDB reads columns lazily from the registered Arrow buffer.
+    """
+    where_clauses = _self_filter_sql_clauses(full_df, date_from, online_filter)
+    where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
+    with _DB_LOCK:
+        try:
+            con.execute("DROP VIEW IF EXISTS self")
+        except Exception:
+            pass
+        try:
+            con.unregister("_full")
+        except Exception:
+            pass
+        con.register("_full", full_df)
+        con.execute(f"CREATE TEMP VIEW self AS SELECT * FROM _full WHERE {where_sql}")
+        input_rows = int(con.execute("SELECT count(*)::BIGINT FROM self").fetchone()[0])
+        date_range = ""
+        if "Date" in full_df.columns and input_rows > 0:
+            row = con.execute("SELECT min(Date), max(Date) FROM self").fetchone()
+            if row and row[0] is not None:
+                date_range = f"{str(row[0])[:10]} to {str(row[1])[:10]}"
+    return input_rows, date_range
+
+
+def _teardown_self_view(con: duckdb.DuckDBPyConnection) -> None:
+    with _DB_LOCK:
+        try:
+            con.execute("DROP VIEW IF EXISTS self")
+        except Exception:
+            pass
+        try:
+            con.unregister("_full")
+        except Exception:
+            pass
 
 
 def get_elo_column_names(elo_rating_type: str) -> dict:
@@ -1276,6 +1359,7 @@ def health() -> dict:
         "status": "ok",
         "service": "acbl-api",
         "memory": get_memory_usage_dict(),
+        "server": _server_runtime_info(),
     }
 
 
@@ -1312,30 +1396,22 @@ def acbl_report(
             t_parse_end = time.perf_counter()
 
             t_load_start = time.perf_counter()
-            required_columns = _required_columns_for_mode(rating_type, elo_rating_type)
-            df = load_elo_ratings(club_or_tournament, columns=required_columns, date_from=parsed_date_from)
-            df = _filter_valid_percentages_acbl(df)
+            full_df = _load_full_frame(club_or_tournament)
             t_load_end = time.perf_counter()
 
             t_filter_start = time.perf_counter()
-            if online_filter == "Local Only" and "is_virtual_game" in df.columns:
-                df = df.filter(pl.col("is_virtual_game") == False)
-            elif online_filter == "Online Only" and "is_virtual_game" in df.columns:
-                df = df.filter(pl.col("is_virtual_game").is_null())
+            con = _get_db_connection()
+            input_rows, date_range = _prepare_self_view(
+                con, full_df, parsed_date_from, online_filter,
+            )
             t_filter_end = time.perf_counter()
 
             t_sql_start = time.perf_counter()
-            con = _get_db_connection()
-            with _DB_LOCK:
-                try:
-                    con.unregister("self")
-                except Exception:
-                    pass
-                con.register("self", df)
+            try:
                 shrinkage_meta = _load_shrinkage_meta(club_or_tournament)
                 anchor_kind = "player" if rating_type == "Players" else "pair"
                 prior_anchor = _shrinkage_anchor(shrinkage_meta, anchor_kind)
-                has_round = "Round" in df.columns
+                has_round = "Round" in full_df.columns
                 if rating_type == "Players":
                     generated_sql = generate_top_players_sql(
                         top_n, min_sessions, rating_method, elo_rating_type,
@@ -1348,21 +1424,19 @@ def acbl_report(
                         prior_anchor=prior_anchor, prior_sessions=prior_sessions,
                         has_round=has_round, min_skill_z=min_skill_z,
                     )
-                result_df = con.execute(generated_sql).pl()
+                with _DB_LOCK:
+                    result_df = con.execute(generated_sql).pl()
+            finally:
+                _teardown_self_view(con)
+                _reset_duckdb_connection()
             t_sql_end = time.perf_counter()
 
             t_serialize_start = time.perf_counter()
             result_rows = result_df.to_dicts()
             t_serialize_end = time.perf_counter()
 
-            date_range = ""
-            if "Date" in df.columns and not df.is_empty():
-                date_min, date_max = df.select([pl.col("Date").min().alias("min"), pl.col("Date").max().alias("max")]).row(0)
-                date_range = f"{str(date_min)[:10]} to {str(date_max)[:10]}"
-
             ended_at = datetime.now()
             elapsed = (ended_at - started_at).total_seconds()
-            input_rows = len(df)
             output_rows = len(result_df)
             perf = {
                 "source": "r2" if _r2_enabled() else "local",
@@ -1397,8 +1471,14 @@ def acbl_report(
                 "perf": perf,
                 "server": _server_runtime_info(),
             }
-            del result_df, df
+            del result_df
+            gc.collect()
             _malloc_trim()
+            print(
+                f"[acbl-api] report {club_or_tournament}/{rating_type} done "
+                f"({output_rows} rows, mem {_cgroup_mem_summary()})",
+                flush=True,
+            )
             response_payload["perf"]["total_seconds"] = round(time.perf_counter() - t0, 3)
             return response_payload
         except HTTPException:
@@ -1477,6 +1557,8 @@ def acbl_detail(
                 "server": _server_runtime_info(),
             }
             del detail, df
+            _reset_duckdb_connection()
+            gc.collect()
             _malloc_trim()
             response_payload["perf"]["total_seconds"] = round(time.perf_counter() - t0, 3)
             return response_payload
