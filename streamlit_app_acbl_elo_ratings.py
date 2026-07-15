@@ -178,19 +178,20 @@ def _fetch_remote_report_table(
         "prior_sessions": int(prior_sessions),
     }
 
-    timeout_seconds = int(os.getenv("ACBL_API_TIMEOUT_SECONDS", "180"))
+    timeout_connect = int(os.getenv("ACBL_API_CONNECT_TIMEOUT_SECONDS", "15"))
+    timeout_read = int(os.getenv("ACBL_API_TIMEOUT_SECONDS", "600"))
     request_url = f"{base_url}/acbl/report"
-    max_attempts = int(os.getenv("ACBL_API_RETRY_ATTEMPTS", "4"))
+    max_attempts = int(os.getenv("ACBL_API_RETRY_ATTEMPTS", "3"))
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         try:
             response = requests.get(
                 request_url,
                 params=params,
-                timeout=timeout_seconds,
+                timeout=(timeout_connect, timeout_read),
             )
             if response.status_code == 503 and attempt < max_attempts - 1:
-                time.sleep(5 + attempt * 5)
+                time.sleep(min(30, 5 + attempt * 10))
                 continue
             response.raise_for_status()
             payload = response.json()
@@ -211,7 +212,7 @@ def _fetch_remote_report_table(
                     f"Request params were invalid. Details: {detail}"
                 ) from exc
             if status == 503 and attempt < max_attempts - 1:
-                time.sleep(5 + attempt * 5)
+                time.sleep(min(30, 5 + attempt * 10))
                 continue
             hint = (
                 "Check ACBL_API_BASE_URL — in Docker use the service hostname "
@@ -220,19 +221,23 @@ def _fetch_remote_report_table(
             raise RuntimeError(
                 f"ACBL API request failed for {request_url}: {exc}. {hint}"
             ) from exc
-        except requests.exceptions.RequestException as exc:
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
             last_exc = exc
             if attempt < max_attempts - 1:
-                time.sleep(5 + attempt * 5)
+                time.sleep(min(30, 5 + attempt * 10))
                 continue
             hint = (
                 "The API process may have been killed loading Club data (out of memory). "
                 "Wait 30 seconds and retry. Operator: check `wslc logs acbl-api` and "
-                "`Invoke-RestMethod http://localhost:8505/health` for build_tag "
-                "2026-07-15-club-toggle-v2. In Docker use ACBL_API_BASE_URL=http://acbl-api:8505."
+                "`Invoke-RestMethod http://localhost:8505/health` for build_tag. "
+                "In Docker use ACBL_API_BASE_URL=http://acbl-api:8505."
             )
             raise RuntimeError(
                 f"ACBL API request failed for {request_url}: {exc}. {hint}"
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(
+                f"ACBL API request failed for {request_url}: {exc}"
             ) from exc
     if last_exc is not None:
         raise RuntimeError(f"ACBL API request failed for {request_url}: {last_exc}") from last_exc
@@ -869,7 +874,6 @@ ACBL_URL_PARAMS = {
 
 
 
-@st.fragment
 def _acbl_report_panel() -> None:
     ctx = st.session_state.get("_acbl_sidebar_ctx")
     if not ctx:
@@ -909,7 +913,12 @@ def _acbl_report_panel() -> None:
         remote_payload = cached_fetch["payload"]
     else:
         try:
-            with st.spinner("Fetching data from API server (takes up to 30 seconds)..."):
+            load_hint = (
+                "Club first load can take 1-2 minutes"
+                if club_or_tournament.lower() == "club"
+                else "up to 30 seconds"
+            )
+            with st.spinner(f"Fetching data from API server ({load_hint})..."):
                 remote_table_df, remote_payload = _fetch_remote_report_table(
                     club_or_tournament=club_or_tournament,
                     rating_type=rating_type,
@@ -930,6 +939,7 @@ def _acbl_report_panel() -> None:
             "table": remote_table_df,
             "payload": remote_payload,
         }
+        st.rerun()
     dataset_type = club_or_tournament.lower()
     date_range = str(remote_payload.get("date_range", "") or "")
     generated_sql = str(remote_payload.get("generated_sql", "") or "")
