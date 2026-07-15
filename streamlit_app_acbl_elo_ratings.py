@@ -745,7 +745,7 @@ def _store_acbl_api_diagnostics(remote_payload: dict) -> None:
         f"sql {perf.get('sql_seconds', 0)}s",
         f"serialize {perf.get('serialize_seconds', 0)}s",
         f"total {perf.get('total_seconds', 0)}s",
-        f"rows {perf.get('input_rows', '?')} → {perf.get('output_rows', '?')}",
+        f"rows {perf.get('input_rows') if perf.get('input_rows') is not None else '?'} → {perf.get('output_rows', '?')}",
     ])
 
     server_line = ""

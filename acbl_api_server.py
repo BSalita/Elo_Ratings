@@ -31,6 +31,8 @@ API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 _SCHEMA_CACHE: dict[str, dict] = {}
 _FRAME_CACHE: dict[str, pl.DataFrame] = {}
 _FRAME_CACHE_TIMES: dict[str, float] = {}
+# Full-dataset Date bounds captured once at frame load (avoids per-request scans).
+_FRAME_DATE_BOUNDS: dict[str, tuple[datetime | None, datetime | None]] = {}
 
 import threading as _threading
 _DB_LOCK = _threading.Lock()
@@ -131,17 +133,31 @@ def _container_memory_bytes() -> int:
     return int(psutil.virtual_memory().total)
 
 
+DUAL_FRAME_CACHE_MIN_BYTES = 40 * 1024 ** 3
+_DUAL_FRAME_CACHE_LOGGED = False
+
+
+def _dual_frame_cache_enabled() -> bool:
+    """Keep Club + Tournament frames resident when the container has enough RAM."""
+    override = os.getenv("ACBL_DUAL_FRAME_CACHE", "").strip().lower()
+    if override in ("1", "true", "yes", "on"):
+        return True
+    if override in ("0", "false", "no", "off"):
+        return False
+    return _container_memory_bytes() >= DUAL_FRAME_CACHE_MIN_BYTES
+
+
 def _cached_frame_bytes() -> int:
-    """Best-effort in-memory size of the resident Polars frame cache."""
-    peak = 0
+    """Best-effort in-memory size of all resident Polars frame caches."""
+    total = 0
     for frame in _FRAME_CACHE.values():
         if frame is None:
             continue
         try:
-            peak = max(peak, int(frame.estimated_size()))
+            total += int(frame.estimated_size())
         except Exception:
             pass
-    return peak
+    return total
 
 
 def _duckdb_memory_limit_bytes() -> int:
@@ -471,17 +487,21 @@ def _reset_duckdb_connection() -> None:
 def _evict_other_frames(keep_source_path: str) -> None:
     """Drop any cached frames other than the one we're about to use.
 
-    The ACBL UI only ever queries one dataset at a time (Club OR Tournament),
-    yet the old code kept both frames resident permanently, doubling the
-    cache footprint (~15.7 GB + ~4.4 GB on real data). Evicting the other
-    one on dataset switch keeps the live cache to a single frame.
+    When ``_dual_frame_cache_enabled()`` (cgroup >= 40 GB or
+    ``ACBL_DUAL_FRAME_CACHE=1``), both Club and Tournament may stay resident
+    so switching back does not reload parquet. On smaller containers we keep a
+    single-frame cache to avoid OOM.
     """
+    if _dual_frame_cache_enabled():
+        return
+
     evicted: list[str] = []
     for old_path in list(_FRAME_CACHE.keys()):
         if old_path == keep_source_path:
             continue
         old_frame = _FRAME_CACHE.pop(old_path, None)
         _FRAME_CACHE_TIMES.pop(old_path, None)
+        _FRAME_DATE_BOUNDS.pop(old_path, None)
         if old_frame is not None:
             del old_frame
         evicted.append(pathlib.Path(old_path).name)
@@ -548,23 +568,49 @@ def _shrink_frame_dtypes(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns(exprs) if exprs else df
 
 
+def _record_frame_date_bounds(source_path: str, full_df: pl.DataFrame) -> None:
+    if "Date" not in full_df.columns or full_df.is_empty():
+        _FRAME_DATE_BOUNDS.pop(source_path, None)
+        return
+    dmin, dmax = full_df.select(
+        pl.col("Date").min().alias("min"),
+        pl.col("Date").max().alias("max"),
+    ).row(0)
+    _FRAME_DATE_BOUNDS[source_path] = (dmin, dmax)
+
+
+def _frame_date_range(source_path: str, date_from: datetime | None = None) -> str:
+    bounds = _FRAME_DATE_BOUNDS.get(source_path)
+    if not bounds or bounds[0] is None or bounds[1] is None:
+        return ""
+    dmin, dmax = bounds
+    if date_from is not None and dmin is not None and date_from > dmin:
+        dmin = date_from
+    return f"{str(dmin)[:10]} to {str(dmax)[:10]}"
+
+
 def _load_full_frame(club_or_tournament: str) -> pl.DataFrame:
     """Load the full parquet once and cache it at module level.
 
-    On first access for a given dataset (Club or Tournament), evicts any
-    other cached frame (single-frame LRU) and down-casts wasteful String /
-    Int64 columns to Categorical / Int32 to keep RAM usage bounded. The
-    dtype casts are spliced into the lazy plan so the streaming collect
-    materializes the already-shrunk frame and peak load memory stays close
-    to the post-cast size, not the raw String size.
+    On first access for a given dataset (Club or Tournament), evicts the other
+    cached frame unless dual-frame caching is enabled (cgroup >= 40 GB).
+    Down-casts wasteful String / Int64 columns to Categorical / Int32.
     """
+    global _DUAL_FRAME_CACHE_LOGGED
     source_path, storage_options = _parquet_source_for(club_or_tournament)
     with _FRAME_LOCK:
         if source_path in _FRAME_CACHE:
             return _FRAME_CACHE[source_path]
 
-        # Single-frame LRU: drop the other dataset before loading the new one so
-        # we never hold both ~15 GB Club + ~4 GB Tournament frames at once.
+        if not _DUAL_FRAME_CACHE_LOGGED:
+            mode = "dual-frame" if _dual_frame_cache_enabled() else "single-frame"
+            print(
+                f"[acbl-api] frame cache mode={mode} "
+                f"(limit {_container_memory_bytes() / 1024 ** 3:.0f} GB, mem {_cgroup_mem_summary()})",
+                flush=True,
+            )
+            _DUAL_FRAME_CACHE_LOGGED = True
+
         _evict_other_frames(source_path)
 
         print(
@@ -598,6 +644,7 @@ def _load_full_frame(club_or_tournament: str) -> pl.DataFrame:
         full_df = lf.collect(engine="streaming")
         _FRAME_CACHE[source_path] = full_df
         _FRAME_CACHE_TIMES[source_path] = time.time()
+        _record_frame_date_bounds(source_path, full_df)
         _malloc_trim()
         print(
             f"[acbl-api] loaded {club_or_tournament} "
@@ -688,13 +735,15 @@ def _self_filter_sql_clauses(
 def _prepare_self_view(
     con: duckdb.DuckDBPyConnection,
     full_df: pl.DataFrame,
+    source_path: str,
     date_from: datetime | None,
     online_filter: str,
-) -> tuple[int, str]:
+) -> tuple[int | None, str]:
     """Register the cached full frame and expose filtered rows as temp view ``self``.
 
     Avoids per-request Polars ``select``/``filter`` copies of the ~19 GB club
     frame; DuckDB reads columns lazily from the registered Arrow buffer.
+    Row counts and date ranges come from load-time metadata (no COUNT scans).
     """
     where_clauses = _self_filter_sql_clauses(full_df, date_from, online_filter)
     where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
@@ -709,12 +758,8 @@ def _prepare_self_view(
             pass
         con.register("_full", full_df)
         con.execute(f"CREATE TEMP VIEW self AS SELECT * FROM _full WHERE {where_sql}")
-        input_rows = int(con.execute("SELECT count(*)::BIGINT FROM self").fetchone()[0])
-        date_range = ""
-        if "Date" in full_df.columns and input_rows > 0:
-            row = con.execute("SELECT min(Date), max(Date) FROM self").fetchone()
-            if row and row[0] is not None:
-                date_range = f"{str(row[0])[:10]} to {str(row[1])[:10]}"
+    input_rows = full_df.height if not where_clauses else None
+    date_range = _frame_date_range(source_path, date_from)
     return input_rows, date_range
 
 
@@ -850,6 +895,8 @@ def _server_runtime_info() -> dict:
         "swap_percent": round(sm.percent, 1),
         "swap_enabled": bool(sm.total > 0),
         "frame_cache": cached_frames,
+        "dual_frame_cache": _dual_frame_cache_enabled(),
+        "cached_frame_gb": round(_cached_frame_bytes() / (1024 ** 3), 2),
         "duckdb_memory_limit_gb": round(_duckdb_memory_limit_bytes() / (1024 ** 3), 2),
     }
 
@@ -1396,13 +1443,14 @@ def acbl_report(
             t_parse_end = time.perf_counter()
 
             t_load_start = time.perf_counter()
+            source_path, _storage_options = _parquet_source_for(club_or_tournament)
             full_df = _load_full_frame(club_or_tournament)
             t_load_end = time.perf_counter()
 
             t_filter_start = time.perf_counter()
             con = _get_db_connection()
             input_rows, date_range = _prepare_self_view(
-                con, full_df, parsed_date_from, online_filter,
+                con, full_df, source_path, parsed_date_from, online_filter,
             )
             t_filter_end = time.perf_counter()
 
