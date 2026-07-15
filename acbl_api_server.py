@@ -189,7 +189,8 @@ def _estimated_frame_bytes(club_or_tournament: str) -> int:
         except Exception:
             pass
     if club_or_tournament.lower() == "club":
-        return int(20 * 1024 ** 3)
+        # Shrunk resident frame ~13 GB; streaming collect peaks higher before shrink.
+        return int(22 * 1024 ** 3)
     return int(5 * 1024 ** 3)
 
 
@@ -209,9 +210,11 @@ def _dual_frame_cache_safe_for_load(club_or_tournament: str) -> bool:
         if p != source_path and f is not None
     )
     load_bytes = _estimated_frame_bytes(club_or_tournament)
+    # Extra headroom for Polars streaming collect peak during a cold load.
+    load_peak = int(6 * 1024 ** 3) if club_or_tournament.lower() == "club" else 0
     query_headroom = int(4 * 1024 ** 3)
-    projected = other_cached + load_bytes + query_headroom
-    return projected <= int(limit * 0.90)
+    projected = other_cached + load_bytes + load_peak + query_headroom
+    return projected <= int(limit * 0.85)
 
 
 def _evict_frames_except(keep_source_path: str) -> None:
@@ -247,9 +250,24 @@ def _evict_other_frames(keep_source_path: str, club_or_tournament: str) -> None:
     """Drop any cached frames other than the one we're about to use.
 
     When dual-frame caching is enabled and cgroup headroom allows, both Club
-    and Tournament stay resident. If the second frame would exceed ~90% of
-    cgroup limit, fall back to single-frame eviction.
+    and Tournament stay resident once loaded. A *cold* Club load always evicts
+    other frames first: streaming collect peaks well above the shrunk frame
+    size and OOM-kills the process if Tournament is still resident.
     """
+    if keep_source_path in _FRAME_CACHE:
+        return
+
+    others_cached = any(p != keep_source_path for p in _FRAME_CACHE)
+    if club_or_tournament.lower() == "club" and others_cached:
+        print(
+            "[acbl-api] cold club load: evicting other frames before load "
+            f"(mem {_cgroup_mem_summary()})",
+            flush=True,
+        )
+        _evict_frames_except(keep_source_path)
+        _wait_for_cgroup_headroom_after_evict(club_or_tournament)
+        return
+
     if _dual_frame_cache_enabled() and _dual_frame_cache_safe_for_load(club_or_tournament):
         return
     if _dual_frame_cache_enabled() and _FRAME_CACHE:
@@ -260,6 +278,8 @@ def _evict_other_frames(keep_source_path: str, club_or_tournament: str) -> None:
             flush=True,
         )
     _evict_frames_except(keep_source_path)
+    if others_cached:
+        _wait_for_cgroup_headroom_after_evict(club_or_tournament)
 
 
 def _cached_frame_bytes() -> int:
@@ -567,9 +587,18 @@ def _malloc_trim() -> None:
         pass
 
 
+def _cgroup_memory_used_bytes() -> int | None:
+    try:
+        return int(pathlib.Path("/sys/fs/cgroup/memory.current").read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+
+
 def _cgroup_mem_summary() -> str:
     try:
-        used = int(pathlib.Path("/sys/fs/cgroup/memory.current").read_text(encoding="utf-8"))
+        used = _cgroup_memory_used_bytes()
+        if used is None:
+            return "n/a"
         limit_raw = pathlib.Path("/sys/fs/cgroup/memory.max").read_text(encoding="utf-8").strip()
         if limit_raw.isdigit():
             limit = int(limit_raw)
@@ -578,6 +607,31 @@ def _cgroup_mem_summary() -> str:
         return f"{used / 1024 ** 3:.2f} GB"
     except Exception:
         return "n/a"
+
+
+def _wait_for_cgroup_headroom_after_evict(club_or_tournament: str) -> None:
+    """Poll cgroup usage until enough RAM is free to start a cold parquet load."""
+    limit = _cgroup_memory_limit_bytes()
+    if limit is None:
+        return
+    load_budget = _estimated_frame_bytes(club_or_tournament) + int(6 * 1024 ** 3)
+    max_used = max(int(2 * 1024 ** 3), int(limit - load_budget))
+    deadline = time.perf_counter() + 45.0
+    while time.perf_counter() < deadline:
+        used = _cgroup_memory_used_bytes()
+        if used is None or used <= max_used:
+            print(
+                f"[acbl-api] cgroup ready for {club_or_tournament} load "
+                f"(target <= {max_used / 1024 ** 3:.1f} GB, mem {_cgroup_mem_summary()})",
+                flush=True,
+            )
+            return
+        time.sleep(0.25)
+    print(
+        f"[acbl-api] cgroup headroom wait timed out before {club_or_tournament} load "
+        f"(target <= {max_used / 1024 ** 3:.1f} GB, mem {_cgroup_mem_summary()})",
+        flush=True,
+    )
 
 
 def _reset_duckdb_connection() -> None:
@@ -1483,11 +1537,15 @@ def generate_top_pairs_sql(
 def health() -> dict:
     from streamlitlib.memory_usage import get_memory_usage_dict
 
+    runtime = _server_runtime_info()
     return {
         "status": "ok",
         "service": "acbl-api",
         "memory": get_memory_usage_dict(),
-        "server": _server_runtime_info(),
+        "server": runtime,
+        "frame_cache": runtime.get("frame_cache", {}),
+        "dual_frame_cache": runtime.get("dual_frame_cache"),
+        "cached_frame_gb": round(_cached_frame_bytes() / (1024 ** 3), 2),
     }
 
 
