@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import pathlib
@@ -33,6 +34,10 @@ _FRAME_CACHE_TIMES: dict[str, float] = {}
 
 import threading as _threading
 _DB_LOCK = _threading.Lock()
+_FRAME_LOCK = _threading.Lock()
+# Serialize report/detail handlers so Club↔Tournament toggles cannot overlap two
+# full-frame loads (~13 GB Club + reload) and OOM the container.
+_REPORT_LOCK = _threading.Lock()
 _DB_CON: duckdb.DuckDBPyConnection | None = None
 
 app = FastAPI(title="ACBL Elo API", version="1.0.0")
@@ -400,6 +405,52 @@ def load_elo_ratings_schema_map(club_or_tournament: str) -> dict:
     return df0.schema
 
 
+def _malloc_trim() -> None:
+    """Prod glibc to return freed pages to the OS.
+
+    On Linux this releases per-request allocation slack that the
+    allocator otherwise keeps in its arenas forever. No-ops on Windows
+    (no libc.so.6) and on platforms whose malloc lacks malloc_trim.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _cgroup_mem_summary() -> str:
+    try:
+        used = int(pathlib.Path("/sys/fs/cgroup/memory.current").read_text(encoding="utf-8"))
+        limit_raw = pathlib.Path("/sys/fs/cgroup/memory.max").read_text(encoding="utf-8").strip()
+        if limit_raw.isdigit():
+            limit = int(limit_raw)
+            if limit > 0:
+                return f"{used / 1024 ** 3:.2f}/{limit / 1024 ** 3:.2f} GB ({100 * used / limit:.0f}%)"
+        return f"{used / 1024 ** 3:.2f} GB"
+    except Exception:
+        return "n/a"
+
+
+def _reset_duckdb_connection() -> None:
+    """Close DuckDB so buffer-pool memory is released on dataset switch."""
+    global _DB_CON
+    with _DB_LOCK:
+        if _DB_CON is None:
+            return
+        try:
+            try:
+                _DB_CON.unregister("self")
+            except Exception:
+                pass
+            _DB_CON.close()
+        except Exception:
+            pass
+        _DB_CON = None
+    gc.collect()
+    _malloc_trim()
+
+
 def _evict_other_frames(keep_source_path: str) -> None:
     """Drop any cached frames other than the one we're about to use.
 
@@ -408,12 +459,28 @@ def _evict_other_frames(keep_source_path: str) -> None:
     cache footprint (~15.7 GB + ~4.4 GB on real data). Evicting the other
     one on dataset switch keeps the live cache to a single frame.
     """
+    evicted: list[str] = []
     for old_path in list(_FRAME_CACHE.keys()):
         if old_path == keep_source_path:
             continue
-        _FRAME_CACHE.pop(old_path, None)
+        old_frame = _FRAME_CACHE.pop(old_path, None)
         _FRAME_CACHE_TIMES.pop(old_path, None)
-    _malloc_trim()
+        if old_frame is not None:
+            del old_frame
+        evicted.append(pathlib.Path(old_path).name)
+    if evicted:
+        print(
+            f"[acbl-api] evicted frame cache {evicted} "
+            f"(keeping {pathlib.Path(keep_source_path).name}, mem {_cgroup_mem_summary()})",
+            flush=True,
+        )
+        gc.collect()
+        _reset_duckdb_connection()
+        _malloc_trim()
+        print(
+            f"[acbl-api] post-evict mem {_cgroup_mem_summary()}",
+            flush=True,
+        )
 
 
 def _dtype_shrink_exprs(schema: dict) -> list[pl.Expr]:
@@ -464,20 +531,6 @@ def _shrink_frame_dtypes(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns(exprs) if exprs else df
 
 
-def _malloc_trim() -> None:
-    """Prod glibc to return freed pages to the OS.
-
-    On Linux this releases per-request allocation slack that the
-    allocator otherwise keeps in its arenas forever. No-ops on Windows
-    (no libc.so.6) and on platforms whose malloc lacks malloc_trim.
-    """
-    try:
-        import ctypes
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except (OSError, AttributeError):
-        pass
-
-
 def _load_full_frame(club_or_tournament: str) -> pl.DataFrame:
     """Load the full parquet once and cache it at module level.
 
@@ -489,40 +542,52 @@ def _load_full_frame(club_or_tournament: str) -> pl.DataFrame:
     to the post-cast size, not the raw String size.
     """
     source_path, storage_options = _parquet_source_for(club_or_tournament)
-    if source_path in _FRAME_CACHE:
-        return _FRAME_CACHE[source_path]
+    with _FRAME_LOCK:
+        if source_path in _FRAME_CACHE:
+            return _FRAME_CACHE[source_path]
 
-    # Single-frame LRU: drop the other dataset before loading the new one so
-    # we never hold both ~15 GB Club + ~4 GB Tournament frames at once.
-    _evict_other_frames(source_path)
+        # Single-frame LRU: drop the other dataset before loading the new one so
+        # we never hold both ~15 GB Club + ~4 GB Tournament frames at once.
+        _evict_other_frames(source_path)
 
-    schema_map = load_elo_ratings_schema_map(club_or_tournament)
-    lf = pl.scan_parquet(source_path, storage_options=storage_options)
+        print(
+            f"[acbl-api] loading {club_or_tournament} parquet "
+            f"({pathlib.Path(source_path).name}, mem {_cgroup_mem_summary()})",
+            flush=True,
+        )
+        t0 = time.perf_counter()
+        schema_map = load_elo_ratings_schema_map(club_or_tournament)
+        lf = pl.scan_parquet(source_path, storage_options=storage_options)
 
-    if "Date" in schema_map:
-        if schema_map["Date"] == pl.Utf8:
-            parsed_dt = pl.coalesce(
-                [
-                    pl.col("Date").str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S%.f", strict=False),
-                    pl.col("Date").str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False),
-                    pl.col("Date").str.strptime(pl.Datetime, format="%Y-%m-%dT%H:%M:%S%.f", strict=False),
-                    pl.col("Date").str.strptime(pl.Datetime, format="%Y-%m-%dT%H:%M:%S", strict=False),
-                    pl.col("Date").str.strptime(pl.Date, format="%Y-%m-%d", strict=False).cast(pl.Datetime, strict=False),
-                ]
-            )
-            lf = lf.with_columns(parsed_dt.alias("Date"))
-        else:
-            lf = lf.with_columns(pl.col("Date").cast(pl.Datetime, strict=False).alias("Date"))
+        if "Date" in schema_map:
+            if schema_map["Date"] == pl.Utf8:
+                parsed_dt = pl.coalesce(
+                    [
+                        pl.col("Date").str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S%.f", strict=False),
+                        pl.col("Date").str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False),
+                        pl.col("Date").str.strptime(pl.Datetime, format="%Y-%m-%dT%H:%M:%S%.f", strict=False),
+                        pl.col("Date").str.strptime(pl.Datetime, format="%Y-%m-%dT%H:%M:%S", strict=False),
+                        pl.col("Date").str.strptime(pl.Date, format="%Y-%m-%d", strict=False).cast(pl.Datetime, strict=False),
+                    ]
+                )
+                lf = lf.with_columns(parsed_dt.alias("Date"))
+            else:
+                lf = lf.with_columns(pl.col("Date").cast(pl.Datetime, strict=False).alias("Date"))
 
-    shrink_exprs = _dtype_shrink_exprs(dict(schema_map))
-    if shrink_exprs:
-        lf = lf.with_columns(shrink_exprs)
+        shrink_exprs = _dtype_shrink_exprs(dict(schema_map))
+        if shrink_exprs:
+            lf = lf.with_columns(shrink_exprs)
 
-    full_df = lf.collect(engine="streaming")
-    _FRAME_CACHE[source_path] = full_df
-    _FRAME_CACHE_TIMES[source_path] = time.time()
-    _malloc_trim()
-    return full_df
+        full_df = lf.collect(engine="streaming")
+        _FRAME_CACHE[source_path] = full_df
+        _FRAME_CACHE_TIMES[source_path] = time.time()
+        _malloc_trim()
+        print(
+            f"[acbl-api] loaded {club_or_tournament} "
+            f"({full_df.height} rows, {time.perf_counter() - t0:.1f}s, mem {_cgroup_mem_summary()})",
+            flush=True,
+        )
+        return full_df
 
 
 def load_elo_ratings(club_or_tournament: str, columns: list[str] | None = None, date_from: datetime | None = None) -> pl.DataFrame:
@@ -1238,110 +1303,108 @@ def acbl_report(
                     "disable (show all qualifying entities).",
     ),
 ) -> dict:
-    started_at = datetime.now()
-    t0 = time.perf_counter()
-    try:
-        t_parse_start = time.perf_counter()
-        parsed_date_from = None if not date_from else datetime.fromisoformat(date_from)
-        t_parse_end = time.perf_counter()
+    with _REPORT_LOCK:
+        started_at = datetime.now()
+        t0 = time.perf_counter()
+        try:
+            t_parse_start = time.perf_counter()
+            parsed_date_from = None if not date_from else datetime.fromisoformat(date_from)
+            t_parse_end = time.perf_counter()
 
-        t_load_start = time.perf_counter()
-        required_columns = _required_columns_for_mode(rating_type, elo_rating_type)
-        df = load_elo_ratings(club_or_tournament, columns=required_columns, date_from=parsed_date_from)
-        df = _filter_valid_percentages_acbl(df)
-        t_load_end = time.perf_counter()
+            t_load_start = time.perf_counter()
+            required_columns = _required_columns_for_mode(rating_type, elo_rating_type)
+            df = load_elo_ratings(club_or_tournament, columns=required_columns, date_from=parsed_date_from)
+            df = _filter_valid_percentages_acbl(df)
+            t_load_end = time.perf_counter()
 
-        t_filter_start = time.perf_counter()
-        if online_filter == "Local Only" and "is_virtual_game" in df.columns:
-            df = df.filter(pl.col("is_virtual_game") == False)
-        elif online_filter == "Online Only" and "is_virtual_game" in df.columns:
-            df = df.filter(pl.col("is_virtual_game").is_null())
-        t_filter_end = time.perf_counter()
+            t_filter_start = time.perf_counter()
+            if online_filter == "Local Only" and "is_virtual_game" in df.columns:
+                df = df.filter(pl.col("is_virtual_game") == False)
+            elif online_filter == "Online Only" and "is_virtual_game" in df.columns:
+                df = df.filter(pl.col("is_virtual_game").is_null())
+            t_filter_end = time.perf_counter()
 
-        t_sql_start = time.perf_counter()
-        con = _get_db_connection()
-        with _DB_LOCK:
-            try:
-                con.unregister("self")
-            except Exception:
-                pass
-            con.register("self", df)
-            shrinkage_meta = _load_shrinkage_meta(club_or_tournament)
-            anchor_kind = "player" if rating_type == "Players" else "pair"
-            prior_anchor = _shrinkage_anchor(shrinkage_meta, anchor_kind)
-            has_round = "Round" in df.columns
-            if rating_type == "Players":
-                generated_sql = generate_top_players_sql(
-                    top_n, min_sessions, rating_method, elo_rating_type,
-                    prior_anchor=prior_anchor, prior_sessions=prior_sessions,
-                    has_round=has_round, min_skill_z=min_skill_z,
-                )
-            else:
-                generated_sql = generate_top_pairs_sql(
-                    top_n, min_sessions, rating_method, elo_rating_type,
-                    prior_anchor=prior_anchor, prior_sessions=prior_sessions,
-                    has_round=has_round, min_skill_z=min_skill_z,
-                )
-            result_df = con.execute(generated_sql).pl()
-        t_sql_end = time.perf_counter()
+            t_sql_start = time.perf_counter()
+            con = _get_db_connection()
+            with _DB_LOCK:
+                try:
+                    con.unregister("self")
+                except Exception:
+                    pass
+                con.register("self", df)
+                shrinkage_meta = _load_shrinkage_meta(club_or_tournament)
+                anchor_kind = "player" if rating_type == "Players" else "pair"
+                prior_anchor = _shrinkage_anchor(shrinkage_meta, anchor_kind)
+                has_round = "Round" in df.columns
+                if rating_type == "Players":
+                    generated_sql = generate_top_players_sql(
+                        top_n, min_sessions, rating_method, elo_rating_type,
+                        prior_anchor=prior_anchor, prior_sessions=prior_sessions,
+                        has_round=has_round, min_skill_z=min_skill_z,
+                    )
+                else:
+                    generated_sql = generate_top_pairs_sql(
+                        top_n, min_sessions, rating_method, elo_rating_type,
+                        prior_anchor=prior_anchor, prior_sessions=prior_sessions,
+                        has_round=has_round, min_skill_z=min_skill_z,
+                    )
+                result_df = con.execute(generated_sql).pl()
+            t_sql_end = time.perf_counter()
 
-        t_serialize_start = time.perf_counter()
-        result_rows = result_df.to_dicts()
-        t_serialize_end = time.perf_counter()
+            t_serialize_start = time.perf_counter()
+            result_rows = result_df.to_dicts()
+            t_serialize_end = time.perf_counter()
 
-        date_range = ""
-        if "Date" in df.columns and not df.is_empty():
-            date_min, date_max = df.select([pl.col("Date").min().alias("min"), pl.col("Date").max().alias("max")]).row(0)
-            date_range = f"{str(date_min)[:10]} to {str(date_max)[:10]}"
+            date_range = ""
+            if "Date" in df.columns and not df.is_empty():
+                date_min, date_max = df.select([pl.col("Date").min().alias("min"), pl.col("Date").max().alias("max")]).row(0)
+                date_range = f"{str(date_min)[:10]} to {str(date_max)[:10]}"
 
-        ended_at = datetime.now()
-        elapsed = (ended_at - started_at).total_seconds()
-        input_rows = len(df)
-        output_rows = len(result_df)
-        perf = {
-            "source": "r2" if _r2_enabled() else "local",
-            "parse_seconds": round(t_parse_end - t_parse_start, 3),
-            "load_seconds": round(t_load_end - t_load_start, 3),
-            "filter_seconds": round(t_filter_end - t_filter_start, 3),
-            "sql_seconds": round(t_sql_end - t_sql_start, 3),
-            "serialize_seconds": round(t_serialize_end - t_serialize_start, 3),
-            "input_rows": input_rows,
-            "output_rows": output_rows,
-        }
-        response_payload = {
-            "rows": result_rows,
-            "generated_sql": generated_sql,
-            "date_range": date_range,
-            "row_count": output_rows,
-            "started_at": started_at.isoformat(),
-            "ended_at": ended_at.isoformat(),
-            "elapsed_seconds": elapsed,
-            "moving_avg_days": moving_avg_days,
-            "shrinkage": {
-                "prior_sessions": int(prior_sessions),
-                "prior_anchor": prior_anchor,
-                "applied": prior_anchor is not None and prior_sessions > 0,
-                "kind": anchor_kind,
-            },
-            "skill_gate": {
-                "min_skill_z": float(min_skill_z),
-                "applied": min_skill_z > SKILL_GATE_DISABLED,
-                "metric": "pool z-score of DD_Tricks_Diff + Par_Suit + Par_Contract",
-            },
-            "perf": perf,
-            "server": _server_runtime_info(),
-        }
-        del result_df, df
-        # Per-request memory hygiene: return per-query slack to the OS so
-        # process RSS doesn't climb forever as the user pages through
-        # different filters. No-op on Windows; real win on Linux.
-        _malloc_trim()
-        response_payload["perf"]["total_seconds"] = round(time.perf_counter() - t0, 3)
-        return response_payload
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+            ended_at = datetime.now()
+            elapsed = (ended_at - started_at).total_seconds()
+            input_rows = len(df)
+            output_rows = len(result_df)
+            perf = {
+                "source": "r2" if _r2_enabled() else "local",
+                "parse_seconds": round(t_parse_end - t_parse_start, 3),
+                "load_seconds": round(t_load_end - t_load_start, 3),
+                "filter_seconds": round(t_filter_end - t_filter_start, 3),
+                "sql_seconds": round(t_sql_end - t_sql_start, 3),
+                "serialize_seconds": round(t_serialize_end - t_serialize_start, 3),
+                "input_rows": input_rows,
+                "output_rows": output_rows,
+            }
+            response_payload = {
+                "rows": result_rows,
+                "generated_sql": generated_sql,
+                "date_range": date_range,
+                "row_count": output_rows,
+                "started_at": started_at.isoformat(),
+                "ended_at": ended_at.isoformat(),
+                "elapsed_seconds": elapsed,
+                "moving_avg_days": moving_avg_days,
+                "shrinkage": {
+                    "prior_sessions": int(prior_sessions),
+                    "prior_anchor": prior_anchor,
+                    "applied": prior_anchor is not None and prior_sessions > 0,
+                    "kind": anchor_kind,
+                },
+                "skill_gate": {
+                    "min_skill_z": float(min_skill_z),
+                    "applied": min_skill_z > SKILL_GATE_DISABLED,
+                    "metric": "pool z-score of DD_Tricks_Diff + Par_Suit + Par_Contract",
+                },
+                "perf": perf,
+                "server": _server_runtime_info(),
+            }
+            del result_df, df
+            _malloc_trim()
+            response_payload["perf"]["total_seconds"] = round(time.perf_counter() - t0, 3)
+            return response_payload
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/acbl/detail")
@@ -1354,70 +1417,70 @@ def acbl_detail(
     player_id: str | None = Query(None),
     pair_ids: str | None = Query(None),
 ) -> dict:
-    started_at = datetime.now()
-    t0 = time.perf_counter()
-    try:
-        t_parse_start = time.perf_counter()
-        parsed_date_from = None if not date_from else datetime.fromisoformat(date_from)
-        t_parse_end = time.perf_counter()
+    with _REPORT_LOCK:
+        started_at = datetime.now()
+        t0 = time.perf_counter()
+        try:
+            t_parse_start = time.perf_counter()
+            parsed_date_from = None if not date_from else datetime.fromisoformat(date_from)
+            t_parse_end = time.perf_counter()
 
-        t_load_start = time.perf_counter()
-        required_columns = _required_columns_for_detail(rating_type, elo_rating_type)
-        df = load_elo_ratings(club_or_tournament, columns=required_columns, date_from=parsed_date_from)
-        df = _filter_valid_percentages_acbl(df)
-        t_load_end = time.perf_counter()
+            t_load_start = time.perf_counter()
+            required_columns = _required_columns_for_detail(rating_type, elo_rating_type)
+            df = load_elo_ratings(club_or_tournament, columns=required_columns, date_from=parsed_date_from)
+            df = _filter_valid_percentages_acbl(df)
+            t_load_end = time.perf_counter()
 
-        t_filter_start = time.perf_counter()
-        if online_filter == "Local Only" and "is_virtual_game" in df.columns:
-            df = df.filter(pl.col("is_virtual_game") == False)
-        elif online_filter == "Online Only" and "is_virtual_game" in df.columns:
-            df = df.filter(pl.col("is_virtual_game").is_null())
-        t_filter_end = time.perf_counter()
+            t_filter_start = time.perf_counter()
+            if online_filter == "Local Only" and "is_virtual_game" in df.columns:
+                df = df.filter(pl.col("is_virtual_game") == False)
+            elif online_filter == "Online Only" and "is_virtual_game" in df.columns:
+                df = df.filter(pl.col("is_virtual_game").is_null())
+            t_filter_end = time.perf_counter()
 
-        t_build_start = time.perf_counter()
-        if rating_type == "Players":
-            if not player_id:
-                raise HTTPException(status_code=400, detail="player_id is required for Players detail.")
-            detail = _build_player_detail(df, player_id=str(player_id), elo_rating_type=elo_rating_type)
-        else:
-            if not pair_ids:
-                raise HTTPException(status_code=400, detail="pair_ids is required for Pairs detail.")
-            detail = _build_pair_detail(df, pair_ids=str(pair_ids), elo_rating_type=elo_rating_type)
-        t_build_end = time.perf_counter()
+            t_build_start = time.perf_counter()
+            if rating_type == "Players":
+                if not player_id:
+                    raise HTTPException(status_code=400, detail="player_id is required for Players detail.")
+                detail = _build_player_detail(df, player_id=str(player_id), elo_rating_type=elo_rating_type)
+            else:
+                if not pair_ids:
+                    raise HTTPException(status_code=400, detail="pair_ids is required for Pairs detail.")
+                detail = _build_pair_detail(df, pair_ids=str(pair_ids), elo_rating_type=elo_rating_type)
+            t_build_end = time.perf_counter()
 
-        t_serialize_start = time.perf_counter()
-        detail_rows = detail.to_dicts()
-        t_serialize_end = time.perf_counter()
+            t_serialize_start = time.perf_counter()
+            detail_rows = detail.to_dicts()
+            t_serialize_end = time.perf_counter()
 
-        ended_at = datetime.now()
-        elapsed = (ended_at - started_at).total_seconds()
-        input_rows = len(df)
-        output_rows = len(detail)
-        perf = {
-            "source": "r2" if _r2_enabled() else "local",
-            "parse_seconds": round(t_parse_end - t_parse_start, 3),
-            "load_seconds": round(t_load_end - t_load_start, 3),
-            "filter_seconds": round(t_filter_end - t_filter_start, 3),
-            "build_seconds": round(t_build_end - t_build_start, 3),
-            "serialize_seconds": round(t_serialize_end - t_serialize_start, 3),
-            "input_rows": input_rows,
-            "output_rows": output_rows,
-        }
-        response_payload = {
-            "rows": detail_rows,
-            "row_count": output_rows,
-            "started_at": started_at.isoformat(),
-            "ended_at": ended_at.isoformat(),
-            "elapsed_seconds": elapsed,
-            "perf": perf,
-            "server": _server_runtime_info(),
-        }
-        del detail, df
-        # Per-request memory hygiene: return per-query slack to the OS.
-        _malloc_trim()
-        response_payload["perf"]["total_seconds"] = round(time.perf_counter() - t0, 3)
-        return response_payload
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+            ended_at = datetime.now()
+            elapsed = (ended_at - started_at).total_seconds()
+            input_rows = len(df)
+            output_rows = len(detail)
+            perf = {
+                "source": "r2" if _r2_enabled() else "local",
+                "parse_seconds": round(t_parse_end - t_parse_start, 3),
+                "load_seconds": round(t_load_end - t_load_start, 3),
+                "filter_seconds": round(t_filter_end - t_filter_start, 3),
+                "build_seconds": round(t_build_end - t_build_start, 3),
+                "serialize_seconds": round(t_serialize_end - t_serialize_start, 3),
+                "input_rows": input_rows,
+                "output_rows": output_rows,
+            }
+            response_payload = {
+                "rows": detail_rows,
+                "row_count": output_rows,
+                "started_at": started_at.isoformat(),
+                "ended_at": ended_at.isoformat(),
+                "elapsed_seconds": elapsed,
+                "perf": perf,
+                "server": _server_runtime_info(),
+            }
+            del detail, df
+            _malloc_trim()
+            response_payload["perf"]["total_seconds"] = round(time.perf_counter() - t0, 3)
+            return response_payload
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
