@@ -25,6 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
+# Bump when deploying memory/toggle fixes so /health confirms the running build.
+API_BUILD_TAG = "2026-07-15-club-toggle-v2"
 
 # Module-level caches to avoid re-reading parquet files on every request.
 # Keys are source paths; values are the cached objects.
@@ -239,7 +241,10 @@ def _evict_frames_except(keep_source_path: str) -> None:
         )
         gc.collect()
         _reset_duckdb_connection()
-        _malloc_trim()
+        for _ in range(4):
+            gc.collect()
+            _malloc_trim()
+            time.sleep(0.25)
         print(
             f"[acbl-api] post-evict mem {_cgroup_mem_summary()}",
             flush=True,
@@ -265,7 +270,8 @@ def _evict_other_frames(keep_source_path: str, club_or_tournament: str) -> None:
             flush=True,
         )
         _evict_frames_except(keep_source_path)
-        _wait_for_cgroup_headroom_after_evict(club_or_tournament)
+        if not _wait_for_cgroup_headroom_after_evict(club_or_tournament):
+            _raise_insufficient_memory(club_or_tournament, "after cold club eviction")
         return
 
     if _dual_frame_cache_enabled() and _dual_frame_cache_safe_for_load(club_or_tournament):
@@ -279,7 +285,8 @@ def _evict_other_frames(keep_source_path: str, club_or_tournament: str) -> None:
         )
     _evict_frames_except(keep_source_path)
     if others_cached:
-        _wait_for_cgroup_headroom_after_evict(club_or_tournament)
+        if not _wait_for_cgroup_headroom_after_evict(club_or_tournament):
+            _raise_insufficient_memory(club_or_tournament, "after eviction")
 
 
 def _cached_frame_bytes() -> int:
@@ -587,6 +594,28 @@ def _malloc_trim() -> None:
         pass
 
 
+def _load_headroom_bytes(club_or_tournament: str) -> int:
+    """RAM required to start a cold parquet load without OOM."""
+    peak = int(8 * 1024 ** 3) if club_or_tournament.lower() == "club" else int(3 * 1024 ** 3)
+    return _estimated_frame_bytes(club_or_tournament) + peak
+
+
+def _raise_insufficient_memory(club_or_tournament: str, phase: str) -> None:
+    used = _cgroup_memory_used_bytes()
+    limit = _cgroup_memory_limit_bytes() or _memory_budget_bytes()
+    need = _load_headroom_bytes(club_or_tournament)
+    free = (limit - used) if used is not None else None
+    free_str = f"{free / 1024 ** 3:.1f} GB" if free is not None else "unknown"
+    detail = (
+        f"Insufficient memory to load {club_or_tournament} ({phase}): "
+        f"need ~{need / 1024 ** 3:.0f} GB free, "
+        f"have {free_str} free of {limit / 1024 ** 3:.0f} GB limit "
+        f"({_cgroup_mem_summary()}). Retry in 30 seconds."
+    )
+    print(f"[acbl-api] {detail}", flush=True)
+    raise HTTPException(status_code=503, detail=detail, headers={"Retry-After": "30"})
+
+
 def _cgroup_memory_used_bytes() -> int | None:
     try:
         return int(pathlib.Path("/sys/fs/cgroup/memory.current").read_text(encoding="utf-8").strip())
@@ -609,14 +638,14 @@ def _cgroup_mem_summary() -> str:
         return "n/a"
 
 
-def _wait_for_cgroup_headroom_after_evict(club_or_tournament: str) -> None:
+def _wait_for_cgroup_headroom_after_evict(club_or_tournament: str) -> bool:
     """Poll cgroup usage until enough RAM is free to start a cold parquet load."""
     limit = _cgroup_memory_limit_bytes()
     if limit is None:
-        return
-    load_budget = _estimated_frame_bytes(club_or_tournament) + int(6 * 1024 ** 3)
+        return True
+    load_budget = _load_headroom_bytes(club_or_tournament)
     max_used = max(int(2 * 1024 ** 3), int(limit - load_budget))
-    deadline = time.perf_counter() + 45.0
+    deadline = time.perf_counter() + 60.0
     while time.perf_counter() < deadline:
         used = _cgroup_memory_used_bytes()
         if used is None or used <= max_used:
@@ -625,13 +654,14 @@ def _wait_for_cgroup_headroom_after_evict(club_or_tournament: str) -> None:
                 f"(target <= {max_used / 1024 ** 3:.1f} GB, mem {_cgroup_mem_summary()})",
                 flush=True,
             )
-            return
+            return True
         time.sleep(0.25)
     print(
         f"[acbl-api] cgroup headroom wait timed out before {club_or_tournament} load "
         f"(target <= {max_used / 1024 ** 3:.1f} GB, mem {_cgroup_mem_summary()})",
         flush=True,
     )
+    return False
 
 
 def _reset_duckdb_connection() -> None:
@@ -746,6 +776,12 @@ def _load_full_frame(club_or_tournament: str) -> pl.DataFrame:
             _DUAL_FRAME_CACHE_LOGGED = True
 
         _evict_other_frames(source_path, club_or_tournament)
+
+        used = _cgroup_memory_used_bytes()
+        limit = _cgroup_memory_limit_bytes() or _memory_budget_bytes()
+        need = _load_headroom_bytes(club_or_tournament)
+        if used is not None and (limit - used) < need:
+            _raise_insufficient_memory(club_or_tournament, "before parquet read")
 
         print(
             f"[acbl-api] loading {club_or_tournament} parquet "
@@ -1546,6 +1582,7 @@ def health() -> dict:
         "frame_cache": runtime.get("frame_cache", {}),
         "dual_frame_cache": runtime.get("dual_frame_cache"),
         "cached_frame_gb": round(_cached_frame_bytes() / (1024 ** 3), 2),
+        "build_tag": API_BUILD_TAG,
     }
 
 

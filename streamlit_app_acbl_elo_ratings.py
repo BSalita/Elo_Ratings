@@ -180,44 +180,63 @@ def _fetch_remote_report_table(
 
     timeout_seconds = int(os.getenv("ACBL_API_TIMEOUT_SECONDS", "180"))
     request_url = f"{base_url}/acbl/report"
-    try:
-        response = requests.get(
-            request_url,
-            params=params,
-            timeout=timeout_seconds,
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except requests.exceptions.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "unknown"
-        detail = ""
-        if exc.response is not None:
-            try:
-                detail = str(exc.response.json())
-            except ValueError:
-                detail = (exc.response.text or "").strip()
-        if status == 422:
+    max_attempts = int(os.getenv("ACBL_API_RETRY_ATTEMPTS", "4"))
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            response = requests.get(
+                request_url,
+                params=params,
+                timeout=timeout_seconds,
+            )
+            if response.status_code == 503 and attempt < max_attempts - 1:
+                time.sleep(5 + attempt * 5)
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            rows = payload.get("rows", [])
+            return pl.DataFrame(rows), payload
+        except requests.exceptions.HTTPError as exc:
+            last_exc = exc
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            detail = ""
+            if exc.response is not None:
+                try:
+                    detail = str(exc.response.json())
+                except ValueError:
+                    detail = (exc.response.text or "").strip()
+            if status == 422:
+                raise RuntimeError(
+                    f"ACBL API request failed for {request_url}: HTTP 422 Unprocessable Entity. "
+                    f"Request params were invalid. Details: {detail}"
+                ) from exc
+            if status == 503 and attempt < max_attempts - 1:
+                time.sleep(5 + attempt * 5)
+                continue
+            hint = (
+                "Check ACBL_API_BASE_URL — in Docker use the service hostname "
+                "(e.g. http://acbl-api:8505), not localhost."
+            )
             raise RuntimeError(
-                f"ACBL API request failed for {request_url}: HTTP 422 Unprocessable Entity. "
-                f"Request params were invalid. Details: {detail}"
+                f"ACBL API request failed for {request_url}: {exc}. {hint}"
             ) from exc
-        hint = (
-            "Check ACBL_API_BASE_URL — in Docker use the service hostname "
-            "(e.g. http://acbl-api:8505), not localhost."
-        )
-        raise RuntimeError(
-            f"ACBL API request failed for {request_url}: {exc}. {hint}"
-        ) from exc
-    except requests.exceptions.RequestException as exc:
-        hint = (
-            "Check ACBL_API_BASE_URL — in Docker use the service hostname "
-            "(e.g. http://acbl-api:8505), not localhost."
-        )
-        raise RuntimeError(
-            f"ACBL API request failed for {request_url}: {exc}. {hint}"
-        ) from exc
-    rows = payload.get("rows", [])
-    return pl.DataFrame(rows), payload
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                time.sleep(5 + attempt * 5)
+                continue
+            hint = (
+                "The API process may have been killed loading Club data (out of memory). "
+                "Wait 30 seconds and retry. Operator: check `wslc logs acbl-api` and "
+                "`Invoke-RestMethod http://localhost:8505/health` for build_tag "
+                "2026-07-15-club-toggle-v2. In Docker use ACBL_API_BASE_URL=http://acbl-api:8505."
+            )
+            raise RuntimeError(
+                f"ACBL API request failed for {request_url}: {exc}. {hint}"
+            ) from exc
+    if last_exc is not None:
+        raise RuntimeError(f"ACBL API request failed for {request_url}: {last_exc}") from last_exc
+    raise RuntimeError(f"ACBL API request failed for {request_url}: unknown error")
 
 
 def _fetch_remote_detail_table(
