@@ -1584,6 +1584,7 @@ def main():
         st.sidebar.markdown('<p style="color: #ffc107; font-weight: 600;">Morty\'s Automated Postmortem Apps</p>', unsafe_allow_html=True)
         st.sidebar.markdown("🔗 [ACBL Postmortem](https://acbl.postmortem.chat)")
         st.sidebar.markdown("🔗 [French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
+        st.sidebar.markdown("🔗 [Calculate PBN](https://pbn.postmortem.chat)")
         #st.sidebar.markdown("🔗 [BridgeWebs Postmortem](https://bridgewebs.postmortem.chat)")
         
         # Developer Settings (kept in sidebar for SQL-gating control)
