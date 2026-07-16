@@ -2394,24 +2394,15 @@ FFBRIDGE_URL_PARAMS = {
 
 @st.fragment
 def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
-    # Fragment owns Scratch/Handicap so toggles remount only this panel (and
-    # its AgGrid), not the full 725k-row script path — that full remount was
-    # the intermittent exit-139 trigger under AppTest / rapid UI toggles.
+    # Fragment remounts on Scratch/Handicap (and other session-state) changes so
+    # AgGrid re-renders without re-running the full dataset load path.
     _load_debug_log("leaderboard panel started")
     ctx = st.session_state.get("_ff_lb_ctx")
     if not ctx:
         _load_debug_log("leaderboard panel: no _ff_lb_ctx; skipping")
         return
-    score_type = st.radio(
-        "Elo Based On",
-        ["Scratch", "Handicap"],
-        index=0,
-        key="elo_score_type",
-        horizontal=True,
-        help="Choose which percentage to use for Elo calculations (rankings always sorted by Elo)",
-    )
+    score_type = st.session_state.get("elo_score_type", "Scratch")
     use_handicap = score_type == "Handicap"
-    sync_state_to_url_params(st, FFBRIDGE_URL_PARAMS)
     results_df = ctx["results_df"]
     players_df = _aggregate_players_from_results_cached(results_df, use_handicap)
     _load_debug_log(
@@ -2794,6 +2785,24 @@ def main():
     with st.sidebar:
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
         st.sidebar.markdown("[What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
+
+        st.radio(
+            "Elo Based On",
+            ["Scratch", "Handicap"],
+            index=0,
+            key="elo_score_type",
+            horizontal=True,
+            help="Choose which percentage to use for Elo calculations (rankings always sorted by Elo)",
+        )
+
+        rating_type = st.radio(
+            "Ranking Type",
+            ["Players", "Pairs"],
+            index=0,
+            key="elo_rating_type",
+            horizontal=True,
+            help="Switch between individual and partnership rankings"
+        )
         
         # API Backend selection
         # Keep widget state and canonical state separate so explicit reruns do not
@@ -2885,19 +2894,6 @@ def main():
             key="elo_name_filter",
             help="Filter results by player or pair name (case-insensitive)"
         )
-        
-        # Ranking type
-        rating_type = st.radio(
-            "Ranking Type",
-            ["Players", "Pairs"],
-            index=0,
-            key="elo_rating_type",
-            horizontal=True,
-            help="Switch between individual and partnership rankings"
-        )
-
-        # Scratch/Handicap lives inside _ffbridge_leaderboard_panel (@st.fragment)
-        # so toggling it does not full-rerun the dataset load path.
 
         # IV fetching is always enabled (cached, refreshes monthly on 15th)
         fetch_iv = True
