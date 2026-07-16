@@ -2,9 +2,8 @@
 # ===================================================
 
 # Core Streamlit web interface
-# KNOWN ISSUE: streamlit >= 1.56.0 breaks streamlit-aggrid (any version).
-# AgGrid DataFrames render as blank. Pin streamlit <= 1.53.1 until resolved.
-streamlit==1.53.1
+# Watch AgGrid visually: >=1.56 historically blanked some grids; confirm in UI.
+streamlit
 streamlit-aggrid==1.1.8.post1
 streamlit-extras
 python-dotenv

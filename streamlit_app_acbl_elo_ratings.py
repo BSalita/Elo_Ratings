@@ -1,7 +1,7 @@
 ﻿# streamlit_app_elo_ratings.py
 #
-# KNOWN ISSUE: streamlit >= 1.56.0 breaks streamlit-aggrid (any version).
-# AgGrid DataFrames render as blank. Pin streamlit <= 1.53.1 until resolved.
+# streamlit==1.59.2 (see requirements.txt). Confirm AgGrid still paints
+# (historical blank-frame risk with some streamlit/aggrid combos).
 #
 # Previous steps:
 # acbl/acbl_elo_ratings_create.py

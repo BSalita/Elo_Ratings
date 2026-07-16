@@ -241,8 +241,11 @@ def ShowDataFrameTable(table_df,key=None,output_method='aggrid',color_column=Non
         gb.configure_selection(selection_mode='single', use_checkbox=False)  # Enable single row selection
         gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True, wrapHeaderText=True, autoHeaderHeight=True)
         
-        # Configure numeric columns for proper sorting
+        # Configure numeric columns for proper sorting (Board is often object dtype from DuckDB/SQL).
+        numeric_sort_columns = {'Board', 'Tricks', 'DD_Tricks', 'DD_Tricks_Dummy', 'Board_Count', 'Board_Plays'}
         for col in table_df.columns:
+            if col in numeric_sort_columns and not pd.api.types.is_numeric_dtype(table_df[col]):
+                table_df[col] = pd.to_numeric(table_df[col], errors='coerce')
             if pd.api.types.is_numeric_dtype(table_df[col]):
                 gb.configure_column(col, type=['numericColumn'], filter='agNumberColumnFilter')
         
@@ -621,11 +624,14 @@ except ImportError:
     from memory_usage import format_memory_metrics, update_session_peak_memory
 
 
-def render_memory_sidebar_caption(st_module) -> None:
-    """Show live cgroup/process memory in the sidebar (updates each rerun)."""
+def get_memory_caption_line(st_module) -> str:
+    """Return live cgroup/process memory line (updates peak across reruns)."""
     metrics = update_session_peak_memory(st_module.session_state)
     peak = st_module.session_state.get("_peak_cgroup_bytes")
-    st_module.sidebar.caption(
-        format_memory_metrics(metrics, peak_cgroup_bytes=peak or None)
-    )
+    return format_memory_metrics(metrics, peak_cgroup_bytes=peak or None)
+
+
+def render_memory_sidebar_caption(st_module) -> None:
+    """Show live cgroup/process memory in the sidebar (updates each rerun)."""
+    st_module.sidebar.caption(get_memory_caption_line(st_module))
 

@@ -1,7 +1,7 @@
 # streamlit_app_ffbridge_elo.py
 #
-# KNOWN ISSUE: streamlit >= 1.56.0 breaks streamlit-aggrid (any version).
-# AgGrid DataFrames render as blank. Pin streamlit <= 1.53.1 until resolved.
+# streamlit==1.59.2 (see requirements.txt). Older 1.53.x segfaulted on Linux
+# remounts; confirm AgGrid still paints (historical blank-frame risk >=1.56).
 #
 """
 FFBridge Elo Ratings - Unified Streamlit Application
@@ -428,11 +428,6 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
     )
 
 
-# AG Grid component class used to turn any cell containing an http(s) URL into
-# a clickable anchor that opens in a new tab. Implemented as a JS class with
-# init()/getGui() because streamlit-aggrid renders through React, which cannot
-# accept a raw DOM element or unescaped HTML string returned from a function
-# cellRenderer.
 _URL_CELL_RENDERER = JsCode("""
 class UrlCellRenderer {
     init(params) {
@@ -499,6 +494,7 @@ def _leaderboard_aggrid_key(
     name_filter: str,
     prior_sessions: int,
 ) -> str:
+    # Omit Scratch/Handicap so H/S toggles update the same AgGrid instance.
     return (
         f"ff_{entity}_table_{rating_type}_{simultaneous_type}_"
         f"club_{_aggrid_key_part(club_filter)}_top{top_n}_min{min_games}_"
@@ -507,13 +503,8 @@ def _leaderboard_aggrid_key(
 
 
 def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = True) -> Dict[str, Any]:
-    """Build an AgGrid with single-click row selection."""
-
-    display_df = df.to_pandas()
-    # Force columns whose names suggest numeric content (e.g. *_Rank, *_Pct,
-    # Games, Player_Elo, Avg_IV_Bonus) to numeric dtype so AgGrid sorts them
-    # numerically rather than alphabetically. Defensive against JSON-roundtrip
-    # null-int columns ending up as pandas object dtype.
+    """Build an AgGrid with single-click row selection (streamlit-aggrid)."""
+    display_df = df.to_pandas(use_pyarrow_extension_array=False)
     coerce_numeric_columns(display_df)
 
     page_size = LEADERBOARD_PAGE_SIZE
@@ -522,7 +513,6 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = 
     gb.configure_pagination(enabled=True, paginationAutoPageSize=False, paginationPageSize=page_size)
     gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
 
-    # Configure every numeric column for numeric sorting + numeric filter.
     numeric_comparator = JsCode("""
         function(valueA, valueB, nodeA, nodeB, isDescending) {
             return Number(valueA) - Number(valueB);
@@ -535,17 +525,13 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = 
                 type=['numericColumn', 'numberColumnFilter'],
                 comparator=numeric_comparator,
             )
-    # Default sort: rank ascending (Quality_Rank is the headline if present,
-    # otherwise the plain Rank column).
     sort_col = 'Quality_Rank' if 'Quality_Rank' in display_df.columns else (
         'Rank' if 'Rank' in display_df.columns else None
     )
     if sort_col is not None:
         gb.configure_column(sort_col, sort='asc')
-
-    # Configure Games column width to fit column name + icon size
     if 'Games' in display_df.columns:
-        gb.configure_column('Games', width=100)  # Width accommodates "Games" text + sort icon
+        gb.configure_column('Games', width=100)
     if render_links:
         for col in _url_columns(display_df):
             gb.configure_column(col, cellRenderer=_URL_CELL_RENDERER, minWidth=240, width=360)
@@ -553,8 +539,7 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = 
     grid_options['rowHeight'] = LEADERBOARD_ROW_HEIGHT
     grid_options['headerHeight'] = 50
     grid_options['domLayout'] = 'normal'
-    n_rows = len(display_df)
-    height = leaderboard_aggrid_viewport_height(n_rows, page_size, pagination=True)
+    height = leaderboard_aggrid_viewport_height(len(display_df), page_size, pagination=True)
 
     return AgGrid(
         display_df,
@@ -571,17 +556,12 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = 
 
 def _render_detail_aggrid_ff(detail_df: pl.DataFrame, key: str, selectable: bool = False):
     """Render a detail DataFrame as a selectable AgGrid. Returns grid response if selectable."""
-    display_df = detail_df.to_pandas()
-    # Force numeric-named columns to numeric dtype so AgGrid sorts them
-    # numerically rather than alphabetically.
+    display_df = detail_df.to_pandas(use_pyarrow_extension_array=False)
     coerce_numeric_columns(display_df)
     gb = GridOptionsBuilder.from_dataframe(display_df)
     if selectable:
         gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
     gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
-    # Explicit numeric comparator required because streamlit-aggrid 1.1.x
-    # delivers cell values to the JS side as strings; without this, columns
-    # like Pair_Elo / Rank would sort as "10, 2, 20, 3" alphabetically.
     numeric_comparator = JsCode("""
         function(valueA, valueB, nodeA, nodeB, isDescending) {
             return Number(valueA) - Number(valueB);
@@ -594,7 +574,6 @@ def _render_detail_aggrid_ff(detail_df: pl.DataFrame, key: str, selectable: bool
                 type=['numericColumn', 'numberColumnFilter'],
                 comparator=numeric_comparator,
             )
-    # Render any column containing http(s) URLs as clickable links.
     for col in _url_columns(display_df):
         gb.configure_column(col, cellRenderer=_URL_CELL_RENDERER, minWidth=240, width=360)
     grid_options = gb.build()
@@ -618,6 +597,7 @@ def _render_detail_aggrid_ff(detail_df: pl.DataFrame, key: str, selectable: bool
         theme=AgGridTheme.BALHAM,
         key=key,
         allow_unsafe_jscode=True,
+        update_on=["selectionChanged"] if selectable else [],
     )
     return response if selectable else None
 
@@ -2372,9 +2352,9 @@ FFBRIDGE_URL_PARAMS = {
         "default": "All Tournaments",
     },
     "club": {
-        "session_key": "elo_club_selectbox",
+        "session_key": "elo_club_filter",
         "parser": str,
-        "default": _ALL_CLUBS_LABEL,
+        "default": "",
     },
     "name": {
         "session_key": "elo_name_filter",
@@ -2414,16 +2394,28 @@ FFBRIDGE_URL_PARAMS = {
 
 @st.fragment
 def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
-    _load_debug_log("leaderboard fragment started")
+    # Fragment owns Scratch/Handicap so toggles remount only this panel (and
+    # its AgGrid), not the full 725k-row script path — that full remount was
+    # the intermittent exit-139 trigger under AppTest / rapid UI toggles.
+    _load_debug_log("leaderboard panel started")
     ctx = st.session_state.get("_ff_lb_ctx")
     if not ctx:
-        _load_debug_log("leaderboard fragment: no _ff_lb_ctx; skipping")
+        _load_debug_log("leaderboard panel: no _ff_lb_ctx; skipping")
         return
-    use_handicap = st.session_state.get("elo_score_type", "Scratch") == "Handicap"
+    score_type = st.radio(
+        "Elo Based On",
+        ["Scratch", "Handicap"],
+        index=0,
+        key="elo_score_type",
+        horizontal=True,
+        help="Choose which percentage to use for Elo calculations (rankings always sorted by Elo)",
+    )
+    use_handicap = score_type == "Handicap"
+    sync_state_to_url_params(st, FFBRIDGE_URL_PARAMS)
     results_df = ctx["results_df"]
     players_df = _aggregate_players_from_results_cached(results_df, use_handicap)
     _load_debug_log(
-        f"leaderboard fragment: aggregated players ({players_df.height} rows, "
+        f"leaderboard panel: aggregated players ({players_df.height} rows, "
         f"handicap={use_handicap})"
     )
     rating_type = ctx["rating_type"]
@@ -2461,12 +2453,12 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
     # Display tables
     if rating_type == "Players":
         if not players_df.is_empty():
-            _load_debug_log("leaderboard fragment: running top players SQL (hc+sc)")
+            _load_debug_log("leaderboard panel: running top players SQL (hc+sc)")
             hc_players, sc_players, sql_h, sql_s, anchor_h, anchor_s = _cached_top_players_both(
                 players_df, top_n, min_games, int(prior_sessions),
             )
             _load_debug_log(
-                f"leaderboard fragment: top players ready "
+                f"leaderboard panel: top players ready "
                 f"(hc={hc_players.height}, sc={sc_players.height} rows)"
             )
             top_players = hc_players if use_handicap else sc_players
@@ -2511,9 +2503,9 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                         "players", rating_type, simultaneous_type,
                         club_filter, top_n, min_games, name_filter, int(prior_sessions),
                     )
-                    _load_debug_log(f"leaderboard fragment: rendering AgGrid ({top_players.height} rows)")
+                    _load_debug_log(f"leaderboard panel: rendering AgGrid ({top_players.height} rows)")
                     grid_response = build_selectable_aggrid(top_players, dynamic_key, render_links=False)
-                    _load_debug_log("leaderboard fragment: AgGrid render returned")
+                    _load_debug_log("leaderboard panel: AgGrid render returned")
 
                     selected_rows = grid_response.get('selected_rows', None)
                     if selected_rows is not None and len(selected_rows) > 0:
@@ -2579,12 +2571,11 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                 # Optional reconciliation: for Octopus, prefer BridgeInterNet scratch/handicap when matchable.
                                 detail_df = _maybe_override_octopus_pct_rows(detail_df, pair_name=player_name, use_handicap=use_handicap)
 
-                                # Display as selectable AgGrid (click row to see tournament opponents)
                                 st.caption("Click a row to see tournament opponents")
                                 # Hide helper columns from display
                                 hidden = [c for c in ('_pair_id', '_team_id', '_club_id') if c in detail_df.columns]
                                 display_detail = detail_df.drop(hidden) if hidden else detail_df
-                                detail_key = f"detail_player_{player_id}_{rating_type}"
+                                detail_key = f"detail_player_{player_id}_{rating_type}_{score_type}"
                                 detail_resp = _render_detail_aggrid_ff(display_detail, key=detail_key, selectable=True)
 
                                 # 3rd df: tournament opponents for clicked row
@@ -2603,11 +2594,11 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                             _show_tournament_opponents(results_df, event_id, exclude_pair_id=row_pair_id)
 
                                 # 4th df: partner aggregation across all tournaments
-                                _show_partner_aggregation(display_detail, key_suffix=f"player_{player_id}")
+                                _show_partner_aggregation(display_detail, key_suffix=f"player_{player_id}_{score_type}")
 
                                 # Opponent History Details + Opponent Summary
-                                _show_opponent_history(results_df, player_results, exclude_id=str(player_id), exclude_mode='player', key_suffix=f"player_{player_id}")
-                                _show_opponent_summary(results_df, player_results, exclude_id=str(player_id), exclude_mode='player', key_suffix=f"player_{player_id}")
+                                _show_opponent_history(results_df, player_results, exclude_id=str(player_id), exclude_mode='player', key_suffix=f"player_{player_id}_{score_type}")
+                                _show_opponent_summary(results_df, player_results, exclude_id=str(player_id), exclude_mode='player', key_suffix=f"player_{player_id}_{score_type}")
                             else:
                                 st.info("No results in selected tournaments.")
 
@@ -2622,12 +2613,12 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                 st.info(f"No players match the minimum requirement of {min_games} games.")
     else:
         if not results_df.is_empty():
-            _load_debug_log("leaderboard fragment: running top pairs SQL (hc+sc)")
+            _load_debug_log("leaderboard panel: running top pairs SQL (hc+sc)")
             hc_pairs, sc_pairs, sql_h, sql_s, anchor_h, anchor_s = _cached_top_pairs_both(
                 results_df, top_n, min_games, int(prior_sessions),
             )
             _load_debug_log(
-                f"leaderboard fragment: top pairs ready "
+                f"leaderboard panel: top pairs ready "
                 f"(hc={hc_pairs.height}, sc={sc_pairs.height} rows)"
             )
             top_pairs = hc_pairs if use_handicap else sc_pairs
@@ -2672,9 +2663,9 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                         "pairs", rating_type, simultaneous_type,
                         club_filter, top_n, min_games, name_filter, int(prior_sessions),
                     )
-                    _load_debug_log(f"leaderboard fragment: rendering AgGrid ({top_pairs.height} rows)")
+                    _load_debug_log(f"leaderboard panel: rendering AgGrid ({top_pairs.height} rows)")
                     grid_response = build_selectable_aggrid(top_pairs, dynamic_key, render_links=False)
-                    _load_debug_log("leaderboard fragment: AgGrid render returned")
+                    _load_debug_log("leaderboard panel: AgGrid render returned")
 
                     selected_rows = grid_response.get('selected_rows', None)
                     if selected_rows is not None and len(selected_rows) > 0:
@@ -2739,12 +2730,11 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                 # Optional reconciliation: for Octopus, prefer BridgeInterNet scratch/handicap when matchable.
                                 detail_df = _maybe_override_octopus_pct_rows(detail_df, pair_name=pair_name, use_handicap=use_handicap)
 
-                                # Display as selectable AgGrid (click row to see tournament opponents)
                                 st.caption("Click a row to see tournament opponents")
                                 # Hide helper columns from display
                                 hidden = [c for c in ('_team_id', '_club_id') if c in detail_df.columns]
                                 display_detail = detail_df.drop(hidden) if hidden else detail_df
-                                detail_key = f"detail_pair_{pair_id}_{rating_type}"
+                                detail_key = f"detail_pair_{pair_id}_{rating_type}_{score_type}"
                                 detail_resp = _render_detail_aggrid_ff(display_detail, key=detail_key, selectable=True)
 
                                 # 3rd df: tournament opponents for clicked row
@@ -2757,11 +2747,11 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                             _show_tournament_opponents(results_df, event_id, exclude_pair_id=str(pair_id))
 
                                 # 4th df: club aggregation across all tournaments
-                                _show_club_aggregation(display_detail, results_df, str(pair_id), key_suffix=f"pair_{pair_id}")
+                                _show_club_aggregation(display_detail, results_df, str(pair_id), key_suffix=f"pair_{pair_id}_{score_type}")
 
                                 # Opponent History Details + Opponent Summary
-                                _show_opponent_history(results_df, pair_results, exclude_id=str(pair_id), exclude_mode='pair', key_suffix=f"pair_{pair_id}")
-                                _show_opponent_summary(results_df, pair_results, exclude_id=str(pair_id), exclude_mode='pair', key_suffix=f"pair_{pair_id}")
+                                _show_opponent_history(results_df, pair_results, exclude_id=str(pair_id), exclude_mode='pair', key_suffix=f"pair_{pair_id}_{score_type}")
+                                _show_opponent_summary(results_df, pair_results, exclude_id=str(pair_id), exclude_mode='pair', key_suffix=f"pair_{pair_id}_{score_type}")
                             else:
                                 st.info("No detailed results found for this pair.")
 
@@ -2775,7 +2765,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
             else:
                 st.info(f"No pairs match the minimum requirement of {min_games} games.")
 
-    _load_debug_log("leaderboard fragment complete")
+    _load_debug_log("leaderboard panel complete")
 
 
 # -------------------------------
@@ -2793,15 +2783,6 @@ def main():
 
     # Apply URL query params -> session state BEFORE widgets render (first run only).
     init_url_params_to_state(st, FFBRIDGE_URL_PARAMS)
-
-    if _FFBRIDGE_CLUB_OPTIONS and len(_ffbridge_club_select_options()) <= 1:
-        st.session_state.elo_available_clubs = _FFBRIDGE_CLUB_OPTIONS
-
-    url_club = st.session_state.get("elo_club_selectbox")
-    if url_club and url_club != _ALL_CLUBS_LABEL:
-        existing = _ffbridge_club_select_options()
-        if url_club not in existing:
-            st.session_state.elo_available_clubs = existing + [url_club]
 
     # Apply common theme
     apply_app_theme(st)
@@ -2890,19 +2871,13 @@ def main():
         
         simultaneous_type = tournament_options_list[tournament_labels.index(selected_tournament_label)]
         
-        club_options = _ffbridge_club_select_options()
-        if "elo_club_selectbox" not in st.session_state:
-            st.session_state.elo_club_selectbox = _ALL_CLUBS_LABEL
-        if st.session_state.elo_club_selectbox not in club_options:
-            st.session_state.elo_club_selectbox = _ALL_CLUBS_LABEL
-
-        selected_club = st.selectbox(
+        # Text input avoids a 500+ option selectbox remounted on every toggle
+        # (previously a SIGSEGV contributor alongside AgGrid).
+        club_filter = st.text_input(
             "Filter by Club",
-            options=club_options,
-            key="elo_club_selectbox",
-            help="Filter results to show only players/pairs from a specific club",
-        )
-        club_filter = "" if selected_club == _ALL_CLUBS_LABEL else selected_club
+            key="elo_club_filter",
+            help="Partial club name match (case-insensitive). Leave blank for all clubs.",
+        ).strip()
         
         # Name filter
         name_filter = st.text_input(
@@ -2921,14 +2896,8 @@ def main():
             help="Switch between individual and partnership rankings"
         )
 
-        st.radio(
-            "Elo Based On",
-            ["Scratch", "Handicap"],
-            index=0,
-            key="elo_score_type",
-            horizontal=True,
-            help="Choose which percentage to use for Elo calculations (rankings always sorted by Elo)",
-        )
+        # Scratch/Handicap lives inside _ffbridge_leaderboard_panel (@st.fragment)
+        # so toggling it does not full-rerun the dataset load path.
 
         # IV fetching is always enabled (cached, refreshes monthly on 15th)
         fetch_iv = True
@@ -3156,7 +3125,10 @@ def _load_main_content(
             results_df = results_df.filter(pl.col('series_id') == simultaneous_type)
     
     if club_filter and not results_df.is_empty() and "club_name" in results_df.columns:
-        results_df = results_df.filter(pl.col("club_name") == club_filter)
+        club_needle = club_filter.lower()
+        results_df = results_df.filter(
+            pl.col("club_name").cast(pl.Utf8).str.to_lowercase().str.contains(club_needle, literal=True)
+        )
     _load_debug_log(f"sidebar filters applied ({results_df.height} rows)")
 
     global _FFBRIDGE_CLUB_OPTIONS
