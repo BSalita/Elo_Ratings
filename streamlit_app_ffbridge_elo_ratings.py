@@ -2287,16 +2287,19 @@ _FFBRIDGE_CLUB_OPTIONS: list[str] | None = None
 
 def _ffbridge_club_select_options() -> list[str]:
     """Club dropdown options; always includes All Clubs (never an empty list)."""
-    raw = st.session_state.get("elo_available_clubs")
+    # Prefer session state; fall back to process cache so a warm container can
+    # paint the dropdown before this session's dataset load finishes.
+    raw = st.session_state.get("elo_available_clubs") or _FFBRIDGE_CLUB_OPTIONS
     if not raw:
         return [_ALL_CLUBS_LABEL]
     names = [_ALL_CLUBS_LABEL]
     seen = {_ALL_CLUBS_LABEL}
     for club in raw:
         label = str(club).strip()
-        if label and label not in seen:
-            names.append(label)
-            seen.add(label)
+        if not label or label == _ALL_CLUBS_LABEL or label in seen:
+            continue
+        names.append(label)
+        seen.add(label)
     return names
 
 
@@ -2352,9 +2355,9 @@ FFBRIDGE_URL_PARAMS = {
         "default": "All Tournaments",
     },
     "club": {
-        "session_key": "elo_club_filter",
+        "session_key": "elo_club_selectbox",
         "parser": str,
-        "default": "",
+        "default": _ALL_CLUBS_LABEL,
     },
     "name": {
         "session_key": "elo_name_filter",
@@ -2880,13 +2883,19 @@ def main():
         
         simultaneous_type = tournament_options_list[tournament_labels.index(selected_tournament_label)]
         
-        # Text input avoids a 500+ option selectbox remounted on every toggle
-        # (previously a SIGSEGV contributor alongside AgGrid).
-        club_filter = st.text_input(
+        club_options = _ffbridge_club_select_options()
+        if "elo_club_selectbox" not in st.session_state:
+            st.session_state.elo_club_selectbox = _ALL_CLUBS_LABEL
+        # Migrate leftover text-input / URL values that are not in the list.
+        if st.session_state.elo_club_selectbox not in club_options:
+            st.session_state.elo_club_selectbox = _ALL_CLUBS_LABEL
+        selected_club = st.selectbox(
             "Filter by Club",
-            key="elo_club_filter",
-            help="Partial club name match (case-insensitive). Leave blank for all clubs.",
-        ).strip()
+            options=club_options,
+            key="elo_club_selectbox",
+            help="Filter results to show only players/pairs from a specific club",
+        )
+        club_filter = "" if selected_club == _ALL_CLUBS_LABEL else selected_club
         
         # Name filter
         name_filter = st.text_input(
@@ -3122,10 +3131,7 @@ def _load_main_content(
             results_df = results_df.filter(pl.col('series_id') == simultaneous_type)
     
     if club_filter and not results_df.is_empty() and "club_name" in results_df.columns:
-        club_needle = club_filter.lower()
-        results_df = results_df.filter(
-            pl.col("club_name").cast(pl.Utf8).str.to_lowercase().str.contains(club_needle, literal=True)
-        )
+        results_df = results_df.filter(pl.col("club_name") == club_filter)
     _load_debug_log(f"sidebar filters applied ({results_df.height} rows)")
 
     global _FFBRIDGE_CLUB_OPTIONS
@@ -3138,9 +3144,14 @@ def _load_main_content(
             }
         )
         new_clubs = [_ALL_CLUBS_LABEL] + unique_clubs
+        prev_clubs = st.session_state.get("elo_available_clubs")
         _FFBRIDGE_CLUB_OPTIONS = new_clubs
         st.session_state.elo_available_clubs = new_clubs
-        _load_debug_log(f"club list updated ({len(unique_clubs)} clubs, no rerun)")
+        # Sidebar selectbox renders before this load; rerun once so options appear.
+        if prev_clubs != new_clubs:
+            _load_debug_log(f"club list updated ({len(unique_clubs)} clubs); rerunning for selectbox")
+            st.rerun()
+        _load_debug_log(f"club list unchanged ({len(unique_clubs)} clubs)")
 
     _load_debug_log("aggregating players (handicap)")
     players_df_hc = (
