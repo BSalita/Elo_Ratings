@@ -27,7 +27,7 @@ import pathlib
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict, Any
 
 # On Windows, install a process-level console control handler via ctypes
@@ -493,12 +493,14 @@ def _leaderboard_aggrid_key(
     min_games: int,
     name_filter: str,
     prior_sessions: int,
+    date_range_choice: str = "All time",
 ) -> str:
     # Omit Scratch/Handicap so H/S toggles update the same AgGrid instance.
     return (
         f"ff_{entity}_table_{rating_type}_{simultaneous_type}_"
         f"club_{_aggrid_key_part(club_filter)}_top{top_n}_min{min_games}_"
-        f"name_{_aggrid_key_part(name_filter)}_prior{prior_sessions}"
+        f"name_{_aggrid_key_part(name_filter)}_prior{prior_sessions}_"
+        f"dr_{_aggrid_key_part(date_range_choice)}"
     )
 
 
@@ -2284,6 +2286,55 @@ _ALL_CLUBS_LABEL = "All Clubs"
 # Process-level club dropdown cache (shared across Streamlit sessions in one container).
 _FFBRIDGE_CLUB_OPTIONS: list[str] | None = None
 
+# ACBL-style rolling windows, plus FFBridge season years (ratings reset July 1).
+_DATE_RANGE_OPTIONS = (
+    "All time",
+    "Current FFBridge year",
+    "Previous FFBridge year",
+    "Last 3 months",
+    "Last 6 months",
+    "Last 1 year",
+    "Last 2 years",
+    "Last 3 years",
+    "Last 4 years",
+    "Last 5 years",
+)
+
+
+def _ffbridge_season_july1(today: datetime) -> datetime:
+    """Start of the FFBridge year that contains ``today`` (July 1)."""
+    year = today.year if today.month >= 7 else today.year - 1
+    return today.replace(year=year, month=7, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def _date_range_bounds(date_range_choice: str) -> Tuple[Optional[str], Optional[str]]:
+    """Inclusive YYYY-MM-DD (from, to) for Date range; None means unbounded on that side."""
+    now = datetime.now()
+    today_s = now.strftime("%Y-%m-%d")
+    if date_range_choice == "All time":
+        return None, None
+    if date_range_choice == "Current FFBridge year":
+        # July 1 of the active season through today.
+        return _ffbridge_season_july1(now).strftime("%Y-%m-%d"), today_s
+    if date_range_choice == "Previous FFBridge year":
+        # Prior season: July 1 through May 31 (FFBridge season window).
+        current_july1 = _ffbridge_season_july1(now)
+        prev_july1 = current_july1.replace(year=current_july1.year - 1)
+        prev_may31 = current_july1.replace(month=5, day=31)
+        return prev_july1.strftime("%Y-%m-%d"), prev_may31.strftime("%Y-%m-%d")
+    days = {
+        "Last 3 months": 90,
+        "Last 6 months": 182,
+        "Last 1 year": 365,
+        "Last 2 years": 365 * 2,
+        "Last 3 years": 365 * 3,
+        "Last 4 years": 365 * 4,
+        "Last 5 years": 365 * 5,
+    }.get(date_range_choice)
+    if days is None:
+        return None, None
+    return (now - timedelta(days=days)).strftime("%Y-%m-%d"), None
+
 
 def _ffbridge_club_select_options() -> list[str]:
     """Club dropdown options; always includes All Clubs (never an empty list)."""
@@ -2364,6 +2415,12 @@ FFBRIDGE_URL_PARAMS = {
         "parser": str,
         "default": "",
     },
+    "date_range": {
+        "session_key": "ffbridge_date_range",
+        "parser": str,
+        "valid_values": _DATE_RANGE_OPTIONS,
+        "default": "All time",
+    },
     "rating": {
         "session_key": "elo_rating_type",
         "parser": str,
@@ -2416,12 +2473,22 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
     simultaneous_type = ctx["simultaneous_type"]
     club_filter = ctx["club_filter"]
     name_filter = ctx["name_filter"]
+    date_range_choice = ctx.get("date_range_choice", "All time")
     top_n = ctx["top_n"]
     min_games = ctx["min_games"]
     prior_sessions = ctx["prior_sessions"]
     if results_df.is_empty():
         st.info("No results found for the selected filters.")
         return
+    if date_range_choice != "All time":
+        dr_from = ctx.get("date_from")
+        dr_to = ctx.get("date_to")
+        if dr_from and dr_to:
+            st.caption(f"Date range: {date_range_choice} ({dr_from} to {dr_to})")
+        elif dr_from:
+            st.caption(f"Date range: {date_range_choice} (from {dr_from})")
+        else:
+            st.caption(f"Date range: {date_range_choice}")
     if rating_type == "Players":
         active_count, avg_games, highest_elo = ctx["player_metrics_hc"] if use_handicap else ctx["player_metrics_sc"]
     else:
@@ -2496,6 +2563,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                     dynamic_key = _leaderboard_aggrid_key(
                         "players", rating_type, simultaneous_type,
                         club_filter, top_n, min_games, name_filter, int(prior_sessions),
+                        date_range_choice,
                     )
                     _load_debug_log(f"leaderboard panel: rendering AgGrid ({top_players.height} rows)")
                     grid_response = build_selectable_aggrid(top_players, dynamic_key, render_links=False)
@@ -2656,6 +2724,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                     dynamic_key = _leaderboard_aggrid_key(
                         "pairs", rating_type, simultaneous_type,
                         club_filter, top_n, min_games, name_filter, int(prior_sessions),
+                        date_range_choice,
                     )
                     _load_debug_log(f"leaderboard panel: rendering AgGrid ({top_pairs.height} rows)")
                     grid_response = build_selectable_aggrid(top_pairs, dynamic_key, render_links=False)
@@ -2904,6 +2973,18 @@ def main():
             help="Filter results by player or pair name (case-insensitive)"
         )
 
+        date_range_choice = st.selectbox(
+            "Date range",
+            options=list(_DATE_RANGE_OPTIONS),
+            index=0,
+            key="ffbridge_date_range",
+            help=(
+                "Restrict rankings and detail to sessions in this window. "
+                "FFBridge years run July 1–May 31 (ratings adjust each July 1)."
+            ),
+        )
+        date_from, date_to = _date_range_bounds(date_range_choice)
+
         # IV fetching is always enabled (cached, refreshes monthly on 15th)
         fetch_iv = True
         
@@ -2982,6 +3063,9 @@ def main():
             simultaneous_type=simultaneous_type,
             club_filter=club_filter,
             name_filter=name_filter,
+            date_range_choice=date_range_choice,
+            date_from=date_from,
+            date_to=date_to,
             rating_type=rating_type,
             top_n=top_n,
             min_games=min_games,
@@ -3007,6 +3091,9 @@ def _load_main_content(
     simultaneous_type,
     club_filter: str,
     name_filter: str,
+    date_range_choice: str,
+    date_from: Optional[str],
+    date_to: Optional[str],
     rating_type: str,
     top_n: int,
     min_games: int,
@@ -3132,6 +3219,12 @@ def _load_main_content(
     
     if club_filter and not results_df.is_empty() and "club_name" in results_df.columns:
         results_df = results_df.filter(pl.col("club_name") == club_filter)
+    if (date_from or date_to) and not results_df.is_empty() and "date" in results_df.columns:
+        session_day = pl.col("date").cast(pl.Utf8).str.slice(0, 10)
+        if date_from:
+            results_df = results_df.filter(session_day >= date_from)
+        if date_to:
+            results_df = results_df.filter(session_day <= date_to)
     _load_debug_log(f"sidebar filters applied ({results_df.height} rows)")
 
     global _FFBRIDGE_CLUB_OPTIONS
@@ -3183,6 +3276,9 @@ def _load_main_content(
         "simultaneous_type": simultaneous_type,
         "club_filter": club_filter,
         "name_filter": name_filter,
+        "date_range_choice": date_range_choice,
+        "date_from": date_from,
+        "date_to": date_to,
         "top_n": top_n,
         "min_games": min_games,
         "prior_sessions": prior_sessions,
