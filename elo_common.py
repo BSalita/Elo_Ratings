@@ -434,6 +434,24 @@ _NUMERIC_NAME_EXACT: frozenset[str] = frozenset({
 })
 
 
+def is_digits_only_filter(text: str) -> bool:
+    """True when a name/number filter token is digits only (player number / ID)."""
+    token = (text or "").strip()
+    return bool(token) and token.isdigit()
+
+
+def player_id_equals_expr(id_col: str, number: str) -> pl.Expr:
+    """Exact match on a player-number column (cast to Utf8)."""
+    return pl.col(id_col).cast(pl.Utf8) == str(number).strip()
+
+
+def pair_id_contains_player_number_expr(id_col: str, number: str) -> pl.Expr:
+    """True if either side of a pair id (``-`` or ``_`` separated) equals ``number``."""
+    needle = str(number).strip()
+    parts = pl.col(id_col).cast(pl.Utf8).str.replace_all("_", "-").str.split("-")
+    return (parts.list.get(0) == needle) | (parts.list.get(1) == needle)
+
+
 def is_numeric_column_name(col_name: str) -> bool:
     """True if a column name suggests numeric values (suffix or exact match).
 

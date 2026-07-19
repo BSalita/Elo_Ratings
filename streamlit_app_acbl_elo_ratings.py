@@ -68,9 +68,12 @@ from elo_common import (
     coerce_int,
     coerce_numeric_columns,
     init_url_params_to_state,
+    is_digits_only_filter,
     leaderboard_aggrid_viewport_height,
     LEADERBOARD_PAGE_SIZE,
     LEADERBOARD_ROW_HEIGHT,
+    pair_id_contains_player_number_expr,
+    player_id_equals_expr,
     render_app_footer,
     footer_streamlit_app_diagnostics_line,
     sync_state_to_url_params,
@@ -1055,24 +1058,46 @@ def _acbl_report_panel() -> None:
                     work_df = pl.from_pandas(work_df)
             except Exception:
                 pass
-            # Apply player name filter if provided (read from session to handle button click reruns)
+            # Apply player name/number filter (read from session to handle button click reruns)
             player_name_filter_value = st.session_state.get('player_name_filter', '').strip()
             if player_name_filter_value:
                 try:
                     if hasattr(work_df, 'select'):  # Polars DataFrame
                         import re
-                        pattern = '(?i)' + re.escape(player_name_filter_value)
                         original_count = len(work_df)
-                        if 'Player_Name' in work_df.columns:
-                            work_df = work_df.filter(pl.col('Player_Name').cast(pl.Utf8).str.contains(pattern, literal=False))
-                            filtered_count = len(work_df)
-                            st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter_value}'")
-                        elif 'Pair_Names' in work_df.columns:
-                            work_df = work_df.filter(pl.col('Pair_Names').cast(pl.Utf8).str.contains(pattern, literal=False))
-                            filtered_count = len(work_df)
-                            st.info(f"🔍 Filtered to {filtered_count} of {original_count} rows matching '{player_name_filter_value}'")
-                        else:
-                            st.warning("⚠️ No Player_Name or Pair_Names column found to filter on")
+                        by_number = is_digits_only_filter(player_name_filter_value)
+                        if by_number:
+                            if 'Player_ID' in work_df.columns:
+                                work_df = work_df.filter(
+                                    player_id_equals_expr('Player_ID', player_name_filter_value)
+                                )
+                            elif 'Pair_IDs' in work_df.columns:
+                                work_df = work_df.filter(
+                                    pair_id_contains_player_number_expr(
+                                        'Pair_IDs', player_name_filter_value
+                                    )
+                                )
+                            else:
+                                st.warning("⚠️ No Player_ID or Pair_IDs column found to filter on")
+                                by_number = False
+                        if not by_number:
+                            pattern = '(?i)' + re.escape(player_name_filter_value)
+                            if 'Player_Name' in work_df.columns:
+                                work_df = work_df.filter(
+                                    pl.col('Player_Name').cast(pl.Utf8).str.contains(pattern, literal=False)
+                                )
+                            elif 'Pair_Names' in work_df.columns:
+                                work_df = work_df.filter(
+                                    pl.col('Pair_Names').cast(pl.Utf8).str.contains(pattern, literal=False)
+                                )
+                            else:
+                                st.warning("⚠️ No Player_Name or Pair_Names column found to filter on")
+                        filtered_count = len(work_df)
+                        kind = "number" if is_digits_only_filter(player_name_filter_value) else "name"
+                        st.info(
+                            f"🔍 Filtered to {filtered_count} of {original_count} rows "
+                            f"matching {kind} '{player_name_filter_value}'"
+                        )
                 except Exception:
                     pass
         
@@ -1516,10 +1541,13 @@ def main():
             st.session_state.content_mode = 'table'
 
         player_name_filter = st.text_input(
-            "Filter by Player Name",
+            "Filter by Player Name or Number",
             value=st.session_state.get("player_name_filter", ""),
-            placeholder="Enter name to search...",
-            help="Filter results to show only players whose names contain this text (case-insensitive)",
+            placeholder="Name text, or digits-only player number...",
+            help=(
+                "Text filters by name (case-insensitive contains). "
+                "Digits-only filters by player number / ID (exact; for pairs, either partner)."
+            ),
             key="player_name_filter",
             on_change=_on_player_name_enter
         )

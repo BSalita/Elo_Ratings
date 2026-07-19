@@ -88,9 +88,12 @@ from elo_common import (
     coerce_int,
     coerce_numeric_columns,
     init_url_params_to_state,
+    is_digits_only_filter,
     leaderboard_aggrid_viewport_height,
     LEADERBOARD_PAGE_SIZE,
     LEADERBOARD_ROW_HEIGHT,
+    pair_id_contains_player_number_expr,
+    player_id_equals_expr,
     render_app_footer,
     footer_streamlit_app_diagnostics_line,
     get_cache_diagnostic_line,
@@ -2550,12 +2553,16 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                     st.code(sql_query, language="sql")
 
             if not top_players.is_empty():
-                # Apply name filter if provided
+                # Apply name / player-number filter if provided
                 if name_filter and name_filter.strip():
-                    name_filter_lower = name_filter.strip().lower()
-                    top_players = top_players.filter(
-                        pl.col('Player_Name').str.to_lowercase().str.contains(name_filter_lower, literal=True)
-                    )
+                    token = name_filter.strip()
+                    if is_digits_only_filter(token) and "Player_ID" in top_players.columns:
+                        top_players = top_players.filter(player_id_equals_expr("Player_ID", token))
+                    else:
+                        name_filter_lower = token.lower()
+                        top_players = top_players.filter(
+                            pl.col('Player_Name').str.to_lowercase().str.contains(name_filter_lower, literal=True)
+                        )
 
                 if not top_players.is_empty():
                     st.caption("Click a row to view player's tournament history")
@@ -2711,12 +2718,18 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                     st.code(sql_query, language="sql")
 
             if not top_pairs.is_empty():
-                # Apply name filter if provided
+                # Apply name / player-number filter if provided
                 if name_filter and name_filter.strip():
-                    name_filter_lower = name_filter.strip().lower()
-                    top_pairs = top_pairs.filter(
-                        pl.col('Pair_Name').str.to_lowercase().str.contains(name_filter_lower, literal=True)
-                    )
+                    token = name_filter.strip()
+                    if is_digits_only_filter(token) and "Pair_ID" in top_pairs.columns:
+                        top_pairs = top_pairs.filter(
+                            pair_id_contains_player_number_expr("Pair_ID", token)
+                        )
+                    else:
+                        name_filter_lower = token.lower()
+                        top_pairs = top_pairs.filter(
+                            pl.col('Pair_Name').str.to_lowercase().str.contains(name_filter_lower, literal=True)
+                        )
 
                 if not top_pairs.is_empty():
                     st.caption("Click a row to view pair's tournament history")
@@ -2966,11 +2979,14 @@ def main():
         )
         club_filter = "" if selected_club == _ALL_CLUBS_LABEL else selected_club
         
-        # Name filter
+        # Name / player-number filter
         name_filter = st.text_input(
-            "Filter by Name",
+            "Filter by Player Name or Number",
             key="elo_name_filter",
-            help="Filter results by player or pair name (case-insensitive)"
+            help=(
+                "Text filters by name (case-insensitive contains). "
+                "Digits-only filters by player number / ID (exact; for pairs, either partner)."
+            ),
         )
 
         date_range_choice = st.selectbox(
