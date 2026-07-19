@@ -26,7 +26,7 @@ DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-07-19-detail-elo-sessions"
+API_BUILD_TAG = "2026-07-19-detail-online-filter"
 
 # Module-level caches to avoid re-reading parquet files on every request.
 # Keys are source paths; values are the cached objects.
@@ -988,7 +988,8 @@ def _required_columns_for_mode(rating_type: str, elo_rating_type: str) -> list[s
 
 
 def _required_columns_for_detail(rating_type: str, elo_rating_type: str) -> list[str]:
-    cols = {"Date", "session_id", "Pct_NS", "Round", "Board"}
+    # is_virtual_game required so Local/Online filters match the leaderboard report.
+    cols = {"Date", "session_id", "Pct_NS", "Round", "Board", "is_virtual_game"}
     for p in "NESW":
         cols.update({f"Player_ID_{p}", f"Player_Name_{p}"})
 

@@ -1227,7 +1227,11 @@ def _acbl_report_panel() -> None:
                                 if detail.is_empty():
                                     st.info("No session data found for this player.")
                                 else:
-                                    n_sessions = detail.select("Session").n_unique()
+                                    n_sessions = (
+                                        detail.filter(pl.col("Session").is_not_null())
+                                        .get_column("Session")
+                                        .n_unique()
+                                    )
                                     st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
                                     _show_all_opponents_aggregation(detail, key_suffix=f"player_{player_id}")
                                     _show_sql_query_block(
@@ -1262,7 +1266,11 @@ def _acbl_report_panel() -> None:
                                 if detail.is_empty():
                                     st.info("No session data found for this pair.")
                                 else:
-                                    n_sessions = detail.select("Session").n_unique()
+                                    n_sessions = (
+                                        detail.filter(pl.col("Session").is_not_null())
+                                        .get_column("Session")
+                                        .n_unique()
+                                    )
                                     st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
                                     _show_all_opponents_aggregation(detail, key_suffix=f"pair_{pair_ids}")
                                     _show_sql_query_block(
