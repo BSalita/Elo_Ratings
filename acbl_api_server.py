@@ -1869,7 +1869,7 @@ def health() -> dict:
 def acbl_report(
     club_or_tournament: str = Query(..., pattern="^(club|tournament)$"),
     rating_type: str = Query(..., pattern="^(Players|Pairs)$"),
-    top_n: int = Query(100, ge=1, le=1000),
+    top_n: int = Query(100, ge=1, le=5000),
     min_sessions: int = Query(10, ge=1, le=10000),
     rating_method: str = Query("Latest"),
     moving_avg_days: int = Query(10, ge=1, le=3650),

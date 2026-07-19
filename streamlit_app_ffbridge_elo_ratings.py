@@ -2435,7 +2435,7 @@ FFBRIDGE_URL_PARAMS = {
     },
     "top_n": {
         "session_key": "elo_top_n",
-        "parser": coerce_int(50, 1000, 50),
+        "parser": coerce_int(50, 5000, 50),
         "default": 250,
     },
     "min_games": {
@@ -2992,7 +2992,7 @@ def main():
         top_n = st.slider(
             "Show Top N",
             min_value=50,
-            max_value=1000,
+            max_value=5000,
             value=250,
             step=50,
             key="elo_top_n"
