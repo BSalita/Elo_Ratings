@@ -176,7 +176,7 @@ def _fetch_remote_report_table(
         "rating_method": rating_method,
         "moving_avg_days": int(moving_avg_days),
         "elo_rating_type": elo_rating_type,
-        "date_from": None if date_from is None else date_from.isoformat(),
+        "date_from": _acbl_date_from_param(date_from),
         "online_filter": online_filter,
         "prior_sessions": int(prior_sessions),
     }
@@ -265,7 +265,7 @@ def _fetch_remote_detail_table(
         "club_or_tournament": club_or_tournament.lower(),
         "rating_type": rating_type,
         "elo_rating_type": elo_rating_type,
-        "date_from": None if date_from is None else date_from.isoformat(),
+        "date_from": _acbl_date_from_param(date_from),
         "online_filter": online_filter,
         "player_id": player_id,
         "pair_ids": pair_ids,
@@ -677,6 +677,31 @@ _DATE_RANGE_OPTIONS = (
 )
 
 
+def _acbl_date_from_param(date_from: datetime | None) -> str | None:
+    """Stable YYYY-MM-DD for API/cache keys (avoids post-fetch st.rerun loops)."""
+    if date_from is None:
+        return None
+    return date_from.strftime("%Y-%m-%d")
+
+
+def _acbl_date_from_for_choice(date_range_choice: str) -> datetime | None:
+    """Lower bound for Date range, floored to local midnight for stable cache signatures."""
+    days = {
+        "All time": None,
+        "Last 3 months": 90,
+        "Last 6 months": 182,
+        "Last 1 year": 365,
+        "Last 2 years": 365 * 2,
+        "Last 3 years": 365 * 3,
+        "Last 4 years": 365 * 4,
+        "Last 5 years": 365 * 5,
+    }.get(date_range_choice)
+    if days is None:
+        return None
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return today - timedelta(days=days)
+
+
 def _acbl_report_fetch_signature(
     club_or_tournament: str,
     rating_type: str,
@@ -698,7 +723,7 @@ def _acbl_report_fetch_signature(
             "rating_method": rating_method,
             "moving_avg_days": int(moving_avg_days),
             "elo_rating_type": elo_rating_type,
-            "date_from": None if date_from is None else date_from.isoformat(),
+            "date_from": _acbl_date_from_param(date_from),
             "online_filter": online_filter,
             "prior_sessions": int(prior_sessions),
         },
@@ -1643,26 +1668,8 @@ def main():
     # Persist current sidebar state to URL query params for shareable links.
     sync_state_to_url_params(st, ACBL_URL_PARAMS)
 
-    # Determine date_from based on selection
-    now = datetime.now()
-    if date_range_choice == "All time":
-        date_from = None
-    elif date_range_choice == "Last 3 months":
-        date_from = now - timedelta(days=90)
-    elif date_range_choice == "Last 6 months":
-        date_from = now - timedelta(days=182)
-    elif date_range_choice == "Last 1 year":
-        date_from = now - timedelta(days=365)
-    elif date_range_choice == "Last 2 years":
-        date_from = now - timedelta(days=365*2)
-    elif date_range_choice == "Last 3 years":
-        date_from = now - timedelta(days=365*3)
-    elif date_range_choice == "Last 4 years":
-        date_from = now - timedelta(days=365*4)
-    elif date_range_choice == "Last 5 years":
-        date_from = now - timedelta(days=365*5)
-    else:
-        date_from = None # Default to all time
+    # Floor to midnight so post-fetch st.rerun() keeps a stable fetch-cache signature.
+    date_from = _acbl_date_from_for_choice(date_range_choice)
 
     st.session_state["_acbl_sidebar_ctx"] = {
         "club_or_tournament": club_or_tournament,
