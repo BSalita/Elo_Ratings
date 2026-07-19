@@ -26,7 +26,7 @@ DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-07-19-crossover-elo"
+API_BUILD_TAG = "2026-07-19-detail-elo-sessions"
 
 # Module-level caches to avoid re-reading parquet files on every request.
 # Keys are source paths; values are the cached objects.
@@ -1157,7 +1157,14 @@ def _build_player_detail(df: pl.DataFrame, player_id: str, elo_rating_type: str)
         field_stdev_col = "Field_Stdev_NS_Player" if is_ns else "Field_Stdev_EW_Player"
         if field_stdev_col in df.columns:
             cols_to_select.append(pl.col(field_stdev_col).cast(pl.Float64).round(1).alias("Field_Stdev"))
-        frames.append(df.filter(pl.col(f"Player_ID_{pos}") == player_id).select(cols_to_select))
+        # Match leaderboard SQL: only boards with a usable Elo contribute to Sessions.
+        frames.append(
+            df.filter(
+                (pl.col(f"Player_ID_{pos}") == player_id)
+                & pl.col(elo_col).is_not_null()
+                & (~pl.col(elo_col).is_nan())
+            ).select(cols_to_select)
+        )
 
     if not frames:
         return pl.DataFrame()
@@ -1194,9 +1201,15 @@ def _build_pair_detail(df: pl.DataFrame, pair_ids: str, elo_rating_type: str) ->
         # columns compare by physical dictionary code, not string value, so they
         # disagree with the lexical CASE WHEN ordering used to build Pair_IDs in
         # the leaderboard SQL and return zero rows.
+        # Match leaderboard SQL: only boards with a usable pair Elo contribute
+        # to Sessions (avoids Session History counting more sessions than the grid).
         side_df = df.filter(
-            ((pl.col(id1_col) == player_a) & (pl.col(id2_col) == player_b))
-            | ((pl.col(id1_col) == player_b) & (pl.col(id2_col) == player_a))
+            (
+                ((pl.col(id1_col) == player_a) & (pl.col(id2_col) == player_b))
+                | ((pl.col(id1_col) == player_b) & (pl.col(id2_col) == player_a))
+            )
+            & pl.col(pair_elo_col).is_not_null()
+            & (~pl.col(pair_elo_col).is_nan())
         )
         if side_df.is_empty():
             continue
