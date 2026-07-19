@@ -26,7 +26,7 @@ DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-07-19-crossover-sessions"
+API_BUILD_TAG = "2026-07-19-crossover-elo"
 
 # Module-level caches to avoid re-reading parquet files on every request.
 # Keys are source paths; values are the cached objects.
@@ -1581,10 +1581,16 @@ def _crossover_session_column(club_or_tournament: str, rating_type: str) -> str:
     return "Tournament_Sessions" if other == "tournament" else "Club_Sessions"
 
 
+def _crossover_elo_column(club_or_tournament: str) -> str:
+    """Column name for Elo in the *other* event type (chess-scaled published)."""
+    other = _other_event_type(club_or_tournament)
+    return "Tournament_Elo" if other == "tournament" else "Club_Elo"
+
+
 def _insert_column_after(df: pl.DataFrame, col: str, after: str) -> pl.DataFrame:
-    cols = [c for c in df.columns if c != col]
     if col not in df.columns:
         return df
+    cols = [c for c in df.columns if c != col]
     if after in cols:
         i = cols.index(after) + 1
         cols = cols[:i] + [col] + cols[i:]
@@ -1593,8 +1599,8 @@ def _insert_column_after(df: pl.DataFrame, col: str, after: str) -> pl.DataFrame
     return df.select(cols)
 
 
-def _lazy_crossover_source(other_event: str) -> pl.LazyFrame:
-    """Projection of the other event parquet for session counting.
+def _lazy_crossover_source(other_event: str, extra_cols: list[str] | None = None) -> pl.LazyFrame:
+    """Projection of the other event parquet for crossover metrics.
 
     Uses the in-memory frame cache when present; otherwise scans parquet with
     column pushdown so a Club report does not load/evict the Tournament cache
@@ -1602,14 +1608,14 @@ def _lazy_crossover_source(other_event: str) -> pl.LazyFrame:
     """
     source_path, storage_options = _parquet_source_for(other_event)
     id_cols = ["Player_ID_N", "Player_ID_S", "Player_ID_E", "Player_ID_W"]
-    want = ["session_id", "Date", "is_virtual_game", *id_cols]
+    want = ["session_id", "Date", "Board", "Round", "is_virtual_game", *id_cols, *(extra_cols or [])]
     with _FRAME_LOCK:
         cached = _FRAME_CACHE.get(source_path)
     if cached is not None:
-        cols = [c for c in want if c in cached.columns]
+        cols = [c for c in dict.fromkeys(want) if c in cached.columns]
         return cached.select(cols).lazy()
     schema = load_elo_ratings_schema_map(other_event)
-    cols = [c for c in want if c in schema]
+    cols = [c for c in dict.fromkeys(want) if c in schema]
     if "session_id" not in cols or not any(c in cols for c in id_cols):
         raise RuntimeError(f"crossover source missing session/player columns: {other_event}")
     return pl.scan_parquet(source_path, storage_options=storage_options).select(cols)
@@ -1642,105 +1648,204 @@ def _pair_ids_expr(id_a: str, id_b: str) -> pl.Expr:
     )
 
 
-def _crossover_session_counts(
+def _polars_rating_agg(rating_method: str, value_col: str = "Elo") -> pl.Expr:
+    """Polars aggregate matching ``_rating_agg_expr`` (Latest / Avg / Max)."""
+    if rating_method == "Avg":
+        return pl.col(value_col).mean()
+    if rating_method == "Max":
+        return pl.col(value_col).max()
+    # Latest: last board in chronological order (Round optional).
+    sort_keys = [pl.col("Date"), pl.col("session_id")]
+    return pl.col(value_col).sort_by(sort_keys + [pl.col("Board")]).last()
+
+
+def _chess_scale_series(values: pl.Series, pop_mean: float | None, pop_sd: float | None) -> pl.Series:
+    if pop_mean is None or pop_sd is None or pop_sd <= 0:
+        return values.cast(pl.Int64, strict=False)
+    scaled = (
+        CHESS_DISPLAY_MEAN
+        + (values.cast(pl.Float64) - pop_mean) / pop_sd * CHESS_DISPLAY_SD
+    ).clip(0.0, 3500.0).round(0)
+    return scaled.cast(pl.Int64, strict=False)
+
+
+def _crossover_metrics(
     *,
     other_event: str,
     rating_type: str,
     entity_ids: list[str],
     count_col: str,
+    elo_col: str,
     date_from: datetime | None,
     online_filter: str,
+    rating_method: str,
+    elo_rating_type: str,
+    prior_sessions: int,
 ) -> pl.DataFrame:
-    """COUNT(DISTINCT session_id) on the other event type for the given IDs."""
+    """Sessions + published chess-scaled Elo on the other event type for given IDs."""
+    id_name = "Player_ID" if rating_type == "Players" else "Pair_IDs"
+    empty = pl.DataFrame({id_name: [], count_col: [], elo_col: []}).cast(
+        {id_name: pl.Utf8, count_col: pl.Int64, elo_col: pl.Int64}
+    )
     if not entity_ids:
-        id_name = "Player_ID" if rating_type == "Players" else "Pair_IDs"
-        return pl.DataFrame({id_name: [], count_col: []}).cast(
-            {id_name: pl.Utf8, count_col: pl.Int64}
-        )
+        return empty
 
-    lf = _apply_crossover_filters(_lazy_crossover_source(other_event), date_from, online_filter)
+    elo_names = get_elo_column_names(elo_rating_type)
+    extra: list[str] = []
+    if rating_type == "Players":
+        pattern = elo_names.get("player_pattern")
+        if not pattern:
+            return empty
+        extra = [pattern.format(pos=p) for p in "NESW"]
+    else:
+        for key in ("pair_ns", "pair_ew"):
+            col = elo_names.get(key)
+            if col:
+                extra.append(col)
+        if not extra:
+            return empty
+
+    lf = _apply_crossover_filters(
+        _lazy_crossover_source(other_event, extra_cols=extra),
+        date_from,
+        online_filter,
+    )
     names = set(lf.collect_schema().names())
     id_cols = [c for c in ("Player_ID_N", "Player_ID_S", "Player_ID_E", "Player_ID_W") if c in names]
     if not id_cols or "session_id" not in names:
         raise RuntimeError(f"crossover source incomplete for {other_event}")
 
     id_set = list(dict.fromkeys(str(x) for x in entity_ids if x is not None and str(x)))
+    present_elo = [c for c in extra if c in names]
+    if not present_elo:
+        return empty
 
     if rating_type == "Players":
+        pattern = elo_names["player_pattern"]
         any_match = pl.any_horizontal([pl.col(c).cast(pl.Utf8).is_in(id_set) for c in id_cols])
         matched = lf.filter(any_match)
-        parts = [
-            matched.select(
-                pl.col(c).cast(pl.Utf8).alias("Player_ID"),
-                pl.col("session_id"),
-            ).filter(pl.col("Player_ID").is_in(id_set))
-            for c in id_cols
-        ]
+        parts: list[pl.LazyFrame] = []
+        for pos, id_c in (("N", "Player_ID_N"), ("E", "Player_ID_E"), ("S", "Player_ID_S"), ("W", "Player_ID_W")):
+            if id_c not in names:
+                continue
+            elo_c = pattern.format(pos=pos)
+            if elo_c not in names:
+                continue
+            parts.append(
+                matched.select(
+                    pl.col(id_c).cast(pl.Utf8).alias("Player_ID"),
+                    pl.col("session_id"),
+                    pl.col("Date"),
+                    pl.col("Board") if "Board" in names else pl.lit(0).alias("Board"),
+                    pl.col(elo_c).cast(pl.Float64).alias("Elo"),
+                ).filter(
+                    pl.col("Player_ID").is_in(id_set)
+                    & pl.col("Elo").is_not_null()
+                    & pl.col("Elo").is_not_nan()
+                )
+            )
+        if not parts:
+            return empty
         long = pl.concat(parts)
-        return (
-            long.group_by("Player_ID")
-            .agg(pl.col("session_id").n_unique().cast(pl.Int64).alias(count_col))
-            .collect(engine="streaming")
-        )
+    else:
+        pair_parts: list[pl.LazyFrame] = []
+        for side, id_a, id_b, elo_key in (
+            ("NS", "Player_ID_N", "Player_ID_S", "pair_ns"),
+            ("EW", "Player_ID_E", "Player_ID_W", "pair_ew"),
+        ):
+            elo_c = elo_names.get(elo_key)
+            if not elo_c or elo_c not in names or id_a not in names or id_b not in names:
+                continue
+            pair_parts.append(
+                lf.select(
+                    _pair_ids_expr(id_a, id_b).alias("Pair_IDs"),
+                    pl.col("session_id"),
+                    pl.col("Date"),
+                    pl.col("Board") if "Board" in names else pl.lit(0).alias("Board"),
+                    pl.col(elo_c).cast(pl.Float64).alias("Elo"),
+                ).filter(
+                    pl.col("Pair_IDs").is_in(id_set)
+                    & pl.col("Elo").is_not_null()
+                    & pl.col("Elo").is_not_nan()
+                )
+            )
+        if not pair_parts:
+            return empty
+        long = pl.concat(pair_parts)
 
-    # Pairs: same lexical Pair_IDs construction as generate_top_pairs_sql.
-    ns = _pair_ids_expr("Player_ID_N", "Player_ID_S") if "Player_ID_N" in names and "Player_ID_S" in names else None
-    ew = _pair_ids_expr("Player_ID_E", "Player_ID_W") if "Player_ID_E" in names and "Player_ID_W" in names else None
-    pair_parts: list[pl.LazyFrame] = []
-    if ns is not None:
-        pair_parts.append(
-            lf.select(ns.alias("Pair_IDs"), pl.col("session_id")).filter(
-                pl.col("Pair_IDs").is_in(id_set)
-            )
+    # One collect: board-level Elo calibration + per-entity sessions/rating.
+    long_df = long.collect(engine="streaming")
+    if long_df.is_empty():
+        return empty
+    elo_vals = long_df.get_column("Elo").drop_nulls().drop_nans()
+    pop_mean = float(elo_vals.mean()) if elo_vals.len() else None
+    pop_sd = float(elo_vals.std(ddof=0)) if elo_vals.len() >= 2 else None
+
+    agg = long_df.group_by(id_name).agg(
+        pl.col("session_id").n_unique().cast(pl.Int64).alias(count_col),
+        _polars_rating_agg(rating_method, "Elo").alias("_elo_raw"),
+    )
+
+    prior_anchor = _shrinkage_anchor(_load_shrinkage_meta(other_event), "player" if rating_type == "Players" else "pair")
+    raw = agg.get_column("_elo_raw").cast(pl.Float64)
+    sessions = agg.get_column(count_col).cast(pl.Float64)
+    if prior_anchor is not None and prior_sessions > 0:
+        published = (
+            (sessions * raw + float(prior_sessions) * float(prior_anchor))
+            / (sessions + float(prior_sessions))
         )
-    if ew is not None:
-        pair_parts.append(
-            lf.select(ew.alias("Pair_IDs"), pl.col("session_id")).filter(
-                pl.col("Pair_IDs").is_in(id_set)
-            )
-        )
-    if not pair_parts:
-        raise RuntimeError(f"crossover pair columns missing for {other_event}")
-    long = pl.concat(pair_parts)
-    return (
-        long.group_by("Pair_IDs")
-        .agg(pl.col("session_id").n_unique().cast(pl.Int64).alias(count_col))
-        .collect(engine="streaming")
+    else:
+        published = raw
+    chess = _chess_scale_series(published, pop_mean, pop_sd if pop_sd and pop_sd > 0 else None)
+    return agg.select(
+        pl.col(id_name).cast(pl.Utf8),
+        pl.col(count_col),
+        chess.alias(elo_col),
     )
 
 
-def _attach_crossover_session_counts(
+def _attach_crossover_columns(
     result_df: pl.DataFrame,
     *,
     club_or_tournament: str,
     rating_type: str,
     date_from: datetime | None,
     online_filter: str,
+    rating_method: str,
+    elo_rating_type: str,
+    prior_sessions: int,
 ) -> pl.DataFrame:
-    """Add other-event session counts for Club↔Tournament crossover."""
+    """Add other-event session counts and Elo for Club↔Tournament crossover."""
     if result_df.is_empty():
         return result_df
     count_col = _crossover_session_column(club_or_tournament, rating_type)
+    elo_col = _crossover_elo_column(club_or_tournament)
     id_col = "Player_ID" if rating_type == "Players" else "Pair_IDs"
     if id_col not in result_df.columns:
         return result_df
     after_col = "Sessions_Played" if rating_type == "Players" else "Sessions"
     other = _other_event_type(club_or_tournament)
     entity_ids = result_df.get_column(id_col).cast(pl.Utf8).to_list()
-    counts = _crossover_session_counts(
+    metrics = _crossover_metrics(
         other_event=other,
         rating_type=rating_type,
         entity_ids=entity_ids,
         count_col=count_col,
+        elo_col=elo_col,
         date_from=date_from,
         online_filter=online_filter,
+        rating_method=rating_method,
+        elo_rating_type=elo_rating_type,
+        prior_sessions=prior_sessions,
     )
     out = (
         result_df.with_columns(pl.col(id_col).cast(pl.Utf8))
-        .join(counts, on=id_col, how="left")
+        .join(metrics, on=id_col, how="left")
         .with_columns(pl.col(count_col).fill_null(0).cast(pl.Int64))
     )
-    return _insert_column_after(out, count_col, after_col)
+    # Elo stays null when the entity has no sessions in the other event.
+    out = _insert_column_after(out, count_col, after_col)
+    return _insert_column_after(out, elo_col, count_col)
 
 
 @app.get("/health")
@@ -1830,12 +1935,15 @@ def acbl_report(
             t_sql_end = time.perf_counter()
 
             t_xover_start = time.perf_counter()
-            result_df = _attach_crossover_session_counts(
+            result_df = _attach_crossover_columns(
                 result_df,
                 club_or_tournament=club_or_tournament,
                 rating_type=rating_type,
                 date_from=parsed_date_from,
                 online_filter=online_filter,
+                rating_method=rating_method,
+                elo_rating_type=elo_rating_type,
+                prior_sessions=prior_sessions,
             )
             t_xover_end = time.perf_counter()
 
