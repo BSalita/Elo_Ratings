@@ -213,6 +213,3 @@ data/
 # Precomputed FFBridge Elo dataset cache. Built by build_ffbridge_elo_parquets.py
 # (locally under data/, or on the production data mount) — never versioned.
 **/elo_cache/
-
-# Nested clone used only for historical Railway repro experiments.
-old/railway-repro/.git/
