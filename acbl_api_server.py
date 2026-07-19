@@ -26,7 +26,7 @@ DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-07-15-club-toggle-v2"
+API_BUILD_TAG = "2026-07-19-crossover-sessions"
 
 # Module-level caches to avoid re-reading parquet files on every request.
 # Keys are source paths; values are the cached objects.
@@ -1569,6 +1569,180 @@ def generate_top_pairs_sql(
     """.strip()
 
 
+def _other_event_type(club_or_tournament: str) -> str:
+    return "tournament" if club_or_tournament.lower() == "club" else "club"
+
+
+def _crossover_session_column(club_or_tournament: str, rating_type: str) -> str:
+    """Column name for sessions played in the *other* event type."""
+    other = _other_event_type(club_or_tournament)
+    if rating_type == "Players":
+        return "Tournament_Sessions_Played" if other == "tournament" else "Club_Sessions_Played"
+    return "Tournament_Sessions" if other == "tournament" else "Club_Sessions"
+
+
+def _insert_column_after(df: pl.DataFrame, col: str, after: str) -> pl.DataFrame:
+    cols = [c for c in df.columns if c != col]
+    if col not in df.columns:
+        return df
+    if after in cols:
+        i = cols.index(after) + 1
+        cols = cols[:i] + [col] + cols[i:]
+    else:
+        cols = cols + [col]
+    return df.select(cols)
+
+
+def _lazy_crossover_source(other_event: str) -> pl.LazyFrame:
+    """Projection of the other event parquet for session counting.
+
+    Uses the in-memory frame cache when present; otherwise scans parquet with
+    column pushdown so a Club report does not load/evict the Tournament cache
+    (and vice versa).
+    """
+    source_path, storage_options = _parquet_source_for(other_event)
+    id_cols = ["Player_ID_N", "Player_ID_S", "Player_ID_E", "Player_ID_W"]
+    want = ["session_id", "Date", "is_virtual_game", *id_cols]
+    with _FRAME_LOCK:
+        cached = _FRAME_CACHE.get(source_path)
+    if cached is not None:
+        cols = [c for c in want if c in cached.columns]
+        return cached.select(cols).lazy()
+    schema = load_elo_ratings_schema_map(other_event)
+    cols = [c for c in want if c in schema]
+    if "session_id" not in cols or not any(c in cols for c in id_cols):
+        raise RuntimeError(f"crossover source missing session/player columns: {other_event}")
+    return pl.scan_parquet(source_path, storage_options=storage_options).select(cols)
+
+
+def _apply_crossover_filters(
+    lf: pl.LazyFrame,
+    date_from: datetime | None,
+    online_filter: str,
+) -> pl.LazyFrame:
+    names = set(lf.collect_schema().names())
+    if date_from is not None and "Date" in names:
+        day = pl.col("Date").cast(pl.Utf8).str.slice(0, 10)
+        lf = lf.filter(day >= date_from.strftime("%Y-%m-%d"))
+    if "is_virtual_game" in names:
+        if online_filter == "Local Only":
+            lf = lf.filter(pl.col("is_virtual_game") == False)  # noqa: E712
+        elif online_filter == "Online Only":
+            lf = lf.filter(pl.col("is_virtual_game").is_null())
+    return lf
+
+
+def _pair_ids_expr(id_a: str, id_b: str) -> pl.Expr:
+    a = pl.col(id_a).cast(pl.Utf8)
+    b = pl.col(id_b).cast(pl.Utf8)
+    return (
+        pl.when(a.is_not_null() & b.is_not_null())
+        .then(pl.when(a < b).then(a + pl.lit("-") + b).otherwise(b + pl.lit("-") + a))
+        .otherwise(None)
+    )
+
+
+def _crossover_session_counts(
+    *,
+    other_event: str,
+    rating_type: str,
+    entity_ids: list[str],
+    count_col: str,
+    date_from: datetime | None,
+    online_filter: str,
+) -> pl.DataFrame:
+    """COUNT(DISTINCT session_id) on the other event type for the given IDs."""
+    if not entity_ids:
+        id_name = "Player_ID" if rating_type == "Players" else "Pair_IDs"
+        return pl.DataFrame({id_name: [], count_col: []}).cast(
+            {id_name: pl.Utf8, count_col: pl.Int64}
+        )
+
+    lf = _apply_crossover_filters(_lazy_crossover_source(other_event), date_from, online_filter)
+    names = set(lf.collect_schema().names())
+    id_cols = [c for c in ("Player_ID_N", "Player_ID_S", "Player_ID_E", "Player_ID_W") if c in names]
+    if not id_cols or "session_id" not in names:
+        raise RuntimeError(f"crossover source incomplete for {other_event}")
+
+    id_set = list(dict.fromkeys(str(x) for x in entity_ids if x is not None and str(x)))
+
+    if rating_type == "Players":
+        any_match = pl.any_horizontal([pl.col(c).cast(pl.Utf8).is_in(id_set) for c in id_cols])
+        matched = lf.filter(any_match)
+        parts = [
+            matched.select(
+                pl.col(c).cast(pl.Utf8).alias("Player_ID"),
+                pl.col("session_id"),
+            ).filter(pl.col("Player_ID").is_in(id_set))
+            for c in id_cols
+        ]
+        long = pl.concat(parts)
+        return (
+            long.group_by("Player_ID")
+            .agg(pl.col("session_id").n_unique().cast(pl.Int64).alias(count_col))
+            .collect(engine="streaming")
+        )
+
+    # Pairs: same lexical Pair_IDs construction as generate_top_pairs_sql.
+    ns = _pair_ids_expr("Player_ID_N", "Player_ID_S") if "Player_ID_N" in names and "Player_ID_S" in names else None
+    ew = _pair_ids_expr("Player_ID_E", "Player_ID_W") if "Player_ID_E" in names and "Player_ID_W" in names else None
+    pair_parts: list[pl.LazyFrame] = []
+    if ns is not None:
+        pair_parts.append(
+            lf.select(ns.alias("Pair_IDs"), pl.col("session_id")).filter(
+                pl.col("Pair_IDs").is_in(id_set)
+            )
+        )
+    if ew is not None:
+        pair_parts.append(
+            lf.select(ew.alias("Pair_IDs"), pl.col("session_id")).filter(
+                pl.col("Pair_IDs").is_in(id_set)
+            )
+        )
+    if not pair_parts:
+        raise RuntimeError(f"crossover pair columns missing for {other_event}")
+    long = pl.concat(pair_parts)
+    return (
+        long.group_by("Pair_IDs")
+        .agg(pl.col("session_id").n_unique().cast(pl.Int64).alias(count_col))
+        .collect(engine="streaming")
+    )
+
+
+def _attach_crossover_session_counts(
+    result_df: pl.DataFrame,
+    *,
+    club_or_tournament: str,
+    rating_type: str,
+    date_from: datetime | None,
+    online_filter: str,
+) -> pl.DataFrame:
+    """Add other-event session counts for Club↔Tournament crossover."""
+    if result_df.is_empty():
+        return result_df
+    count_col = _crossover_session_column(club_or_tournament, rating_type)
+    id_col = "Player_ID" if rating_type == "Players" else "Pair_IDs"
+    if id_col not in result_df.columns:
+        return result_df
+    after_col = "Sessions_Played" if rating_type == "Players" else "Sessions"
+    other = _other_event_type(club_or_tournament)
+    entity_ids = result_df.get_column(id_col).cast(pl.Utf8).to_list()
+    counts = _crossover_session_counts(
+        other_event=other,
+        rating_type=rating_type,
+        entity_ids=entity_ids,
+        count_col=count_col,
+        date_from=date_from,
+        online_filter=online_filter,
+    )
+    out = (
+        result_df.with_columns(pl.col(id_col).cast(pl.Utf8))
+        .join(counts, on=id_col, how="left")
+        .with_columns(pl.col(count_col).fill_null(0).cast(pl.Int64))
+    )
+    return _insert_column_after(out, count_col, after_col)
+
+
 @app.get("/health")
 def health() -> dict:
     from streamlitlib.memory_usage import get_memory_usage_dict
@@ -1655,6 +1829,16 @@ def acbl_report(
                 _reset_duckdb_connection()
             t_sql_end = time.perf_counter()
 
+            t_xover_start = time.perf_counter()
+            result_df = _attach_crossover_session_counts(
+                result_df,
+                club_or_tournament=club_or_tournament,
+                rating_type=rating_type,
+                date_from=parsed_date_from,
+                online_filter=online_filter,
+            )
+            t_xover_end = time.perf_counter()
+
             t_serialize_start = time.perf_counter()
             result_rows = result_df.to_dicts()
             t_serialize_end = time.perf_counter()
@@ -1668,6 +1852,7 @@ def acbl_report(
                 "load_seconds": round(t_load_end - t_load_start, 3),
                 "filter_seconds": round(t_filter_end - t_filter_start, 3),
                 "sql_seconds": round(t_sql_end - t_sql_start, 3),
+                "crossover_seconds": round(t_xover_end - t_xover_start, 3),
                 "serialize_seconds": round(t_serialize_end - t_serialize_start, 3),
                 "input_rows": input_rows,
                 "output_rows": output_rows,

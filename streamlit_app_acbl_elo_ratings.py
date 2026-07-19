@@ -972,8 +972,12 @@ def _acbl_report_panel() -> None:
     # measures and when to look at it.
     st.caption(
         "🎯 Leaderboard is sorted by **Player_Elo_Rank** / "
-        "**Pair_Elo_Rank** (pure Bayesian-shrunk Elo). The "
-        "**Quality_Rank** column (after Sessions) is the average of "
+        "**Pair_Elo_Rank** (pure Bayesian-shrunk Elo). "
+        "**Sessions_Played** / **Sessions** count sessions in the selected "
+        "Event type; **Tournament_Sessions_Played** / **Club_Sessions_Played** "
+        "(or **Tournament_Sessions** / **Club_Sessions** for pairs) count "
+        "sessions in the other event type (club↔tournament crossover). "
+        "The **Quality_Rank** column (after Sessions) is the average of "
         "`Player_Elo_Rank` (or `Pair_Elo_Rank`), `Par_Suit_Rank`, "
         "`Par_Contract_Rank`, and `DD_Tricks_Diff_Rank` over the "
         "qualifying pool — when a player's Quality_Rank is much higher "

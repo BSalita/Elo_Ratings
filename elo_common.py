@@ -422,6 +422,8 @@ _NUMERIC_NAME_SUFFIXES: tuple[str, ...] = (
 )
 _NUMERIC_NAME_EXACT: frozenset[str] = frozenset({
     "Rank", "Sessions", "Sessions_Played", "Games",
+    "Club_Sessions", "Tournament_Sessions",
+    "Club_Sessions_Played", "Tournament_Sessions_Played",
     "MasterPoints", "MasterPoint_Rank",
     "Avg_MPs", "Geo_MPs",
     "Quality_Rank", "Quality_Score",
