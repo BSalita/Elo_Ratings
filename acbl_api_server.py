@@ -12,6 +12,7 @@ import duckdb
 import polars as pl
 import psutil
 
+from acbl_strata import STRATA_DEFAULT, strata_label_to_bucket
 from elo_common import (
     CHESS_DISPLAY_MEAN,
     CHESS_DISPLAY_SD,
@@ -26,7 +27,7 @@ DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-07-19-detail-online-filter"
+API_BUILD_TAG = "2026-07-19-strata-filter"
 
 # Module-level caches to avoid re-reading parquet files on every request.
 # Keys are source paths; values are the cached objects.
@@ -885,10 +886,24 @@ def _duckdb_timestamp_literal(dt: datetime) -> str:
     return f"TIMESTAMP '{dt.strftime('%Y-%m-%d %H:%M:%S')}'"
 
 
+def _require_strata_column(df: pl.DataFrame | pl.LazyFrame, *, names: set[str] | None = None) -> None:
+    cols = names if names is not None else set(df.columns)
+    if "strata_bucket" not in cols:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Elo parquet is missing strata_bucket. Rebuild via "
+                "acbl_sql_to_board_results_clean.py (club mpLimits→mp_limit) then "
+                "acbl_elo_ratings_create.py, and refresh the deployed parquet."
+            ),
+        )
+
+
 def _self_filter_sql_clauses(
     full_df: pl.DataFrame,
     date_from: datetime | None,
     online_filter: str,
+    strata: str,
 ) -> list[str]:
     clauses: list[str] = []
     if date_from is not None and "Date" in full_df.columns:
@@ -897,6 +912,11 @@ def _self_filter_sql_clauses(
         clauses.append("is_virtual_game = false")
     elif online_filter == "Online Only" and "is_virtual_game" in full_df.columns:
         clauses.append("is_virtual_game IS NULL")
+    bucket = strata_label_to_bucket(strata)
+    if bucket is not None:
+        _require_strata_column(full_df)
+        # Bucket ids are controlled constants (no user free-text).
+        clauses.append(f"strata_bucket = '{bucket}'")
     if "Pct_NS" in full_df.columns:
         clauses.append("(Pct_NS IS NULL OR (Pct_NS >= 0 AND Pct_NS <= 1))")
     return clauses
@@ -908,6 +928,7 @@ def _prepare_self_view(
     source_path: str,
     date_from: datetime | None,
     online_filter: str,
+    strata: str = STRATA_DEFAULT,
 ) -> tuple[int | None, str]:
     """Register the cached full frame and expose filtered rows as temp view ``self``.
 
@@ -915,7 +936,7 @@ def _prepare_self_view(
     frame; DuckDB reads columns lazily from the registered Arrow buffer.
     Row counts and date ranges come from load-time metadata (no COUNT scans).
     """
-    where_clauses = _self_filter_sql_clauses(full_df, date_from, online_filter)
+    where_clauses = _self_filter_sql_clauses(full_df, date_from, online_filter, strata)
     where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
     with _DB_LOCK:
         try:
@@ -961,7 +982,7 @@ def get_elo_column_names(elo_rating_type: str) -> dict:
 
 def _required_columns_for_mode(rating_type: str, elo_rating_type: str) -> list[str]:
     cols = {
-        "Date", "session_id", "is_virtual_game", "Pct_NS", "Round", "Board",
+        "Date", "session_id", "is_virtual_game", "strata_bucket", "Pct_NS", "Round", "Board",
         "DD_Tricks_Diff", "Is_Par_Suit", "Is_Par_Contract", "Is_Sacrifice",
         "Pair_Number_NS", "Pair_Number_EW",
     }
@@ -988,8 +1009,8 @@ def _required_columns_for_mode(rating_type: str, elo_rating_type: str) -> list[s
 
 
 def _required_columns_for_detail(rating_type: str, elo_rating_type: str) -> list[str]:
-    # is_virtual_game required so Local/Online filters match the leaderboard report.
-    cols = {"Date", "session_id", "Pct_NS", "Round", "Board", "is_virtual_game"}
+    # is_virtual_game / strata_bucket required so filters match the leaderboard report.
+    cols = {"Date", "session_id", "Pct_NS", "Round", "Board", "is_virtual_game", "strata_bucket"}
     for p in "NESW":
         cols.update({f"Player_ID_{p}", f"Player_Name_{p}"})
 
@@ -1622,7 +1643,10 @@ def _lazy_crossover_source(other_event: str, extra_cols: list[str] | None = None
     """
     source_path, storage_options = _parquet_source_for(other_event)
     id_cols = ["Player_ID_N", "Player_ID_S", "Player_ID_E", "Player_ID_W"]
-    want = ["session_id", "Date", "Board", "Round", "is_virtual_game", *id_cols, *(extra_cols or [])]
+    want = [
+        "session_id", "Date", "Board", "Round", "is_virtual_game", "strata_bucket",
+        *id_cols, *(extra_cols or []),
+    ]
     with _FRAME_LOCK:
         cached = _FRAME_CACHE.get(source_path)
     if cached is not None:
@@ -1639,6 +1663,7 @@ def _apply_crossover_filters(
     lf: pl.LazyFrame,
     date_from: datetime | None,
     online_filter: str,
+    strata: str = STRATA_DEFAULT,
 ) -> pl.LazyFrame:
     names = set(lf.collect_schema().names())
     if date_from is not None and "Date" in names:
@@ -1649,6 +1674,10 @@ def _apply_crossover_filters(
             lf = lf.filter(pl.col("is_virtual_game") == False)  # noqa: E712
         elif online_filter == "Online Only":
             lf = lf.filter(pl.col("is_virtual_game").is_null())
+    bucket = strata_label_to_bucket(strata)
+    if bucket is not None:
+        _require_strata_column(lf, names=names)
+        lf = lf.filter(pl.col("strata_bucket") == bucket)
     return lf
 
 
@@ -1695,6 +1724,7 @@ def _crossover_metrics(
     rating_method: str,
     elo_rating_type: str,
     prior_sessions: int,
+    strata: str = STRATA_DEFAULT,
 ) -> pl.DataFrame:
     """Sessions + published chess-scaled Elo on the other event type for given IDs."""
     id_name = "Player_ID" if rating_type == "Players" else "Pair_IDs"
@@ -1723,6 +1753,7 @@ def _crossover_metrics(
         _lazy_crossover_source(other_event, extra_cols=extra),
         date_from,
         online_filter,
+        strata,
     )
     names = set(lf.collect_schema().names())
     id_cols = [c for c in ("Player_ID_N", "Player_ID_S", "Player_ID_E", "Player_ID_W") if c in names]
@@ -1828,6 +1859,7 @@ def _attach_crossover_columns(
     rating_method: str,
     elo_rating_type: str,
     prior_sessions: int,
+    strata: str = STRATA_DEFAULT,
 ) -> pl.DataFrame:
     """Add other-event session counts and Elo for Club↔Tournament crossover."""
     if result_df.is_empty():
@@ -1851,6 +1883,7 @@ def _attach_crossover_columns(
         rating_method=rating_method,
         elo_rating_type=elo_rating_type,
         prior_sessions=prior_sessions,
+        strata=strata,
     )
     out = (
         result_df.with_columns(pl.col(id_col).cast(pl.Utf8))
@@ -1890,6 +1923,10 @@ def acbl_report(
     elo_rating_type: str = Query("Current Rating (End of Session)"),
     date_from: str | None = Query(None),
     online_filter: str = Query("All"),
+    strata: str = Query(
+        STRATA_DEFAULT,
+        description="Event MP-limit strata filter (Open / restricted buckets / All).",
+    ),
     prior_sessions: int = Query(
         SHRINKAGE_DEFAULT_PRIOR_SESSIONS, ge=0, le=1000,
         description="Bayesian shrinkage prior weight (in 'sessions equivalent'). "
@@ -1919,7 +1956,7 @@ def acbl_report(
             t_filter_start = time.perf_counter()
             con = _get_db_connection()
             input_rows, date_range = _prepare_self_view(
-                con, full_df, source_path, parsed_date_from, online_filter,
+                con, full_df, source_path, parsed_date_from, online_filter, strata,
             )
             t_filter_end = time.perf_counter()
 
@@ -1958,6 +1995,7 @@ def acbl_report(
                 rating_method=rating_method,
                 elo_rating_type=elo_rating_type,
                 prior_sessions=prior_sessions,
+                strata=strata,
             )
             t_xover_end = time.perf_counter()
 
@@ -2030,6 +2068,7 @@ def acbl_detail(
     elo_rating_type: str = Query("Current Rating (End of Session)"),
     date_from: str | None = Query(None),
     online_filter: str = Query("All"),
+    strata: str = Query(STRATA_DEFAULT),
     player_id: str | None = Query(None),
     pair_ids: str | None = Query(None),
 ) -> dict:
@@ -2052,6 +2091,10 @@ def acbl_detail(
                 df = df.filter(pl.col("is_virtual_game") == False)
             elif online_filter == "Online Only" and "is_virtual_game" in df.columns:
                 df = df.filter(pl.col("is_virtual_game").is_null())
+            bucket = strata_label_to_bucket(strata)
+            if bucket is not None:
+                _require_strata_column(df)
+                df = df.filter(pl.col("strata_bucket") == bucket)
             t_filter_end = time.perf_counter()
 
             t_build_start = time.perf_counter()

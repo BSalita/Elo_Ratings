@@ -62,6 +62,7 @@ from streamlitlib.streamlitlib import (
 )
 
 # Import common Elo utilities (shared with FFBridge app)
+from acbl_strata import STRATA_DEFAULT, STRATA_OPTIONS
 from elo_common import (
     ASSISTANT_LOGO_URL,
     apply_app_theme,
@@ -155,6 +156,7 @@ def _fetch_remote_report_table(
     date_from: datetime | None,
     online_filter: str,
     prior_sessions: int = 50,
+    strata: str = STRATA_DEFAULT,
 ) -> tuple[pl.DataFrame, dict]:
     """Fetch pre-aggregated report rows from the ACBL API service.
 
@@ -178,6 +180,7 @@ def _fetch_remote_report_table(
         "elo_rating_type": elo_rating_type,
         "date_from": _acbl_date_from_param(date_from),
         "online_filter": online_filter,
+        "strata": strata,
         "prior_sessions": int(prior_sessions),
     }
 
@@ -255,6 +258,7 @@ def _fetch_remote_detail_table(
     online_filter: str,
     player_id: str | None = None,
     pair_ids: str | None = None,
+    strata: str = STRATA_DEFAULT,
 ) -> pl.DataFrame:
     """Fetch session-level detail rows from the ACBL API service."""
     base_url = _acbl_api_base_url()
@@ -267,6 +271,7 @@ def _fetch_remote_detail_table(
         "elo_rating_type": elo_rating_type,
         "date_from": _acbl_date_from_param(date_from),
         "online_filter": online_filter,
+        "strata": strata,
         "player_id": player_id,
         "pair_ids": pair_ids,
     }
@@ -713,6 +718,7 @@ def _acbl_report_fetch_signature(
     date_from: datetime | None,
     online_filter: str,
     prior_sessions: int,
+    strata: str = STRATA_DEFAULT,
 ) -> str:
     return json.dumps(
         {
@@ -725,6 +731,7 @@ def _acbl_report_fetch_signature(
             "elo_rating_type": elo_rating_type,
             "date_from": _acbl_date_from_param(date_from),
             "online_filter": online_filter,
+            "strata": strata,
             "prior_sessions": int(prior_sessions),
         },
         sort_keys=True,
@@ -743,11 +750,12 @@ def _acbl_report_cache_key(
     online_filter: str,
     masterpoints_filter: str,
     prior_sessions: int,
+    strata: str = STRATA_DEFAULT,
 ) -> str:
     return (
         f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_"
         f"{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_"
-        f"{online_filter}_{masterpoints_filter}_prior{prior_sessions}"
+        f"{online_filter}_{strata}_{masterpoints_filter}_prior{prior_sessions}"
     )
 
 
@@ -760,15 +768,17 @@ def _acbl_leaderboard_aggrid_key(
     online_filter: str,
     masterpoints_filter: str,
     name_filter: str,
+    strata: str = STRATA_DEFAULT,
 ) -> str:
     """Stable AgGrid key — omit club_or_tournament and API date_range so Club/Tournament toggles update in place."""
     import re as _re
     nf = _re.sub(r"[^\w\-]", "_", (name_filter or "").strip())[:48]
     elo_part = _re.sub(r"[^\w\-]", "_", elo_rating_type)[:32]
     mp_part = _re.sub(r"[^\w\-]", "_", masterpoints_filter)[:24]
+    strata_part = _re.sub(r"[^\w\-]", "_", strata)[:24]
     return (
         f"acbl_table_{rating_type}_top{top_n}_min{min_sessions}_{rating_method}_"
-        f"{elo_part}_{online_filter}_mp{mp_part}_name_{nf}"
+        f"{elo_part}_{online_filter}_{strata_part}_mp{mp_part}_name_{nf}"
     )
 
 
@@ -888,6 +898,12 @@ ACBL_URL_PARAMS = {
         "valid_values": ("All", "Local Only", "Online Only"),
         "default": "Local Only",
     },
+    "strata": {
+        "session_key": "acbl_strata",
+        "parser": str,
+        "valid_values": STRATA_OPTIONS,
+        "default": STRATA_DEFAULT,
+    },
     "mp": {
         "session_key": "acbl_masterpoints",
         "parser": str,
@@ -914,6 +930,7 @@ def _acbl_report_panel() -> None:
     elo_rating_type = ctx["elo_rating_type"]
     date_from = ctx["date_from"]
     online_filter = ctx["online_filter"]
+    strata = ctx.get("strata", STRATA_DEFAULT)
     club_or_tournament = ctx["club_or_tournament"]
 
     prior_sessions = int(st.session_state.get("acbl_prior_sessions", 50))
@@ -929,6 +946,7 @@ def _acbl_report_panel() -> None:
         date_from=date_from,
         online_filter=online_filter,
         prior_sessions=prior_sessions,
+        strata=strata,
     )
     cached_fetch = st.session_state.get("_acbl_report_fetch_cache")
     if (
@@ -958,6 +976,7 @@ def _acbl_report_panel() -> None:
                     date_from=date_from,
                     online_filter=online_filter,
                     prior_sessions=prior_sessions,
+                    strata=strata,
                 )
         except Exception as exc:
             st.error(str(exc))
@@ -1059,6 +1078,7 @@ def _acbl_report_panel() -> None:
             rating_method, int(moving_avg_days), elo_rating_type, date_range,
             online_filter, st.session_state.get('masterpoints_filter', 'All'),
             int(st.session_state.get('acbl_prior_sessions', 50)),
+            strata=strata,
         )
         st.session_state.acbl_report_cache_key = cache_key
         st.session_state.acbl_club_or_tournament = club_or_tournament
@@ -1214,6 +1234,7 @@ def _acbl_report_panel() -> None:
                 elo_rating_type, online_filter,
                 st.session_state.get('masterpoints_filter', 'All'),
                 st.session_state.get('player_name_filter', ''),
+                strata=strata,
             )
         
             grid_response = AgGrid(
@@ -1248,6 +1269,7 @@ def _acbl_report_panel() -> None:
                                     date_from=date_from,
                                     online_filter=online_filter,
                                     player_id=player_id,
+                                    strata=strata,
                                 )
                                 if detail.is_empty():
                                     st.info("No session data found for this player.")
@@ -1287,6 +1309,7 @@ def _acbl_report_panel() -> None:
                                     date_from=date_from,
                                     online_filter=online_filter,
                                     pair_ids=pair_ids,
+                                    strata=strata,
                                 )
                                 if detail.is_empty():
                                     st.info("No session data found for this pair.")
@@ -1601,6 +1624,25 @@ def main():
             key="acbl_online_filter",
             help="Filter by game type: Local (in-person), Online (virtual), or All games"
         )
+
+        # Event MP-limit strata (default: open / unlimited top flight)
+        if (
+            "acbl_strata" in st.session_state
+            and st.session_state.acbl_strata not in STRATA_OPTIONS
+        ):
+            st.session_state.acbl_strata = STRATA_DEFAULT
+        strata = st.selectbox(
+            "Strata",
+            options=list(STRATA_OPTIONS),
+            index=list(STRATA_OPTIONS).index(STRATA_DEFAULT),
+            key="acbl_strata",
+            help=(
+                "Filter which games count toward Elo. Open = unlimited top MP limit "
+                "(includes stratified open-top club games). Restricted buckets use "
+                "the event's top MP ceiling. Orthogonal to Masterpoints Range "
+                "(player holdings)."
+            ),
+        )
         
         # Masterpoints range filter (Players only)
         masterpoints_options = ["All"] + [format_masterpoints_label(lo, hi) for (lo, hi) in MASTERPOINT_RANGES]
@@ -1681,6 +1723,7 @@ def main():
         "elo_rating_type": elo_rating_type,
         "date_from": date_from,
         "online_filter": online_filter,
+        "strata": strata,
     }
 
     # -------------------------------
@@ -1697,6 +1740,7 @@ def main():
         "elo_rating_type": elo_rating_type,
         "date_range_choice": date_range_choice,
         "online_filter": online_filter,
+        "strata": strata,
     }
     
     # Check if settings have changed since last report
