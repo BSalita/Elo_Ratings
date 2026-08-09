@@ -1,0 +1,26 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Streamlit: streamlit_app_elo_ratings.py",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "module": "streamlit",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "run",
+                "streamlit_app_ffbridge_elo_ratings.py", // was "${file}"
+            ],
+            "env": {
+                "STREAMLIT_APP": "streamlit_app_elo_ratings.py",
+                "STREAMLIT_ENV": "sql_query_mode",
+                "STREAMLIT_QUERY_STRING": "", // todo: player id or pair id or opions such as top n, min sessions, rating method, date range?
+            }
+        }
+    ]
+}
