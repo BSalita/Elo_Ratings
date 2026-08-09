@@ -1,0 +1,30 @@
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+    "python.terminal.activateEnvironment": true,
+    "python.terminal.activateEnvInCurrentTerminal": true,
+    "terminal.integrated.defaultProfile.windows": "PowerShell",
+    "terminal.integrated.profiles.windows": {
+        "PowerShell": {
+            "source": "PowerShell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass"
+            ]
+        }
+    },
+    "terminal.integrated.env.windows": {
+        "VIRTUAL_ENV": "${workspaceFolder}\\.venv",
+        "VIRTUAL_ENV_PROMPT": ".venv",
+        "PATH": "${workspaceFolder}\\.venv\\Scripts;${env:PATH}"
+    },
+    "python.analysis.extraPaths": [
+        "./streamlitlib",
+        "../mlBridge"
+    ],
+    "python.analysis.autoImportCompletions": true,
+    "cursorpyright.analysis.autoImportCompletions": true,
+    "cursorpyright.analysis.extraPaths": [
+        "./streamlitlib",
+        "../mlBridge"
+    ]
+}
