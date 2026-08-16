@@ -22,6 +22,10 @@ pandas
 polars
 duckdb
 psycopg[binary]
+# Needed when importing the mlBridge package (monorepo_src.pth -> ../mlBridge)
+scikit-learn
+sqlalchemy
+sqlalchemy-utils
 
 # Data visualization
 matplotlib
