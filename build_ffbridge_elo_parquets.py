@@ -78,10 +78,12 @@ _MLBRIDGE_DIR = next(
     for path in (_APP_DIR / "mlBridge", _APP_DIR.parent / "mlBridge")
     if path.is_dir()
 )
-for _path in reversed((_MLBRIDGE_DIR.parent, _MLBRIDGE_DIR, _APP_DIR)):
+_IMPORT_PATHS = list(dict.fromkeys((_APP_DIR, _MLBRIDGE_DIR.parent, _MLBRIDGE_DIR)))
+for _path in reversed(_IMPORT_PATHS):
     _path_str = str(_path)
-    if _path_str not in sys.path:
-        sys.path.insert(0, _path_str)
+    while _path_str in sys.path:
+        sys.path.remove(_path_str)
+    sys.path.insert(0, _path_str)
 
 import mlBridge.mlBridgeFFIndexLib as ffindex
 
