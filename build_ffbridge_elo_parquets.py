@@ -68,6 +68,21 @@ import sys
 from datetime import datetime, timezone
 from typing import Optional
 
+# mlBridge's package initializer imports logging_config as a top-level module,
+# so both the package parent and package directory must be importable. The
+# Streamlit launch environment already provides this; direct builder execution
+# inside the deployment container does not.
+_APP_DIR = pathlib.Path(__file__).resolve().parent
+_MLBRIDGE_DIR = next(
+    path
+    for path in (_APP_DIR / "mlBridge", _APP_DIR.parent / "mlBridge")
+    if path.is_dir()
+)
+for _path in reversed((_MLBRIDGE_DIR.parent, _MLBRIDGE_DIR, _APP_DIR)):
+    _path_str = str(_path)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
+
 import mlBridge.mlBridgeFFIndexLib as ffindex
 
 # Importing the app module is side-effect free (main() is guarded and
