@@ -1296,6 +1296,15 @@ def process_tournaments_to_elo(
             'handicap_pair_elo': pl.Float64,
             'pair_elo': pl.Float64,
         }
+        if 'player1_lancelot_id' in all_results[0]:
+            results_schema.update({
+                'player1_lancelot_id': pl.Utf8,
+                'player2_lancelot_id': pl.Utf8,
+                'player1_classic_person_id': pl.Utf8,
+                'player2_classic_person_id': pl.Utf8,
+                'player1_license_number': pl.Utf8,
+                'player2_license_number': pl.Utf8,
+            })
         results_df = pl.DataFrame(all_results, schema=results_schema)
     else:
         results_df = pl.DataFrame()

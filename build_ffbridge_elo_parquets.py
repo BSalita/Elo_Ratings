@@ -106,7 +106,7 @@ def _preflight() -> int:
 
     if not cache_dir:
         problems.append(
-            "FFBRIDGE_CACHE_DIR is not set — set it to the persistent data mount "
+            "FFBRIDGE_CACHE_DIR is not set - set it to the persistent data mount "
             "(e.g. /data/ffbridge)."
         )
 
@@ -123,7 +123,7 @@ def _preflight() -> int:
     # Classic backend needs a bearer token for live fetches; Lancelot is public.
     if not os.environ.get("FFBRIDGE_BEARER_TOKEN", "").strip():
         print(
-            "[preflight] WARN: FFBRIDGE_BEARER_TOKEN not set — the Classic backend "
+            "[preflight] WARN: FFBRIDGE_BEARER_TOKEN not set - the Classic backend "
             "cannot fetch new events (Lancelot is public and unaffected).",
             flush=True,
         )
@@ -207,12 +207,12 @@ def build_one(api_name: str, fetch_iv: bool, if_stale: bool = False, max_age_hou
 
     # Force-refresh the tournament list so newly published events are discovered
     # (the on-disk list cache never expires by design).
-    print(f"[builder] {api_name}: refreshing tournament list…", flush=True)
+    print(f"[builder] {api_name}: refreshing tournament list...", flush=True)
     all_tournaments = api_module.fetch_tournament_list(series_id="all", limit=None, force_refresh=True)
     if not all_tournaments:
         print(f"[builder] {api_name}: no tournaments returned; skipping", flush=True)
         return 0
-    print(f"[builder] {api_name}: {len(all_tournaments)} tournaments; computing Elo…", flush=True)
+    print(f"[builder] {api_name}: {len(all_tournaments)} tournaments; computing Elo...", flush=True)
     dataset = app.compute_and_persist_elo_dataset(
         api_module, all_tournaments, api_key, fetch_iv, show_progress=False
     )
@@ -271,10 +271,14 @@ def main() -> int:
                 built += 1
                 total_rows += rows
         except Exception as exc:
-            # Don't fail the container start over a build error; the app has its
-            # own in-process rebuild fallback and can serve the last parquet.
             print(f"[builder] ERROR building {api_name}: {exc}", flush=True)
-            if not args.if_stale:
+            required_lancelot_index_missing = (
+                api_name == "FFBridge Lancelot API"
+                and not _lancelot_player_session_index_ready()
+            )
+            # A stale rebuild may continue serving its previous artifacts, but
+            # first deployment cannot succeed without the shared index.
+            if not args.if_stale or required_lancelot_index_missing:
                 return 1
 
     elapsed = (datetime.now() - started).total_seconds()
