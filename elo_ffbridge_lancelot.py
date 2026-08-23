@@ -277,6 +277,14 @@ def _normalize_ranking_results(ranking: List[Dict[str, Any]], series_id: Optiona
             'pair_id': str(team.get('id', '')),
             'player1_id': p1_id,
             'player2_id': p2_id,
+            # Preserve every Lancelot identity namespace for the shared
+            # player-session index. Elo continues to use migrationId above.
+            'player1_lancelot_id': str(p1.get('id') or ''),
+            'player2_lancelot_id': str(p2.get('id') or ''),
+            'player1_classic_person_id': str(p1.get('migrationId') or ''),
+            'player2_classic_person_id': str(p2.get('migrationId') or ''),
+            'player1_license_number': str(p1.get('ffbId') or ''),
+            'player2_license_number': str(p2.get('ffbId') or ''),
             'player1_name': p1_name,
             'player2_name': p2_name,
             'percentage': pct,

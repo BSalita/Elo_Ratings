@@ -32,6 +32,11 @@ What a rebuild does (and does NOT) refresh
   (``initial_players=None``). Elo is order-dependent, so a newly inserted event
   can shift the whole downstream chain — ratings are replayed, not appended.
 - Parquet output: fully regenerated and legacy count-keyed files are pruned.
+- Shared Lancelot index: rankings also produce
+  ``player_session_index/lancelot_persons.parquet`` and
+  ``lancelot_player_sessions.parquet``. This canonical index preserves
+  Lancelot, migration/Classic, and license identifiers without coupling its
+  consumers to the Elo result schema.
 
 NUANCE — revised/corrected past events are NOT picked up. Because event results
 are cached with no expiry, if FFBridge later re-scores or amends an event we
@@ -62,6 +67,8 @@ import pathlib
 import sys
 from datetime import datetime, timezone
 from typing import Optional
+
+import mlBridge.mlBridgeFFIndexLib as ffindex
 
 # Importing the app module is side-effect free (main() is guarded and
 # set_page_config lives inside main()), so we can reuse its pipeline directly.
@@ -120,6 +127,14 @@ def _newest_persisted_age_hours(api_key: str, fetch_iv: bool) -> Optional[float]
     return app._newest_persisted_age_hours(api_key, fetch_iv)
 
 
+def _lancelot_player_session_index_ready() -> bool:
+    try:
+        ffindex.validate_index()
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        return False
+    return True
+
+
 def _prune_other_fetch_iv(api_key: str, fetch_iv: bool) -> None:
     """Delete orphaned elo_cache sets for this backend with the opposite fetch_iv."""
     other = int(not fetch_iv)
@@ -160,10 +175,17 @@ def build_one(api_name: str, fetch_iv: bool, if_stale: bool = False, max_age_hou
 
     if if_stale:
         age = _newest_persisted_age_hours(api_key, fetch_iv)
-        if age is not None and age < max_age_hours:
+        index_missing = (
+            api_module is app.lancelot_api
+            and not _lancelot_player_session_index_ready()
+        )
+        if age is not None and age < max_age_hours and not index_missing:
             print(f"[builder] {api_name}: cache fresh ({age:.1f}h < {max_age_hours}h); skipping", flush=True)
             return -1
-        reason = "missing" if age is None else f"stale ({age:.1f}h)"
+        if index_missing:
+            reason = "shared player-session index missing"
+        else:
+            reason = "missing" if age is None else f"stale ({age:.1f}h)"
         print(f"[builder] {api_name}: cache {reason}; rebuilding", flush=True)
 
     # Force-refresh the tournament list so newly published events are discovered
@@ -177,6 +199,14 @@ def build_one(api_name: str, fetch_iv: bool, if_stale: bool = False, max_age_hou
     dataset = app.compute_and_persist_elo_dataset(
         api_module, all_tournaments, api_key, fetch_iv, show_progress=False
     )
+    if api_module is app.lancelot_api:
+        metadata = ffindex.build_and_write_index(dataset["results_df"])
+        print(
+            "[builder] wrote shared Lancelot player-session index "
+            f"({metadata['persons_rows']} persons, "
+            f"{metadata['player_session_rows']} player-session rows)",
+            flush=True,
+        )
     rows = dataset["results_df"].height
     key = app._elo_cache_key(api_key, fetch_iv)
     print(f"[builder] {api_name}: wrote '{key}' ({rows} result rows)", flush=True)
