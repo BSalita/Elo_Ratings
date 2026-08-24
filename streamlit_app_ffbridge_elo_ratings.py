@@ -500,6 +500,7 @@ def _leaderboard_aggrid_key(
     top_n: int,
     min_games: int,
     name_filter: str,
+    player_number_filter: str,
     prior_sessions: int,
     date_range_choice: str = "All time",
 ) -> str:
@@ -507,7 +508,8 @@ def _leaderboard_aggrid_key(
     return (
         f"ff_{entity}_table_{rating_type}_{simultaneous_type}_"
         f"club_{_aggrid_key_part(club_filter)}_top{top_n}_min{min_games}_"
-        f"name_{_aggrid_key_part(name_filter)}_prior{prior_sessions}_"
+        f"name_{_aggrid_key_part(name_filter)}_"
+        f"number_{_aggrid_key_part(player_number_filter)}_prior{prior_sessions}_"
         f"dr_{_aggrid_key_part(date_range_choice)}"
     )
 
@@ -1899,6 +1901,11 @@ FFBRIDGE_URL_PARAMS = {
         "parser": str,
         "default": "",
     },
+    "player_number": {
+        "session_key": "elo_player_number_filter",
+        "parser": str,
+        "default": "",
+    },
     "date_range": {
         "session_key": "ffbridge_date_range",
         "parser": str,
@@ -1957,6 +1964,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
     simultaneous_type = ctx["simultaneous_type"]
     club_filter = ctx["club_filter"]
     name_filter = ctx["name_filter"]
+    player_number_filter = ctx["player_number_filter"]
     date_range_choice = ctx.get("date_range_choice", "All time")
     top_n = ctx["top_n"]
     min_games = ctx["min_games"]
@@ -2034,23 +2042,27 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                     st.code(sql_query, language="sql")
 
             if not top_players.is_empty():
-                # Apply name / player-number filter if provided
+                # Apply the independent name and player-number filters.
                 if name_filter and name_filter.strip():
                     token = name_filter.strip()
+                    name_filter_lower = token.lower()
+                    top_players = top_players.filter(
+                        pl.col('Player_Name').str.to_lowercase().str.contains(name_filter_lower, literal=True)
+                    )
+                if player_number_filter and player_number_filter.strip():
+                    token = player_number_filter.strip()
                     if is_digits_only_filter(token) and "Player_ID" in top_players.columns:
                         top_players = top_players.filter(player_id_equals_expr("Player_ID", token))
-                    else:
-                        name_filter_lower = token.lower()
-                        top_players = top_players.filter(
-                            pl.col('Player_Name').str.to_lowercase().str.contains(name_filter_lower, literal=True)
-                        )
+                    elif not is_digits_only_filter(token):
+                        st.warning("Player number must contain digits only.")
 
                 if not top_players.is_empty():
                     st.caption("Click a row to view player's tournament history")
                     # Create dynamic key based on filter parameters to reset selection when data changes
                     dynamic_key = _leaderboard_aggrid_key(
                         "players", rating_type, simultaneous_type,
-                        club_filter, top_n, min_games, name_filter, int(prior_sessions),
+                        club_filter, top_n, min_games, name_filter,
+                        player_number_filter, int(prior_sessions),
                         date_range_choice,
                     )
                     _load_debug_log(f"leaderboard panel: rendering AgGrid ({top_players.height} rows)")
@@ -2155,7 +2167,11 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                     st.session_state.display_df = top_players
                     st.session_state.report_title = f"FFBridge Top Players - {datetime.now().strftime('%Y-%m-%d')}"
                 else:
-                    if name_filter and name_filter.strip():
+                    if player_number_filter and player_number_filter.strip():
+                        st.info(
+                            f"No players match player number '{player_number_filter.strip()}'."
+                        )
+                    elif name_filter and name_filter.strip():
                         st.info(f"No players match the name filter '{name_filter}'.")
                     else:
                         st.info(f"No players match the minimum requirement of {min_games} games.")
@@ -2199,25 +2215,29 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                     st.code(sql_query, language="sql")
 
             if not top_pairs.is_empty():
-                # Apply name / player-number filter if provided
+                # Apply the independent name and player-number filters.
                 if name_filter and name_filter.strip():
                     token = name_filter.strip()
+                    name_filter_lower = token.lower()
+                    top_pairs = top_pairs.filter(
+                        pl.col('Pair_Name').str.to_lowercase().str.contains(name_filter_lower, literal=True)
+                    )
+                if player_number_filter and player_number_filter.strip():
+                    token = player_number_filter.strip()
                     if is_digits_only_filter(token) and "Pair_ID" in top_pairs.columns:
                         top_pairs = top_pairs.filter(
                             pair_id_contains_player_number_expr("Pair_ID", token)
                         )
-                    else:
-                        name_filter_lower = token.lower()
-                        top_pairs = top_pairs.filter(
-                            pl.col('Pair_Name').str.to_lowercase().str.contains(name_filter_lower, literal=True)
-                        )
+                    elif not is_digits_only_filter(token):
+                        st.warning("Player number must contain digits only.")
 
                 if not top_pairs.is_empty():
                     st.caption("Click a row to view pair's tournament history")
                     # Create dynamic key based on filter parameters to reset selection when data changes
                     dynamic_key = _leaderboard_aggrid_key(
                         "pairs", rating_type, simultaneous_type,
-                        club_filter, top_n, min_games, name_filter, int(prior_sessions),
+                        club_filter, top_n, min_games, name_filter,
+                        player_number_filter, int(prior_sessions),
                         date_range_choice,
                     )
                     _load_debug_log(f"leaderboard panel: rendering AgGrid ({top_pairs.height} rows)")
@@ -2315,7 +2335,11 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                     st.session_state.display_df = top_pairs
                     st.session_state.report_title = f"FFBridge Top Pairs - {datetime.now().strftime('%Y-%m-%d')}"
                 else:
-                    if name_filter and name_filter.strip():
+                    if player_number_filter and player_number_filter.strip():
+                        st.info(
+                            f"No pairs include player number '{player_number_filter.strip()}'."
+                        )
+                    elif name_filter and name_filter.strip():
                         st.info(f"No pairs match the name filter '{name_filter}'.")
                     else:
                         st.info(f"No pairs match the minimum requirement of {min_games} games.")
@@ -2460,14 +2484,18 @@ def main():
         )
         club_filter = "" if selected_club == _ALL_CLUBS_LABEL else selected_club
         
-        # Name / player-number filter
+        # Independent name and player-number filters.
         name_filter = st.text_input(
-            "Filter by Player Name or Number",
+            "Filter by player name",
             key="elo_name_filter",
-            help=(
-                "Text filters by name (case-insensitive contains). "
-                "Digits-only filters by player number / ID (exact; for pairs, either partner)."
-            ),
+            placeholder="Name contains...",
+            help="Case-insensitive partial match; for pairs, matches either partner's name.",
+        )
+        player_number_filter = st.text_input(
+            "Filter by player number",
+            key="elo_player_number_filter",
+            placeholder="Exact player number...",
+            help="Digits-only exact match; for pairs, matches either partner's player number.",
         )
 
         date_range_choice = st.selectbox(
@@ -2560,6 +2588,7 @@ def main():
             simultaneous_type=simultaneous_type,
             club_filter=club_filter,
             name_filter=name_filter,
+            player_number_filter=player_number_filter,
             date_range_choice=date_range_choice,
             date_from=date_from,
             date_to=date_to,
@@ -2588,6 +2617,7 @@ def _load_main_content(
     simultaneous_type,
     club_filter: str,
     name_filter: str,
+    player_number_filter: str,
     date_range_choice: str,
     date_from: Optional[str],
     date_to: Optional[str],
@@ -2773,6 +2803,7 @@ def _load_main_content(
         "simultaneous_type": simultaneous_type,
         "club_filter": club_filter,
         "name_filter": name_filter,
+        "player_number_filter": player_number_filter,
         "date_range_choice": date_range_choice,
         "date_from": date_from,
         "date_to": date_to,

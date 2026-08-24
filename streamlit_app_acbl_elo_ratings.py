@@ -768,17 +768,19 @@ def _acbl_leaderboard_aggrid_key(
     online_filter: str,
     masterpoints_filter: str,
     name_filter: str,
+    player_number_filter: str,
     strata: str = STRATA_DEFAULT,
 ) -> str:
     """Stable AgGrid key — omit club_or_tournament and API date_range so Club/Tournament toggles update in place."""
     import re as _re
     nf = _re.sub(r"[^\w\-]", "_", (name_filter or "").strip())[:48]
+    pnf = _re.sub(r"\D", "", (player_number_filter or "").strip())[:16]
     elo_part = _re.sub(r"[^\w\-]", "_", elo_rating_type)[:32]
     mp_part = _re.sub(r"[^\w\-]", "_", masterpoints_filter)[:24]
     strata_part = _re.sub(r"[^\w\-]", "_", strata)[:24]
     return (
         f"acbl_table_{rating_type}_top{top_n}_min{min_sessions}_{rating_method}_"
-        f"{elo_part}_{online_filter}_{strata_part}_mp{mp_part}_name_{nf}"
+        f"{elo_part}_{online_filter}_{strata_part}_mp{mp_part}_name_{nf}_number_{pnf}"
     )
 
 
@@ -883,6 +885,11 @@ ACBL_URL_PARAMS = {
     },
     "name": {
         "session_key": "player_name_filter",
+        "parser": str,
+        "default": "",
+    },
+    "player_number": {
+        "session_key": "player_number_filter",
         "parser": str,
         "default": "",
     },
@@ -1103,48 +1110,57 @@ def _acbl_report_panel() -> None:
                     work_df = pl.from_pandas(work_df)
             except Exception:
                 pass
-            # Apply player name/number filter (read from session to handle button click reruns)
+            # Apply the independent player-name and player-number filters.
             player_name_filter_value = st.session_state.get('player_name_filter', '').strip()
+            player_number_filter_value = st.session_state.get('player_number_filter', '').strip()
             if player_name_filter_value:
                 try:
                     if hasattr(work_df, 'select'):  # Polars DataFrame
                         import re
                         original_count = len(work_df)
-                        by_number = is_digits_only_filter(player_name_filter_value)
-                        if by_number:
+                        pattern = '(?i)' + re.escape(player_name_filter_value)
+                        if 'Player_Name' in work_df.columns:
+                            work_df = work_df.filter(
+                                pl.col('Player_Name').cast(pl.Utf8).str.contains(pattern, literal=False)
+                            )
+                        elif 'Pair_Names' in work_df.columns:
+                            work_df = work_df.filter(
+                                pl.col('Pair_Names').cast(pl.Utf8).str.contains(pattern, literal=False)
+                            )
+                        else:
+                            st.warning("⚠️ No Player_Name or Pair_Names column found to filter on")
+                        filtered_count = len(work_df)
+                        st.info(
+                            f"🔍 Filtered to {filtered_count} of {original_count} rows "
+                            f"matching name '{player_name_filter_value}'"
+                        )
+                except Exception:
+                    pass
+            if player_number_filter_value:
+                if not is_digits_only_filter(player_number_filter_value):
+                    st.warning("Player number must contain digits only.")
+                else:
+                    try:
+                        if hasattr(work_df, 'select'):
+                            original_count = len(work_df)
                             if 'Player_ID' in work_df.columns:
                                 work_df = work_df.filter(
-                                    player_id_equals_expr('Player_ID', player_name_filter_value)
+                                    player_id_equals_expr('Player_ID', player_number_filter_value)
                                 )
                             elif 'Pair_IDs' in work_df.columns:
                                 work_df = work_df.filter(
                                     pair_id_contains_player_number_expr(
-                                        'Pair_IDs', player_name_filter_value
+                                        'Pair_IDs', player_number_filter_value
                                     )
                                 )
                             else:
                                 st.warning("⚠️ No Player_ID or Pair_IDs column found to filter on")
-                                by_number = False
-                        if not by_number:
-                            pattern = '(?i)' + re.escape(player_name_filter_value)
-                            if 'Player_Name' in work_df.columns:
-                                work_df = work_df.filter(
-                                    pl.col('Player_Name').cast(pl.Utf8).str.contains(pattern, literal=False)
-                                )
-                            elif 'Pair_Names' in work_df.columns:
-                                work_df = work_df.filter(
-                                    pl.col('Pair_Names').cast(pl.Utf8).str.contains(pattern, literal=False)
-                                )
-                            else:
-                                st.warning("⚠️ No Player_Name or Pair_Names column found to filter on")
-                        filtered_count = len(work_df)
-                        kind = "number" if is_digits_only_filter(player_name_filter_value) else "name"
-                        st.info(
-                            f"🔍 Filtered to {filtered_count} of {original_count} rows "
-                            f"matching {kind} '{player_name_filter_value}'"
-                        )
-                except Exception:
-                    pass
+                            st.info(
+                                f"🔍 Filtered to {len(work_df)} of {original_count} rows "
+                                f"matching player number '{player_number_filter_value}'"
+                            )
+                    except Exception:
+                        pass
         
             # Apply Masterpoints range filter for Players view
             if rating_type == "Players":
@@ -1234,6 +1250,7 @@ def _acbl_report_panel() -> None:
                 elo_rating_type, online_filter,
                 st.session_state.get('masterpoints_filter', 'All'),
                 st.session_state.get('player_name_filter', ''),
+                st.session_state.get('player_number_filter', ''),
                 strata=strata,
             )
         
@@ -1590,22 +1607,27 @@ def main():
             help="Choose timing of Elo analysis"
         )
         
-        # Player name filter (use a stable session key to avoid rerun inconsistencies)
-        def _on_player_name_enter():
-            # Ensure table is shown when ENTER is pressed in the name box
+        # Player filters use stable session keys to avoid rerun inconsistencies.
+        def _on_player_filter_enter():
+            # Ensure table is shown when ENTER is pressed in either filter.
             st.session_state.show_main_content = True
             st.session_state.content_mode = 'table'
 
         player_name_filter = st.text_input(
-            "Filter by Player Name or Number",
+            "Filter by player name",
             value=st.session_state.get("player_name_filter", ""),
-            placeholder="Name text, or digits-only player number...",
-            help=(
-                "Text filters by name (case-insensitive contains). "
-                "Digits-only filters by player number / ID (exact; for pairs, either partner)."
-            ),
+            placeholder="Name contains...",
+            help="Case-insensitive partial match; for pairs, matches either partner's name.",
             key="player_name_filter",
-            on_change=_on_player_name_enter
+            on_change=_on_player_filter_enter,
+        )
+        player_number_filter = st.text_input(
+            "Filter by player number",
+            value=st.session_state.get("player_number_filter", ""),
+            placeholder="Exact player number...",
+            help="Digits-only exact match; for pairs, matches either partner's player number.",
+            key="player_number_filter",
+            on_change=_on_player_filter_enter,
         )
         
         # Date range quick filter (default All time)
