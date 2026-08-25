@@ -1540,8 +1540,8 @@ def _elo_cache_meta_paths(api_key: str, fetch_iv: bool) -> List[pathlib.Path]:
     seen: set[pathlib.Path] = set()
     paths: List[pathlib.Path] = []
     for pattern in (
-        f"elo_full_v4_{api_key}_iv_{iv}.meta.json",
-        f"elo_full_v4_{api_key}_*_iv_{iv}.meta.json",
+        f"elo_full_v5_{api_key}_iv_{iv}.meta.json",
+        f"elo_full_v5_{api_key}_*_iv_{iv}.meta.json",
     ):
         for meta_path in _FFBRIDGE_ELO_CACHE_DIR.glob(pattern):
             if meta_path not in seen:
@@ -2253,13 +2253,12 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                     (pl.col('score_source') if 'score_source' in player_results.columns else pl.lit('national_official')).alias('Score_Source'),
                                     (pl.col('score_source_url') if 'score_source_url' in player_results.columns else pl.lit(None, dtype=pl.Utf8)).alias('Score_Source_URL'),
                                 ]
-                                # Pct_Used: use handicap if requested AND not null, otherwise scratch
+                                # Pct_Used follows the selected category. Scratch-only
+                                # sessions leave handicap empty instead of copying scratch.
                                 if use_handicap and 'handicap_percentage' in player_results.columns:
-                                    # Use handicap when available, fall back to scratch when null
                                     cols_to_select.append(
-                                        pl.when(pl.col('handicap_percentage').is_not_null())
-                                          .then(pl.col('handicap_percentage').cast(pl.Float64, strict=False).round(2))
-                                          .otherwise(pl.col('scratch_percentage').cast(pl.Float64, strict=False).round(2))
+                                        pl.col('handicap_percentage')
+                                          .cast(pl.Float64, strict=False).round(2)
                                           .alias('Pct_Used')
                                     )
                                 else:
@@ -2421,13 +2420,12 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                     (pl.col('score_source') if 'score_source' in pair_results.columns else pl.lit('national_official')).alias('Score_Source'),
                                     (pl.col('score_source_url') if 'score_source_url' in pair_results.columns else pl.lit(None, dtype=pl.Utf8)).alias('Score_Source_URL'),
                                 ]
-                                # Pct_Used: use handicap if requested AND not null, otherwise scratch
+                                # Pct_Used follows the selected category. Scratch-only
+                                # sessions leave handicap empty instead of copying scratch.
                                 if use_handicap and 'handicap_percentage' in pair_results.columns:
-                                    # Use handicap when available, fall back to scratch when null
                                     cols_to_select.append(
-                                        pl.when(pl.col('handicap_percentage').is_not_null())
-                                          .then(pl.col('handicap_percentage').cast(pl.Float64, strict=False).round(2))
-                                          .otherwise(pl.col('scratch_percentage').cast(pl.Float64, strict=False).round(2))
+                                        pl.col('handicap_percentage')
+                                          .cast(pl.Float64, strict=False).round(2)
                                           .alias('Pct_Used')
                                     )
                                 else:

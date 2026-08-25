@@ -157,8 +157,8 @@ def _prune_other_fetch_iv(api_key: str, fetch_iv: bool) -> None:
     cache_dir = app._FFBRIDGE_ELO_CACHE_DIR
     iv = int(fetch_iv)
     patterns = (
-        f"elo_full_v4_{api_key}_iv_{other}.results.parquet",
-        f"elo_full_v4_{api_key}_*_iv_{other}.results.parquet",
+        f"elo_full_v5_{api_key}_iv_{other}.results.parquet",
+        f"elo_full_v5_{api_key}_*_iv_{other}.results.parquet",
     )
     try:
         seen: set[pathlib.Path] = set()

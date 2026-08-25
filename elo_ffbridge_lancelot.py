@@ -246,6 +246,59 @@ def fetch_tournament_results(session_id: str, tournament_date: str = "", series_
     return [], False
 
 
+def _as_number(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _official_scratch_and_handicap(
+    entry: Dict[str, Any],
+    *,
+    session_score: Optional[float],
+    is_octopus: bool,
+) -> Tuple[Optional[float], Optional[float], float, str]:
+    """Map a published Lancelot ranking row to scratch, handicap, and IV bonus.
+
+    Verified against FFBridge and club tables (2026-08-25):
+    - `sessionScore` is scratch for scratch-only series (Rondes de France, etc.).
+    - `sessionScore` is the national handicap percentage for Octopus.
+    - `totalBonus` is the Octopus IV handicap in percentage points.
+    - `peBonus` is PE ranking points. Never convert it into a percentage.
+    """
+    explicit_scratch = _as_number(entry.get("totalScoreWithoutHandicap"))
+    explicit_handicap = _as_number(
+        entry.get("scoreHandicap")
+        if entry.get("scoreHandicap") is not None
+        else entry.get("handicapPercentage")
+    )
+    total_bonus = _as_number(entry.get("totalBonus")) or 0.0
+    has_handicap_scoring = (
+        is_octopus
+        or total_bonus > 0
+        or explicit_scratch is not None
+        or explicit_handicap is not None
+    )
+    if not has_handicap_scoring or session_score is None:
+        return session_score, None, 0.0, "scratch_only"
+
+    if explicit_scratch is not None and explicit_handicap is not None:
+        scratch_pct = explicit_scratch
+        handicap_pct = explicit_handicap
+    elif explicit_scratch is not None:
+        scratch_pct = explicit_scratch
+        handicap_pct = session_score
+    else:
+        handicap_pct = (
+            explicit_handicap if explicit_handicap is not None else session_score
+        )
+        scratch_pct = handicap_pct - total_bonus
+    return scratch_pct, handicap_pct, handicap_pct - scratch_pct, "official"
+
+
 def _normalize_ranking_results(
     ranking: List[Dict[str, Any]],
     series_id: Optional[Any] = None,
@@ -290,13 +343,11 @@ def _normalize_ranking_results(
             if entry.get('sessionScore') is not None
             else entry.get('totalScore')
         )
-        national_pct = (
-            float(national_pct_raw) if national_pct_raw is not None else None
-        )
+        national_pct = _as_number(national_pct_raw)
         pe_bonus_raw = float(entry.get('peBonus') or 0)
-
-        # Derive IV bonus (peBonus is in tenths of a percent)
-        iv_bonus = pe_bonus_raw / 10.0
+        # peBonus is PE ranking points, not a percentage adjustment.
+        # Octopus IV handicap lives in totalBonus (percentage points).
+        iv_bonus = float(_as_number(entry.get('totalBonus')) or 0.0)
 
         team_id = str(team.get('id', ''))
         if national_pending:
@@ -325,22 +376,11 @@ def _normalize_ranking_results(
             pct = scratch_pct
         else:
             pct = national_pct
-            # Determine scratch and handicap percentages
-            # Only treat as handicapped if:
-            # 1. It's Octopus tournament (has verified handicap scoring), OR
-            # 2. iv_bonus > 0 (actual bonus being applied)
-            # Otherwise, tournament only has scratch scores (handicap = scratch)
-            has_handicap_scoring = is_octopus or iv_bonus > 0
-            if has_handicap_scoring and pct is not None:
-                # Assume pct is handicap-adjusted, derive scratch
-                scratch_pct = pct - iv_bonus
-                handicap_pct = pct
-                handicap_status = "official"
-            else:
-                # No handicap scoring - only scratch scores
-                scratch_pct = pct
-                handicap_pct = None
-                handicap_status = "scratch_only"
+            scratch_pct, handicap_pct, iv_bonus, handicap_status = (
+                _official_scratch_and_handicap(
+                    entry, session_score=national_pct, is_octopus=is_octopus
+                )
+            )
             scratch_status = "official" if scratch_pct is not None else "unresolved"
             score_source = "national_official"
             score_status = "official"

@@ -129,12 +129,12 @@ def elo_cache_key(api_key: str, fetch_iv: bool, n_tournaments: int = 0) -> str:
     sessions even when no new past events existed.
     """
     del n_tournaments
-    return f"elo_full_v4_{api_key}_iv_{int(fetch_iv)}"
+    return f"elo_full_v5_{api_key}_iv_{int(fetch_iv)}"
 
 
 def legacy_elo_cache_keys(api_key: str, fetch_iv: bool) -> List[str]:
     """Parquet keys from before the stable-key change (middle segment = list length)."""
-    prefix = f"elo_full_v4_{api_key}_"
+    prefix = f"elo_full_v5_{api_key}_"
     suffix = f"_iv_{int(fetch_iv)}"
     keys: List[str] = []
     for meta_path in ELO_CACHE_DIR.glob(f"{prefix}*{suffix}.meta.json"):
@@ -462,7 +462,7 @@ def aggregate_players_from_results(results_df: pl.DataFrame, use_handicap: bool)
         return pl.DataFrame()
     elo_col_p1 = "player1_handicap_elo_after" if use_handicap else "player1_scratch_elo_after"
     elo_col_p2 = "player2_handicap_elo_after" if use_handicap else "player2_scratch_elo_after"
-    pct_expr = "COALESCE(handicap_percentage, scratch_percentage)" if use_handicap else "scratch_percentage"
+    pct_expr = "handicap_percentage" if use_handicap else "scratch_percentage"
     return duckdb.sql(f"""
         WITH player_results AS (
             SELECT
@@ -501,7 +501,7 @@ def aggregate_players_from_results(results_df: pl.DataFrame, use_handicap: bool)
             SUM(CASE WHEN score_status = 'provisional' THEN 1 ELSE 0 END)
                 AS provisional_games,
             ROUND(AVG(scratch_percentage), 2) AS avg_scratch_pct,
-            ROUND(AVG(COALESCE(handicap_percentage, scratch_percentage)), 2) AS avg_handicap_pct,
+            ROUND(AVG(handicap_percentage), 2) AS avg_handicap_pct,
             ROUND(AVG(iv_bonus), 1) AS avg_iv_bonus,
             ROUND(AVG({pct_expr}), 2) AS avg_percentage,
             ROUND(STDDEV_SAMP({pct_expr}), 2) AS stdev_percentage
@@ -652,7 +652,7 @@ def show_top_pairs(
         return results_df, "", None
 
     elo_col = "handicap_pair_elo" if use_handicap else "scratch_pair_elo"
-    pct_col = "COALESCE(handicap_percentage, scratch_percentage)" if use_handicap else "scratch_percentage"
+    pct_col = "handicap_percentage" if use_handicap else "scratch_percentage"
 
     pair_elo_col_name = "HC_Pair_Elo" if use_handicap else "Pair_Elo"
     title_col_name = "Scratch_Title" if use_handicap else "Title"
@@ -806,7 +806,7 @@ def show_top_pairs(
                 ARG_MAX(COALESCE(handicap_pair_elo, scratch_pair_elo), date) AS avg_handicap_elo,
                 ARG_MAX({elo_col}, date) AS avg_pair_elo,
                 AVG(scratch_percentage) AS avg_scratch_pct,
-                AVG(COALESCE(handicap_percentage, scratch_percentage)) AS avg_handicap_pct,
+                AVG(handicap_percentage) AS avg_handicap_pct,
                 AVG(iv_bonus) AS avg_iv_bonus,
                 AVG({pct_col}) AS avg_percentage,
                 STDDEV_SAMP({pct_col}) AS stdev_percentage,

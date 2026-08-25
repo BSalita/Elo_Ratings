@@ -19,6 +19,8 @@ def _ranking_row(
     surname2: str,
     *,
     score: float = 0.0,
+    pe_bonus: float = 0,
+    total_bonus: float = 0.0,
 ) -> dict:
     return {
         "sessionScore": score,
@@ -28,7 +30,8 @@ def _ranking_row(
         "totalScoreWithoutHandicap": None,
         "rankWithoutHandicap": None,
         "theoreticalRank": None,
-        "peBonus": 0,
+        "peBonus": pe_bonus,
+        "totalBonus": total_bonus,
         "rank": 1,
         "simultaneousId": 5802079,
         "team": {
@@ -162,13 +165,70 @@ class PublicationStateTests(unittest.TestCase):
         self.assertEqual(rows[0]["scratch_percentage"], 54.41)
 
 
+class OfficialCategoryMappingTests(unittest.TestCase):
+    def test_rondes_de_france_keeps_session_score_as_scratch(self) -> None:
+        rows = lancelot._normalize_ranking_results(
+            [_ranking_row(10, "Salita", "Collins", score=65.67, pe_bonus=52)],
+            series_id=3,
+            tournament_date="2026-08-25",
+        )
+        self.assertEqual(rows[0]["scratch_percentage"], 65.67)
+        self.assertIsNone(rows[0]["handicap_percentage"])
+        self.assertEqual(rows[0]["handicap_score_status"], "scratch_only")
+        self.assertEqual(rows[0]["iv_bonus"], 0.0)
+        self.assertEqual(rows[0]["pe_bonus"], "52.0")
+
+    def test_octopus_uses_total_bonus_not_pe_bonus(self) -> None:
+        rows = lancelot._normalize_ranking_results(
+            [
+                _ranking_row(
+                    10,
+                    "Salita",
+                    "Jacoupy",
+                    score=71.74,
+                    pe_bonus=0,
+                    total_bonus=10.0,
+                )
+            ],
+            series_id=386,
+            tournament_date="2026-08-17",
+        )
+        self.assertAlmostEqual(rows[0]["scratch_percentage"], 61.74)
+        self.assertEqual(rows[0]["handicap_percentage"], 71.74)
+        self.assertEqual(rows[0]["iv_bonus"], 10.0)
+        self.assertEqual(rows[0]["handicap_score_status"], "official")
+
+
 class ScoreAvailabilityTests(unittest.TestCase):
     def test_schema_version_forces_full_elo_replay(self) -> None:
         self.assertTrue(
             reports.elo_cache_key("FFBridge_Lancelot_API", True).startswith(
-                "elo_full_v4_"
+                "elo_full_v5_"
             )
         )
+
+    def test_scratch_only_does_not_fill_handicap_average(self) -> None:
+        frame = pl.DataFrame(
+            {
+                "player1_id": ["1", "1"],
+                "player2_id": ["2", "3"],
+                "player1_name": ["Salita", "Salita"],
+                "player2_name": ["Collins", "Other"],
+                "player1_scratch_elo_after": [1600.0, 1610.0],
+                "player2_scratch_elo_after": [1500.0, 1500.0],
+                "player1_handicap_elo_after": [1600.0, 1610.0],
+                "player2_handicap_elo_after": [1500.0, 1500.0],
+                "scratch_percentage": [65.67, 54.41],
+                "handicap_percentage": [None, 64.41],
+                "iv_bonus": [0.0, 10.0],
+                "score_status": ["official", "official"],
+                "date": ["2026-08-25", "2026-08-24"],
+            }
+        )
+        players = reports.aggregate_players_from_results(frame, use_handicap=False)
+        salita = players.filter(pl.col("player_id") == "1")
+        self.assertAlmostEqual(salita.item(0, "avg_scratch_pct"), 60.04)
+        self.assertAlmostEqual(salita.item(0, "avg_handicap_pct"), 64.41)
 
     def test_unresolved_categories_are_filtered_independently(self) -> None:
         frame = pl.DataFrame(
