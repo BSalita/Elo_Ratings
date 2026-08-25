@@ -16,10 +16,6 @@ uvicorn
 # MCP server (elo_mcp_server.py, streamable HTTP transport)
 mcp
 
-# S3-compatible client (used for fetching shrinkage sidecar JSONs from
-# Cloudflare R2 in acbl_api_server.py when R2_BUCKET is configured).
-boto3
-
 # Data processing and analysis
 pandas
 polars

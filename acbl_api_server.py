@@ -185,7 +185,7 @@ def _dual_frame_cache_enabled() -> bool:
 
 def _estimated_frame_bytes(club_or_tournament: str) -> int:
     """Conservative in-memory size for a dataset not yet cached."""
-    source_path, _ = _parquet_source_for(club_or_tournament)
+    source_path = _parquet_source_for(club_or_tournament)
     cached = _FRAME_CACHE.get(source_path)
     if cached is not None:
         try:
@@ -205,7 +205,7 @@ def _dual_frame_cache_safe_for_load(club_or_tournament: str) -> bool:
     limit = _cgroup_memory_limit_bytes()
     if limit is None:
         return False
-    source_path, _ = _parquet_source_for(club_or_tournament)
+    source_path = _parquet_source_for(club_or_tournament)
     if source_path in _FRAME_CACHE:
         return True
     other_cached = sum(
@@ -343,28 +343,6 @@ def _duckdb_temp_dir() -> str:
     return str(pathlib.Path(tempfile.gettempdir()) / "acbl_duckdb_spill")
 
 
-def _r2_enabled() -> bool:
-    return bool(os.getenv("R2_BUCKET", "").strip())
-
-
-def _r2_storage_options() -> dict:
-    bucket = os.getenv("R2_BUCKET", "").strip()
-    endpoint = os.getenv("R2_ENDPOINT", "").strip()
-    access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
-    secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
-    region = os.getenv("R2_REGION", "auto").strip() or "auto"
-
-    if not bucket or not endpoint or not access_key or not secret_key:
-        raise ValueError("R2 env vars are incomplete. Set bucket, endpoint, access key, and secret key.")
-
-    return {
-        "aws_region": region,
-        "aws_access_key_id": access_key,
-        "aws_secret_access_key": secret_key,
-        "aws_endpoint_url": endpoint,
-    }
-
-
 # In-memory cache for shrinkage sidecars (one per club|tournament). Loaded
 # lazily on first /acbl/report request and reused across calls.
 _SHRINKAGE_META_CACHE: dict[str, dict | None] = {}
@@ -435,43 +413,6 @@ def _shrinkage_sidecar_search_paths(filename: str) -> list[pathlib.Path]:
     return candidates
 
 
-def _load_shrinkage_meta_from_r2(filename: str) -> dict | None:
-    """Fetch the shrinkage sidecar JSON from R2 (S3-compatible) storage.
-
-    Uses the same ``R2_*`` env vars as :func:`_r2_storage_options`. Returns
-    ``None`` on any failure (missing key, network error, JSON parse error,
-    missing optional dependency) so the caller can fall back to local paths.
-    """
-    if not _r2_enabled():
-        return None
-
-    try:
-        import boto3
-        from botocore.config import Config as _BotoConfig
-        from botocore.exceptions import BotoCoreError, ClientError
-    except ImportError:
-        return None
-
-    bucket = os.getenv("R2_BUCKET", "").strip()
-    prefix = os.getenv("R2_PREFIX", "data").strip().strip("/")
-    key = f"{prefix}/{filename}" if prefix else filename
-
-    try:
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=os.getenv("R2_ENDPOINT", "").strip() or None,
-            aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID", "").strip() or None,
-            aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", "").strip() or None,
-            region_name=os.getenv("R2_REGION", "auto").strip() or "auto",
-            config=_BotoConfig(signature_version="s3v4"),
-        )
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        body = obj["Body"].read()
-        return json.loads(body.decode("utf-8"))
-    except (BotoCoreError, ClientError, json.JSONDecodeError, OSError, UnicodeDecodeError):
-        return None
-
-
 def _load_shrinkage_meta(club_or_tournament: str) -> dict | None:
     """Load the shrinkage sidecar JSON written by acbl_elo_ratings_create.py.
 
@@ -480,13 +421,7 @@ def _load_shrinkage_meta(club_or_tournament: str) -> dict | None:
     rebuilt the lookup parquets). In that case the report falls back to
     Published == Raw so the API still works.
 
-    Lookup order:
-
-    1. R2 (S3-compatible) at ``s3://$R2_BUCKET/$R2_PREFIX/<filename>`` when
-       ``R2_BUCKET`` is set. This is the canonical source when parquets live in R2.
-    2. Local filesystem candidates (DATA_ROOT, ACBL_SHRINKAGE_DIR override,
-       e:/bridge/data/acbl) for local dev.
-
+    Looks in DATA_ROOT, optional ACBL_SHRINKAGE_DIR, then e:/bridge/data/acbl.
     Cached at module level.
     """
     key = club_or_tournament.lower()
@@ -494,12 +429,6 @@ def _load_shrinkage_meta(club_or_tournament: str) -> dict | None:
         return _SHRINKAGE_META_CACHE[key]
 
     filename = f"acbl_{key}_elo_shrinkage.json"
-
-    if _r2_enabled():
-        meta = _load_shrinkage_meta_from_r2(filename)
-        if meta is not None:
-            _SHRINKAGE_META_CACHE[key] = meta
-            return meta
 
     for path in _shrinkage_sidecar_search_paths(filename):
         if not path.exists():
@@ -559,25 +488,19 @@ def _published_elo_sql(raw_col: str, sessions_col: str,
     )
 
 
-def _parquet_source_for(club_or_tournament: str) -> tuple[str, dict | None]:
+def _parquet_source_for(club_or_tournament: str) -> str:
     filename = f"acbl_{club_or_tournament.lower()}_elo_ratings.parquet"
-    if _r2_enabled():
-        bucket = os.getenv("R2_BUCKET", "").strip()
-        prefix = os.getenv("R2_PREFIX", "data").strip().strip("/")
-        key = f"{prefix}/{filename}" if prefix else filename
-        return f"s3://{bucket}/{key}", _r2_storage_options()
-
     file_path = DATA_ROOT.joinpath(filename)
     if not file_path.exists():
         raise FileNotFoundError(f"Missing file: {file_path}")
-    return str(file_path), None
+    return str(file_path)
 
 
 def load_elo_ratings_schema_map(club_or_tournament: str) -> dict:
-    source_path, storage_options = _parquet_source_for(club_or_tournament)
+    source_path = _parquet_source_for(club_or_tournament)
     if source_path in _SCHEMA_CACHE:
         return _SCHEMA_CACHE[source_path]
-    df0 = pl.read_parquet(source_path, n_rows=0, storage_options=storage_options)
+    df0 = pl.read_parquet(source_path, n_rows=0)
     _SCHEMA_CACHE[source_path] = df0.schema
     return df0.schema
 
@@ -762,7 +685,7 @@ def _load_full_frame(club_or_tournament: str) -> pl.DataFrame:
     Down-casts wasteful String / Int64 columns to Categorical / Int32.
     """
     global _DUAL_FRAME_CACHE_LOGGED
-    source_path, storage_options = _parquet_source_for(club_or_tournament)
+    source_path = _parquet_source_for(club_or_tournament)
     with _FRAME_LOCK:
         if source_path in _FRAME_CACHE:
             return _FRAME_CACHE[source_path]
@@ -792,7 +715,7 @@ def _load_full_frame(club_or_tournament: str) -> pl.DataFrame:
         )
         t0 = time.perf_counter()
         schema_map = load_elo_ratings_schema_map(club_or_tournament)
-        lf = pl.scan_parquet(source_path, storage_options=storage_options)
+        lf = pl.scan_parquet(source_path)
 
         if "Date" in schema_map:
             if schema_map["Date"] == pl.Utf8:
@@ -1642,7 +1565,7 @@ def _lazy_crossover_source(other_event: str, extra_cols: list[str] | None = None
     column pushdown so a Club report does not load/evict the Tournament cache
     (and vice versa).
     """
-    source_path, storage_options = _parquet_source_for(other_event)
+    source_path = _parquet_source_for(other_event)
     id_cols = ["Player_ID_N", "Player_ID_S", "Player_ID_E", "Player_ID_W"]
     want = [
         "session_id", "Date", "Board", "Round", "is_virtual_game", "strata_bucket",
@@ -1657,7 +1580,7 @@ def _lazy_crossover_source(other_event: str, extra_cols: list[str] | None = None
     cols = [c for c in dict.fromkeys(want) if c in schema]
     if "session_id" not in cols or not any(c in cols for c in id_cols):
         raise RuntimeError(f"crossover source missing session/player columns: {other_event}")
-    return pl.scan_parquet(source_path, storage_options=storage_options).select(cols)
+    return pl.scan_parquet(source_path).select(cols)
 
 
 def _apply_crossover_filters(
@@ -1959,7 +1882,7 @@ def acbl_report(
             t_parse_end = time.perf_counter()
 
             t_load_start = time.perf_counter()
-            source_path, _storage_options = _parquet_source_for(club_or_tournament)
+            source_path = _parquet_source_for(club_or_tournament)
             full_df = _load_full_frame(club_or_tournament)
             t_load_end = time.perf_counter()
 
@@ -2024,7 +1947,7 @@ def acbl_report(
             elapsed = (ended_at - started_at).total_seconds()
             output_rows = len(result_df)
             perf = {
-                "source": "r2" if _r2_enabled() else "local",
+                "source": "local",
                 "parse_seconds": round(t_parse_end - t_parse_start, 3),
                 "load_seconds": round(t_load_end - t_load_start, 3),
                 "filter_seconds": round(t_filter_end - t_filter_start, 3),
@@ -2134,7 +2057,7 @@ def acbl_detail(
             input_rows = len(df)
             output_rows = len(detail)
             perf = {
-                "source": "r2" if _r2_enabled() else "local",
+                "source": "local",
                 "parse_seconds": round(t_parse_end - t_parse_start, 3),
                 "load_seconds": round(t_load_end - t_load_start, 3),
                 "filter_seconds": round(t_filter_end - t_filter_start, 3),
