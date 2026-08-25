@@ -25,6 +25,7 @@ FFBRIDGE_API_BASE_URL = os.environ.get(
     "FFBRIDGE_API_BASE_URL", "http://localhost:8511"
 ).rstrip("/")
 ELO_MCP_PORT = int(os.environ.get("ELO_MCP_PORT", "8510"))
+MCP_SCHEMA_VERSION = "2026-08-25-tournament-v2"
 
 # Payload cap: MCP responses are JSON over a single HTTP exchange; thousands of
 # rows are fine, tens of thousands are not.
@@ -32,7 +33,7 @@ _MAX_TOP_N = 5000
 _MAX_HISTORY_ROWS = 500
 _API_TIMEOUT_S = 300
 
-mcp = MCPServer("elo-ratings")
+mcp = MCPServer("elo-ratings", version=MCP_SCHEMA_VERSION)
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -42,6 +43,7 @@ async def health(request: Request) -> JSONResponse:
         {
             "status": "ok",
             "service": "elo-mcp",
+            "schema_version": MCP_SCHEMA_VERSION,
             "acbl_api_base_url": ACBL_API_BASE_URL,
             "ffbridge_api_base_url": FFBRIDGE_API_BASE_URL,
         }
@@ -171,6 +173,86 @@ def ffbridge_top_pairs(
             "date_from": date_from,
             "date_to": date_to,
         },
+    )
+
+
+@mcp.tool()
+def ffbridge_top_players_v2(
+    top_n: int = 250,
+    min_games: int = 10,
+    score: str = "Scratch",
+    club: Optional[str] = None,
+    date_range: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    prior_sessions: int = 50,
+    api_backend: Optional[str] = None,
+    series_id: Optional[str] = None,
+    tournament_name: Optional[str] = None,
+    tournament: Optional[str] = None,
+    tournament_contains: Optional[str] = None,
+    player_name: Optional[str] = None,
+    player_number: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Versioned FFBridge player leaderboard schema.
+
+    tournament is an exact event-name match; tournament_contains is a
+    case- and accent-insensitive substring applied before Elo calculation.
+    """
+    return ffbridge_top_players(
+        top_n=top_n,
+        min_games=min_games,
+        score=score,
+        club=club,
+        date_range=date_range,
+        date_from=date_from,
+        date_to=date_to,
+        prior_sessions=prior_sessions,
+        api_backend=api_backend,
+        series_id=series_id,
+        tournament_name=tournament_name,
+        tournament=tournament,
+        tournament_contains=tournament_contains,
+        player_name=player_name,
+        player_number=player_number,
+    )
+
+
+@mcp.tool()
+def ffbridge_top_pairs_v2(
+    top_n: int = 250,
+    min_games: int = 10,
+    score: str = "Scratch",
+    club: Optional[str] = None,
+    date_range: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    prior_sessions: int = 50,
+    api_backend: Optional[str] = None,
+    series_id: Optional[str] = None,
+    tournament_name: Optional[str] = None,
+    tournament: Optional[str] = None,
+    tournament_contains: Optional[str] = None,
+    player_name: Optional[str] = None,
+    player_number: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Versioned FFBridge pair leaderboard schema with tournament filters."""
+    return ffbridge_top_pairs(
+        top_n=top_n,
+        min_games=min_games,
+        score=score,
+        club=club,
+        date_range=date_range,
+        date_from=date_from,
+        date_to=date_to,
+        prior_sessions=prior_sessions,
+        api_backend=api_backend,
+        series_id=series_id,
+        tournament_name=tournament_name,
+        tournament=tournament,
+        tournament_contains=tournament_contains,
+        player_name=player_name,
+        player_number=player_number,
     )
 
 

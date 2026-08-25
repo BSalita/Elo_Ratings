@@ -114,10 +114,16 @@ class FirstPartyApiBoundaryTests(unittest.TestCase):
         for tool in (
             elo_mcp_server.ffbridge_top_players,
             elo_mcp_server.ffbridge_top_pairs,
+            elo_mcp_server.ffbridge_top_players_v2,
+            elo_mcp_server.ffbridge_top_pairs_v2,
         ):
             parameters = inspect.signature(tool).parameters
             self.assertIn("tournament", parameters)
             self.assertIn("tournament_contains", parameters)
+        self.assertEqual(
+            elo_mcp_server.MCP_SCHEMA_VERSION,
+            "2026-08-25-tournament-v2",
+        )
 
     @patch("elo_mcp_server.requests.get")
     def test_ffbridge_mcp_calls_our_rest_api(self, mock_get: Mock) -> None:
