@@ -115,6 +115,7 @@ from ffbridge_report_service import (
     date_range_bounds as _date_range_bounds,
     elo_cache_key as _elo_cache_key,
     elo_cache_paths as _elo_cache_paths,
+    filter_score_available as _filter_score_available,
     filter_valid_percentages as _filter_valid_percentages_ffbridge,
     filter_results as _filter_ffbridge_results,
     legacy_elo_cache_keys as _legacy_elo_cache_keys,
@@ -1024,8 +1025,22 @@ def process_tournaments_to_elo(
             p1_name = result.get('player1_name', '')
             p2_name = result.get('player2_name', '')
             
-            # Get percentages
-            raw_pct = float(result.get('percentage', 50.0) or 50.0)
+            # Get percentages. Provisional Scratch and Handicap availability is
+            # independent; an unresolved category must never become a synthetic
+            # zero or 50%.
+            raw_pct_value = result.get('percentage')
+            try:
+                raw_pct = (
+                    float(raw_pct_value) if raw_pct_value is not None else None
+                )
+            except (ValueError, TypeError):
+                raw_pct = None
+            scratch_score_status = str(
+                result.get('scratch_score_status') or 'official'
+            )
+            handicap_score_status = str(
+                result.get('handicap_score_status') or 'scratch_only'
+            )
             handicap_pct_raw = result.get('handicap_percentage')
             # handicap_pct_raw may be None for scratch-only events
             try:
@@ -1041,16 +1056,45 @@ def process_tournaments_to_elo(
             
             club_pct_raw = result.get('club_percentage')
             try:
-                club_pct = float(club_pct_raw) if club_pct_raw is not None else (raw_pct - pe_bonus / 10.0)
+                club_pct = (
+                    float(club_pct_raw)
+                    if club_pct_raw is not None
+                    else (
+                        raw_pct - pe_bonus / 10.0
+                        if raw_pct is not None
+                        else None
+                    )
+                )
             except (ValueError, TypeError):
-                club_pct = raw_pct - pe_bonus / 10.0
+                club_pct = (
+                    raw_pct - pe_bonus / 10.0
+                    if raw_pct is not None
+                    else None
+                )
             
             # Get scratch (unhandicapped) percentage and IV bonus
             scratch_pct_raw = result.get('scratch_percentage')
             try:
-                scratch_pct = float(scratch_pct_raw) if scratch_pct_raw is not None else club_pct
+                scratch_pct = (
+                    float(scratch_pct_raw)
+                    if scratch_pct_raw is not None
+                    else club_pct
+                )
             except (ValueError, TypeError):
                 scratch_pct = club_pct
+            scratch_eligible = (
+                scratch_pct is not None
+                and scratch_score_status != 'unresolved'
+            )
+            handicap_uses_scratch = (
+                handicap_pct is None
+                and handicap_score_status != 'unresolved'
+                and scratch_eligible
+            )
+            handicap_eligible = (
+                handicap_pct is not None
+                and handicap_score_status != 'unresolved'
+            ) or handicap_uses_scratch
             
             iv_bonus_raw = result.get('iv_bonus')
             try:
@@ -1065,7 +1109,14 @@ def process_tournaments_to_elo(
             
             # We'll compute both, but use_handicap determines which is used for 'percentage' column
             # For scratch-only events (handicap_pct is None), always use scratch
-            percentage = handicap_pct if (use_handicap and handicap_pct is not None) else scratch_pct
+            if use_handicap:
+                percentage = (
+                    handicap_pct
+                    if handicap_pct is not None
+                    else (scratch_pct if handicap_uses_scratch else None)
+                )
+            else:
+                percentage = scratch_pct if scratch_eligible else None
             
             rank_club = result.get('rank') or 0
             rank_handicap = result.get('theoretical_rank') or 0
@@ -1106,11 +1157,18 @@ def process_tournaments_to_elo(
                 'player1_name': str(p1_name),
                 'player2_name': str(p2_name),
                 'pair_name': str(pair_name),
-                'percentage': float(percentage),
+                'percentage': float(percentage) if percentage is not None else None,
                 'handicap_percentage': float(handicap_pct) if handicap_pct is not None else None,
-                'scratch_percentage': float(scratch_pct),
+                'scratch_percentage': float(scratch_pct) if scratch_pct is not None else None,
                 'iv_bonus': float(iv_bonus),
-                'club_percentage': float(club_pct),
+                'club_percentage': float(club_pct) if club_pct is not None else None,
+                'national_scratch_percentage': result.get('national_scratch_percentage'),
+                'national_handicap_percentage': result.get('national_handicap_percentage'),
+                'score_source': str(result.get('score_source') or 'national_official'),
+                'score_status': str(result.get('score_status') or 'official'),
+                'scratch_score_status': scratch_score_status,
+                'handicap_score_status': handicap_score_status,
+                'score_source_url': result.get('score_source_url'),
                 'rank': int(rank) if rank is not None else 0,
                 'rank_without_handicap': int(rank_club) if rank_club is not None else 0,
                 'theoretical_rank': int(rank_handicap) if rank_handicap is not None else 0,
@@ -1145,7 +1203,16 @@ def process_tournaments_to_elo(
             if p1_id:
                 # Scratch Elo - calculate in original range, don't scale during calculation
                 scratch_r1_before = scratch_ratings.get(p1_id, DEFAULT_ELO)
-                scratch_r1_after = calculate_elo_from_percentage(scratch_r1_before, scratch_pct, scratch_field_avg, field_strength_scale=scratch_field_strength)
+                scratch_r1_after = (
+                    calculate_elo_from_percentage(
+                        scratch_r1_before,
+                        scratch_pct,
+                        scratch_field_avg,
+                        field_strength_scale=scratch_field_strength,
+                    )
+                    if scratch_eligible
+                    else scratch_r1_before
+                )
                 scratch_ratings[p1_id] = scratch_r1_after
                 
                 # Handicap Elo (use scratch if handicap not available)
@@ -1153,7 +1220,16 @@ def process_tournaments_to_elo(
                 h_pct_for_elo = handicap_pct if handicap_pct is not None else scratch_pct
                 h_field_for_elo = handicap_field_avg if handicap_pct is not None else scratch_field_avg
                 h_strength_for_elo = handicap_field_strength if handicap_pct is not None else scratch_field_strength
-                handicap_r1_after = calculate_elo_from_percentage(handicap_r1_before, h_pct_for_elo, h_field_for_elo, field_strength_scale=h_strength_for_elo)
+                handicap_r1_after = (
+                    calculate_elo_from_percentage(
+                        handicap_r1_before,
+                        h_pct_for_elo,
+                        h_field_for_elo,
+                        field_strength_scale=h_strength_for_elo,
+                    )
+                    if handicap_eligible
+                    else handicap_r1_before
+                )
                 handicap_ratings[p1_id] = handicap_r1_after
                 
                 # Scale Elo values for display (calculations done in original range)
@@ -1166,25 +1242,35 @@ def process_tournaments_to_elo(
                 result_record['player1_elo_after'] = scale_to_chess_range(handicap_r1_after if use_handicap else scratch_r1_after)
                 
                 player_names[p1_id] = p1_name
-                player_games[p1_id] = player_games.get(p1_id, 0) + 1
-                
-                n = player_pct_n.get(p1_id, 0) + 1
-                mean = player_pct_mean.get(p1_id, 0.0)
-                m2 = player_pct_m2.get(p1_id, 0.0)
-                x = float(percentage)
-                delta = x - mean
-                mean += delta / n
-                delta2 = x - mean
-                m2 += delta * delta2
-                player_pct_n[p1_id] = n
-                player_pct_mean[p1_id] = mean
-                player_pct_m2[p1_id] = m2
+                if percentage is not None:
+                    player_games[p1_id] = player_games.get(p1_id, 0) + 1
+
+                    n = player_pct_n.get(p1_id, 0) + 1
+                    mean = player_pct_mean.get(p1_id, 0.0)
+                    m2 = player_pct_m2.get(p1_id, 0.0)
+                    x = float(percentage)
+                    delta = x - mean
+                    mean += delta / n
+                    delta2 = x - mean
+                    m2 += delta * delta2
+                    player_pct_n[p1_id] = n
+                    player_pct_mean[p1_id] = mean
+                    player_pct_m2[p1_id] = m2
             
             # Update player 2 ratings (BOTH scratch and handicap)
             if p2_id:
                 # Scratch Elo - calculate in original range, don't scale during calculation
                 scratch_r2_before = scratch_ratings.get(p2_id, DEFAULT_ELO)
-                scratch_r2_after = calculate_elo_from_percentage(scratch_r2_before, scratch_pct, scratch_field_avg, field_strength_scale=scratch_field_strength)
+                scratch_r2_after = (
+                    calculate_elo_from_percentage(
+                        scratch_r2_before,
+                        scratch_pct,
+                        scratch_field_avg,
+                        field_strength_scale=scratch_field_strength,
+                    )
+                    if scratch_eligible
+                    else scratch_r2_before
+                )
                 scratch_ratings[p2_id] = scratch_r2_after
                 
                 # Handicap Elo (use scratch if handicap not available)
@@ -1192,7 +1278,16 @@ def process_tournaments_to_elo(
                 h_pct_for_elo = handicap_pct if handicap_pct is not None else scratch_pct
                 h_field_for_elo = handicap_field_avg if handicap_pct is not None else scratch_field_avg
                 h_strength_for_elo = handicap_field_strength if handicap_pct is not None else scratch_field_strength
-                handicap_r2_after = calculate_elo_from_percentage(handicap_r2_before, h_pct_for_elo, h_field_for_elo, field_strength_scale=h_strength_for_elo)
+                handicap_r2_after = (
+                    calculate_elo_from_percentage(
+                        handicap_r2_before,
+                        h_pct_for_elo,
+                        h_field_for_elo,
+                        field_strength_scale=h_strength_for_elo,
+                    )
+                    if handicap_eligible
+                    else handicap_r2_before
+                )
                 handicap_ratings[p2_id] = handicap_r2_after
                 
                 # Scale Elo values for display (calculations done in original range)
@@ -1205,19 +1300,20 @@ def process_tournaments_to_elo(
                 result_record['player2_elo_after'] = scale_to_chess_range(handicap_r2_after if use_handicap else scratch_r2_after)
                 
                 player_names[p2_id] = p2_name
-                player_games[p2_id] = player_games.get(p2_id, 0) + 1
-                
-                n = player_pct_n.get(p2_id, 0) + 1
-                mean = player_pct_mean.get(p2_id, 0.0)
-                m2 = player_pct_m2.get(p2_id, 0.0)
-                x = float(percentage)
-                delta = x - mean
-                mean += delta / n
-                delta2 = x - mean
-                m2 += delta * delta2
-                player_pct_n[p2_id] = n
-                player_pct_mean[p2_id] = mean
-                player_pct_m2[p2_id] = m2
+                if percentage is not None:
+                    player_games[p2_id] = player_games.get(p2_id, 0) + 1
+
+                    n = player_pct_n.get(p2_id, 0) + 1
+                    mean = player_pct_mean.get(p2_id, 0.0)
+                    m2 = player_pct_m2.get(p2_id, 0.0)
+                    x = float(percentage)
+                    delta = x - mean
+                    mean += delta / n
+                    delta2 = x - mean
+                    m2 += delta * delta2
+                    player_pct_n[p2_id] = n
+                    player_pct_mean[p2_id] = mean
+                    player_pct_m2[p2_id] = m2
             
             # Calculate pair Elo (both types)
             if p1_id and p2_id:
@@ -1234,6 +1330,33 @@ def process_tournaments_to_elo(
     cache_stats["processed_tournament_ids"] = [
         str(t.get("id")) for t in sorted_tournaments if t.get("id") is not None
     ]
+    cache_stats.update({
+        "official_rows": sum(
+            row.get("score_status") == "official" for row in all_results
+        ),
+        "provisional_rows": sum(
+            row.get("score_status") == "provisional" for row in all_results
+        ),
+        "unresolved_rows": sum(
+            row.get("score_status") == "unresolved" for row in all_results
+        ),
+        "provisional_scratch_rows": sum(
+            row.get("scratch_score_status") == "provisional"
+            for row in all_results
+        ),
+        "provisional_handicap_rows": sum(
+            row.get("handicap_score_status") == "provisional"
+            for row in all_results
+        ),
+        "unresolved_scratch_rows": sum(
+            row.get("scratch_score_status") == "unresolved"
+            for row in all_results
+        ),
+        "unresolved_handicap_rows": sum(
+            row.get("handicap_score_status") == "unresolved"
+            for row in all_results
+        ),
+    })
     print(f"[Processing] done: {total_t} tournaments in {_elapsed:.1f}s "
           f"(cached={cache_stats['cached']} fetched={cache_stats['fetched']} "
           f"missing={len(cache_stats['missing_ids'])}, rows={len(all_results)})", flush=True)
@@ -1266,6 +1389,13 @@ def process_tournaments_to_elo(
             'scratch_percentage': pl.Float64,
             'iv_bonus': pl.Float64,
             'club_percentage': pl.Float64,
+            'national_scratch_percentage': pl.Float64,
+            'national_handicap_percentage': pl.Float64,
+            'score_source': pl.Utf8,
+            'score_status': pl.Utf8,
+            'scratch_score_status': pl.Utf8,
+            'handicap_score_status': pl.Utf8,
+            'score_source_url': pl.Utf8,
             'rank': pl.Int64,
             'rank_without_handicap': pl.Int64,
             'theoretical_rank': pl.Int64,
@@ -1410,8 +1540,8 @@ def _elo_cache_meta_paths(api_key: str, fetch_iv: bool) -> List[pathlib.Path]:
     seen: set[pathlib.Path] = set()
     paths: List[pathlib.Path] = []
     for pattern in (
-        f"elo_full_v3_{api_key}_iv_{iv}.meta.json",
-        f"elo_full_v3_{api_key}_*_iv_{iv}.meta.json",
+        f"elo_full_v4_{api_key}_iv_{iv}.meta.json",
+        f"elo_full_v4_{api_key}_*_iv_{iv}.meta.json",
     ):
         for meta_path in _FFBRIDGE_ELO_CACHE_DIR.glob(pattern):
             if meta_path not in seen:
@@ -1567,6 +1697,23 @@ def _needs_elo_rebuild(
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except Exception:
         return True, "incomplete parquet metadata"
+    stats = meta.get("processing_stats") or {}
+    has_pending_scores = any(
+        int(stats.get(field, 0) or 0) > 0
+        for field in (
+            "provisional_rows",
+            "unresolved_scratch_rows",
+            "unresolved_handicap_rows",
+        )
+    )
+    if (
+        has_pending_scores
+        and age >= lancelot_api.PENDING_RESULTS_CACHE_HOURS
+    ):
+        return True, (
+            f"pending scores due for refresh ({age:.1f}h >= "
+            f"{lancelot_api.PENDING_RESULTS_CACHE_HOURS}h)"
+        )
     built_ids = {str(x) for x in meta.get("processed_tournament_ids", [])}
 
     if built_ids:
@@ -1857,6 +2004,7 @@ def _ffbridge_dataset_summary_line(
         f"cached {processing_stats.get('cached', 0)}",
         f"fetched {processing_stats.get('fetched', 0)}",
         f"missing results {missing_str}",
+        f"provisional rows {processing_stats.get('provisional_rows', 0)}",
         f"{n_tournaments} tournaments",
         f"{result_rows:,} result rows",
     ]
@@ -1953,7 +2101,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
         return
     score_type = st.session_state.get("elo_score_type", "Scratch")
     use_handicap = score_type == "Handicap"
-    results_df = ctx["results_df"]
+    results_df = _filter_score_available(ctx["results_df"], use_handicap)
     players_df = _aggregate_players_from_results_cached(results_df, use_handicap)
     _load_debug_log(
         f"leaderboard panel: aggregated players ({players_df.height} rows, "
@@ -1971,6 +2119,20 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
     if results_df.is_empty():
         st.info("No results found for the selected filters.")
         return
+    provisional_rows = (
+        results_df.filter(pl.col("score_status") == "provisional").height
+        if "score_status" in results_df.columns
+        else 0
+    )
+    st.caption(
+        "Avg_Scratch is the arithmetic mean of Scratch_% values used in this "
+        "filtered rating sample."
+    )
+    if provisional_rows:
+        st.warning(
+            f"{provisional_rows} result row(s) use provisional club scores. "
+            "They will be replaced and Elo replayed after national publication."
+        )
     if date_range_choice != "All time":
         dr_from = ctx.get("date_from")
         dr_to = ctx.get("date_to")
@@ -2087,6 +2249,9 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                     (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_%'),
                                     (pl.col('iv_bonus') if 'iv_bonus' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(1).alias('IV_Bonus'),
                                     ((pl.col('handicap_field_strength') if use_handicap else pl.col('scratch_field_strength')) if (('handicap_field_strength' if use_handicap else 'scratch_field_strength') in player_results.columns) else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(3).alias('Field_Strength'),
+                                    (pl.col('score_status') if 'score_status' in player_results.columns else pl.lit('official')).alias('Score_Status'),
+                                    (pl.col('score_source') if 'score_source' in player_results.columns else pl.lit('national_official')).alias('Score_Source'),
+                                    (pl.col('score_source_url') if 'score_source_url' in player_results.columns else pl.lit(None, dtype=pl.Utf8)).alias('Score_Source_URL'),
                                 ]
                                 # Pct_Used: use handicap if requested AND not null, otherwise scratch
                                 if use_handicap and 'handicap_percentage' in player_results.columns:
@@ -2125,8 +2290,6 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                 if 'club_id' in player_results.columns:
                                     helper_cols.append(pl.col('club_id').alias('_club_id'))
                                 detail_df = player_results.select(cols_to_select + helper_cols)
-                                # Optional reconciliation: for Octopus, prefer BridgeInterNet scratch/handicap when matchable.
-                                detail_df = _maybe_override_octopus_pct_rows(detail_df, pair_name=player_name, use_handicap=use_handicap)
 
                                 st.caption("Click a row to see tournament opponents")
                                 # Hide helper columns from display
@@ -2254,6 +2417,9 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                     (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_%'),
                                     (pl.col('iv_bonus') if 'iv_bonus' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(1).alias('IV_Bonus'),
                                     ((pl.col('handicap_field_strength') if use_handicap else pl.col('scratch_field_strength')) if (('handicap_field_strength' if use_handicap else 'scratch_field_strength') in pair_results.columns) else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(3).alias('Field_Strength'),
+                                    (pl.col('score_status') if 'score_status' in pair_results.columns else pl.lit('official')).alias('Score_Status'),
+                                    (pl.col('score_source') if 'score_source' in pair_results.columns else pl.lit('national_official')).alias('Score_Source'),
+                                    (pl.col('score_source_url') if 'score_source_url' in pair_results.columns else pl.lit(None, dtype=pl.Utf8)).alias('Score_Source_URL'),
                                 ]
                                 # Pct_Used: use handicap if requested AND not null, otherwise scratch
                                 if use_handicap and 'handicap_percentage' in pair_results.columns:
@@ -2293,8 +2459,6 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                 if 'club_id' in pair_results.columns:
                                     helper_cols.append(pl.col('club_id').alias('_club_id'))
                                 detail_df = pair_results.select(cols_to_select + helper_cols)
-                                # Optional reconciliation: for Octopus, prefer BridgeInterNet scratch/handicap when matchable.
-                                detail_df = _maybe_override_octopus_pct_rows(detail_df, pair_name=pair_name, use_handicap=use_handicap)
 
                                 st.caption("Click a row to see tournament opponents")
                                 # Hide helper columns from display

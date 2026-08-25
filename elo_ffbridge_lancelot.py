@@ -15,6 +15,11 @@ import requests
 import streamlit as st
 import polars as pl
 
+from ffbridge_provisional_scores import (
+    fetch_provisional_pair_percentages,
+    national_ranking_is_pending,
+)
+
 # Import shared utilities
 from elo_ffbridge_common import (
     SERIES_NAMES,
@@ -49,6 +54,7 @@ print(
 
 REQUEST_TIMEOUT = 10  # seconds (reduced from 30 to fail faster on hung requests)
 REQUEST_DELAY = 0.1  # seconds between API requests
+PENDING_RESULTS_CACHE_HOURS = 6
 
 # Lancelot ID to Migration ID (FFBridge series ID) mapping (shared)
 LANCELOT_TO_MIGRATION = mlBridgeFFLib.LANCELOT_TO_MIGRATION
@@ -205,27 +211,60 @@ def fetch_tournament_results(session_id: str, tournament_date: str = "", series_
     date_part = date_match.group(1) if date_match else ""
     friendly_name = f"ranking_{session_id}_{date_part}" if date_part else f"ranking_{session_id}"
     
-    # Check disk cache
-    cached_data = load_from_disk_cache(CACHE_DIR, friendly_name, max_age_hours=None, series_id=series_id)
+    # Finalized national results are immutable for normal operation. Pending
+    # zero-shell rankings get a short TTL so later national publication replaces
+    # provisional club values on the next full Elo replay.
+    cached_data = load_from_disk_cache(
+        CACHE_DIR, friendly_name, max_age_hours=None, series_id=series_id
+    )
     if cached_data:
-        return _normalize_ranking_results(cached_data, series_id=series_id), True
+        if national_ranking_is_pending(cached_data):
+            cached_data = load_from_disk_cache(
+                CACHE_DIR,
+                friendly_name,
+                max_age_hours=PENDING_RESULTS_CACHE_HOURS,
+                series_id=series_id,
+            )
+        if cached_data:
+            return _normalize_ranking_results(
+                cached_data,
+                series_id=series_id,
+                tournament_date=tournament_date,
+            ), True
     
     # Fetch from API
     data = lancelot_get(f"/results/sessions/{session_id}/ranking")
     
     if data and isinstance(data, list):
         save_to_disk_cache(CACHE_DIR, friendly_name, data, series_id=series_id)
-        return _normalize_ranking_results(data, series_id=series_id), False
+        return _normalize_ranking_results(
+            data,
+            series_id=series_id,
+            tournament_date=tournament_date,
+        ), False
     
     return [], False
 
 
-def _normalize_ranking_results(ranking: List[Dict[str, Any]], series_id: Optional[Any] = None) -> List[Dict[str, Any]]:
+def _normalize_ranking_results(
+    ranking: List[Dict[str, Any]],
+    series_id: Optional[Any] = None,
+    tournament_date: str = "",
+) -> List[Dict[str, Any]]:
     """Normalize Lancelot ranking data to common result format."""
     results = []
-    
+
     # Check if this is an Octopus tournament (series_id 386)
-    is_octopus = series_id == 386
+    normalized_series_id = normalize_series_id(series_id)
+    is_octopus = normalized_series_id == 386
+    national_pending = national_ranking_is_pending(ranking)
+    provisional_scores = (
+        fetch_provisional_pair_percentages(
+            ranking, tournament_date, normalized_series_id
+        )
+        if national_pending
+        else {}
+    )
     
     for entry in ranking:
         if not isinstance(entry, dict):
@@ -246,35 +285,73 @@ def _normalize_ranking_results(ranking: List[Dict[str, Any]], series_id: Optiona
         p1_name = f"{p1.get('firstName', '')} {p1.get('lastName', '')}".strip()
         p2_name = f"{p2.get('firstName', '')} {p2.get('lastName', '')}".strip()
         
-        pct = float(entry.get('sessionScore') or entry.get('totalScore') or 0)
+        national_pct_raw = (
+            entry.get('sessionScore')
+            if entry.get('sessionScore') is not None
+            else entry.get('totalScore')
+        )
+        national_pct = (
+            float(national_pct_raw) if national_pct_raw is not None else None
+        )
         pe_bonus_raw = float(entry.get('peBonus') or 0)
-        
+
         # Derive IV bonus (peBonus is in tenths of a percent)
         iv_bonus = pe_bonus_raw / 10.0
-        
-        # Determine scratch and handicap percentages
-        # Only treat as handicapped if:
-        # 1. It's Octopus tournament (has verified handicap scoring), OR
-        # 2. iv_bonus > 0 (actual bonus being applied)
-        # Otherwise, tournament only has scratch scores (handicap = scratch)
-        has_handicap_scoring = is_octopus or iv_bonus > 0
-        
-        if has_handicap_scoring:
-            # Assume pct is handicap-adjusted, derive scratch
-            scratch_pct = pct - iv_bonus
-            handicap_pct = pct
+
+        team_id = str(team.get('id', ''))
+        if national_pending:
+            provisional = provisional_scores.get(team_id, {})
+            scratch_pct = provisional.get("scratch_percentage")
+            handicap_pct = provisional.get("handicap_percentage")
+            if scratch_pct is not None and handicap_pct is not None:
+                iv_bonus = float(handicap_pct) - float(scratch_pct)
+            scratch_status = "provisional" if scratch_pct is not None else "unresolved"
+            handicap_status = (
+                "provisional" if handicap_pct is not None else "unresolved"
+            )
+            has_provisional_score = (
+                scratch_pct is not None or handicap_pct is not None
+            )
+            score_source = (
+                "club_provisional" if has_provisional_score else "unresolved"
+            )
+            score_status = (
+                "provisional" if has_provisional_score else "unresolved"
+            )
+            source_url = (
+                provisional.get("scratch_url")
+                or provisional.get("handicap_url")
+            )
+            pct = scratch_pct
         else:
-            # No handicap scoring - only scratch scores
-            # Set handicap to None to indicate scratch-only event
-            scratch_pct = pct
-            handicap_pct = None
+            pct = national_pct
+            # Determine scratch and handicap percentages
+            # Only treat as handicapped if:
+            # 1. It's Octopus tournament (has verified handicap scoring), OR
+            # 2. iv_bonus > 0 (actual bonus being applied)
+            # Otherwise, tournament only has scratch scores (handicap = scratch)
+            has_handicap_scoring = is_octopus or iv_bonus > 0
+            if has_handicap_scoring and pct is not None:
+                # Assume pct is handicap-adjusted, derive scratch
+                scratch_pct = pct - iv_bonus
+                handicap_pct = pct
+                handicap_status = "official"
+            else:
+                # No handicap scoring - only scratch scores
+                scratch_pct = pct
+                handicap_pct = None
+                handicap_status = "scratch_only"
+            scratch_status = "official" if scratch_pct is not None else "unresolved"
+            score_source = "national_official"
+            score_status = "official"
+            source_url = None
         
         # Normalize club code using shared utility
         club_code = normalize_club_code(entry.get('simultaneousId', ''))
         
         results.append({
-            'team_id': str(team.get('id', '')),
-            'pair_id': str(team.get('id', '')),
+            'team_id': team_id,
+            'pair_id': team_id,
             'player1_id': p1_id,
             'player2_id': p2_id,
             # Preserve every Lancelot identity namespace for the shared
@@ -289,9 +366,20 @@ def _normalize_ranking_results(ranking: List[Dict[str, Any]], series_id: Optiona
             'player2_name': p2_name,
             'percentage': pct,
             'handicap_percentage': handicap_pct,
-            'scratch_percentage': scratch_pct,  # Derived unhandicapped score
+            'scratch_percentage': scratch_pct,
             'iv_bonus': iv_bonus,  # Derived IV bonus (percentage points)
-            'club_percentage': scratch_pct,  # Club % is same as scratch
+            'club_percentage': scratch_pct,
+            'national_scratch_percentage': (
+                scratch_pct if not national_pending else None
+            ),
+            'national_handicap_percentage': (
+                handicap_pct if not national_pending else None
+            ),
+            'score_source': score_source,
+            'score_status': score_status,
+            'scratch_score_status': scratch_status,
+            'handicap_score_status': handicap_status,
+            'score_source_url': source_url,
             'rank': entry.get('rank', 0),
             'theoretical_rank': entry.get('rankWithoutHandicap'),
             'pe': entry.get('pe', 0),

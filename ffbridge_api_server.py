@@ -30,6 +30,7 @@ def health() -> dict:
         "service": "ffbridge-api",
         "dataset_built_at": info.get("built_at"),
         "result_rows": info.get("result_rows"),
+        "score_provenance": info.get("score_provenance", {}),
     }
 
 

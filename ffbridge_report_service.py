@@ -129,12 +129,12 @@ def elo_cache_key(api_key: str, fetch_iv: bool, n_tournaments: int = 0) -> str:
     sessions even when no new past events existed.
     """
     del n_tournaments
-    return f"elo_full_v3_{api_key}_iv_{int(fetch_iv)}"
+    return f"elo_full_v4_{api_key}_iv_{int(fetch_iv)}"
 
 
 def legacy_elo_cache_keys(api_key: str, fetch_iv: bool) -> List[str]:
     """Parquet keys from before the stable-key change (middle segment = list length)."""
-    prefix = f"elo_full_v3_{api_key}_"
+    prefix = f"elo_full_v4_{api_key}_"
     suffix = f"_iv_{int(fetch_iv)}"
     keys: List[str] = []
     for meta_path in ELO_CACHE_DIR.glob(f"{prefix}*{suffix}.meta.json"):
@@ -238,6 +238,7 @@ def dataset_info(api_key: Optional[str] = None, fetch_iv: bool = True) -> Dict[s
         "date_max": date_max,
         "clubs": clubs,
         "processing_stats": meta.get("processing_stats", {}),
+        "score_provenance": score_provenance_counts(results_df),
         "date_range_options": list(DATE_RANGE_OPTIONS),
         "api_backends": list(API_BACKEND_KEYS),
         "tournament_series": [
@@ -303,6 +304,56 @@ def filter_valid_percentages(df: pl.DataFrame) -> pl.DataFrame:
         valid_expr = valid_expr & (col.is_null() | ((col >= 0.0) & (col <= 100.0)))
 
     return df.filter(valid_expr)
+
+
+def filter_score_available(df: pl.DataFrame, use_handicap: bool) -> pl.DataFrame:
+    """Exclude only categories explicitly unresolved during publication."""
+    status_column = (
+        "handicap_score_status" if use_handicap else "scratch_score_status"
+    )
+    if df.is_empty() or status_column not in df.columns:
+        return df
+    return df.filter(
+        pl.col(status_column).is_null()
+        | (pl.col(status_column).cast(pl.Utf8) != "unresolved")
+    )
+
+
+def score_provenance_counts(df: pl.DataFrame) -> Dict[str, int]:
+    """Compact score-source diagnostics for API/UI metadata."""
+    if df.is_empty():
+        return {
+            "official_rows": 0,
+            "provisional_rows": 0,
+            "unresolved_rows": 0,
+            "provisional_scratch_rows": 0,
+            "provisional_handicap_rows": 0,
+            "unresolved_scratch_rows": 0,
+            "unresolved_handicap_rows": 0,
+        }
+
+    def _count(column: str, value: str) -> int:
+        if column not in df.columns:
+            return 0
+        return df.filter(pl.col(column).cast(pl.Utf8) == value).height
+
+    return {
+        "official_rows": _count("score_status", "official"),
+        "provisional_rows": _count("score_status", "provisional"),
+        "unresolved_rows": _count("score_status", "unresolved"),
+        "provisional_scratch_rows": _count(
+            "scratch_score_status", "provisional"
+        ),
+        "provisional_handicap_rows": _count(
+            "handicap_score_status", "provisional"
+        ),
+        "unresolved_scratch_rows": _count(
+            "scratch_score_status", "unresolved"
+        ),
+        "unresolved_handicap_rows": _count(
+            "handicap_score_status", "unresolved"
+        ),
+    }
 
 
 def filter_results(
@@ -423,6 +474,7 @@ def aggregate_players_from_results(results_df: pl.DataFrame, use_handicap: bool)
                 scratch_percentage,
                 handicap_percentage,
                 iv_bonus,
+                score_status,
                 date
             FROM results_df
             UNION ALL
@@ -435,6 +487,7 @@ def aggregate_players_from_results(results_df: pl.DataFrame, use_handicap: bool)
                 scratch_percentage,
                 handicap_percentage,
                 iv_bonus,
+                score_status,
                 date
             FROM results_df
         )
@@ -445,6 +498,8 @@ def aggregate_players_from_results(results_df: pl.DataFrame, use_handicap: bool)
             ROUND(ARG_MAX(COALESCE(handicap_elo, scratch_elo), date), 1) AS handicap_elo,
             ROUND(ARG_MAX(elo_rating, date), 1) AS elo_rating,
             COUNT(*) AS games_played,
+            SUM(CASE WHEN score_status = 'provisional' THEN 1 ELSE 0 END)
+                AS provisional_games,
             ROUND(AVG(scratch_percentage), 2) AS avg_scratch_pct,
             ROUND(AVG(COALESCE(handicap_percentage, scratch_percentage)), 2) AS avg_handicap_pct,
             ROUND(AVG(iv_bonus), 1) AS avg_iv_bonus,
@@ -565,7 +620,8 @@ def show_top_players(
             ROUND(avg_handicap_pct, 1) AS Avg_Handicap,
             ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,
             ROUND(stdev_percentage, 1) AS Pct_Stdev,
-            CAST(games_played AS INTEGER) AS Games
+            CAST(games_played AS INTEGER) AS Games,
+            CAST(provisional_games AS INTEGER) AS Provisional_Games
         FROM ranked
         ORDER BY Rank ASC
         LIMIT {top_n}
@@ -754,7 +810,9 @@ def show_top_pairs(
                 AVG(iv_bonus) AS avg_iv_bonus,
                 AVG({pct_col}) AS avg_percentage,
                 STDDEV_SAMP({pct_col}) AS stdev_percentage,
-                COUNT(*) AS games_played
+                COUNT(*) AS games_played,
+                SUM(CASE WHEN score_status = 'provisional' THEN 1 ELSE 0 END)
+                    AS provisional_games
             FROM results_df
             GROUP BY pair_id
         ),
@@ -797,7 +855,8 @@ def show_top_pairs(
             ROUND(avg_handicap_pct, 1) AS Avg_Handicap,
             ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,
             ROUND(stdev_percentage, 1) AS Pct_Stdev,
-            CAST(games_played AS INTEGER) AS Games
+            CAST(games_played AS INTEGER) AS Games,
+            CAST(provisional_games AS INTEGER) AS Provisional_Games
         FROM with_player_titles
         ORDER BY Rank ASC
         LIMIT {top_n}
@@ -814,7 +873,8 @@ def show_top_pairs(
             ROUND(avg_handicap_pct, 1) AS Avg_Handicap,
             ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,
             ROUND(stdev_percentage, 1) AS Pct_Stdev,
-            CAST(games_played AS INTEGER) AS Games
+            CAST(games_played AS INTEGER) AS Games,
+            CAST(provisional_games AS INTEGER) AS Provisional_Games
         FROM ranked
         ORDER BY Rank ASC
         LIMIT {top_n}
@@ -877,6 +937,8 @@ def run_leaderboard_report(
         date_from=date_from,
         date_to=date_to,
     )
+    provenance = score_provenance_counts(results_df)
+    results_df = filter_score_available(results_df, use_handicap)
 
     if rating == "Players":
         players_df = aggregate_players_from_results(results_df, use_handicap)
@@ -922,6 +984,7 @@ def run_leaderboard_report(
         "date_to": date_to,
         "filtered_result_rows": results_df.height,
         "dataset_built_at": meta.get("built_at"),
+        "score_provenance": provenance,
     }
 
 
@@ -947,6 +1010,8 @@ def run_player_history(
         "date", "tournament_id", "club_name", "pair_id", "pair_name",
         "player1_id", "player1_name", "player2_id", "player2_name",
         "scratch_percentage", "handicap_percentage", "iv_bonus", "rank",
+        "score_source", "score_status", "scratch_score_status",
+        "handicap_score_status", "score_source_url",
         "player1_scratch_elo_after", "player2_scratch_elo_after",
         "player1_handicap_elo_after", "player2_handicap_elo_after",
     ]

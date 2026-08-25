@@ -24,10 +24,9 @@ What a rebuild does (and does NOT) refresh
 ------------------------------------------
 - Tournament LIST: fully re-fetched from the API (``force_refresh=True``) to
   discover new event IDs.
-- Event RESULTS (raw data): INCREMENTAL. ``fetch_tournament_results`` reads the
-  on-disk cache first (``max_age_hours=None`` — never expires), so only new/
-  uncached events hit the API; previously fetched events are served from the
-  volume cache and are never re-downloaded.
+- Event RESULTS (raw data): INCREMENTAL. Finalized events retain their on-disk
+  cache, while Lancelot rankings identified as unpublished zero shells expire
+  after six hours and are re-fetched.
 - Elo ratings: FULL recompute from scratch over the entire history every time
   (``initial_players=None``). Elo is order-dependent, so a newly inserted event
   can shift the whole downstream chain — ratings are replayed, not appended.
@@ -49,8 +48,8 @@ cache on the volume so they are re-downloaded on the next rebuild, e.g.:
     #   Lancelot: $FFBRIDGE_CACHE_DIR/lancelot_cache/**/results_*.json
     # then trigger a rebuild (redeploy, or run this builder without --if-stale).
 
-There is no per-results expiry/force flag today; add one to
-``fetch_tournament_results`` if periodic re-fetching of amended events is needed.
+Finalized results remain immutable in normal operation. Delete their raw cache
+entry explicitly if an already-published event is amended upstream.
 
 Usage:
     python build_ffbridge_elo_parquets.py                 # force build all backends
@@ -158,8 +157,8 @@ def _prune_other_fetch_iv(api_key: str, fetch_iv: bool) -> None:
     cache_dir = app._FFBRIDGE_ELO_CACHE_DIR
     iv = int(fetch_iv)
     patterns = (
-        f"elo_full_v3_{api_key}_iv_{other}.results.parquet",
-        f"elo_full_v3_{api_key}_*_iv_{other}.results.parquet",
+        f"elo_full_v4_{api_key}_iv_{other}.results.parquet",
+        f"elo_full_v4_{api_key}_*_iv_{other}.results.parquet",
     )
     try:
         seen: set[pathlib.Path] = set()
@@ -178,6 +177,30 @@ def _prune_other_fetch_iv(api_key: str, fetch_iv: bool) -> None:
         print(f"[builder] orphan prune skipped for {api_key}: {exc}", flush=True)
 
 
+def _persisted_dataset_has_pending_scores(
+    api_key: str,
+    fetch_iv: bool,
+) -> bool:
+    """Whether the current parquet metadata contains provisional/unresolved rows."""
+    for meta_path in app._elo_cache_meta_paths(api_key, fetch_iv):
+        try:
+            stats = json.loads(meta_path.read_text(encoding="utf-8")).get(
+                "processing_stats", {}
+            )
+        except (OSError, json.JSONDecodeError):
+            continue
+        if any(
+            int(stats.get(field, 0) or 0) > 0
+            for field in (
+                "provisional_rows",
+                "unresolved_scratch_rows",
+                "unresolved_handicap_rows",
+            )
+        ):
+            return True
+    return False
+
+
 def build_one(api_name: str, fetch_iv: bool, if_stale: bool = False, max_age_hours: float = 20.0) -> int:
     """Build and persist the dataset for a single API backend.
 
@@ -192,15 +215,31 @@ def build_one(api_name: str, fetch_iv: bool, if_stale: bool = False, max_age_hou
 
     if if_stale:
         age = _newest_persisted_age_hours(api_key, fetch_iv)
+        pending_refresh_due = (
+            api_module is app.lancelot_api
+            and age is not None
+            and age >= app.lancelot_api.PENDING_RESULTS_CACHE_HOURS
+            and _persisted_dataset_has_pending_scores(api_key, fetch_iv)
+        )
         index_missing = (
             api_module is app.lancelot_api
             and not _lancelot_player_session_index_ready()
         )
-        if age is not None and age < max_age_hours and not index_missing:
+        if (
+            age is not None
+            and age < max_age_hours
+            and not index_missing
+            and not pending_refresh_due
+        ):
             print(f"[builder] {api_name}: cache fresh ({age:.1f}h < {max_age_hours}h); skipping", flush=True)
             return -1
         if index_missing:
             reason = "shared player-session index missing"
+        elif pending_refresh_due:
+            reason = (
+                f"pending scores due for refresh ({age:.1f}h >= "
+                f"{app.lancelot_api.PENDING_RESULTS_CACHE_HOURS}h)"
+            )
         else:
             reason = "missing" if age is None else f"stale ({age:.1f}h)"
         print(f"[builder] {api_name}: cache {reason}; rebuilding", flush=True)
