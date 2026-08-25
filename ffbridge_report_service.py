@@ -1,7 +1,7 @@
 """Headless FFBridge Elo report service.
 
-Single source of truth for the FFBridge leaderboard logic, shared by
-streamlit_app_ffbridge_elo_ratings.py (UI) and elo_mcp_server.py (MCP tools).
+Single source of truth for the FFBridge leaderboard logic, used by the
+Streamlit app and first-party FFBridge REST API. MCP calls that REST API.
 Reads the persisted Elo parquet set (written by build_ffbridge_elo_parquets.py
 / compute_and_persist_elo_dataset) and runs the leaderboard SQL. No Streamlit
 imports here.
@@ -15,6 +15,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 import polars as pl
+
+from elo_filter_common import (
+    filter_ffbridge_leaderboard,
+    filter_fuzzy_text,
+    filter_normalized_substring,
+    fuzzy_text_score,
+)
 
 # Directory for the persisted (precomputed) Elo dataset parquets. In production
 # set FFBRIDGE_CACHE_DIR to a persistent mount (e.g. /data/ffbridge) so the raw
@@ -46,6 +53,46 @@ DEFAULT_TOP_N = 250
 DEFAULT_MIN_GAMES = 10
 DEFAULT_PRIOR_SESSIONS = 50
 
+API_BACKEND_KEYS = {
+    "FFBridge Classic API": "FFBridge_Classic_API",
+    "FFBridge Lancelot API": "FFBridge_Lancelot_API",
+}
+
+SERIES_NAMES = {
+    3: "Rondes de France",
+    4: "Trophes du Voyage",
+    5: "Roy Rene",
+    140: "Armour du Bridge",
+    384: "Simultanet",
+    386: "Simultane Octopus",
+    604: "Atout Simultane",
+    868: "Festival des Simultanes",
+}
+
+
+def resolve_series_id(series: Optional[int | str]) -> Optional[int]:
+    """Resolve an exact ID or fuzzy tournament-series name."""
+    if series in (None, "", "all"):
+        return None
+    try:
+        series_id = int(series)
+    except (TypeError, ValueError):
+        ranked = sorted(
+            (
+                (fuzzy_text_score(name, series), series_id, name)
+                for series_id, name in SERIES_NAMES.items()
+            ),
+            reverse=True,
+        )
+        if not ranked or ranked[0][0] < 0.72:
+            raise ValueError(
+                f"Unknown tournament series {series!r}; valid: {SERIES_NAMES}"
+            )
+        return ranked[0][1]
+    if series_id not in SERIES_NAMES:
+        raise ValueError(f"Unknown series_id {series_id}; valid: {list(SERIES_NAMES)}")
+    return series_id
+
 
 def default_api_key() -> str:
     """Persisted-parquet key for the default backend (mirrors the UI default)."""
@@ -55,6 +102,20 @@ def default_api_key() -> str:
     if prefer_classic and os.getenv("FFBRIDGE_BEARER_TOKEN", "").strip():
         return "FFBridge_Classic_API"
     return "FFBridge_Lancelot_API"
+
+
+def api_key_for_backend(api_backend: Optional[str]) -> str:
+    """Convert a Streamlit backend label (or persisted key) to a cache key."""
+    if not api_backend:
+        return default_api_key()
+    value = str(api_backend).strip()
+    if value in API_BACKEND_KEYS:
+        return API_BACKEND_KEYS[value]
+    if value in API_BACKEND_KEYS.values():
+        return value
+    raise ValueError(
+        f"Unknown api_backend {api_backend!r}; valid: {list(API_BACKEND_KEYS)}"
+    )
 
 
 # -------------------------------
@@ -178,6 +239,11 @@ def dataset_info(api_key: Optional[str] = None, fetch_iv: bool = True) -> Dict[s
         "clubs": clubs,
         "processing_stats": meta.get("processing_stats", {}),
         "date_range_options": list(DATE_RANGE_OPTIONS),
+        "api_backends": list(API_BACKEND_KEYS),
+        "tournament_series": [
+            {"series_id": series_id, "name": name}
+            for series_id, name in SERIES_NAMES.items()
+        ],
     }
 
 
@@ -242,17 +308,38 @@ def filter_valid_percentages(df: pl.DataFrame) -> pl.DataFrame:
 def filter_results(
     results_df: pl.DataFrame,
     *,
-    series_id: Optional[str] = None,
+    series_id: Optional[int | str] = None,
+    tournament: Optional[str] = None,
+    tournament_contains: Optional[str] = None,
     club: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
 ) -> pl.DataFrame:
-    """Sidebar-equivalent filters: series, club name, inclusive date window."""
+    """Pre-ranking filters for tournament, series, club, and date."""
+    if tournament and tournament_contains:
+        raise ValueError(
+            "Pass either tournament or tournament_contains, not both"
+        )
     df = results_df
-    if series_id and series_id != "all" and "series_id" in df.columns:
-        df = df.filter(pl.col("series_id") == series_id)
+    normalized_series_id = resolve_series_id(series_id)
+    if normalized_series_id is not None and "series_id" in df.columns:
+        df = df.filter(
+            pl.col("series_id").cast(pl.Int64, strict=False) == normalized_series_id
+        )
+    if tournament or tournament_contains:
+        if "tournament_name" not in df.columns:
+            raise ValueError("Persisted results do not contain tournament_name")
+        tournament_names = pl.col("tournament_name").cast(pl.Utf8)
+        if tournament:
+            df = df.filter(tournament_names == tournament.strip())
+        else:
+            df = filter_normalized_substring(
+                df,
+                column="tournament_name",
+                query=tournament_contains,
+            )
     if club and not df.is_empty() and "club_name" in df.columns:
-        df = df.filter(pl.col("club_name") == club)
+        df = filter_fuzzy_text(df, column="club_name", query=club)
     if (date_from or date_to) and not df.is_empty() and "date" in df.columns:
         session_day = pl.col("date").cast(pl.Utf8).str.slice(0, 10)
         if date_from:
@@ -260,6 +347,59 @@ def filter_results(
         if date_to:
             df = df.filter(session_day <= date_to)
     return df
+
+
+def list_tournaments(
+    *,
+    club: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    contains: Optional[str] = None,
+    limit: int = 500,
+    api_key: Optional[str] = None,
+    fetch_iv: bool = True,
+) -> Dict[str, Any]:
+    """Discover canonical tournament names after optional club/date filters."""
+    results_df, meta = load_results(api_key, fetch_iv)
+    results_df = filter_valid_percentages(results_df)
+    results_df = filter_results(
+        results_df,
+        club=club,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    if "tournament_name" not in results_df.columns:
+        raise ValueError("Persisted results do not contain tournament_name")
+    if contains:
+        results_df = filter_normalized_substring(
+            results_df,
+            column="tournament_name",
+            query=contains,
+        )
+    grouping = ["tournament_name"]
+    if "series_id" in results_df.columns:
+        grouping.append("series_id")
+    rows = (
+        results_df.group_by(grouping)
+        .agg(
+            pl.len().alias("result_rows"),
+            pl.col("date").cast(pl.Utf8).str.slice(0, 10).min().alias("date_min"),
+            pl.col("date").cast(pl.Utf8).str.slice(0, 10).max().alias("date_max"),
+            pl.col("club_name").n_unique().alias("club_count"),
+        )
+        .sort(["date_max", "tournament_name"], descending=[True, False])
+        .head(limit)
+        .to_dicts()
+    )
+    return {
+        "tournaments": rows,
+        "count": len(rows),
+        "club": club,
+        "date_from": date_from,
+        "date_to": date_to,
+        "contains": contains,
+        "dataset_built_at": meta.get("built_at"),
+    }
 
 
 # -------------------------------
@@ -694,7 +834,12 @@ def run_leaderboard_report(
     top_n: int = DEFAULT_TOP_N,
     min_games: int = DEFAULT_MIN_GAMES,
     prior_sessions: int = DEFAULT_PRIOR_SESSIONS,
+    series_id: Optional[int | str] = None,
+    tournament: Optional[str] = None,
+    tournament_contains: Optional[str] = None,
     club: Optional[str] = None,
+    player_name: Optional[str] = None,
+    player_number: Optional[str] = None,
     date_range: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -720,10 +865,17 @@ def run_leaderboard_report(
             )
         date_from, date_to = date_range_bounds(date_range)
 
+    normalized_series_id = resolve_series_id(series_id)
     results_df, meta = load_results(api_key, fetch_iv)
     results_df = filter_valid_percentages(results_df)
     results_df = filter_results(
-        results_df, club=club, date_from=date_from, date_to=date_to,
+        results_df,
+        series_id=normalized_series_id,
+        tournament=tournament,
+        tournament_contains=tournament_contains,
+        club=club,
+        date_from=date_from,
+        date_to=date_to,
     )
 
     if rating == "Players":
@@ -740,6 +892,15 @@ def run_leaderboard_report(
         )
     del sql
 
+    name_token = (player_name or "").strip()
+    number_token = (player_number or "").strip()
+    table = filter_ffbridge_leaderboard(
+        table,
+        rating_type=rating,
+        player_name=name_token,
+        player_number=number_token,
+    )
+
     return {
         "rows": table.to_dicts() if not table.is_empty() else [],
         "rating": rating,
@@ -748,9 +909,55 @@ def run_leaderboard_report(
         "min_games": min_games,
         "prior_sessions": prior_sessions,
         "prior_anchor": prior_anchor,
+        "series_id": normalized_series_id,
+        "series_name": (
+            None if normalized_series_id is None else SERIES_NAMES[normalized_series_id]
+        ),
+        "tournament": (tournament or "").strip() or None,
+        "tournament_contains": (tournament_contains or "").strip() or None,
         "club": club,
+        "player_name": name_token or None,
+        "player_number": number_token or None,
         "date_from": date_from,
         "date_to": date_to,
         "filtered_result_rows": results_df.height,
+        "dataset_built_at": meta.get("built_at"),
+    }
+
+
+def run_player_history(
+    player_id: str,
+    *,
+    limit: int = 100,
+    api_key: Optional[str] = None,
+    fetch_iv: bool = True,
+) -> Dict[str, Any]:
+    """Return one player's persisted per-session history."""
+    pid = str(player_id).strip()
+    if not pid.isdigit():
+        raise ValueError("player_id must contain digits only")
+    results_df, meta = load_results(api_key, fetch_iv)
+    results_df = filter_valid_percentages(results_df)
+    player_expr = (
+        (pl.col("player1_id").cast(pl.Utf8) == pid)
+        | (pl.col("player2_id").cast(pl.Utf8) == pid)
+    )
+    all_sessions = results_df.filter(player_expr)
+    wanted = [
+        "date", "tournament_id", "club_name", "pair_id", "pair_name",
+        "player1_id", "player1_name", "player2_id", "player2_name",
+        "scratch_percentage", "handicap_percentage", "iv_bonus", "rank",
+        "player1_scratch_elo_after", "player2_scratch_elo_after",
+        "player1_handicap_elo_after", "player2_handicap_elo_after",
+    ]
+    sessions = (
+        all_sessions.sort("date", descending=True)
+        .select([column for column in wanted if column in all_sessions.columns])
+        .head(limit)
+    )
+    return {
+        "player_id": pid,
+        "sessions": sessions.to_dicts(),
+        "total_sessions": all_sessions.height,
         "dataset_built_at": meta.get("built_at"),
     }

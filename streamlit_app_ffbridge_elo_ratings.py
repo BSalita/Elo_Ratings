@@ -88,12 +88,9 @@ from elo_common import (
     coerce_int,
     coerce_numeric_columns,
     init_url_params_to_state,
-    is_digits_only_filter,
     leaderboard_aggrid_viewport_height,
     LEADERBOARD_PAGE_SIZE,
     LEADERBOARD_ROW_HEIGHT,
-    pair_id_contains_player_number_expr,
-    player_id_equals_expr,
     render_app_footer,
     footer_streamlit_app_diagnostics_line,
     get_cache_diagnostic_line,
@@ -102,6 +99,7 @@ from elo_common import (
 
 # Import FFBridge-specific utilities
 from elo_ffbridge_common import normalize_series_id
+from elo_filter_common import filter_ffbridge_leaderboard
 
 # Import API adapters
 import elo_ffbridge_classic as classic_api
@@ -118,6 +116,7 @@ from ffbridge_report_service import (
     elo_cache_key as _elo_cache_key,
     elo_cache_paths as _elo_cache_paths,
     filter_valid_percentages as _filter_valid_percentages_ffbridge,
+    filter_results as _filter_ffbridge_results,
     legacy_elo_cache_keys as _legacy_elo_cache_keys,
     resolve_elo_cache_key as _resolve_elo_cache_key,
     show_top_players,
@@ -2042,19 +2041,15 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                     st.code(sql_query, language="sql")
 
             if not top_players.is_empty():
-                # Apply the independent name and player-number filters.
-                if name_filter and name_filter.strip():
-                    token = name_filter.strip()
-                    name_filter_lower = token.lower()
-                    top_players = top_players.filter(
-                        pl.col('Player_Name').str.to_lowercase().str.contains(name_filter_lower, literal=True)
+                try:
+                    top_players = filter_ffbridge_leaderboard(
+                        top_players,
+                        rating_type="Players",
+                        player_name=name_filter,
+                        player_number=player_number_filter,
                     )
-                if player_number_filter and player_number_filter.strip():
-                    token = player_number_filter.strip()
-                    if is_digits_only_filter(token) and "Player_ID" in top_players.columns:
-                        top_players = top_players.filter(player_id_equals_expr("Player_ID", token))
-                    elif not is_digits_only_filter(token):
-                        st.warning("Player number must contain digits only.")
+                except ValueError as exc:
+                    st.warning(str(exc))
 
                 if not top_players.is_empty():
                     st.caption("Click a row to view player's tournament history")
@@ -2215,21 +2210,15 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                     st.code(sql_query, language="sql")
 
             if not top_pairs.is_empty():
-                # Apply the independent name and player-number filters.
-                if name_filter and name_filter.strip():
-                    token = name_filter.strip()
-                    name_filter_lower = token.lower()
-                    top_pairs = top_pairs.filter(
-                        pl.col('Pair_Name').str.to_lowercase().str.contains(name_filter_lower, literal=True)
+                try:
+                    top_pairs = filter_ffbridge_leaderboard(
+                        top_pairs,
+                        rating_type="Pairs",
+                        player_name=name_filter,
+                        player_number=player_number_filter,
                     )
-                if player_number_filter and player_number_filter.strip():
-                    token = player_number_filter.strip()
-                    if is_digits_only_filter(token) and "Pair_ID" in top_pairs.columns:
-                        top_pairs = top_pairs.filter(
-                            pair_id_contains_player_number_expr("Pair_ID", token)
-                        )
-                    elif not is_digits_only_filter(token):
-                        st.warning("Player number must contain digits only.")
+                except ValueError as exc:
+                    st.warning(str(exc))
 
                 if not top_pairs.is_empty():
                     st.caption("Click a row to view pair's tournament history")
@@ -2488,7 +2477,7 @@ def main():
         name_filter = st.text_input(
             "Filter by player name",
             key="elo_name_filter",
-            placeholder="Name contains...",
+            placeholder="Fuzzy name match...",
             help="Case-insensitive partial match; for pairs, matches either partner's name.",
         )
         player_number_filter = st.text_input(
@@ -2740,18 +2729,13 @@ def _load_main_content(
     # Apply filters
     results_df = full_results_df
     
-    if simultaneous_type != "all":
-        if 'series_id' in results_df.columns:
-            results_df = results_df.filter(pl.col('series_id') == simultaneous_type)
-    
-    if club_filter and not results_df.is_empty() and "club_name" in results_df.columns:
-        results_df = results_df.filter(pl.col("club_name") == club_filter)
-    if (date_from or date_to) and not results_df.is_empty() and "date" in results_df.columns:
-        session_day = pl.col("date").cast(pl.Utf8).str.slice(0, 10)
-        if date_from:
-            results_df = results_df.filter(session_day >= date_from)
-        if date_to:
-            results_df = results_df.filter(session_day <= date_to)
+    results_df = _filter_ffbridge_results(
+        results_df,
+        series_id=simultaneous_type,
+        club=club_filter,
+        date_from=date_from,
+        date_to=date_to,
+    )
     _load_debug_log(f"sidebar filters applied ({results_df.height} rows)")
 
     global _FFBRIDGE_CLUB_OPTIONS

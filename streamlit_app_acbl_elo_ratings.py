@@ -22,7 +22,7 @@ import json
 import pathlib
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 # On Windows, install a process-level console control handler via ctypes
 # for immediate clean exit on Ctrl+C. Works from any thread (unlike signal.signal).
@@ -69,68 +69,23 @@ from elo_common import (
     coerce_int,
     coerce_numeric_columns,
     init_url_params_to_state,
-    is_digits_only_filter,
     leaderboard_aggrid_viewport_height,
     LEADERBOARD_PAGE_SIZE,
     LEADERBOARD_ROW_HEIGHT,
-    pair_id_contains_player_number_expr,
-    player_id_equals_expr,
     render_app_footer,
     footer_streamlit_app_diagnostics_line,
     sync_state_to_url_params,
 )
+from elo_filter_common import (
+    ACBL_DATE_RANGE_OPTIONS as _DATE_RANGE_OPTIONS,
+    ACBL_MASTERPOINT_RANGES as MASTERPOINT_RANGES,
+    acbl_date_from_for_range,
+    filter_acbl_leaderboard,
+    format_masterpoints_label,
+    masterpoints_bounds as get_masterpoints_bounds,
+)
 
 logger = logging.getLogger(__name__)
-
-# -------------------------------
-# Masterpoints Range - Single Source of Truth
-# -------------------------------
-# Define ranges once and derive labels from bounds
-MASTERPOINT_RANGES = [
-    (0, 5),
-    (5, 20),
-    (20, 50),
-    (50, 100),
-    (100, 200),
-    (200, 300),
-    (300, 500),
-    (500, 750),
-    (750, 1000),
-    (1000, 1500),
-    (1500, 2500),
-    (2500, 3500),
-    (3500, 5000),
-    (5000, 7500),
-    (7500, 10000),
-    (10000, None),
-]
-
-def format_masterpoints_label(lower: float | int, upper: float | int | None) -> str:
-    """Build a human-readable label from bounds."""
-    if upper is None:
-        return f"{int(lower)}+"
-    return f"{int(lower)}-{int(upper)}"
-
-def get_masterpoints_bounds(range_label: str) -> tuple[float | None, float | None]:
-    """Return (lower, upper) bounds for the given range label. 'All' -> (None, None)."""
-    if not range_label or range_label == "All":
-        return (None, None)
-    for lo, hi in MASTERPOINT_RANGES:
-        if format_masterpoints_label(lo, hi) == range_label:
-            return (lo, hi)
-    return (None, None)
-
-def apply_masterpoints_filter_polars(df: pl.DataFrame, range_label: str) -> pl.DataFrame:
-    """Filter Polars DataFrame by MasterPoints according to range_label."""
-    lower, upper = get_masterpoints_bounds(range_label)
-    if ('MasterPoints' not in df.columns) or (lower is None and upper is None):
-        return df
-    mp_col = pl.col('MasterPoints').cast(pl.Float64)
-    if upper is None:
-        return df.filter(mp_col >= lower)
-    return df.filter((mp_col >= lower) & (mp_col < upper))
-
- # No pandas fallback: filtering is standardized on Polars only
 
 # -------------------------------
 # Config / API
@@ -670,18 +625,6 @@ _ELO_MOMENT_OPTIONS = (
     "Expected Rating",
 )
 
-_DATE_RANGE_OPTIONS = (
-    "All time",
-    "Last 3 months",
-    "Last 6 months",
-    "Last 1 year",
-    "Last 2 years",
-    "Last 3 years",
-    "Last 4 years",
-    "Last 5 years",
-)
-
-
 def _acbl_date_from_param(date_from: datetime | None) -> str | None:
     """Stable YYYY-MM-DD for API/cache keys (avoids post-fetch st.rerun loops)."""
     if date_from is None:
@@ -691,20 +634,8 @@ def _acbl_date_from_param(date_from: datetime | None) -> str | None:
 
 def _acbl_date_from_for_choice(date_range_choice: str) -> datetime | None:
     """Lower bound for Date range, floored to local midnight for stable cache signatures."""
-    days = {
-        "All time": None,
-        "Last 3 months": 90,
-        "Last 6 months": 182,
-        "Last 1 year": 365,
-        "Last 2 years": 365 * 2,
-        "Last 3 years": 365 * 3,
-        "Last 4 years": 365 * 4,
-        "Last 5 years": 365 * 5,
-    }.get(date_range_choice)
-    if days is None:
-        return None
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    return today - timedelta(days=days)
+    date_from = acbl_date_from_for_range(date_range_choice)
+    return datetime.fromisoformat(date_from) if date_from else None
 
 
 def _acbl_report_fetch_signature(
@@ -1113,66 +1044,20 @@ def _acbl_report_panel() -> None:
             # Apply the independent player-name and player-number filters.
             player_name_filter_value = st.session_state.get('player_name_filter', '').strip()
             player_number_filter_value = st.session_state.get('player_number_filter', '').strip()
-            if player_name_filter_value:
-                try:
-                    if hasattr(work_df, 'select'):  # Polars DataFrame
-                        import re
-                        original_count = len(work_df)
-                        pattern = '(?i)' + re.escape(player_name_filter_value)
-                        if 'Player_Name' in work_df.columns:
-                            work_df = work_df.filter(
-                                pl.col('Player_Name').cast(pl.Utf8).str.contains(pattern, literal=False)
-                            )
-                        elif 'Pair_Names' in work_df.columns:
-                            work_df = work_df.filter(
-                                pl.col('Pair_Names').cast(pl.Utf8).str.contains(pattern, literal=False)
-                            )
-                        else:
-                            st.warning("⚠️ No Player_Name or Pair_Names column found to filter on")
-                        filtered_count = len(work_df)
-                        st.info(
-                            f"🔍 Filtered to {filtered_count} of {original_count} rows "
-                            f"matching name '{player_name_filter_value}'"
-                        )
-                except Exception:
-                    pass
-            if player_number_filter_value:
-                if not is_digits_only_filter(player_number_filter_value):
-                    st.warning("Player number must contain digits only.")
-                else:
-                    try:
-                        if hasattr(work_df, 'select'):
-                            original_count = len(work_df)
-                            if 'Player_ID' in work_df.columns:
-                                work_df = work_df.filter(
-                                    player_id_equals_expr('Player_ID', player_number_filter_value)
-                                )
-                            elif 'Pair_IDs' in work_df.columns:
-                                work_df = work_df.filter(
-                                    pair_id_contains_player_number_expr(
-                                        'Pair_IDs', player_number_filter_value
-                                    )
-                                )
-                            else:
-                                st.warning("⚠️ No Player_ID or Pair_IDs column found to filter on")
-                            st.info(
-                                f"🔍 Filtered to {len(work_df)} of {original_count} rows "
-                                f"matching player number '{player_number_filter_value}'"
-                            )
-                    except Exception:
-                        pass
-        
-            # Apply Masterpoints range filter for Players view
-            if rating_type == "Players":
-                mp_filter_label = st.session_state.get('masterpoints_filter', 'All')
-                if mp_filter_label != "All":
-                    try:
-                        original_count = len(work_df)
-                        work_df = apply_masterpoints_filter_polars(work_df, mp_filter_label)
-                        filtered_count = len(work_df)
-                        st.info(f"🎯 Masterpoints {mp_filter_label}: {filtered_count} of {original_count} players")
-                    except Exception:
-                        pass
+            mp_filter_label = st.session_state.get('masterpoints_filter', 'All')
+            original_count = len(work_df)
+            try:
+                work_df = filter_acbl_leaderboard(
+                    work_df,
+                    rating_type=rating_type,
+                    player_name=player_name_filter_value,
+                    player_number=player_number_filter_value,
+                    masterpoints_range=mp_filter_label,
+                )
+            except ValueError as exc:
+                st.warning(str(exc))
+            if player_name_filter_value or player_number_filter_value or mp_filter_label != "All":
+                st.info(f"🔍 Sidebar filters: {len(work_df)} of {original_count} rows")
         
             # Convert to pandas for AgGrid
             # Convert to pandas for AgGrid rendering
@@ -1616,7 +1501,7 @@ def main():
         player_name_filter = st.text_input(
             "Filter by player name",
             value=st.session_state.get("player_name_filter", ""),
-            placeholder="Name contains...",
+            placeholder="Fuzzy name match...",
             help="Case-insensitive partial match; for pairs, matches either partner's name.",
             key="player_name_filter",
             on_change=_on_player_filter_enter,
@@ -1829,17 +1714,15 @@ def main():
             pdf_filename = f"Unofficial Elo Scores for ACBL {club_or_tournament} MatchPoint Games - Top {top_n} {rating_type} {created_on}.pdf"
             # Generate PDF
             try:
-                # Apply Masterpoints range filter to table_df for Players PDF if requested
-                if rating_type == "Players":
-                    mp_filter_label = st.session_state.get('masterpoints_filter', 'All')
-                    if mp_filter_label != "All":
-                        try:
-                            if not hasattr(table_df, 'select'):
-                                # Ensure Polars for filtering
-                                table_df = pl.from_pandas(table_df)
-                            table_df = apply_masterpoints_filter_polars(table_df, mp_filter_label)
-                        except Exception:
-                            pass
+                if not hasattr(table_df, 'select'):
+                    table_df = pl.from_pandas(table_df)
+                table_df = filter_acbl_leaderboard(
+                    table_df,
+                    rating_type=rating_type,
+                    player_name=st.session_state.get('player_name_filter', ''),
+                    player_number=st.session_state.get('player_number_filter', ''),
+                    masterpoints_range=st.session_state.get('masterpoints_filter', 'All'),
+                )
                 # Enable shrink_to_fit for both Player and Pair reports to prevent truncation
                 # really want title, from date to be centered with reduced line spacing between them.
                 pdf_bytes = create_pdf([f"## {title}", f"### From {date_range}", "### Created by https://elo.7nt.info", table_df], title, max_rows=int(top_n), max_cols=None, rows_per_page=(21, 28), shrink_to_fit=True)

@@ -13,6 +13,7 @@ import polars as pl
 import psutil
 
 from acbl_strata import STRATA_DEFAULT, strata_label_to_bucket
+from elo_filter_common import acbl_date_from_for_range, filter_acbl_leaderboard
 from elo_common import (
     CHESS_DISPLAY_MEAN,
     CHESS_DISPLAY_SD,
@@ -1922,6 +1923,7 @@ def acbl_report(
     moving_avg_days: int = Query(10, ge=1, le=3650),
     elo_rating_type: str = Query("Current Rating (End of Session)"),
     date_from: str | None = Query(None),
+    date_range: str | None = Query(None),
     online_filter: str = Query("All"),
     strata: str = Query(
         STRATA_DEFAULT,
@@ -1939,13 +1941,21 @@ def acbl_report(
                     "pool) is below this. Higher = stricter. Set <= -90 to "
                     "disable (show all qualifying entities).",
     ),
+    player_name: str | None = Query(None),
+    player_number: str | None = Query(None, pattern=r"^\d*$"),
+    masterpoints_range: str = Query("All"),
 ) -> dict:
     with _REPORT_LOCK:
         started_at = datetime.now()
         t0 = time.perf_counter()
         try:
             t_parse_start = time.perf_counter()
-            parsed_date_from = None if not date_from else datetime.fromisoformat(date_from)
+            effective_date_from = date_from or (
+                acbl_date_from_for_range(date_range) if date_range else None
+            )
+            parsed_date_from = (
+                None if not effective_date_from else datetime.fromisoformat(effective_date_from)
+            )
             t_parse_end = time.perf_counter()
 
             t_load_start = time.perf_counter()
@@ -1996,6 +2006,13 @@ def acbl_report(
                 elo_rating_type=elo_rating_type,
                 prior_sessions=prior_sessions,
                 strata=strata,
+            )
+            result_df = filter_acbl_leaderboard(
+                result_df,
+                rating_type=rating_type,
+                player_name=player_name,
+                player_number=player_number,
+                masterpoints_range=masterpoints_range,
             )
             t_xover_end = time.perf_counter()
 
