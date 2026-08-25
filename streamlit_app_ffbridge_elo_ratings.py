@@ -566,6 +566,11 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = 
     )
 
 
+def _national_rank_expr() -> pl.Expr:
+    """Lancelot national finishing position (1 = first in the simultaneous)."""
+    return pl.col("national_rank").cast(pl.Int32, strict=False).alias("National_Rank")
+
+
 def _render_detail_aggrid_ff(detail_df: pl.DataFrame, key: str, selectable: bool = False):
     """Render a detail DataFrame as a selectable AgGrid. Returns grid response if selectable."""
     display_df = detail_df.to_pandas(use_pyarrow_extension_array=False)
@@ -628,6 +633,7 @@ def _show_tournament_opponents(results_df: pl.DataFrame, tournament_id: str, exc
     cols = [pl.col('pair_name').alias('Pair')]
     if 'rank' in tourney_results.columns:
         cols.append(pl.col('rank').cast(pl.Int32, strict=False).alias('Rank'))
+    cols.append(_national_rank_expr())
     if 'scratch_percentage' in tourney_results.columns:
         cols.append(pl.col('scratch_percentage').cast(pl.Float64, strict=False).round(2).alias('Scratch_%'))
     if 'handicap_percentage' in tourney_results.columns:
@@ -733,6 +739,7 @@ def _build_opponent_data(results_df: pl.DataFrame, entity_tournaments: pl.DataFr
     ]
     if 'rank' in all_opp.columns:
         cols.append(pl.col('rank').cast(pl.Int32, strict=False).alias('Rank'))
+    cols.append(_national_rank_expr())
     if 'scratch_percentage' in all_opp.columns:
         cols.append(pl.col('scratch_percentage').cast(pl.Float64, strict=False).round(2).alias('Scratch_%'))
     if 'handicap_percentage' in all_opp.columns:
@@ -1121,6 +1128,15 @@ def process_tournaments_to_elo(
             rank_club = result.get('rank') or 0
             rank_handicap = result.get('theoretical_rank') or 0
             rank = rank_handicap if use_handicap and rank_handicap is not None else rank_club
+            national_rank_raw = result.get('rank')
+            try:
+                national_rank = (
+                    int(national_rank_raw)
+                    if national_rank_raw not in (None, "")
+                    else None
+                )
+            except (TypeError, ValueError):
+                national_rank = None
             
             team_id = result.get('team_id') or ''
             pe = result.get('pe') or 0
@@ -1172,6 +1188,7 @@ def process_tournaments_to_elo(
                 'rank': int(rank) if rank is not None else 0,
                 'rank_without_handicap': int(rank_club) if rank_club is not None else 0,
                 'theoretical_rank': int(rank_handicap) if rank_handicap is not None else 0,
+                'national_rank': national_rank,
                 'pe': float(pe) if pe is not None else 0.0,
                 'pe_bonus': str(pe_bonus) if pe_bonus is not None else '',
                 'scratch_field_avg': float(scratch_field_avg),
@@ -1399,6 +1416,7 @@ def process_tournaments_to_elo(
             'rank': pl.Int64,
             'rank_without_handicap': pl.Int64,
             'theoretical_rank': pl.Int64,
+            'national_rank': pl.Int64,
             'pe': pl.Float64,
             'pe_bonus': pl.Utf8,
             'scratch_field_avg': pl.Float64,
@@ -1540,8 +1558,8 @@ def _elo_cache_meta_paths(api_key: str, fetch_iv: bool) -> List[pathlib.Path]:
     seen: set[pathlib.Path] = set()
     paths: List[pathlib.Path] = []
     for pattern in (
-        f"elo_full_v5_{api_key}_iv_{iv}.meta.json",
-        f"elo_full_v5_{api_key}_*_iv_{iv}.meta.json",
+        f"elo_full_v6_{api_key}_iv_{iv}.meta.json",
+        f"elo_full_v6_{api_key}_*_iv_{iv}.meta.json",
     ):
         for meta_path in _FFBRIDGE_ELO_CACHE_DIR.glob(pattern):
             if meta_path not in seen:
@@ -2272,6 +2290,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                     cols_to_select.append(pl.col('theoretical_rank').alias('Rank'))
                                 else:
                                     cols_to_select.append(pl.col('rank').alias('Rank'))
+                                cols_to_select.append(_national_rank_expr())
                                 # Add current IV (note: this is current IV, not IV at tournament time)
                                 if 'pair_iv' in player_results.columns:
                                     cols_to_select.append(pl.col('pair_iv').alias('Current_Pair_IV'))
@@ -2439,6 +2458,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                     cols_to_select.append(pl.col('theoretical_rank').alias('Rank'))
                                 else:
                                     cols_to_select.append(pl.col('rank').alias('Rank'))
+                                cols_to_select.append(_national_rank_expr())
                                 # Add current IV (note: this is current IV, not IV at tournament time)
                                 if 'pair_iv' in pair_results.columns:
                                     cols_to_select.append(pl.col('pair_iv').alias('Current_Pair_IV'))

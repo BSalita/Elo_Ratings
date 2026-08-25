@@ -129,12 +129,12 @@ def elo_cache_key(api_key: str, fetch_iv: bool, n_tournaments: int = 0) -> str:
     sessions even when no new past events existed.
     """
     del n_tournaments
-    return f"elo_full_v5_{api_key}_iv_{int(fetch_iv)}"
+    return f"elo_full_v6_{api_key}_iv_{int(fetch_iv)}"
 
 
 def legacy_elo_cache_keys(api_key: str, fetch_iv: bool) -> List[str]:
     """Parquet keys from before the stable-key change (middle segment = list length)."""
-    prefix = f"elo_full_v5_{api_key}_"
+    prefix = f"elo_full_v6_{api_key}_"
     suffix = f"_iv_{int(fetch_iv)}"
     keys: List[str] = []
     for meta_path in ELO_CACHE_DIR.glob(f"{prefix}*{suffix}.meta.json"):
@@ -1010,6 +1010,7 @@ def run_player_history(
         "date", "tournament_id", "club_name", "pair_id", "pair_name",
         "player1_id", "player1_name", "player2_id", "player2_name",
         "scratch_percentage", "handicap_percentage", "iv_bonus", "rank",
+        "national_rank", "rank_without_handicap", "theoretical_rank",
         "score_source", "score_status", "scratch_score_status",
         "handicap_score_status", "score_source_url",
         "player1_scratch_elo_after", "player2_scratch_elo_after",
