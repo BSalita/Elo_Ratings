@@ -84,6 +84,7 @@ from elo_filter_common import (
     format_masterpoints_label,
     masterpoints_bounds as get_masterpoints_bounds,
 )
+from elo_session_common import summarize_acbl_sessions
 
 logger = logging.getLogger(__name__)
 
@@ -514,6 +515,35 @@ def _render_detail_aggrid(detail_df: pl.DataFrame, key: str, selectable: bool = 
         update_on=["selectionChanged"],
     )
     return response if selectable else None
+
+
+def _render_session_summary(detail: pl.DataFrame, key: str) -> dict | None:
+    """Render one row per session and return the selected summary row."""
+    summary = summarize_acbl_sessions(detail)
+    if summary.is_empty():
+        st.info("No sessions found in the board detail.")
+        return None
+
+    visible_rows = min(summary.height, 15)
+    event = st.dataframe(
+        summary,
+        key=key,
+        hide_index=True,
+        height=38 + visible_rows * 35,
+        on_select="rerun",
+        selection_mode="single-row",
+        column_config={
+            "Avg_Pct": st.column_config.NumberColumn("Avg %", format="%.1f%%"),
+            "Opponent_Pairs": st.column_config.NumberColumn("Opponents"),
+            "Elo_Start": st.column_config.NumberColumn("Elo start"),
+            "Elo_End": st.column_config.NumberColumn("Elo end"),
+            "Elo_Delta": st.column_config.NumberColumn("Elo delta"),
+        },
+    )
+    selected_indices = event.selection.rows
+    if not selected_indices:
+        return None
+    return summary.row(selected_indices[0], named=True)
 
 
 def _show_sql_query_block(sql_text: str) -> None:
@@ -1181,8 +1211,7 @@ def _acbl_report_panel() -> None:
                                         .get_column("Session")
                                         .n_unique()
                                     )
-                                    st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
-                                    _show_all_opponents_aggregation(detail, key_suffix=f"player_{player_id}")
+                                    st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a session to see opponents and boards")
                                     _show_sql_query_block(
                                         f"""SELECT *
     FROM acbl_detail_api
@@ -1190,13 +1219,19 @@ def _acbl_report_panel() -> None:
       AND player_id = '{player_id}'
     ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
                                     )
-                                    st.markdown("#### Board-by-Board Detail")
-                                    detail_grid = _render_detail_aggrid(detail, key=f"detail_player_remote_{player_id}", selectable=True)
-                                    if detail_grid is not None:
-                                        sel = detail_grid.get("selected_rows", None)
-                                        if sel is not None and len(sel) > 0:
-                                            sel_row = sel.iloc[0] if hasattr(sel, "iloc") else sel[0]
-                                            _show_opponent_aggregation(detail, sel_row)
+                                    st.markdown("#### Sessions")
+                                    selected_session = _render_session_summary(
+                                        detail,
+                                        key=f"sessions_player_{player_id}",
+                                    )
+                                    if selected_session is not None:
+                                        _show_opponent_aggregation(detail, selected_session)
+                                        session_id = selected_session["Session"]
+                                        st.markdown(f"#### Boards — Session {session_id}")
+                                        _render_detail_aggrid(
+                                            detail.filter(pl.col("Session") == session_id),
+                                            key=f"detail_player_remote_{player_id}_{session_id}",
+                                        )
                         else:
                             pair_ids = str(selected_row.get("Pair_IDs", ""))
                             pair_names = selected_row.get("Pair_Names", "Unknown")
@@ -1221,8 +1256,7 @@ def _acbl_report_panel() -> None:
                                         .get_column("Session")
                                         .n_unique()
                                     )
-                                    st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a row to see opponent breakdown")
-                                    _show_all_opponents_aggregation(detail, key_suffix=f"pair_{pair_ids}")
+                                    st.caption(f"{len(detail)} boards across {n_sessions} sessions — click a session to see opponents and boards")
                                     _show_sql_query_block(
                                         f"""SELECT *
     FROM acbl_detail_api
@@ -1230,13 +1264,19 @@ def _acbl_report_panel() -> None:
       AND pair_ids = '{pair_ids}'
     ORDER BY Date DESC, Session DESC, Round ASC, Board ASC;"""
                                     )
-                                    st.markdown("#### Board-by-Board Detail")
-                                    detail_grid = _render_detail_aggrid(detail, key=f"detail_pair_remote_{pair_ids}", selectable=True)
-                                    if detail_grid is not None:
-                                        sel = detail_grid.get("selected_rows", None)
-                                        if sel is not None and len(sel) > 0:
-                                            sel_row = sel.iloc[0] if hasattr(sel, "iloc") else sel[0]
-                                            _show_opponent_aggregation(detail, sel_row)
+                                    st.markdown("#### Sessions")
+                                    selected_session = _render_session_summary(
+                                        detail,
+                                        key=f"sessions_pair_{pair_ids}",
+                                    )
+                                    if selected_session is not None:
+                                        _show_opponent_aggregation(detail, selected_session)
+                                        session_id = selected_session["Session"]
+                                        st.markdown(f"#### Boards — Session {session_id}")
+                                        _render_detail_aggrid(
+                                            detail.filter(pl.col("Session") == session_id),
+                                            key=f"detail_pair_remote_{pair_ids}_{session_id}",
+                                        )
                 except Exception as exc:
                     st.error(f"Session detail API request failed: {exc}")
         
