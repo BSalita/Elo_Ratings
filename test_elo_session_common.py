@@ -64,11 +64,11 @@ class AcblSessionSummaryTests(unittest.TestCase):
         tournament = summarize_acbl_sessions(tournament_detail, "Tournament")
 
         self.assertEqual(
-            club["Results URL"][0],
+            club["Results_URL"][0],
             "https://my.acbl.org/club-results/details/1033402",
         )
         self.assertEqual(
-            tournament["Results URL"][0],
+            tournament["Results_URL"][0],
             "https://live.acbl.org/event/2509101/271B/2/summary",
         )
 
@@ -84,7 +84,7 @@ class AcblSessionSummaryTests(unittest.TestCase):
         summary = summarize_acbl_sessions(detail, "Club")
 
         self.assertEqual(summary["Session"][0], "1493280")
-        self.assertIsNone(summary["Results URL"][0])
+        self.assertIsNone(summary["Results_URL"][0])
 
 
 if __name__ == "__main__":

@@ -89,12 +89,12 @@ def summarize_acbl_sessions(
             raise ValueError(
                 "club_or_tournament must be either 'Club' or 'Tournament'"
             )
-        summary = summary.with_columns(results_url.alias("Results URL"))
+        summary = summary.with_columns(results_url.alias("Results_URL"))
 
     preferred_order = [
         "Date",
         "Session",
-        "Results URL",
+        "Results_URL",
         "Partner",
         "Boards",
         "Opponent_Pairs",

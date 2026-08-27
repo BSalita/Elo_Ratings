@@ -119,6 +119,7 @@ from ffbridge_report_service import (
     filter_valid_percentages as _filter_valid_percentages_ffbridge,
     filter_results as _filter_ffbridge_results,
     legacy_elo_cache_keys as _legacy_elo_cache_keys,
+    load_quality_sidecars as _load_quality_sidecars,
     resolve_elo_cache_key as _resolve_elo_cache_key,
     show_top_players,
     show_top_pairs,
@@ -347,7 +348,7 @@ def _ffbridge_results_url_expr() -> pl.Expr:
             )
         )
         .otherwise(pl.lit(None, dtype=pl.Utf8))
-        .alias("Results URL")
+        .alias("Results_URL")
     )
 
 
@@ -363,9 +364,9 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
     """
     For Octopus sessions, try to override Scratch_% / Handicap_% with BridgeInterNet values.
     Adds three URL columns:
-      - 'Organization URL'     : BridgeInterNet results page when reconciliation succeeds (Octopus only).
-      - 'ffbridge Result'      : Public FFBridge "Espace Licenci├⌐" results page (requires being signed in).
-      - 'ffbridge API Endpoint': Raw FFBridge JSON API URL (devs only; returns 401 without JWT).
+      - 'Organization_URL'     : BridgeInterNet results page when reconciliation succeeds (Octopus only).
+      - 'ffbridge_Result'      : Public FFBridge "Espace Licenci├⌐" results page (requires being signed in).
+      - 'ffbridge_API_Endpoint': Raw FFBridge JSON API URL (devs only; returns 401 without JWT).
 
     Args:
         detail_df: DataFrame with tournament results. Should include hidden helper
@@ -442,9 +443,9 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
         else:
             r["Pct_Used"] = scratch
         # User-facing URL columns: cell renderer turns http(s) values into anchors.
-        r["Organization URL"] = bi_url if bi_url else None
-        r["ffbridge Result"] = webpage_url if webpage_url else None
-        r["ffbridge API Endpoint"] = api_url if api_url else None
+        r["Organization_URL"] = bi_url if bi_url else None
+        r["ffbridge_Result"] = webpage_url if webpage_url else None
+        r["ffbridge_API_Endpoint"] = api_url if api_url else None
         rows.append(r)
 
     # The URL columns are None for most (non-Octopus) rows and only get a string
@@ -454,9 +455,9 @@ def _maybe_override_octopus_pct_rows(detail_df: pl.DataFrame, pair_name: str, us
     return pl.DataFrame(
         rows,
         schema_overrides={
-            "Organization URL": pl.Utf8,
-            "ffbridge Result": pl.Utf8,
-            "ffbridge API Endpoint": pl.Utf8,
+            "Organization_URL": pl.Utf8,
+            "ffbridge_Result": pl.Utf8,
+            "ffbridge_API_Endpoint": pl.Utf8,
         },
         infer_schema_length=None,
     )
@@ -514,6 +515,29 @@ def _url_columns(display_df: pd.DataFrame) -> List[str]:
     return url_cols
 
 
+def _move_url_columns_to_end(display_df: pd.DataFrame) -> pd.DataFrame:
+    """Keep all user-facing link columns together at the right edge."""
+    known_url_columns = {
+        "Organization_URL",
+        "ffbridge_Result",
+        "ffbridge_API_Endpoint",
+        "Results_URL",
+        "Score_Source_URL",
+    }
+    detected_url_columns = set(_url_columns(display_df))
+    url_columns = [
+        column
+        for column in display_df.columns
+        if column in known_url_columns or column in detected_url_columns
+    ]
+    if not url_columns:
+        return display_df
+    non_url_columns = [
+        column for column in display_df.columns if column not in url_columns
+    ]
+    return display_df.loc[:, [*non_url_columns, *url_columns]]
+
+
 def _aggrid_key_part(value: str) -> str:
     return re.sub(r"[^\w\-]", "_", (value or "").strip())[:48]
 
@@ -544,6 +568,7 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = 
     """Build an AgGrid with single-click row selection (streamlit-aggrid)."""
     display_df = df.to_pandas(use_pyarrow_extension_array=False)
     coerce_numeric_columns(display_df)
+    display_df = _move_url_columns_to_end(display_df)
 
     page_size = LEADERBOARD_PAGE_SIZE
     gb = GridOptionsBuilder.from_dataframe(display_df)
@@ -563,9 +588,7 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = 
                 type=['numericColumn', 'numberColumnFilter'],
                 comparator=numeric_comparator,
             )
-    sort_col = 'Quality_Rank' if 'Quality_Rank' in display_df.columns else (
-        'Rank' if 'Rank' in display_df.columns else None
-    )
+    sort_col = 'Rank' if 'Rank' in display_df.columns else None
     if sort_col is not None:
         gb.configure_column(sort_col, sort='asc')
     if 'Games' in display_df.columns:
@@ -606,6 +629,7 @@ def _render_detail_aggrid_ff(
     """Render a detail DataFrame as a selectable AgGrid. Returns grid response if selectable."""
     display_df = detail_df.to_pandas(use_pyarrow_extension_array=False)
     coerce_numeric_columns(display_df)
+    display_df = _move_url_columns_to_end(display_df)
     gb = GridOptionsBuilder.from_dataframe(display_df)
     if selectable:
         gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
@@ -1945,15 +1969,18 @@ def _cached_top_players_both(
     top_n: int,
     min_games: int,
     prior_sessions: int,
+    quality_df: Optional[pl.DataFrame],
 ) -> Tuple[pl.DataFrame, pl.DataFrame, str, str, Optional[float], Optional[float]]:
     if players_df.is_empty():
         empty = pl.DataFrame()
         return empty, empty, "", "", None, None
     hc, sql_h, anchor_h = show_top_players(
         players_df, top_n, min_games, use_handicap=True, prior_sessions=prior_sessions,
+        quality_df=quality_df,
     )
     sc, sql_s, anchor_s = show_top_players(
         players_df, top_n, min_games, use_handicap=False, prior_sessions=prior_sessions,
+        quality_df=quality_df,
     )
     return hc, sc, sql_h, sql_s, anchor_h, anchor_s
 
@@ -1964,17 +1991,18 @@ def _cached_top_pairs_both(
     top_n: int,
     min_games: int,
     prior_sessions: int,
+    quality_df: Optional[pl.DataFrame],
 ) -> Tuple[pl.DataFrame, pl.DataFrame, str, str, Optional[float], Optional[float]]:
     if results_df.is_empty():
         empty = pl.DataFrame()
         return empty, empty, "", "", None, None
     hc, sql_h, anchor_h = show_top_pairs(
         results_df, top_n, min_games, use_handicap=True, players_df=None,
-        prior_sessions=prior_sessions,
+        prior_sessions=prior_sessions, quality_df=quality_df,
     )
     sc, sql_s, anchor_s = show_top_pairs(
         results_df, top_n, min_games, use_handicap=False, players_df=None,
-        prior_sessions=prior_sessions,
+        prior_sessions=prior_sessions, quality_df=quality_df,
     )
     return hc, sc, sql_h, sql_s, anchor_h, anchor_s
 
@@ -2262,6 +2290,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
             _load_debug_log("leaderboard panel: running top players SQL (hc+sc)")
             hc_players, sc_players, sql_h, sql_s, anchor_h, anchor_s = _cached_top_players_both(
                 players_df, top_n, min_games, int(prior_sessions),
+                ctx.get("quality_players"),
             )
             _load_debug_log(
                 f"leaderboard panel: top players ready "
@@ -2270,6 +2299,10 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
             top_players = hc_players if use_handicap else sc_players
             sql_query = sql_h if use_handicap else sql_s
             prior_anchor = anchor_h if use_handicap else anchor_s
+            if "Quality_Rank" in top_players.columns:
+                st.caption(
+                    f"Quality data through {ctx['quality_status']['cutoff']}."
+                )
 
             if prior_sessions > 0 and prior_anchor is not None:
                 st.caption(
@@ -2468,6 +2501,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
             _load_debug_log("leaderboard panel: running top pairs SQL (hc+sc)")
             hc_pairs, sc_pairs, sql_h, sql_s, anchor_h, anchor_s = _cached_top_pairs_both(
                 results_df, top_n, min_games, int(prior_sessions),
+                ctx.get("quality_pairs"),
             )
             _load_debug_log(
                 f"leaderboard panel: top pairs ready "
@@ -2476,6 +2510,10 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
             top_pairs = hc_pairs if use_handicap else sc_pairs
             sql_query = sql_h if use_handicap else sql_s
             prior_anchor = anchor_h if use_handicap else anchor_s
+            if "Quality_Rank" in top_pairs.columns:
+                st.caption(
+                    f"Quality data through {ctx['quality_status']['cutoff']}."
+                )
 
             if prior_sessions > 0 and prior_anchor is not None:
                 st.caption(
@@ -3011,6 +3049,12 @@ def _load_main_content(
     st.session_state._ffbridge_loaded_api_key = api_key
     full_results_df = dataset['results_df']
     processing_stats = dataset['processing_stats']
+    quality_players, quality_pairs, quality_status = _load_quality_sidecars()
+    quality_summary = (
+        f"quality available through {quality_status['cutoff']}"
+        if quality_status["status"] == "available"
+        else "quality unavailable"
+    )
 
     stats_placeholder.caption(
         "Elo dataset — "
@@ -3022,6 +3066,7 @@ def _load_main_content(
             result_rows=full_results_df.height,
             list_fallback_note=list_fallback_note,
         )
+        + f" • {quality_summary}"
     )
 
     # Exclude invalid percentage rows before any downstream filtering/aggregation
@@ -3101,6 +3146,9 @@ def _load_main_content(
         "player_metrics_sc": player_metrics_sc,
         "pair_metrics_hc": pair_metrics_hc,
         "pair_metrics_sc": pair_metrics_sc,
+        "quality_players": quality_players,
+        "quality_pairs": quality_pairs,
+        "quality_status": quality_status,
     }
     del players_df_hc, players_df_sc
     _load_debug_log("leaderboard context ready; rendering panel")

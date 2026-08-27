@@ -6,7 +6,10 @@ from unittest.mock import patch
 import polars as pl
 
 import elo_ffbridge_lancelot as lancelot
-from streamlit_app_ffbridge_elo_ratings import _ffbridge_results_url_expr
+from streamlit_app_ffbridge_elo_ratings import (
+    _ffbridge_results_url_expr,
+    _move_url_columns_to_end,
+)
 
 
 class FFBridgeResultsUrlTests(unittest.TestCase):
@@ -50,6 +53,23 @@ class FFBridgeResultsUrlTests(unittest.TestCase):
             actual = lancelot.fetch_session_group_ids("282839")
 
         self.assertEqual(actual, {"5802079": "21333"})
+
+    def test_moves_all_url_columns_to_right_edge(self) -> None:
+        display = pl.DataFrame(
+            {
+                "Results_URL": ["https://example.test/results"],
+                "Date": ["2025-01-01"],
+                "Score_Source_URL": [None],
+                "Rank": [1],
+            }
+        ).to_pandas()
+
+        reordered = _move_url_columns_to_end(display)
+
+        self.assertEqual(
+            reordered.columns.to_list(),
+            ["Date", "Rank", "Results_URL", "Score_Source_URL"],
+        )
 
 
 if __name__ == "__main__":

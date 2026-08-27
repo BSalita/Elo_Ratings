@@ -31,8 +31,32 @@ _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _CACHE_DIR_ENV = os.environ.get("FFBRIDGE_CACHE_DIR", "").strip()
 if _CACHE_DIR_ENV:
     ELO_CACHE_DIR = pathlib.Path(_CACHE_DIR_ENV).resolve() / "elo_cache"
+    QUALITY_CACHE_DIR = pathlib.Path(_CACHE_DIR_ENV).resolve() / "quality_cache"
 else:
     ELO_CACHE_DIR = _SCRIPT_DIR / "data" / "ffbridge" / "elo_cache"
+    QUALITY_CACHE_DIR = _SCRIPT_DIR / "data" / "ffbridge" / "quality_cache"
+
+QUALITY_PLAYERS_PATH = QUALITY_CACHE_DIR / "ffbridge_quality_players.parquet"
+QUALITY_PAIRS_PATH = QUALITY_CACHE_DIR / "ffbridge_quality_pairs.parquet"
+QUALITY_METADATA_PATH = QUALITY_CACHE_DIR / "ffbridge_quality_metadata.json"
+
+_QUALITY_METRIC_COLUMNS = (
+    "par_suit_rate",
+    "par_contract_rate",
+    "sacrifice_rate",
+    "dd_tricks_diff_avg",
+)
+_QUALITY_OUTPUT_COLUMNS = (
+    "Quality_Rank",
+    "Par_Suit_Rate_Pct",
+    "Par_Suit_Rank",
+    "Par_Contract_Rate_Pct",
+    "Par_Contract_Rank",
+    "Sacrifice_Rate_Pct",
+    "Sacrifice_Rank",
+    "DD_Tricks_Diff_Avg",
+    "DD_Tricks_Diff_Rank",
+)
 
 # ACBL-style rolling windows, plus FFBridge season years (ratings reset July 1).
 DATE_RANGE_OPTIONS = (
@@ -184,6 +208,15 @@ def resolve_elo_cache_key(api_key: str, fetch_iv: bool) -> Optional[str]:
 # Per (api_key, fetch_iv): (cache_key, results_mtime, results_df, meta). Reloads
 # when a rebuild replaces the parquet (mtime change) or resolves to a new key.
 _RESULTS_CACHE: Dict[Tuple[str, bool], Tuple[str, float, pl.DataFrame, Dict[str, Any]]] = {}
+_QUALITY_CACHE: Dict[
+    pathlib.Path,
+    Tuple[
+        Tuple[int, int, int],
+        pl.DataFrame,
+        pl.DataFrame,
+        Dict[str, Any],
+    ],
+] = {}
 
 
 def load_results(
@@ -214,9 +247,201 @@ def load_results(
     return results_df, meta
 
 
+def _validate_quality_frame(
+    frame: pl.DataFrame,
+    *,
+    id_column: str,
+    path: pathlib.Path,
+) -> pl.DataFrame:
+    """Validate and normalize one quality sidecar without fabricating values."""
+    required = {id_column, *_QUALITY_METRIC_COLUMNS}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(
+            f"Incompatible FFBridge quality cache {path}: missing columns {missing}"
+        )
+    id_dtype = frame.schema[id_column]
+    if id_dtype != pl.String and not id_dtype.is_integer():
+        raise ValueError(
+            f"Incompatible FFBridge quality cache {path}: {id_column} must be "
+            f"string/integer, got {id_dtype}"
+        )
+    for column in _QUALITY_METRIC_COLUMNS:
+        dtype = frame.schema[column]
+        if not dtype.is_numeric():
+            raise ValueError(
+                f"Incompatible FFBridge quality cache {path}: {column} must be "
+                f"numeric, got {dtype}"
+            )
+    if frame.get_column(id_column).null_count():
+        raise ValueError(
+            f"Incompatible FFBridge quality cache {path}: null {id_column}"
+        )
+    normalized = frame.select(
+        pl.col(id_column).cast(pl.Utf8),
+        *[pl.col(column).cast(pl.Float64) for column in _QUALITY_METRIC_COLUMNS],
+    )
+    if normalized.get_column(id_column).n_unique() != normalized.height:
+        raise ValueError(
+            f"Incompatible FFBridge quality cache {path}: duplicate {id_column}"
+        )
+    return normalized
+
+
+def load_quality_sidecars(
+    cache_dir: Optional[pathlib.Path] = None,
+) -> Tuple[Optional[pl.DataFrame], Optional[pl.DataFrame], Dict[str, Any]]:
+    """Load quality sidecars once, reloading when any source mtime changes.
+
+    A wholly absent cache is an expected deployment state and returns an
+    explicit unavailable status. A partial, corrupt, or incompatible cache is
+    an error because silently omitting configured quality data would hide a
+    broken production deployment.
+    """
+    quality_dir = (
+        pathlib.Path(cache_dir) if cache_dir is not None else QUALITY_CACHE_DIR
+    ).resolve()
+    players_path = quality_dir / QUALITY_PLAYERS_PATH.name
+    pairs_path = quality_dir / QUALITY_PAIRS_PATH.name
+    metadata_path = quality_dir / QUALITY_METADATA_PATH.name
+    paths = (players_path, pairs_path, metadata_path)
+    present = tuple(path.exists() for path in paths)
+    if not any(present):
+        return None, None, {
+            "status": "unavailable",
+            "reason": "quality_cache_missing",
+            "cutoff": None,
+        }
+    if not all(present):
+        missing = [str(path) for path, exists in zip(paths, present) if not exists]
+        raise FileNotFoundError(
+            "Incomplete FFBridge quality cache; missing " + ", ".join(missing)
+        )
+
+    signature = tuple(path.stat().st_mtime_ns for path in paths)
+    cached = _QUALITY_CACHE.get(quality_dir)
+    if cached is not None and cached[0] == signature:
+        return cached[1], cached[2], cached[3]
+
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Corrupt FFBridge quality metadata {metadata_path}: {exc}"
+        ) from exc
+    if not isinstance(metadata, dict):
+        raise ValueError(
+            f"Incompatible FFBridge quality metadata {metadata_path}: expected object"
+        )
+    cutoff = metadata.get("cutoff")
+    if not isinstance(cutoff, str) or not cutoff.strip():
+        raise ValueError(
+            f"Incompatible FFBridge quality metadata {metadata_path}: "
+            "non-empty string 'cutoff' is required"
+        )
+
+    try:
+        players = _validate_quality_frame(
+            pl.read_parquet(players_path),
+            id_column="player_id",
+            path=players_path,
+        )
+        pairs = _validate_quality_frame(
+            pl.read_parquet(pairs_path),
+            id_column="pair_id",
+            path=pairs_path,
+        )
+    except (OSError, pl.exceptions.PolarsError) as exc:
+        raise ValueError(f"Corrupt FFBridge quality cache under {quality_dir}: {exc}") from exc
+
+    status = dict(metadata)
+    status.update({"status": "available", "cutoff": cutoff.strip()})
+    _QUALITY_CACHE[quality_dir] = (signature, players, pairs, status)
+    print(
+        f"[ffbridge_report_service] loaded quality sidecars "
+        f"({players.height} players, {pairs.height} pairs, cutoff={cutoff.strip()})",
+        flush=True,
+    )
+    return players, pairs, status
+
+
+def _attach_quality_sidecar(
+    leaderboard: pl.DataFrame,
+    quality_df: Optional[pl.DataFrame],
+    *,
+    leaderboard_id: str,
+    quality_id: str,
+) -> pl.DataFrame:
+    """Left-join metrics and rank them over the full qualifying leaderboard."""
+    if quality_df is None or leaderboard.is_empty():
+        return leaderboard
+
+    joined = leaderboard.with_columns(
+        pl.col(leaderboard_id).cast(pl.Utf8)
+    ).join(
+        quality_df,
+        left_on=leaderboard_id,
+        right_on=quality_id,
+        how="left",
+        validate="m:1",
+    )
+    joined = joined.with_columns(
+        pl.col("par_suit_rate")
+        .rank(method="min", descending=True)
+        .cast(pl.Int32)
+        .alias("Par_Suit_Rank"),
+        pl.col("par_contract_rate")
+        .rank(method="min", descending=True)
+        .cast(pl.Int32)
+        .alias("Par_Contract_Rank"),
+        pl.col("sacrifice_rate")
+        .rank(method="min", descending=True)
+        .cast(pl.Int32)
+        .alias("Sacrifice_Rank"),
+        pl.col("dd_tricks_diff_avg")
+        .rank(method="min", descending=True)
+        .cast(pl.Int32)
+        .alias("DD_Tricks_Diff_Rank"),
+    )
+    composite_present = (
+        pl.col("Par_Suit_Rank").is_not_null()
+        & pl.col("Par_Contract_Rank").is_not_null()
+        & pl.col("DD_Tricks_Diff_Rank").is_not_null()
+    )
+    joined = joined.with_columns(
+        pl.when(composite_present)
+        .then(
+            (
+                pl.col("Rank")
+                + pl.col("Par_Suit_Rank")
+                + pl.col("Par_Contract_Rank")
+                + pl.col("DD_Tricks_Diff_Rank")
+            )
+            / 4.0
+        )
+        .otherwise(None)
+        .alias("_quality_score")
+    ).with_columns(
+        pl.when(pl.col("_quality_score").is_not_null())
+        .then(pl.col("_quality_score").rank(method="min"))
+        .otherwise(None)
+        .cast(pl.Int32)
+        .alias("Quality_Rank"),
+        (pl.col("par_suit_rate") * 100).round(1).alias("Par_Suit_Rate_Pct"),
+        (pl.col("par_contract_rate") * 100).round(1).alias("Par_Contract_Rate_Pct"),
+        (pl.col("sacrifice_rate") * 100).round(1).alias("Sacrifice_Rate_Pct"),
+        pl.col("dd_tricks_diff_avg").round(2).alias("DD_Tricks_Diff_Avg"),
+    )
+    return joined.drop([*_QUALITY_METRIC_COLUMNS, "_quality_score"]).select(
+        *leaderboard.columns,
+        *_QUALITY_OUTPUT_COLUMNS,
+    )
+
+
 def dataset_info(api_key: Optional[str] = None, fetch_iv: bool = True) -> Dict[str, Any]:
     """Summary of the persisted dataset (no result rows)."""
     results_df, meta = load_results(api_key, fetch_iv)
+    _quality_players, _quality_pairs, quality_status = load_quality_sidecars()
     clubs: List[str] = []
     if "club_name" in results_df.columns:
         clubs = sorted(
@@ -239,6 +464,9 @@ def dataset_info(api_key: Optional[str] = None, fetch_iv: bool = True) -> Dict[s
         "clubs": clubs,
         "processing_stats": meta.get("processing_stats", {}),
         "score_provenance": score_provenance_counts(results_df),
+        "quality": quality_status,
+        "quality_status": quality_status["status"],
+        "quality_cutoff": quality_status.get("cutoff"),
         "date_range_options": list(DATE_RANGE_OPTIONS),
         "api_backends": list(API_BACKEND_KEYS),
         "tournament_series": [
@@ -516,6 +744,7 @@ def show_top_players(
     min_games: int = 5,
     use_handicap: bool = False,
     prior_sessions: int = 0,
+    quality_df: Optional[pl.DataFrame] = None,
 ) -> Tuple[pl.DataFrame, str, Optional[float]]:
     """Get top players sorted by Elo rating using SQL.
 
@@ -624,10 +853,16 @@ def show_top_players(
             CAST(provisional_games AS INTEGER) AS Provisional_Games
         FROM ranked
         ORDER BY Rank ASC
-        LIMIT {top_n}
+        LIMIT {max(top_n, players_df.height)}
     """
 
     result = duckdb.sql(query).pl()
+    result = _attach_quality_sidecar(
+        result,
+        quality_df,
+        leaderboard_id="Player_ID",
+        quality_id="player_id",
+    ).head(top_n)
     return result, query, prior_anchor
 
 
@@ -638,6 +873,7 @@ def show_top_pairs(
     use_handicap: bool = False,
     players_df: Optional[pl.DataFrame] = None,
     prior_sessions: int = 0,
+    quality_df: Optional[pl.DataFrame] = None,
 ) -> Tuple[pl.DataFrame, str, Optional[float]]:
     """Get top pairs sorted by Elo rating using SQL.
 
@@ -859,7 +1095,7 @@ def show_top_pairs(
             CAST(provisional_games AS INTEGER) AS Provisional_Games
         FROM with_player_titles
         ORDER BY Rank ASC
-        LIMIT {top_n}
+        LIMIT {max(top_n, results_df.height)}
     """
     else:
         query += f"""
@@ -877,10 +1113,16 @@ def show_top_pairs(
             CAST(provisional_games AS INTEGER) AS Provisional_Games
         FROM ranked
         ORDER BY Rank ASC
-        LIMIT {top_n}
+        LIMIT {max(top_n, results_df.height)}
     """
 
     result = duckdb.sql(query).pl()
+    result = _attach_quality_sidecar(
+        result,
+        quality_df,
+        leaderboard_id="Pair_ID",
+        quality_id="pair_id",
+    ).head(top_n)
     return result, query, prior_anchor
 
 
@@ -927,6 +1169,7 @@ def run_leaderboard_report(
 
     normalized_series_id = resolve_series_id(series_id)
     results_df, meta = load_results(api_key, fetch_iv)
+    quality_players, quality_pairs, quality_status = load_quality_sidecars()
     results_df = filter_valid_percentages(results_df)
     results_df = filter_results(
         results_df,
@@ -945,12 +1188,14 @@ def run_leaderboard_report(
         table, sql, prior_anchor = show_top_players(
             players_df, top_n, min_games,
             use_handicap=use_handicap, prior_sessions=prior_sessions,
+            quality_df=quality_players,
         )
     else:
         table, sql, prior_anchor = show_top_pairs(
             results_df, top_n, min_games,
             use_handicap=use_handicap, players_df=None,
             prior_sessions=prior_sessions,
+            quality_df=quality_pairs,
         )
     del sql
 
@@ -985,6 +1230,9 @@ def run_leaderboard_report(
         "filtered_result_rows": results_df.height,
         "dataset_built_at": meta.get("built_at"),
         "score_provenance": provenance,
+        "quality": quality_status,
+        "quality_status": quality_status["status"],
+        "quality_cutoff": quality_status.get("cutoff"),
     }
 
 
