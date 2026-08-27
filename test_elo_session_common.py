@@ -47,7 +47,8 @@ class AcblSessionSummaryTests(unittest.TestCase):
         club_detail = pl.DataFrame(
             {
                 "Date": [datetime(2026, 1, 2)],
-                "Session": ["1033402"],
+                "Session": ["1493280"],
+                "Event_ID": [1033402],
                 "Board": [1],
             }
         )

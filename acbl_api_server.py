@@ -934,7 +934,16 @@ def _required_columns_for_mode(rating_type: str, elo_rating_type: str) -> list[s
 
 def _required_columns_for_detail(rating_type: str, elo_rating_type: str) -> list[str]:
     # is_virtual_game / strata_bucket required so filters match the leaderboard report.
-    cols = {"Date", "session_id", "Pct_NS", "Round", "Board", "is_virtual_game", "strata_bucket"}
+    cols = {
+        "Date",
+        "session_id",
+        "event_id",
+        "Pct_NS",
+        "Round",
+        "Board",
+        "is_virtual_game",
+        "strata_bucket",
+    }
     for p in "NESW":
         cols.update({f"Player_ID_{p}", f"Player_Name_{p}"})
 
@@ -1078,7 +1087,11 @@ def _build_player_detail(df: pl.DataFrame, player_id: str, elo_rating_type: str)
         partner_pos_map = {"N": "S", "S": "N", "E": "W", "W": "E"}
         partner = partner_pos_map[pos]
         opp1, opp2 = (("E", "W") if pos in ("N", "S") else ("N", "S"))
-        cols_to_select = [pl.col("Date"), pl.col("session_id").alias("Session")]
+        cols_to_select = [
+            pl.col("Date"),
+            pl.col("session_id").alias("Session"),
+            pl.col("event_id").alias("Event_ID"),
+        ]
         if "Round" in df.columns:
             cols_to_select.append(pl.col("Round"))
         if "Board" in df.columns:
@@ -1161,7 +1174,11 @@ def _build_pair_detail(df: pl.DataFrame, pair_ids: str, elo_rating_type: str) ->
             continue
         opp_side = "EW" if side == "NS" else "NS"
         opp1, opp2 = (("E", "W") if opp_side == "EW" else ("N", "S"))
-        cols_to_select = [pl.col("Date"), pl.col("session_id").alias("Session")]
+        cols_to_select = [
+            pl.col("Date"),
+            pl.col("session_id").alias("Session"),
+            pl.col("event_id").alias("Event_ID"),
+        ]
         if "Round" in df.columns:
             cols_to_select.append(pl.col("Round"))
         if "Board" in df.columns:

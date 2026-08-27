@@ -29,6 +29,8 @@ def summarize_acbl_sessions(
     aggregations: list[pl.Expr] = []
     if "Date" in ordered.columns:
         aggregations.append(pl.col("Date").first().alias("Date"))
+    if "Event_ID" in ordered.columns:
+        aggregations.append(pl.col("Event_ID").first().alias("Event_ID"))
     if "Partner" in ordered.columns:
         aggregations.append(pl.col("Partner").first().alias("Partner"))
     aggregations.append(pl.len().alias("Boards"))
@@ -65,10 +67,14 @@ def summarize_acbl_sessions(
     if club_or_tournament is not None:
         source = club_or_tournament.strip().lower()
         if source == "club":
+            if "Event_ID" not in summary.columns:
+                raise ValueError(
+                    "ACBL club detail is missing required 'Event_ID' column"
+                )
             results_url = pl.concat_str(
                 [
                     pl.lit("https://my.acbl.org/club-results/details/"),
-                    pl.col("Session").cast(pl.Utf8),
+                    pl.col("Event_ID").cast(pl.Utf8),
                 ]
             )
         elif source == "tournament":

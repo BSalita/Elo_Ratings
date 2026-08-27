@@ -327,21 +327,30 @@ def _ffbridge_webpage_url(tournament_id: str, team_id: str, club_id: str) -> str
 
 def _ffbridge_results_url_expr() -> pl.Expr:
     """Public results page for one FFBridge session result row."""
-    required = [
-        pl.col(column).cast(pl.Utf8).fill_null("").str.strip_chars()
-        for column in ("tournament_id", "team_id", "club_id")
-    ]
+    tournament_id = (
+        pl.col("tournament_id").cast(pl.Utf8).fill_null("").str.strip_chars()
+    )
+    team_id = pl.col("team_id").cast(pl.Utf8).fill_null("").str.strip_chars()
+    club_id = pl.col("club_id").cast(pl.Utf8).fill_null("").str.strip_chars()
+    club_code = (
+        pl.col("club_code").cast(pl.Utf8).fill_null("").str.strip_chars()
+    )
+    organization_id = pl.when(club_id != "").then(club_id).otherwise(club_code)
     return (
-        pl.when(pl.all_horizontal([value != "" for value in required]))
+        pl.when(
+            pl.all_horizontal(
+                [tournament_id != "", team_id != "", organization_id != ""]
+            )
+        )
         .then(
             pl.concat_str(
                 [
                     pl.lit("https://licencie.ffbridge.fr/#/resultats/simultane/"),
-                    pl.col("tournament_id").cast(pl.Utf8),
+                    tournament_id,
                     pl.lit("/details/"),
-                    pl.col("team_id").cast(pl.Utf8),
+                    team_id,
                     pl.lit("?orgId="),
-                    pl.col("club_id").cast(pl.Utf8),
+                    organization_id,
                 ]
             )
         )
@@ -1199,7 +1208,9 @@ def process_tournaments_to_elo(
             
             team_id = result.get('team_id') or ''
             pe = result.get('pe') or 0
-            club_id = result.get('club_id', '')
+            # Classic supplies organization.id as club_id; Lancelot supplies
+            # the same route identifier as simultaneousId/club_code.
+            club_id = result.get('club_id') or result.get('club_code') or ''
             club_name = result.get('club_name', '')
             club_code = result.get('club_code', '')
             

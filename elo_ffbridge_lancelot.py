@@ -424,6 +424,9 @@ def _normalize_ranking_results(
             'theoretical_rank': entry.get('rankWithoutHandicap'),
             'pe': entry.get('pe', 0),
             'pe_bonus': str(pe_bonus_raw),
+            # Lancelot exposes the organization route identifier as
+            # simultaneousId/ffbCode rather than Classic's organization.id.
+            'club_id': club_code,
             'club_code': club_code,
             'club_name': '',  # Will be populated by build_club_name_mapping
             # IV fields (not available from Lancelot API without auth)
