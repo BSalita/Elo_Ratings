@@ -14,6 +14,7 @@ import psutil
 
 from acbl_strata import STRATA_DEFAULT, strata_label_to_bucket
 from elo_filter_common import acbl_date_from_for_range, filter_acbl_leaderboard
+from elo_session_common import acbl_results_url_expr
 from elo_common import (
     CHESS_DISPLAY_MEAN,
     CHESS_DISPLAY_SD,
@@ -2030,6 +2031,7 @@ def acbl_detail(
     player_id: str | None = Query(None),
     pair_ids: str | None = Query(None),
 ) -> dict:
+    """Return board detail with the published session Results_URL."""
     with _REPORT_LOCK:
         started_at = datetime.now()
         t0 = time.perf_counter()
@@ -2066,6 +2068,19 @@ def acbl_detail(
                 if not pair_ids:
                     raise HTTPException(status_code=400, detail="pair_ids is required for Pairs detail.")
                 detail = _build_pair_detail(df, pair_ids=str(pair_ids), elo_rating_type=elo_rating_type)
+            if club_or_tournament == "club":
+                if "Event_ID" in detail.columns:
+                    detail = detail.with_columns(acbl_results_url_expr("club"))
+                else:
+                    detail = detail.with_columns(
+                        pl.lit(None, dtype=pl.Utf8).alias("Results_URL")
+                    )
+            else:
+                detail = detail.with_columns(acbl_results_url_expr("tournament"))
+            detail = detail.select(
+                *[column for column in detail.columns if column != "Results_URL"],
+                "Results_URL",
+            )
             t_build_end = time.perf_counter()
 
             t_serialize_start = time.perf_counter()

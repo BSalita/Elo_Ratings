@@ -94,6 +94,34 @@ SERIES_NAMES = {
 }
 
 
+def ffbridge_results_url_expr(
+    *,
+    session_column: str = "tournament_id",
+    group_column: str = "group_id",
+) -> pl.Expr:
+    """Build the public FFBridge group/session ranking URL."""
+    session_id = (
+        pl.col(session_column).cast(pl.Utf8).fill_null("").str.strip_chars()
+    )
+    group_id = pl.col(group_column).cast(pl.Utf8).fill_null("").str.strip_chars()
+    return (
+        pl.when((session_id != "") & (group_id != ""))
+        .then(
+            pl.concat_str(
+                [
+                    pl.lit("https://www.ffbridge.fr/competitions/results/groups/"),
+                    group_id,
+                    pl.lit("/sessions/"),
+                    session_id,
+                    pl.lit("/ranking"),
+                ]
+            )
+        )
+        .otherwise(None)
+        .alias("Results_URL")
+    )
+
+
 def resolve_series_id(series: Optional[int | str]) -> Optional[int]:
     """Resolve an exact ID or fuzzy tournament-series name."""
     if series in (None, "", "all"):
@@ -1254,6 +1282,12 @@ def run_player_history(
         | (pl.col("player2_id").cast(pl.Utf8) == pid)
     )
     all_sessions = results_df.filter(player_expr)
+    if "group_id" in all_sessions.columns:
+        all_sessions = all_sessions.with_columns(ffbridge_results_url_expr())
+    else:
+        all_sessions = all_sessions.with_columns(
+            pl.lit(None, dtype=pl.Utf8).alias("Results_URL")
+        )
     wanted = [
         "date", "tournament_id", "club_name", "pair_id", "pair_name",
         "player1_id", "player1_name", "player2_id", "player2_name",
@@ -1263,6 +1297,7 @@ def run_player_history(
         "handicap_score_status", "score_source_url",
         "player1_scratch_elo_after", "player2_scratch_elo_after",
         "player1_handicap_elo_after", "player2_handicap_elo_after",
+        "Results_URL",
     ]
     sessions = (
         all_sessions.sort("date", descending=True)

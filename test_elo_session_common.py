@@ -46,10 +46,10 @@ class AcblSessionSummaryTests(unittest.TestCase):
     def test_adds_club_and_tournament_results_urls(self) -> None:
         club_detail = pl.DataFrame(
             {
-                "Date": [datetime(2026, 1, 2)],
-                "Session": ["1493280"],
-                "Event_ID": [1033402],
-                "Board": [1],
+                "Date": [datetime(2026, 1, 2), datetime(2026, 1, 2)],
+                "Session": ["1493280", "1493280"],
+                "Event_ID": [None, 1033402],
+                "Board": [1, 2],
             }
         )
         tournament_detail = pl.DataFrame(
@@ -71,6 +71,8 @@ class AcblSessionSummaryTests(unittest.TestCase):
             tournament["Results_URL"][0],
             "https://live.acbl.org/event/2509101/271B/2/summary",
         )
+        self.assertEqual(club.columns[-1], "Results_URL")
+        self.assertEqual(tournament.columns[-1], "Results_URL")
 
     def test_club_summary_survives_legacy_detail_without_event_id(self) -> None:
         detail = pl.DataFrame(

@@ -5,6 +5,52 @@ from __future__ import annotations
 import polars as pl
 
 
+def acbl_results_url_expr(
+    club_or_tournament: str,
+    *,
+    event_id_column: str = "Event_ID",
+    session_column: str = "Session",
+) -> pl.Expr:
+    """Build the published ACBL results URL for a detail row."""
+    source = club_or_tournament.strip().lower()
+    if source == "club":
+        event_id = (
+            pl.col(event_id_column).cast(pl.Utf8).fill_null("").str.strip_chars()
+        )
+        return (
+            pl.when(event_id != "")
+            .then(
+                pl.concat_str(
+                    [
+                        pl.lit("https://my.acbl.org/club-results/details/"),
+                        event_id,
+                    ]
+                )
+            )
+            .otherwise(None)
+            .alias("Results_URL")
+        )
+    if source == "tournament":
+        session = (
+            pl.col(session_column).cast(pl.Utf8).fill_null("").str.strip_chars()
+        )
+        return (
+            pl.when(session != "")
+            .then(
+                pl.concat_str(
+                    [
+                        pl.lit("https://live.acbl.org/event/"),
+                        session.str.replace_all("-", "/"),
+                        pl.lit("/summary"),
+                    ]
+                )
+            )
+            .otherwise(None)
+            .alias("Results_URL")
+        )
+    raise ValueError("club_or_tournament must be either 'Club' or 'Tournament'")
+
+
 def summarize_acbl_sessions(
     detail: pl.DataFrame,
     club_or_tournament: str | None = None,
@@ -30,7 +76,13 @@ def summarize_acbl_sessions(
     if "Date" in ordered.columns:
         aggregations.append(pl.col("Date").first().alias("Date"))
     if "Event_ID" in ordered.columns:
-        aggregations.append(pl.col("Event_ID").first().alias("Event_ID"))
+        event_id = pl.col("Event_ID").cast(pl.Utf8).str.strip_chars()
+        aggregations.append(
+            event_id
+            .filter(event_id.is_not_null() & (event_id != ""))
+            .first()
+            .alias("Event_ID")
+        )
     if "Partner" in ordered.columns:
         aggregations.append(pl.col("Partner").first().alias("Partner"))
     aggregations.append(pl.len().alias("Boards"))
@@ -68,33 +120,21 @@ def summarize_acbl_sessions(
         source = club_or_tournament.strip().lower()
         if source == "club":
             results_url = (
-                pl.concat_str(
-                    [
-                        pl.lit("https://my.acbl.org/club-results/details/"),
-                        pl.col("Event_ID").cast(pl.Utf8),
-                    ]
-                )
+                acbl_results_url_expr(source)
                 if "Event_ID" in summary.columns
-                else pl.lit(None, dtype=pl.Utf8)
+                else pl.lit(None, dtype=pl.Utf8).alias("Results_URL")
             )
         elif source == "tournament":
-            results_url = pl.concat_str(
-                [
-                    pl.lit("https://live.acbl.org/event/"),
-                    pl.col("Session").cast(pl.Utf8).str.replace_all("-", "/"),
-                    pl.lit("/summary"),
-                ]
-            )
+            results_url = acbl_results_url_expr(source)
         else:
             raise ValueError(
                 "club_or_tournament must be either 'Club' or 'Tournament'"
             )
-        summary = summary.with_columns(results_url.alias("Results_URL"))
+        summary = summary.with_columns(results_url)
 
     preferred_order = [
         "Date",
         "Session",
-        "Results_URL",
         "Partner",
         "Boards",
         "Opponent_Pairs",
@@ -102,6 +142,7 @@ def summarize_acbl_sessions(
         "Elo_Start",
         "Elo_End",
         "Elo_Delta",
+        "Results_URL",
     ]
     return summary.select(
         [column for column in preferred_order if column in summary.columns]

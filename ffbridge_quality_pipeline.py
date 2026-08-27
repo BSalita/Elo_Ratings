@@ -398,6 +398,37 @@ def validate_unique_board_plays(frame: pl.DataFrame) -> None:
         )
 
 
+def deduplicate_board_plays(frame: pl.DataFrame) -> pl.DataFrame:
+    """Collapse repeated endpoint copies, rejecting conflicting quality values."""
+    key = ["session_id", "board_id", *(f"Player_ID_{seat}" for seat in SEATS)]
+    _require_columns(frame, [*key, *QUALITY_COLUMNS], "Board-quality frame")
+    duplicate_keys = frame.group_by(key).len().filter(pl.col("len") > 1)
+    if duplicate_keys.is_empty():
+        return frame
+
+    conflicts = (
+        frame.join(duplicate_keys.select(key), on=key, how="inner")
+        .group_by(key)
+        .agg(
+            *[
+                pl.col(column).drop_nulls().n_unique().alias(column)
+                for column in QUALITY_COLUMNS
+            ]
+        )
+        .filter(
+            pl.any_horizontal(
+                [pl.col(column) > 1 for column in QUALITY_COLUMNS]
+            )
+        )
+    )
+    if conflicts.height:
+        raise ValueError(
+            "Conflicting duplicate board-play quality values; "
+            f"{conflicts.height} key(s), sample={conflicts.head(3).to_dicts()}"
+        )
+    return frame.unique(subset=key, keep="first", maintain_order=True)
+
+
 def _dynamic_dd_score_expr(frame: pl.DataFrame) -> pl.Expr:
     expressions: list[pl.Expr] = []
     for level in range(1, 8):
@@ -565,6 +596,7 @@ def normalize_quality_frame(
         ].unique().head(10).to_list()
         raise ValueError(f"Missing metadata dates for sessions: {missing_sessions}")
     if reject_duplicates:
+        selected = deduplicate_board_plays(selected)
         validate_unique_board_plays(selected)
     return selected.sort(["Date", "session_id", "Board", "board_id"])
 

@@ -62,6 +62,7 @@ def leaderboard_report(
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> dict:
+    """Return Elo rows with deployed quality metrics and quality-cache status."""
     tournament_filters = [
         value
         for value in (
@@ -126,6 +127,7 @@ def player_history(
     limit: int = Query(100, ge=1, le=500),
     api_backend: str | None = Query(None),
 ) -> dict:
+    """Return newest-first FFBridge sessions, including public Results_URL."""
     return _run(
         reports.run_player_history,
         player_id=player_id,

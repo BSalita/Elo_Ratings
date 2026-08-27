@@ -118,6 +118,7 @@ from ffbridge_report_service import (
     filter_score_available as _filter_score_available,
     filter_valid_percentages as _filter_valid_percentages_ffbridge,
     filter_results as _filter_ffbridge_results,
+    ffbridge_results_url_expr as _ffbridge_results_url_expr,
     legacy_elo_cache_keys as _legacy_elo_cache_keys,
     load_quality_sidecars as _load_quality_sidecars,
     resolve_elo_cache_key as _resolve_elo_cache_key,
@@ -324,32 +325,6 @@ def _ffbridge_webpage_url(tournament_id: str, team_id: str, club_id: str) -> str
     if not (tid and teamid and cid):
         return ""
     return f"https://licencie.ffbridge.fr/#/resultats/simultane/{tid}/details/{teamid}?orgId={cid}"
-
-
-def _ffbridge_results_url_expr() -> pl.Expr:
-    """Public results page for one FFBridge session result row."""
-    session_id = (
-        pl.col("tournament_id").cast(pl.Utf8).fill_null("").str.strip_chars()
-    )
-    group_id = (
-        pl.col("group_id").cast(pl.Utf8).fill_null("").str.strip_chars()
-    )
-    return (
-        pl.when(pl.all_horizontal([session_id != "", group_id != ""]))
-        .then(
-            pl.concat_str(
-                [
-                    pl.lit("https://www.ffbridge.fr/competitions/results/groups/"),
-                    group_id,
-                    pl.lit("/sessions/"),
-                    session_id,
-                    pl.lit("/ranking"),
-                ]
-            )
-        )
-        .otherwise(pl.lit(None, dtype=pl.Utf8))
-        .alias("Results_URL")
-    )
 
 
 def _ffbridge_api_url(tournament_id: str) -> str:

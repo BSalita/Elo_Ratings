@@ -6,6 +6,7 @@ from unittest.mock import patch
 import polars as pl
 
 import elo_ffbridge_lancelot as lancelot
+import ffbridge_report_service as reports
 from streamlit_app_ffbridge_elo_ratings import (
     _ffbridge_results_url_expr,
     _move_url_columns_to_end,
@@ -70,6 +71,32 @@ class FFBridgeResultsUrlTests(unittest.TestCase):
             reordered.columns.to_list(),
             ["Date", "Rank", "Results_URL", "Score_Source_URL"],
         )
+
+    def test_player_history_api_rows_include_results_url_last(self) -> None:
+        persisted = pl.DataFrame(
+            {
+                "date": ["2025-01-01"],
+                "tournament_id": ["282839"],
+                "group_id": ["21333"],
+                "player1_id": ["101"],
+                "player2_id": ["202"],
+                "scratch_percentage": [55.0],
+            }
+        )
+        with patch.object(
+            reports,
+            "load_results",
+            return_value=(persisted, {"built_at": "2025-01-02T00:00:00Z"}),
+        ):
+            response = reports.run_player_history("101")
+
+        row = response["sessions"][0]
+        self.assertEqual(
+            row["Results_URL"],
+            "https://www.ffbridge.fr/competitions/results/groups/"
+            "21333/sessions/282839/ranking",
+        )
+        self.assertEqual(list(row)[-1], "Results_URL")
 
 
 if __name__ == "__main__":

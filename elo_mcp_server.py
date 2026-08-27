@@ -107,6 +107,8 @@ def ffbridge_top_players(
     club and player_name are typo-tolerant; numeric player IDs remain exact.
     date_range is a named window (e.g. 'Current FFBridge year', 'Last 1 year');
     explicit date_from/date_to (YYYY-MM-DD, inclusive) override it.
+    When deployed quality sidecars are available, rows include DD/par/sacrifice
+    quality metrics and the response reports quality_status/quality_cutoff.
     """
     return _ffbridge_get(
         "/ffbridge/report",
@@ -152,6 +154,7 @@ def ffbridge_top_pairs(
     """FFBridge pair Elo leaderboard. Parameters as in ffbridge_top_players.
     Pair Elo uses Latest semantics (rating after the pair's most recent
     session), shrunk toward the qualifying-pair median when prior_sessions > 0.
+    Deployed quality sidecars add DD/par/sacrifice metrics and ranks.
     """
     return _ffbridge_get(
         "/ffbridge/report",
@@ -291,7 +294,7 @@ def ffbridge_player_history(
 ) -> Dict[str, Any]:
     """Per-session tournament history for one FFBridge player (newest first):
     date, tournament, club, partner/pair, scratch and handicap percentages,
-    rank, and Elo after the session."""
+    rank, Elo after the session, and Results_URL."""
     return _ffbridge_get(
         "/ffbridge/player-history",
         {
@@ -371,10 +374,11 @@ def acbl_detail(
     online_filter: Optional[str] = None,
     strata: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Per-session detail for one ACBL player or pair from acbl-api /acbl/detail.
+    """Board detail for one ACBL player or pair from acbl-api /acbl/detail.
 
     For rating_type='Players' pass player_id (ACBL number); for 'Pairs' pass
-    pair_ids as 'id1-id2'. Other params as in acbl_report.
+    pair_ids as 'id1-id2'. Rows include Results_URL. Other params as in
+    acbl_report.
     """
     return _acbl_get(
         "/acbl/detail",

@@ -186,10 +186,23 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
         self.assertEqual(row["board_frequencies"][0]["ewScore"], "")
         self.assertEqual(unmapped, 1)
 
-    def test_duplicate_board_play_rows_are_rejected(self) -> None:
+    def test_duplicate_endpoint_copies_are_collapsed(self) -> None:
         duplicated = pl.concat([_quality_input().head(1), _quality_input().head(1)])
-        with self.assertRaisesRegex(ValueError, "Duplicate board-play rows"):
-            normalize_quality_frame(duplicated, session_dates=_dates())
+        normalized = normalize_quality_frame(duplicated, session_dates=_dates())
+        self.assertEqual(normalized.height, 1)
+
+    def test_conflicting_duplicate_board_plays_are_rejected(self) -> None:
+        original = _quality_input().head(1)
+        conflicting = original.with_columns(
+            pl.lit(-3, dtype=original.schema["DDTricks_Diff"]).alias(
+                "DDTricks_Diff"
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "Conflicting duplicate"):
+            normalize_quality_frame(
+                pl.concat([original, conflicting]),
+                session_dates=_dates(),
+            )
 
     def test_session_without_deal_and_contract_is_explicitly_unsupported(self) -> None:
         raw = pl.DataFrame(
