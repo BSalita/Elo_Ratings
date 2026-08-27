@@ -226,10 +226,12 @@ def fetch_tournament_results(session_id: str, tournament_date: str = "", series_
                 series_id=series_id,
             )
         if cached_data:
+            group_ids = fetch_session_group_ids(session_id)
             return _normalize_ranking_results(
                 cached_data,
                 series_id=series_id,
                 tournament_date=tournament_date,
+                group_ids=group_ids,
             ), True
     
     # Fetch from API
@@ -237,10 +239,12 @@ def fetch_tournament_results(session_id: str, tournament_date: str = "", series_
     
     if data and isinstance(data, list):
         save_to_disk_cache(CACHE_DIR, friendly_name, data, series_id=series_id)
+        group_ids = fetch_session_group_ids(session_id)
         return _normalize_ranking_results(
             data,
             series_id=series_id,
             tournament_date=tournament_date,
+            group_ids=group_ids,
         ), False
     
     return [], False
@@ -303,9 +307,11 @@ def _normalize_ranking_results(
     ranking: List[Dict[str, Any]],
     series_id: Optional[Any] = None,
     tournament_date: str = "",
+    group_ids: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """Normalize Lancelot ranking data to common result format."""
     results = []
+    group_ids = group_ids or {}
 
     # Check if this is an Octopus tournament (series_id 386)
     normalized_series_id = normalize_series_id(series_id)
@@ -424,6 +430,7 @@ def _normalize_ranking_results(
             'theoretical_rank': entry.get('rankWithoutHandicap'),
             'pe': entry.get('pe', 0),
             'pe_bonus': str(pe_bonus_raw),
+            'group_id': group_ids.get(club_code),
             # Lancelot exposes the organization route identifier as
             # simultaneousId/ffbCode rather than Classic's organization.id.
             'club_id': club_code,
@@ -436,6 +443,39 @@ def _normalize_ranking_results(
         })
     
     return results
+
+
+def fetch_session_group_ids(session_id: str) -> Dict[str, str]:
+    """Map each participating club's FFB code to its public results group ID."""
+    cache_name = f"result_group_ids_{session_id}"
+    cached_data = load_from_disk_cache(
+        CACHE_DIR,
+        cache_name,
+        max_age_hours=None,
+        series_id=None,
+    )
+    if isinstance(cached_data, dict):
+        return {str(key): str(value) for key, value in cached_data.items()}
+
+    data = lancelot_get(f"/competitions/sessions/{session_id}")
+    if not isinstance(data, dict):
+        return {}
+
+    mapping: Dict[str, str] = {}
+    for group_session in data.get("groupSessions") or []:
+        group = group_session.get("group") or {}
+        organization = (
+            ((group.get("phase") or {}).get("stade") or {}).get("organization")
+            or {}
+        )
+        club_code = normalize_club_code(organization.get("ffbCode"))
+        group_id = group.get("id")
+        if club_code and group_id not in (None, ""):
+            mapping[club_code] = str(group_id)
+
+    if mapping:
+        save_to_disk_cache(CACHE_DIR, cache_name, mapping, series_id=None)
+    return mapping
 
 
 def fetch_session_clubs(session_id: int) -> List[Dict[str, Any]]:

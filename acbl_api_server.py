@@ -937,7 +937,6 @@ def _required_columns_for_detail(rating_type: str, elo_rating_type: str) -> list
     cols = {
         "Date",
         "session_id",
-        "event_id",
         "Pct_NS",
         "Round",
         "Board",
@@ -1090,8 +1089,9 @@ def _build_player_detail(df: pl.DataFrame, player_id: str, elo_rating_type: str)
         cols_to_select = [
             pl.col("Date"),
             pl.col("session_id").alias("Session"),
-            pl.col("event_id").alias("Event_ID"),
         ]
+        if "event_id" in df.columns:
+            cols_to_select.append(pl.col("event_id").alias("Event_ID"))
         if "Round" in df.columns:
             cols_to_select.append(pl.col("Round"))
         if "Board" in df.columns:
@@ -1177,8 +1177,9 @@ def _build_pair_detail(df: pl.DataFrame, pair_ids: str, elo_rating_type: str) ->
         cols_to_select = [
             pl.col("Date"),
             pl.col("session_id").alias("Session"),
-            pl.col("event_id").alias("Event_ID"),
         ]
+        if "event_id" in df.columns:
+            cols_to_select.append(pl.col("event_id").alias("Event_ID"))
         if "Round" in df.columns:
             cols_to_select.append(pl.col("Round"))
         if "Board" in df.columns:
@@ -2039,6 +2040,8 @@ def acbl_detail(
 
             t_load_start = time.perf_counter()
             required_columns = _required_columns_for_detail(rating_type, elo_rating_type)
+            if "event_id" in load_elo_ratings_schema_map(club_or_tournament):
+                required_columns.append("event_id")
             df = load_elo_ratings(club_or_tournament, columns=required_columns, date_from=parsed_date_from)
             df = _filter_valid_percentages_acbl(df)
             t_load_end = time.perf_counter()

@@ -327,30 +327,22 @@ def _ffbridge_webpage_url(tournament_id: str, team_id: str, club_id: str) -> str
 
 def _ffbridge_results_url_expr() -> pl.Expr:
     """Public results page for one FFBridge session result row."""
-    tournament_id = (
+    session_id = (
         pl.col("tournament_id").cast(pl.Utf8).fill_null("").str.strip_chars()
     )
-    team_id = pl.col("team_id").cast(pl.Utf8).fill_null("").str.strip_chars()
-    club_id = pl.col("club_id").cast(pl.Utf8).fill_null("").str.strip_chars()
-    club_code = (
-        pl.col("club_code").cast(pl.Utf8).fill_null("").str.strip_chars()
+    group_id = (
+        pl.col("group_id").cast(pl.Utf8).fill_null("").str.strip_chars()
     )
-    organization_id = pl.when(club_id != "").then(club_id).otherwise(club_code)
     return (
-        pl.when(
-            pl.all_horizontal(
-                [tournament_id != "", team_id != "", organization_id != ""]
-            )
-        )
+        pl.when(pl.all_horizontal([session_id != "", group_id != ""]))
         .then(
             pl.concat_str(
                 [
-                    pl.lit("https://licencie.ffbridge.fr/#/resultats/simultane/"),
-                    tournament_id,
-                    pl.lit("/details/"),
-                    team_id,
-                    pl.lit("?orgId="),
-                    organization_id,
+                    pl.lit("https://www.ffbridge.fr/competitions/results/groups/"),
+                    group_id,
+                    pl.lit("/sessions/"),
+                    session_id,
+                    pl.lit("/ranking"),
                 ]
             )
         )
@@ -1265,6 +1257,11 @@ def process_tournaments_to_elo(
                 'handicap_field_avg': float(handicap_field_avg),
                 'scratch_field_strength': float(scratch_field_strength),
                 'handicap_field_strength': float(handicap_field_strength),
+                'group_id': (
+                    str(result.get('group_id'))
+                    if result.get('group_id') not in (None, '')
+                    else None
+                ),
                 'club_id': str(club_id),
                 'club_name': str(club_name),
                 'club_code': str(club_code),
@@ -1493,6 +1490,7 @@ def process_tournaments_to_elo(
             'handicap_field_avg': pl.Float64,
             'scratch_field_strength': pl.Float64,
             'handicap_field_strength': pl.Float64,
+            'group_id': pl.Utf8,
             'club_id': pl.Utf8,
             'club_name': pl.Utf8,
             'club_code': pl.Utf8,
@@ -1773,6 +1771,12 @@ def _needs_elo_rebuild(
     results_path, players_path, meta_path = _elo_cache_paths(key)
     if not (results_path.exists() and players_path.exists() and meta_path.exists()):
         return True, "missing or unreadable parquet"
+    if "Lancelot" in api_key:
+        try:
+            if "group_id" not in pl.read_parquet_schema(results_path):
+                return True, "results cache predates FFBridge group links"
+        except Exception:
+            return True, "unreadable parquet schema"
 
     age = _newest_persisted_age_hours(api_key, fetch_iv)
     if age is None:

@@ -72,6 +72,20 @@ class AcblSessionSummaryTests(unittest.TestCase):
             "https://live.acbl.org/event/2509101/271B/2/summary",
         )
 
+    def test_club_summary_survives_legacy_detail_without_event_id(self) -> None:
+        detail = pl.DataFrame(
+            {
+                "Date": [datetime(2026, 1, 2)],
+                "Session": ["1493280"],
+                "Board": [1],
+            }
+        )
+
+        summary = summarize_acbl_sessions(detail, "Club")
+
+        self.assertEqual(summary["Session"][0], "1493280")
+        self.assertIsNone(summary["Results URL"][0])
+
 
 if __name__ == "__main__":
     unittest.main()

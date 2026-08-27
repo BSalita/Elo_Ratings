@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import polars as pl
 
+import elo_ffbridge_lancelot as lancelot
 from streamlit_app_ffbridge_elo_ratings import _ffbridge_results_url_expr
 
 
 class FFBridgeResultsUrlTests(unittest.TestCase):
-    def test_uses_classic_club_id_or_lancelot_club_code(self) -> None:
+    def test_uses_public_group_and_session_route(self) -> None:
         rows = pl.DataFrame(
             {
-                "tournament_id": ["300751", "300751", "300751"],
-                "team_id": ["15128020", "15128021", "15128022"],
-                "club_id": ["123", None, None],
-                "club_code": ["ignored", "4100081", ""],
+                "tournament_id": ["282839", "282840"],
+                "group_id": ["21333", None],
             }
         )
 
@@ -22,15 +22,34 @@ class FFBridgeResultsUrlTests(unittest.TestCase):
 
         self.assertEqual(
             urls[0],
-            "https://licencie.ffbridge.fr/#/resultats/simultane/"
-            "300751/details/15128020?orgId=123",
+            "https://www.ffbridge.fr/competitions/results/groups/"
+            "21333/sessions/282839/ranking",
         )
-        self.assertEqual(
-            urls[1],
-            "https://licencie.ffbridge.fr/#/resultats/simultane/"
-            "300751/details/15128021?orgId=4100081",
-        )
-        self.assertIsNone(urls[2])
+        self.assertIsNone(urls[1])
+
+    def test_extracts_club_code_to_group_id_mapping(self) -> None:
+        payload = {
+            "groupSessions": [
+                {
+                    "group": {
+                        "id": 21333,
+                        "phase": {
+                            "stade": {
+                                "organization": {"ffbCode": "5802079"}
+                            }
+                        },
+                    }
+                }
+            ]
+        }
+        with (
+            patch.object(lancelot, "load_from_disk_cache", return_value=None),
+            patch.object(lancelot, "save_to_disk_cache"),
+            patch.object(lancelot, "lancelot_get", return_value=payload),
+        ):
+            actual = lancelot.fetch_session_group_ids("282839")
+
+        self.assertEqual(actual, {"5802079": "21333"})
 
 
 if __name__ == "__main__":

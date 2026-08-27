@@ -153,7 +153,8 @@ class PublicationStateTests(unittest.TestCase):
     ) -> None:
         pending = [_ranking_row(10, "Salita", "Jacoupy")]
         official = [_ranking_row(10, "Salita", "Jacoupy", score=54.41)]
-        load_cache.side_effect = [pending, None]
+        # Ranking cache check, expired-cache reload, then session-group cache.
+        load_cache.side_effect = [pending, None, None]
         get_api.return_value = official
         rows, was_cached = lancelot.fetch_tournament_results(
             "300751",
