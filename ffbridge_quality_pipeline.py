@@ -590,6 +590,16 @@ def normalize_quality_frame(
         "Pair_ID_EW",
         *QUALITY_COLUMNS,
     )
+    identity_columns = [f"Player_ID_{seat}" for seat in SEATS]
+    selected = selected.filter(
+        pl.any_horizontal(
+            [pl.col(column).is_not_null() for column in identity_columns]
+        )
+    )
+    if selected.is_empty():
+        raise NoQualityRowsError(
+            "Session has no board rows with a mapped player identity"
+        )
     if selected["Date"].null_count():
         missing_sessions = selected.filter(pl.col("Date").is_null())[
             "session_id"
@@ -1086,16 +1096,16 @@ def build_historical_fragments(
         try:
             raw, unmapped = load_raw_session(pathlib.Path(report.source_dir), session)
             augmented = augment_raw_session(raw)
+            fragment = normalize_quality_frame(
+                augmented,
+                session_dates=session_dates,
+                reject_duplicates=True,
+            )
         except NoQualityRowsError as exc:
             unsupported.append(
                 {"session_id": session.session_id, "reason": str(exc)}
             )
             continue
-        fragment = normalize_quality_frame(
-            augmented,
-            session_dates=session_dates,
-            reject_duplicates=True,
-        )
         _atomic_write_parquet(fragment, fragment_path)
         fragments.append(fragment)
         total_unmapped += unmapped

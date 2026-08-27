@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pathlib
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -10,6 +12,7 @@ import ffbridge_report_service as reports
 from streamlit_app_ffbridge_elo_ratings import (
     _ffbridge_results_url_expr,
     _move_url_columns_to_end,
+    _results_cache_has_group_links,
 )
 
 
@@ -97,6 +100,21 @@ class FFBridgeResultsUrlTests(unittest.TestCase):
             "21333/sessions/282839/ranking",
         )
         self.assertEqual(list(row)[-1], "Results_URL")
+
+    def test_empty_group_id_cache_requires_link_backfill(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "results.parquet"
+            pl.DataFrame(
+                {"group_id": [None, ""], "tournament_id": ["1", "2"]},
+                schema={"group_id": pl.String, "tournament_id": pl.String},
+            ).write_parquet(path)
+            self.assertFalse(_results_cache_has_group_links(path))
+
+            pl.DataFrame(
+                {"group_id": [None, "21333"], "tournament_id": ["1", "2"]},
+                schema={"group_id": pl.String, "tournament_id": pl.String},
+            ).write_parquet(path)
+            self.assertTrue(_results_cache_has_group_links(path))
 
 
 if __name__ == "__main__":

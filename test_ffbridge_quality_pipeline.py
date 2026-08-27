@@ -204,6 +204,41 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
                 session_dates=_dates(),
             )
 
+    def test_identityless_board_rows_are_excluded_before_deduplication(self) -> None:
+        original = _quality_input().head(1)
+        identityless = original.with_columns(
+            *[
+                pl.lit(
+                    None, dtype=original.schema[f"Player_ID_{seat}"]
+                ).alias(f"Player_ID_{seat}")
+                for seat in ("N", "E", "S", "W")
+            ],
+            pl.lit(-3, dtype=original.schema["DDTricks_Diff"]).alias(
+                "DDTricks_Diff"
+            ),
+        )
+
+        normalized = normalize_quality_frame(
+            pl.concat([original, identityless]),
+            session_dates=_dates(),
+        )
+
+        self.assertEqual(normalized.height, 1)
+        self.assertEqual(normalized["DD_Tricks_Diff"][0], original["DDTricks_Diff"][0])
+
+    def test_session_without_mapped_player_identity_is_unsupported(self) -> None:
+        original = _quality_input().head(1)
+        identityless = original.with_columns(
+            *[
+                pl.lit(
+                    None, dtype=original.schema[f"Player_ID_{seat}"]
+                ).alias(f"Player_ID_{seat}")
+                for seat in ("N", "E", "S", "W")
+            ]
+        )
+        with self.assertRaisesRegex(NoQualityRowsError, "mapped player identity"):
+            normalize_quality_frame(identityless, session_dates=_dates())
+
     def test_session_without_deal_and_contract_is_explicitly_unsupported(self) -> None:
         raw = pl.DataFrame(
             {
