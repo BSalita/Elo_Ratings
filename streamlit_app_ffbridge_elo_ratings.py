@@ -571,7 +571,12 @@ def _national_rank_expr() -> pl.Expr:
     return pl.col("national_rank").cast(pl.Int32, strict=False).alias("National_Rank")
 
 
-def _render_detail_aggrid_ff(detail_df: pl.DataFrame, key: str, selectable: bool = False):
+def _render_detail_aggrid_ff(
+    detail_df: pl.DataFrame,
+    key: str,
+    selectable: bool = False,
+    hidden_columns: tuple[str, ...] = (),
+):
     """Render a detail DataFrame as a selectable AgGrid. Returns grid response if selectable."""
     display_df = detail_df.to_pandas(use_pyarrow_extension_array=False)
     coerce_numeric_columns(display_df)
@@ -593,6 +598,9 @@ def _render_detail_aggrid_ff(detail_df: pl.DataFrame, key: str, selectable: bool
             )
     for col in _url_columns(display_df):
         gb.configure_column(col, cellRenderer=_URL_CELL_RENDERER, minWidth=240, width=360)
+    for col in hidden_columns:
+        if col in display_df.columns:
+            gb.configure_column(col, hide=True)
     grid_options = gb.build()
     grid_options['rowHeight'] = 28
     grid_options['domLayout'] = 'normal'
@@ -612,11 +620,37 @@ def _render_detail_aggrid_ff(detail_df: pl.DataFrame, key: str, selectable: bool
         gridOptions=grid_options,
         height=height,
         theme=AgGridTheme.BALHAM,
+        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
         key=key,
         allow_unsafe_jscode=True,
         update_on=["selectionChanged"] if selectable else [],
     )
     return response if selectable else None
+
+
+def _render_ffbridge_session_summary(
+    detail_df: pl.DataFrame,
+    key: str,
+    hidden_columns: tuple[str, ...] = (),
+) -> dict | None:
+    """Render one AgGrid row per session and return the selected full row."""
+    response = _render_detail_aggrid_ff(
+        detail_df,
+        key=key,
+        selectable=True,
+        hidden_columns=hidden_columns,
+    )
+    if response is None:
+        return None
+    selected_rows = response.get("selected_rows", None)
+    if selected_rows is None or len(selected_rows) == 0:
+        return None
+    selected_row = (
+        selected_rows.iloc[0]
+        if hasattr(selected_rows, "iloc")
+        else selected_rows[0]
+    )
+    return selected_row.to_dict() if hasattr(selected_row, "to_dict") else selected_row
 
 
 def _show_tournament_opponents(results_df: pl.DataFrame, tournament_id: str, exclude_pair_id: str = None) -> None:
@@ -2251,8 +2285,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                         player_name = selected_row.get('Player_Name', 'Unknown')
 
                         if player_id and not results_df.is_empty():
-                            # Show tournament history
-                            st.markdown(f"#### Tournament History Details: **{player_name}**")
+                            st.markdown(f"#### Session History: **{player_name}** ({player_id})")
                             player_results = results_df.filter(
                                 (pl.col('player1_id') == str(player_id)) | 
                                 (pl.col('player2_id') == str(player_id))
@@ -2262,7 +2295,10 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                 cols_to_select = [
                                     pl.col('date').str.slice(0, 10).alias('Date'),
                                     pl.col('tournament_id').alias('Event_ID'),
-                                    pl.col('pair_name').alias('Partner'),
+                                    pl.when(pl.col('player1_id') == str(player_id))
+                                      .then(pl.col('player2_name'))
+                                      .otherwise(pl.col('player1_name'))
+                                      .alias('Partner'),
                                     (pl.col('scratch_percentage') if 'scratch_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Scratch_%'),
                                     (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_%'),
                                     (pl.col('iv_bonus') if 'iv_bonus' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(1).alias('IV_Bonus'),
@@ -2294,12 +2330,36 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                 # Add current IV (note: this is current IV, not IV at tournament time)
                                 if 'pair_iv' in player_results.columns:
                                     cols_to_select.append(pl.col('pair_iv').alias('Current_Pair_IV'))
-                                # Dynamically select Elo based on current use_handicap setting
-                                elo_col = 'player1_handicap_elo_after' if use_handicap else 'player1_scratch_elo_after'
-                                if elo_col in player_results.columns:
-                                    cols_to_select.append(pl.col(elo_col).round(0).alias('Elo_After'))
-                                elif 'player1_elo_after' in player_results.columns:
-                                    cols_to_select.append(pl.col('player1_elo_after').round(0).alias('Elo_After'))
+                                # Select the clicked player's Elo, regardless of whether
+                                # that player occupies player1 or player2 in this result.
+                                elo_prefix = 'handicap' if use_handicap else 'scratch'
+                                p1_before = f'player1_{elo_prefix}_elo_before'
+                                p2_before = f'player2_{elo_prefix}_elo_before'
+                                p1_after = f'player1_{elo_prefix}_elo_after'
+                                p2_after = f'player2_{elo_prefix}_elo_after'
+                                if all(
+                                    column in player_results.columns
+                                    for column in (p1_before, p2_before, p1_after, p2_after)
+                                ):
+                                    selected_before = (
+                                        pl.when(pl.col('player1_id') == str(player_id))
+                                        .then(pl.col(p1_before))
+                                        .otherwise(pl.col(p2_before))
+                                    )
+                                    selected_after = (
+                                        pl.when(pl.col('player1_id') == str(player_id))
+                                        .then(pl.col(p1_after))
+                                        .otherwise(pl.col(p2_after))
+                                    )
+                                    cols_to_select.extend(
+                                        [
+                                            selected_before.round(0).alias('Elo_Before'),
+                                            selected_after.round(0).alias('Elo_After'),
+                                            (selected_after - selected_before)
+                                            .round(0)
+                                            .alias('Elo_Delta'),
+                                        ]
+                                    )
 
                                 # Also keep helper columns for URL construction and opponent lookup.
                                 helper_cols = [pl.col('pair_id').alias('_pair_id')]
@@ -2309,29 +2369,38 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                     helper_cols.append(pl.col('club_id').alias('_club_id'))
                                 detail_df = player_results.select(cols_to_select + helper_cols)
 
-                                st.caption("Click a row to see tournament opponents")
-                                # Hide helper columns from display
-                                hidden = [c for c in ('_pair_id', '_team_id', '_club_id') if c in detail_df.columns]
-                                display_detail = detail_df.drop(hidden) if hidden else detail_df
-                                detail_key = f"detail_player_{player_id}_{rating_type}_{score_type}"
-                                detail_resp = _render_detail_aggrid_ff(display_detail, key=detail_key, selectable=True)
+                                st.caption(
+                                    f"{detail_df.height} sessions — click a session "
+                                    "to see tournament opponents"
+                                )
+                                st.markdown("#### Sessions")
+                                hidden = tuple(
+                                    column
+                                    for column in ('_pair_id', '_team_id', '_club_id')
+                                    if column in detail_df.columns
+                                )
+                                selected_session = _render_ffbridge_session_summary(
+                                    detail_df,
+                                    key=f"sessions_player_{player_id}_{rating_type}_{score_type}",
+                                    hidden_columns=hidden,
+                                )
 
-                                # 3rd df: tournament opponents for clicked row
-                                if detail_resp is not None:
-                                    d_sel = detail_resp.get('selected_rows', None)
-                                    if d_sel is not None and len(d_sel) > 0:
-                                        d_row = d_sel.iloc[0] if hasattr(d_sel, 'iloc') else d_sel[0]
-                                        event_id = str(d_row.get('Event_ID', ''))
-                                        # Find pair_id for this row
-                                        row_pair_id = None
-                                        if event_id and '_pair_id' in detail_df.columns:
-                                            match = detail_df.filter(pl.col('Event_ID') == event_id)
-                                            if not match.is_empty():
-                                                row_pair_id = str(match.select('_pair_id').row(0)[0])
-                                        if event_id:
-                                            _show_tournament_opponents(results_df, event_id, exclude_pair_id=row_pair_id)
+                                if selected_session is not None:
+                                    event_id = str(selected_session.get('Event_ID', ''))
+                                    row_pair_id = selected_session.get('_pair_id')
+                                    if event_id:
+                                        _show_tournament_opponents(
+                                            results_df,
+                                            event_id,
+                                            exclude_pair_id=(
+                                                str(row_pair_id)
+                                                if row_pair_id is not None
+                                                else None
+                                            ),
+                                        )
 
                                 # 4th df: partner aggregation across all tournaments
+                                display_detail = detail_df.drop(list(hidden)) if hidden else detail_df
                                 _show_partner_aggregation(display_detail, key_suffix=f"player_{player_id}_{score_type}")
 
                                 # Opponent History Details + Opponent Summary
@@ -2421,7 +2490,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                         pair_name = selected_row.get('Pair_Name', 'Unknown')
 
                         if pair_id and not results_df.is_empty():
-                            st.markdown(f"### Tournament History Details for **{pair_name}**")
+                            st.markdown(f"#### Session History: **{pair_name}**")
 
                             pair_results = results_df.filter(
                                 pl.col('pair_id') == str(pair_id)
@@ -2478,23 +2547,33 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                     helper_cols.append(pl.col('club_id').alias('_club_id'))
                                 detail_df = pair_results.select(cols_to_select + helper_cols)
 
-                                st.caption("Click a row to see tournament opponents")
-                                # Hide helper columns from display
-                                hidden = [c for c in ('_team_id', '_club_id') if c in detail_df.columns]
-                                display_detail = detail_df.drop(hidden) if hidden else detail_df
-                                detail_key = f"detail_pair_{pair_id}_{rating_type}_{score_type}"
-                                detail_resp = _render_detail_aggrid_ff(display_detail, key=detail_key, selectable=True)
+                                st.caption(
+                                    f"{detail_df.height} sessions — click a session "
+                                    "to see tournament opponents"
+                                )
+                                st.markdown("#### Sessions")
+                                hidden = tuple(
+                                    column
+                                    for column in ('_team_id', '_club_id')
+                                    if column in detail_df.columns
+                                )
+                                selected_session = _render_ffbridge_session_summary(
+                                    detail_df,
+                                    key=f"sessions_pair_{pair_id}_{rating_type}_{score_type}",
+                                    hidden_columns=hidden,
+                                )
 
-                                # 3rd df: tournament opponents for clicked row
-                                if detail_resp is not None:
-                                    d_sel = detail_resp.get('selected_rows', None)
-                                    if d_sel is not None and len(d_sel) > 0:
-                                        d_row = d_sel.iloc[0] if hasattr(d_sel, 'iloc') else d_sel[0]
-                                        event_id = str(d_row.get('Event_ID', ''))
-                                        if event_id:
-                                            _show_tournament_opponents(results_df, event_id, exclude_pair_id=str(pair_id))
+                                if selected_session is not None:
+                                    event_id = str(selected_session.get('Event_ID', ''))
+                                    if event_id:
+                                        _show_tournament_opponents(
+                                            results_df,
+                                            event_id,
+                                            exclude_pair_id=str(pair_id),
+                                        )
 
                                 # 4th df: club aggregation across all tournaments
+                                display_detail = detail_df.drop(list(hidden)) if hidden else detail_df
                                 _show_club_aggregation(display_detail, results_df, str(pair_id), key_suffix=f"pair_{pair_id}_{score_type}")
 
                                 # Opponent History Details + Opponent Summary

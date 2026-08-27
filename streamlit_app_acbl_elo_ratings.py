@@ -502,48 +502,42 @@ def _render_detail_aggrid(detail_df: pl.DataFrame, key: str, selectable: bool = 
         grid_options['alwaysShowVerticalScroll'] = True
         height = header_height + max_visible * row_height + 20
 
-    from st_aggrid import GridUpdateMode, DataReturnMode
+    from st_aggrid import DataReturnMode
     response = AgGrid(
         pdf,
         gridOptions=grid_options,
         height=height,
         theme=AgGridTheme.BALHAM,
-        update_mode=GridUpdateMode.MODEL_CHANGED,
         data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
         key=key,
         allow_unsafe_jscode=True,
-        update_on=["selectionChanged"],
+        update_on=["selectionChanged"] if selectable else [],
     )
     return response if selectable else None
 
 
 def _render_session_summary(detail: pl.DataFrame, key: str) -> dict | None:
-    """Render one row per session and return the selected summary row."""
+    """Render one AgGrid row per session and return the selected summary row."""
     summary = summarize_acbl_sessions(detail)
     if summary.is_empty():
         st.info("No sessions found in the board detail.")
         return None
 
-    visible_rows = min(summary.height, 15)
-    event = st.dataframe(
+    response = _render_detail_aggrid(
         summary,
         key=key,
-        hide_index=True,
-        height=38 + visible_rows * 35,
-        on_select="rerun",
-        selection_mode="single-row",
-        column_config={
-            "Avg_Pct": st.column_config.NumberColumn("Avg %", format="%.1f%%"),
-            "Opponent_Pairs": st.column_config.NumberColumn("Opponents"),
-            "Elo_Start": st.column_config.NumberColumn("Elo start"),
-            "Elo_End": st.column_config.NumberColumn("Elo end"),
-            "Elo_Delta": st.column_config.NumberColumn("Elo delta"),
-        },
+        selectable=True,
     )
-    selected_indices = event.selection.rows
-    if not selected_indices:
+    if response is None:
         return None
-    return summary.row(selected_indices[0], named=True)
+    selected_rows = response.get("selected_rows", None)
+    if selected_rows is None or len(selected_rows) == 0:
+        return None
+    return (
+        selected_rows.iloc[0]
+        if hasattr(selected_rows, "iloc")
+        else selected_rows[0]
+    )
 
 
 def _show_sql_query_block(sql_text: str) -> None:
