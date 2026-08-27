@@ -516,9 +516,13 @@ def _render_detail_aggrid(detail_df: pl.DataFrame, key: str, selectable: bool = 
     return response if selectable else None
 
 
-def _render_session_summary(detail: pl.DataFrame, key: str) -> dict | None:
+def _render_session_summary(
+    detail: pl.DataFrame,
+    key: str,
+    club_or_tournament: str,
+) -> dict | None:
     """Render one AgGrid row per session and return the selected summary row."""
-    summary = summarize_acbl_sessions(detail)
+    summary = summarize_acbl_sessions(detail, club_or_tournament)
     if summary.is_empty():
         st.info("No sessions found in the board detail.")
         return None
@@ -1217,6 +1221,7 @@ def _acbl_report_panel() -> None:
                                     selected_session = _render_session_summary(
                                         detail,
                                         key=f"sessions_player_{player_id}",
+                                        club_or_tournament=club_or_tournament,
                                     )
                                     if selected_session is not None:
                                         _show_opponent_aggregation(detail, selected_session)
@@ -1262,6 +1267,7 @@ def _acbl_report_panel() -> None:
                                     selected_session = _render_session_summary(
                                         detail,
                                         key=f"sessions_pair_{pair_ids}",
+                                        club_or_tournament=club_or_tournament,
                                     )
                                     if selected_session is not None:
                                         _show_opponent_aggregation(detail, selected_session)

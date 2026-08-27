@@ -325,6 +325,31 @@ def _ffbridge_webpage_url(tournament_id: str, team_id: str, club_id: str) -> str
     return f"https://licencie.ffbridge.fr/#/resultats/simultane/{tid}/details/{teamid}?orgId={cid}"
 
 
+def _ffbridge_results_url_expr() -> pl.Expr:
+    """Public results page for one FFBridge session result row."""
+    required = [
+        pl.col(column).cast(pl.Utf8).fill_null("").str.strip_chars()
+        for column in ("tournament_id", "team_id", "club_id")
+    ]
+    return (
+        pl.when(pl.all_horizontal([value != "" for value in required]))
+        .then(
+            pl.concat_str(
+                [
+                    pl.lit("https://licencie.ffbridge.fr/#/resultats/simultane/"),
+                    pl.col("tournament_id").cast(pl.Utf8),
+                    pl.lit("/details/"),
+                    pl.col("team_id").cast(pl.Utf8),
+                    pl.lit("?orgId="),
+                    pl.col("club_id").cast(pl.Utf8),
+                ]
+            )
+        )
+        .otherwise(pl.lit(None, dtype=pl.Utf8))
+        .alias("Results URL")
+    )
+
+
 def _ffbridge_api_url(tournament_id: str) -> str:
     """Build the FFBridge Classic API URL for a tournament (dev reference; needs JWT)."""
     tid = str(tournament_id or "").strip()
@@ -2295,6 +2320,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                 cols_to_select = [
                                     pl.col('date').str.slice(0, 10).alias('Date'),
                                     pl.col('tournament_id').alias('Event_ID'),
+                                    _ffbridge_results_url_expr(),
                                     pl.when(pl.col('player1_id') == str(player_id))
                                       .then(pl.col('player2_name'))
                                       .otherwise(pl.col('player1_name'))
@@ -2500,6 +2526,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                 cols_to_select = [
                                     pl.col('date').str.slice(0, 10).alias('Date'),
                                     pl.col('tournament_id').alias('Event_ID'),
+                                    _ffbridge_results_url_expr(),
                                     (pl.col('scratch_percentage') if 'scratch_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Scratch_%'),
                                     (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_%'),
                                     (pl.col('iv_bonus') if 'iv_bonus' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(1).alias('IV_Bonus'),

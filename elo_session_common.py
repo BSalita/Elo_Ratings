@@ -5,7 +5,10 @@ from __future__ import annotations
 import polars as pl
 
 
-def summarize_acbl_sessions(detail: pl.DataFrame) -> pl.DataFrame:
+def summarize_acbl_sessions(
+    detail: pl.DataFrame,
+    club_or_tournament: str | None = None,
+) -> pl.DataFrame:
     """Collapse ACBL board detail to one chronologically ordered row per session."""
     if "Session" not in detail.columns:
         raise ValueError("ACBL detail is missing required 'Session' column")
@@ -59,10 +62,33 @@ def summarize_acbl_sessions(detail: pl.DataFrame) -> pl.DataFrame:
         summary = summary.with_columns(
             (pl.col("Elo_End") - pl.col("Elo_Start")).alias("Elo_Delta")
         )
+    if club_or_tournament is not None:
+        source = club_or_tournament.strip().lower()
+        if source == "club":
+            results_url = pl.concat_str(
+                [
+                    pl.lit("https://my.acbl.org/club-results/details/"),
+                    pl.col("Session").cast(pl.Utf8),
+                ]
+            )
+        elif source == "tournament":
+            results_url = pl.concat_str(
+                [
+                    pl.lit("https://live.acbl.org/event/"),
+                    pl.col("Session").cast(pl.Utf8).str.replace_all("-", "/"),
+                    pl.lit("/summary"),
+                ]
+            )
+        else:
+            raise ValueError(
+                "club_or_tournament must be either 'Club' or 'Tournament'"
+            )
+        summary = summary.with_columns(results_url.alias("Results URL"))
 
     preferred_order = [
         "Date",
         "Session",
+        "Results URL",
         "Partner",
         "Boards",
         "Opponent_Pairs",

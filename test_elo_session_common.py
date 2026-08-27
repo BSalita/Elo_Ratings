@@ -43,6 +43,34 @@ class AcblSessionSummaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Session"):
             summarize_acbl_sessions(pl.DataFrame({"Board": [1]}))
 
+    def test_adds_club_and_tournament_results_urls(self) -> None:
+        club_detail = pl.DataFrame(
+            {
+                "Date": [datetime(2026, 1, 2)],
+                "Session": ["1033402"],
+                "Board": [1],
+            }
+        )
+        tournament_detail = pl.DataFrame(
+            {
+                "Date": [datetime(2026, 1, 2)],
+                "Session": ["2509101-271B-2"],
+                "Board": [1],
+            }
+        )
+
+        club = summarize_acbl_sessions(club_detail, "Club")
+        tournament = summarize_acbl_sessions(tournament_detail, "Tournament")
+
+        self.assertEqual(
+            club["Results URL"][0],
+            "https://my.acbl.org/club-results/details/1033402",
+        )
+        self.assertEqual(
+            tournament["Results URL"][0],
+            "https://live.acbl.org/event/2509101/271B/2/summary",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
