@@ -457,7 +457,11 @@ def fetch_session_group_ids(session_id: str) -> Dict[str, str]:
     if isinstance(cached_data, dict):
         return {str(key): str(value) for key, value in cached_data.items()}
 
-    data = lancelot_get(f"/competitions/sessions/{session_id}")
+    data = None
+    for _attempt in range(3):
+        data = lancelot_get(f"/competitions/sessions/{session_id}")
+        if isinstance(data, dict):
+            break
     if not isinstance(data, dict):
         return {}
 

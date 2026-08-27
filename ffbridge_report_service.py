@@ -1303,7 +1303,7 @@ def run_player_history(
     wanted = [
         "date", "tournament_id", "club_name", "pair_id", "pair_name",
         "player1_id", "player1_name", "player2_id", "player2_name",
-        "scratch_percentage", "handicap_percentage", "iv_bonus", "rank",
+        "scratch_percentage", "handicap_percentage", "iv_bonus",
         "national_rank", "rank_without_handicap", "theoretical_rank",
         "score_source", "score_status", "scratch_score_status",
         "handicap_score_status", "score_source_url",

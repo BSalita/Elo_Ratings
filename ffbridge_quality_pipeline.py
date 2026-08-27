@@ -422,7 +422,7 @@ def deduplicate_board_plays(frame: pl.DataFrame) -> pl.DataFrame:
         )
     )
     if conflicts.height:
-        raise ValueError(
+        raise NoQualityRowsError(
             "Conflicting duplicate board-play quality values; "
             f"{conflicts.height} key(s), sample={conflicts.head(3).to_dicts()}"
         )

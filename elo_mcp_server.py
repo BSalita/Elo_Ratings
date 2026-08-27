@@ -295,7 +295,8 @@ def ffbridge_player_history(
 ) -> Dict[str, Any]:
     """Per-session tournament history for one FFBridge player (newest first):
     date, tournament, club, partner/pair, scratch and handicap percentages,
-    rank, Elo after the session, and Results_URL, plus link-coverage status."""
+    national rank, Elo after the session, and Results_URL, plus link-coverage
+    status."""
     return _ffbridge_get(
         "/ffbridge/player-history",
         {

@@ -690,8 +690,6 @@ def _show_tournament_opponents(results_df: pl.DataFrame, tournament_id: str, exc
         return
 
     cols = [pl.col('pair_name').alias('Pair')]
-    if 'rank' in tourney_results.columns:
-        cols.append(pl.col('rank').cast(pl.Int32, strict=False).alias('Rank'))
     cols.append(_national_rank_expr())
     if 'scratch_percentage' in tourney_results.columns:
         cols.append(pl.col('scratch_percentage').cast(pl.Float64, strict=False).round(2).alias('Scratch_%'))
@@ -701,8 +699,8 @@ def _show_tournament_opponents(results_df: pl.DataFrame, tournament_id: str, exc
         cols.append(pl.col('pair_elo').cast(pl.Float64, strict=False).round(0).cast(pl.Int32, strict=False).alias('Pair_Elo'))
 
     opp_df = tourney_results.select(cols)
-    if 'Rank' in opp_df.columns:
-        opp_df = opp_df.sort('Rank')
+    if 'National_Rank' in opp_df.columns:
+        opp_df = opp_df.sort('National_Rank')
 
     t_name = tourney_results.select('tournament_name').row(0)[0] if 'tournament_name' in tourney_results.columns else tournament_id
     t_date = tourney_results.select(pl.col('date').str.slice(0, 10)).row(0)[0] if 'date' in tourney_results.columns else ''
@@ -721,8 +719,14 @@ def _show_partner_aggregation(detail_df: pl.DataFrame, key_suffix: str) -> None:
     ]
     if 'Pct_Used' in detail_df.columns:
         agg_cols.append(pl.col('Pct_Used').mean().cast(pl.Float64).round(2).alias('Avg_Pct'))
-    if 'Rank' in detail_df.columns:
-        agg_cols.append(pl.col('Rank').cast(pl.Float64, strict=False).mean().round(1).alias('Avg_Rank'))
+    if 'National_Rank' in detail_df.columns:
+        agg_cols.append(
+            pl.col('National_Rank')
+            .cast(pl.Float64, strict=False)
+            .mean()
+            .round(1)
+            .alias('Avg_National_Rank')
+        )
     if 'Elo_After' in detail_df.columns:
         agg_cols.append(pl.col('Elo_After').last().round(0).cast(pl.Int32, strict=False).alias('Last_Elo'))
 
@@ -752,8 +756,14 @@ def _show_club_aggregation(detail_df: pl.DataFrame, results_df: pl.DataFrame, pa
         agg_cols.append(pl.col('scratch_percentage').cast(pl.Float64, strict=False).mean().round(2).alias('Avg_Scratch_%'))
     if 'handicap_percentage' in pair_data.columns:
         agg_cols.append(pl.col('handicap_percentage').cast(pl.Float64, strict=False).mean().round(2).alias('Avg_Handicap_%'))
-    if 'rank' in pair_data.columns:
-        agg_cols.append(pl.col('rank').cast(pl.Float64, strict=False).mean().round(1).alias('Avg_Rank'))
+    if 'national_rank' in pair_data.columns:
+        agg_cols.append(
+            pl.col('national_rank')
+            .cast(pl.Float64, strict=False)
+            .mean()
+            .round(1)
+            .alias('Avg_National_Rank')
+        )
 
     club_agg = (
         pair_data
@@ -796,8 +806,6 @@ def _build_opponent_data(results_df: pl.DataFrame, entity_tournaments: pl.DataFr
         pl.col('date').str.slice(0, 10).alias('Date'),
         pl.col('pair_name').alias('Opponent'),
     ]
-    if 'rank' in all_opp.columns:
-        cols.append(pl.col('rank').cast(pl.Int32, strict=False).alias('Rank'))
     cols.append(_national_rank_expr())
     if 'scratch_percentage' in all_opp.columns:
         cols.append(pl.col('scratch_percentage').cast(pl.Float64, strict=False).round(2).alias('Scratch_%'))
@@ -806,7 +814,10 @@ def _build_opponent_data(results_df: pl.DataFrame, entity_tournaments: pl.DataFr
     if 'pair_elo' in all_opp.columns:
         cols.append(pl.col('pair_elo').cast(pl.Float64, strict=False).round(0).cast(pl.Int32, strict=False).alias('Pair_Elo'))
 
-    return all_opp.select(cols).sort(['Date', 'Event_ID', 'Rank'], descending=[True, False, False])
+    return all_opp.select(cols).sort(
+        ['Date', 'Event_ID', 'National_Rank'],
+        descending=[True, False, False],
+    )
 
 
 def _show_opponent_history(results_df: pl.DataFrame, entity_tournaments: pl.DataFrame, exclude_id: str, exclude_mode: str = 'pair', key_suffix: str = '') -> None:
@@ -1755,10 +1766,10 @@ def _fetch_tournament_list_resilient(
     return [], "none"
 
 
-def _results_cache_has_group_links(results_path: pathlib.Path) -> bool:
+def _results_cache_has_complete_group_links(results_path: pathlib.Path) -> bool:
     if "group_id" not in pl.read_parquet_schema(results_path):
         return False
-    return bool(
+    return not bool(
         pl.scan_parquet(results_path)
         .select(
             (
@@ -1766,10 +1777,10 @@ def _results_cache_has_group_links(results_path: pathlib.Path) -> bool:
                 .cast(pl.Utf8)
                 .fill_null("")
                 .str.strip_chars()
-                != ""
+                == ""
             )
             .any()
-            .alias("has_group_links")
+            .alias("has_missing_group_links")
         )
         .collect()
         .item()
@@ -1793,8 +1804,8 @@ def _needs_elo_rebuild(
         return True, "missing or unreadable parquet"
     if "Lancelot" in api_key:
         try:
-            if not _results_cache_has_group_links(results_path):
-                return True, "results cache has no FFBridge group links"
+            if not _results_cache_has_complete_group_links(results_path):
+                return True, "results cache has missing FFBridge group links"
         except Exception:
             return True, "unreadable parquet schema"
 
@@ -2391,11 +2402,6 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                         (pl.col('scratch_percentage') if 'scratch_percentage' in player_results.columns else pl.col('percentage'))
                                           .cast(pl.Float64, strict=False).round(2).alias('Pct_Used')
                                     )
-                                # Dynamically select Rank based on current use_handicap setting
-                                if use_handicap and 'theoretical_rank' in player_results.columns:
-                                    cols_to_select.append(pl.col('theoretical_rank').alias('Rank'))
-                                else:
-                                    cols_to_select.append(pl.col('rank').alias('Rank'))
                                 cols_to_select.append(_national_rank_expr())
                                 # Add current IV (note: this is current IV, not IV at tournament time)
                                 if 'pair_iv' in player_results.columns:
@@ -2598,11 +2604,6 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                         (pl.col('scratch_percentage') if 'scratch_percentage' in pair_results.columns else pl.col('percentage'))
                                           .cast(pl.Float64, strict=False).round(2).alias('Pct_Used')
                                     )
-                                # Dynamically select Rank based on current use_handicap setting
-                                if use_handicap and 'theoretical_rank' in pair_results.columns:
-                                    cols_to_select.append(pl.col('theoretical_rank').alias('Rank'))
-                                else:
-                                    cols_to_select.append(pl.col('rank').alias('Rank'))
                                 cols_to_select.append(_national_rank_expr())
                                 # Add current IV (note: this is current IV, not IV at tournament time)
                                 if 'pair_iv' in pair_results.columns:

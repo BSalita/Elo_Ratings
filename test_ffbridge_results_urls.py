@@ -12,7 +12,7 @@ import ffbridge_report_service as reports
 from streamlit_app_ffbridge_elo_ratings import (
     _ffbridge_results_url_expr,
     _move_url_columns_to_end,
-    _results_cache_has_group_links,
+    _results_cache_has_complete_group_links,
 )
 
 
@@ -58,6 +58,35 @@ class FFBridgeResultsUrlTests(unittest.TestCase):
 
         self.assertEqual(actual, {"5802079": "21333"})
 
+    def test_group_id_metadata_fetch_retries_transient_empty_response(self) -> None:
+        payload = {
+            "groupSessions": [
+                {
+                    "group": {
+                        "id": 21333,
+                        "phase": {
+                            "stade": {
+                                "organization": {"ffbCode": "5802079"}
+                            }
+                        },
+                    }
+                }
+            ]
+        }
+        with (
+            patch.object(lancelot, "load_from_disk_cache", return_value=None),
+            patch.object(lancelot, "save_to_disk_cache"),
+            patch.object(
+                lancelot,
+                "lancelot_get",
+                side_effect=[None, payload],
+            ) as get,
+        ):
+            actual = lancelot.fetch_session_group_ids("282839")
+
+        self.assertEqual(actual, {"5802079": "21333"})
+        self.assertEqual(get.call_count, 2)
+
     def test_moves_all_url_columns_to_right_edge(self) -> None:
         display = pl.DataFrame(
             {
@@ -84,6 +113,8 @@ class FFBridgeResultsUrlTests(unittest.TestCase):
                 "player1_id": ["101"],
                 "player2_id": ["202"],
                 "scratch_percentage": [55.0],
+                "rank": [3],
+                "national_rank": [3],
             }
         )
         with patch.object(
@@ -94,6 +125,8 @@ class FFBridgeResultsUrlTests(unittest.TestCase):
             response = reports.run_player_history("101")
 
         row = response["sessions"][0]
+        self.assertNotIn("rank", row)
+        self.assertEqual(row["national_rank"], 3)
         self.assertEqual(
             row["Results_URL"],
             "https://www.ffbridge.fr/competitions/results/groups/"
@@ -110,13 +143,19 @@ class FFBridgeResultsUrlTests(unittest.TestCase):
                 {"group_id": [None, ""], "tournament_id": ["1", "2"]},
                 schema={"group_id": pl.String, "tournament_id": pl.String},
             ).write_parquet(path)
-            self.assertFalse(_results_cache_has_group_links(path))
+            self.assertFalse(_results_cache_has_complete_group_links(path))
 
             pl.DataFrame(
                 {"group_id": [None, "21333"], "tournament_id": ["1", "2"]},
                 schema={"group_id": pl.String, "tournament_id": pl.String},
             ).write_parquet(path)
-            self.assertTrue(_results_cache_has_group_links(path))
+            self.assertFalse(_results_cache_has_complete_group_links(path))
+
+            pl.DataFrame(
+                {"group_id": ["21291", "21333"], "tournament_id": ["1", "2"]},
+                schema={"group_id": pl.String, "tournament_id": pl.String},
+            ).write_parquet(path)
+            self.assertTrue(_results_cache_has_complete_group_links(path))
 
 
 if __name__ == "__main__":
