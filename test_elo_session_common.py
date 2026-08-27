@@ -5,7 +5,7 @@ from datetime import datetime
 
 import polars as pl
 
-from elo_session_common import summarize_acbl_sessions
+from elo_session_common import results_url_status, summarize_acbl_sessions
 
 
 class AcblSessionSummaryTests(unittest.TestCase):
@@ -87,6 +87,20 @@ class AcblSessionSummaryTests(unittest.TestCase):
 
         self.assertEqual(summary["Session"][0], "1493280")
         self.assertIsNone(summary["Results_URL"][0])
+
+    def test_results_url_status_reports_partial_coverage(self) -> None:
+        status = results_url_status(
+            pl.DataFrame({"Results_URL": ["https://example.test", None, ""]})
+        )
+        self.assertEqual(
+            status,
+            {
+                "status": "incomplete",
+                "total_rows": 3,
+                "linked_rows": 1,
+                "missing_rows": 2,
+            },
+        )
 
 
 if __name__ == "__main__":

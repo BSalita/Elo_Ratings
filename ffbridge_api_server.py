@@ -31,6 +31,8 @@ def health() -> dict:
         "dataset_built_at": info.get("built_at"),
         "result_rows": info.get("result_rows"),
         "score_provenance": info.get("score_provenance", {}),
+        "results_links": info.get("results_links", {}),
+        "quality_status": info.get("quality_status"),
     }
 
 

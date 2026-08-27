@@ -22,6 +22,7 @@ from elo_filter_common import (
     filter_normalized_substring,
     fuzzy_text_score,
 )
+from elo_session_common import results_url_status
 
 # Directory for the persisted (precomputed) Elo dataset parquets. In production
 # set FFBRIDGE_CACHE_DIR to a persistent mount (e.g. /data/ffbridge) so the raw
@@ -119,6 +120,15 @@ def ffbridge_results_url_expr(
         )
         .otherwise(None)
         .alias("Results_URL")
+    )
+
+
+def ffbridge_results_link_status(frame: pl.DataFrame) -> dict[str, int | str]:
+    """Summarize public-link coverage in persisted FFBridge result rows."""
+    if not {"tournament_id", "group_id"}.issubset(frame.columns):
+        return results_url_status(frame)
+    return results_url_status(
+        frame.select(ffbridge_results_url_expr())
     )
 
 
@@ -492,6 +502,7 @@ def dataset_info(api_key: Optional[str] = None, fetch_iv: bool = True) -> Dict[s
         "clubs": clubs,
         "processing_stats": meta.get("processing_stats", {}),
         "score_provenance": score_provenance_counts(results_df),
+        "results_links": ffbridge_results_link_status(results_df),
         "quality": quality_status,
         "quality_status": quality_status["status"],
         "quality_cutoff": quality_status.get("cutoff"),
@@ -1258,6 +1269,7 @@ def run_leaderboard_report(
         "filtered_result_rows": results_df.height,
         "dataset_built_at": meta.get("built_at"),
         "score_provenance": provenance,
+        "results_links": ffbridge_results_link_status(results_df),
         "quality": quality_status,
         "quality_status": quality_status["status"],
         "quality_cutoff": quality_status.get("cutoff"),
@@ -1308,5 +1320,6 @@ def run_player_history(
         "player_id": pid,
         "sessions": sessions.to_dicts(),
         "total_sessions": all_sessions.height,
+        "results_links": results_url_status(sessions),
         "dataset_built_at": meta.get("built_at"),
     }

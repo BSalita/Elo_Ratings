@@ -14,7 +14,7 @@ import psutil
 
 from acbl_strata import STRATA_DEFAULT, strata_label_to_bucket
 from elo_filter_common import acbl_date_from_for_range, filter_acbl_leaderboard
-from elo_session_common import acbl_results_url_expr
+from elo_session_common import acbl_results_url_expr, results_url_status
 from elo_common import (
     CHESS_DISPLAY_MEAN,
     CHESS_DISPLAY_SD,
@@ -2084,6 +2084,7 @@ def acbl_detail(
             t_build_end = time.perf_counter()
 
             t_serialize_start = time.perf_counter()
+            link_status = results_url_status(detail)
             detail_rows = detail.to_dicts()
             t_serialize_end = time.perf_counter()
 
@@ -2108,6 +2109,7 @@ def acbl_detail(
                 "ended_at": ended_at.isoformat(),
                 "elapsed_seconds": elapsed,
                 "perf": perf,
+                "results_url_status": link_status,
                 "server": _server_runtime_info(),
             }
             del detail, df

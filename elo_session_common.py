@@ -5,6 +5,44 @@ from __future__ import annotations
 import polars as pl
 
 
+def results_url_status(
+    frame: pl.DataFrame,
+    *,
+    column: str = "Results_URL",
+) -> dict[str, int | str]:
+    """Summarize published-result link coverage without returning URL values."""
+    total_rows = frame.height
+    if column not in frame.columns:
+        linked_rows = 0
+    else:
+        linked_rows = frame.select(
+            (
+                pl.col(column)
+                .cast(pl.Utf8)
+                .fill_null("")
+                .str.strip_chars()
+                != ""
+            )
+            .sum()
+            .alias("linked_rows")
+        ).item()
+    missing_rows = total_rows - linked_rows
+    if total_rows == 0:
+        status = "empty"
+    elif missing_rows == 0:
+        status = "available"
+    elif linked_rows == 0:
+        status = "unavailable"
+    else:
+        status = "incomplete"
+    return {
+        "status": status,
+        "total_rows": total_rows,
+        "linked_rows": linked_rows,
+        "missing_rows": missing_rows,
+    }
+
+
 def acbl_results_url_expr(
     club_or_tournament: str,
     *,

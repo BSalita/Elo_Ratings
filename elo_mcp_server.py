@@ -75,7 +75,8 @@ def _acbl_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
 def ffbridge_dataset_info(api_backend: Optional[str] = None) -> Dict[str, Any]:
     """Summary of the FFBridge Elo dataset: build time, result-row count,
     covered date range, available club names (for the club filter of the
-    leaderboard tools), and valid date_range choices."""
+    leaderboard tools), result-link coverage, quality status, and valid
+    date_range choices."""
     return _ffbridge_get(
         "/ffbridge/dataset-info", {"api_backend": api_backend}
     )
@@ -108,7 +109,7 @@ def ffbridge_top_players(
     date_range is a named window (e.g. 'Current FFBridge year', 'Last 1 year');
     explicit date_from/date_to (YYYY-MM-DD, inclusive) override it.
     When deployed quality sidecars are available, rows include DD/par/sacrifice
-    quality metrics and the response reports quality_status/quality_cutoff.
+    quality metrics. The response reports quality and result-link status.
     """
     return _ffbridge_get(
         "/ffbridge/report",
@@ -294,7 +295,7 @@ def ffbridge_player_history(
 ) -> Dict[str, Any]:
     """Per-session tournament history for one FFBridge player (newest first):
     date, tournament, club, partner/pair, scratch and handicap percentages,
-    rank, Elo after the session, and Results_URL."""
+    rank, Elo after the session, and Results_URL, plus link-coverage status."""
     return _ffbridge_get(
         "/ffbridge/player-history",
         {
@@ -377,8 +378,8 @@ def acbl_detail(
     """Board detail for one ACBL player or pair from acbl-api /acbl/detail.
 
     For rating_type='Players' pass player_id (ACBL number); for 'Pairs' pass
-    pair_ids as 'id1-id2'. Rows include Results_URL. Other params as in
-    acbl_report.
+    pair_ids as 'id1-id2'. Rows include Results_URL and the response includes
+    results_url_status. Other params as in acbl_report.
     """
     return _acbl_get(
         "/acbl/detail",

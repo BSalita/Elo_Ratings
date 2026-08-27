@@ -100,6 +100,8 @@ class FFBridgeResultsUrlTests(unittest.TestCase):
             "21333/sessions/282839/ranking",
         )
         self.assertEqual(list(row)[-1], "Results_URL")
+        self.assertEqual(response["results_links"]["status"], "available")
+        self.assertEqual(response["results_links"]["linked_rows"], 1)
 
     def test_empty_group_id_cache_requires_link_backfill(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
