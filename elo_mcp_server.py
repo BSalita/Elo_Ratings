@@ -291,17 +291,21 @@ def ffbridge_tournaments(
 def ffbridge_player_history(
     player_id: str,
     limit: int = 100,
+    score: str = "Scratch",
     api_backend: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Per-session tournament history for one FFBridge player (newest first):
-    date, tournament, club, partner/pair, scratch and handicap percentages,
-    national rank, Elo after the session, and Results_URL, plus link-coverage
-    status."""
+    date, tournament, club, partner/pair, all four club/national
+    scratch/handicap percentages, their four corresponding ranks, the
+    organizer's Theoretical_Rank prediction, Pct_Used, Score_Source,
+    Scoring_Mode, Elo after the session,
+    Results_URL, and link coverage."""
     return _ffbridge_get(
         "/ffbridge/player-history",
         {
             "player_id": player_id,
             "limit": min(limit, _MAX_HISTORY_ROWS),
+            "score": score,
             "api_backend": api_backend,
         },
     )

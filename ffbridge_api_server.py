@@ -127,13 +127,15 @@ def tournaments(
 def player_history(
     player_id: str = Query(..., pattern=r"^\d+$"),
     limit: int = Query(100, ge=1, le=500),
+    score: str = Query("Scratch", pattern="^(Scratch|Handicap)$"),
     api_backend: str | None = Query(None),
 ) -> dict:
-    """Return newest-first FFBridge sessions, including public Results_URL."""
+    """Return canonical score provenance and Results_URL for newest sessions."""
     return _run(
         reports.run_player_history,
         player_id=player_id,
         limit=limit,
+        score=score,
         api_key=api_backend,
     )
 

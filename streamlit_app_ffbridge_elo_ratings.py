@@ -115,6 +115,7 @@ from ffbridge_report_service import (
     date_range_bounds as _date_range_bounds,
     elo_cache_key as _elo_cache_key,
     elo_cache_paths as _elo_cache_paths,
+    elo_pair_cache_path as _elo_pair_cache_path,
     filter_score_available as _filter_score_available,
     filter_valid_percentages as _filter_valid_percentages_ffbridge,
     filter_results as _filter_ffbridge_results,
@@ -590,9 +591,25 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = 
     )
 
 
-def _national_rank_expr() -> pl.Expr:
-    """Lancelot national finishing position (1 = first in the simultaneous)."""
-    return pl.col("national_rank").cast(pl.Int32, strict=False).alias("National_Rank")
+def _resolved_score_expr(use_handicap: bool) -> pl.Expr:
+    category = "Handicap" if use_handicap else "Scratch"
+    return pl.coalesce(
+        pl.col(f"National_{category}_Pct"),
+        pl.col(f"Club_{category}_Pct"),
+    )
+
+
+def _resolved_score_source_expr(use_handicap: bool) -> pl.Expr:
+    category = "Handicap" if use_handicap else "Scratch"
+    national = f"National_{category}_Pct"
+    club = f"Club_{category}_Pct"
+    return (
+        pl.when(pl.col(national).is_not_null())
+        .then(pl.lit(national))
+        .when(pl.col(club).is_not_null())
+        .then(pl.lit(club))
+        .otherwise(None)
+    )
 
 
 def _render_detail_aggrid_ff(
@@ -690,17 +707,41 @@ def _show_tournament_opponents(results_df: pl.DataFrame, tournament_id: str, exc
         return
 
     cols = [pl.col('pair_name').alias('Pair')]
-    cols.append(_national_rank_expr())
-    if 'scratch_percentage' in tourney_results.columns:
-        cols.append(pl.col('scratch_percentage').cast(pl.Float64, strict=False).round(2).alias('Scratch_%'))
-    if 'handicap_percentage' in tourney_results.columns:
-        cols.append(pl.col('handicap_percentage').cast(pl.Float64, strict=False).round(2).alias('Handicap_%'))
+    for column in (
+        'Club_Scratch_Pct',
+        'Club_Handicap_Pct',
+        'National_Scratch_Pct',
+        'National_Handicap_Pct',
+    ):
+        if column in tourney_results.columns:
+            cols.append(
+                pl.col(column).cast(pl.Float64, strict=False).round(2).alias(column)
+            )
+    for column in (
+        'Club_Scratch_Rank',
+        'Club_Handicap_Rank',
+        'National_Scratch_Rank',
+        'National_Handicap_Rank',
+    ):
+        if column in tourney_results.columns:
+            cols.append(pl.col(column).cast(pl.Int64, strict=False).alias(column))
+    if 'Theoretical_Rank' in tourney_results.columns:
+        cols.append(pl.col('Theoretical_Rank').cast(pl.Int64, strict=False))
     if 'pair_elo' in tourney_results.columns:
         cols.append(pl.col('pair_elo').cast(pl.Float64, strict=False).round(0).cast(pl.Int32, strict=False).alias('Pair_Elo'))
 
     opp_df = tourney_results.select(cols)
-    if 'National_Rank' in opp_df.columns:
-        opp_df = opp_df.sort('National_Rank')
+    if {'National_Handicap_Rank', 'National_Scratch_Rank'}.issubset(opp_df.columns):
+        opp_df = (
+            opp_df.with_columns(
+                pl.coalesce(
+                    'National_Handicap_Rank',
+                    'National_Scratch_Rank',
+                ).alias('_Sort_Rank')
+            )
+            .sort('_Sort_Rank', nulls_last=True)
+            .drop('_Sort_Rank')
+        )
 
     t_name = tourney_results.select('tournament_name').row(0)[0] if 'tournament_name' in tourney_results.columns else tournament_id
     t_date = tourney_results.select(pl.col('date').str.slice(0, 10)).row(0)[0] if 'date' in tourney_results.columns else ''
@@ -752,10 +793,20 @@ def _show_club_aggregation(detail_df: pl.DataFrame, results_df: pl.DataFrame, pa
     agg_cols = [
         pl.len().alias('Tournaments'),
     ]
-    if 'scratch_percentage' in pair_data.columns:
-        agg_cols.append(pl.col('scratch_percentage').cast(pl.Float64, strict=False).mean().round(2).alias('Avg_Scratch_%'))
-    if 'handicap_percentage' in pair_data.columns:
-        agg_cols.append(pl.col('handicap_percentage').cast(pl.Float64, strict=False).mean().round(2).alias('Avg_Handicap_%'))
+    for column in (
+        'Club_Scratch_Pct',
+        'Club_Handicap_Pct',
+        'National_Scratch_Pct',
+        'National_Handicap_Pct',
+    ):
+        if column in pair_data.columns:
+            agg_cols.append(
+                pl.col(column)
+                .cast(pl.Float64, strict=False)
+                .mean()
+                .round(2)
+                .alias(f'Avg_{column}')
+            )
     if 'national_rank' in pair_data.columns:
         agg_cols.append(
             pl.col('national_rank')
@@ -806,17 +857,42 @@ def _build_opponent_data(results_df: pl.DataFrame, entity_tournaments: pl.DataFr
         pl.col('date').str.slice(0, 10).alias('Date'),
         pl.col('pair_name').alias('Opponent'),
     ]
-    cols.append(_national_rank_expr())
-    if 'scratch_percentage' in all_opp.columns:
-        cols.append(pl.col('scratch_percentage').cast(pl.Float64, strict=False).round(2).alias('Scratch_%'))
-    if 'handicap_percentage' in all_opp.columns:
-        cols.append(pl.col('handicap_percentage').cast(pl.Float64, strict=False).round(2).alias('Handicap_%'))
+    for column in (
+        'Club_Scratch_Pct',
+        'Club_Handicap_Pct',
+        'National_Scratch_Pct',
+        'National_Handicap_Pct',
+    ):
+        if column in all_opp.columns:
+            cols.append(
+                pl.col(column).cast(pl.Float64, strict=False).round(2).alias(column)
+            )
+    for column in (
+        'Club_Scratch_Rank',
+        'Club_Handicap_Rank',
+        'National_Scratch_Rank',
+        'National_Handicap_Rank',
+    ):
+        if column in all_opp.columns:
+            cols.append(pl.col(column).cast(pl.Int64, strict=False).alias(column))
+    if 'Theoretical_Rank' in all_opp.columns:
+        cols.append(pl.col('Theoretical_Rank').cast(pl.Int64, strict=False))
     if 'pair_elo' in all_opp.columns:
         cols.append(pl.col('pair_elo').cast(pl.Float64, strict=False).round(0).cast(pl.Int32, strict=False).alias('Pair_Elo'))
 
-    return all_opp.select(cols).sort(
-        ['Date', 'Event_ID', 'National_Rank'],
-        descending=[True, False, False],
+    result = all_opp.select(cols).with_columns(
+        pl.coalesce(
+            'National_Handicap_Rank',
+            'National_Scratch_Rank',
+        ).alias('_Sort_Rank')
+    )
+    return (
+        result.sort(
+            ['Date', 'Event_ID', '_Sort_Rank'],
+            descending=[True, False, False],
+            nulls_last=True,
+        )
+        .drop('_Sort_Rank')
     )
 
 
@@ -844,15 +920,19 @@ def _show_opponent_summary(results_df: pl.DataFrame, entity_tournaments: pl.Data
     # Build entity's per-tournament stats for joining
     entity_cols = [pl.col('tournament_id').alias('Event_ID')]
     has_rank = 'rank' in entity_tournaments.columns
-    has_scratch = 'scratch_percentage' in entity_tournaments.columns
-    has_handicap = 'handicap_percentage' in entity_tournaments.columns
     has_elo = 'pair_elo' in entity_tournaments.columns
     if has_rank:
         entity_cols.append(pl.col('rank').cast(pl.Float64, strict=False).alias('My_Rank'))
-    if has_scratch:
-        entity_cols.append(pl.col('scratch_percentage').cast(pl.Float64, strict=False).alias('My_Scratch_%'))
-    if has_handicap:
-        entity_cols.append(pl.col('handicap_percentage').cast(pl.Float64, strict=False).alias('My_Handicap_%'))
+    for column in (
+        'Club_Scratch_Pct',
+        'Club_Handicap_Pct',
+        'National_Scratch_Pct',
+        'National_Handicap_Pct',
+    ):
+        if column in entity_tournaments.columns:
+            entity_cols.append(
+                pl.col(column).cast(pl.Float64, strict=False).alias(f'My_{column}')
+            )
     if has_elo:
         entity_cols.append(pl.col('pair_elo').cast(pl.Float64, strict=False).alias('My_Pair_Elo'))
 
@@ -871,20 +951,33 @@ def _show_opponent_summary(results_df: pl.DataFrame, entity_tournaments: pl.Data
     # Opponent averages
     if 'Rank' in opp_joined.columns:
         agg_cols.append(pl.col('Rank').mean().round(1).alias('Opp_Avg_Rank'))
-    if 'Scratch_%' in opp_joined.columns:
-        agg_cols.append(pl.col('Scratch_%').mean().round(2).alias('Opp_Avg_Scratch_%'))
-    if 'Handicap_%' in opp_joined.columns:
-        agg_cols.append(pl.col('Handicap_%').mean().round(2).alias('Opp_Avg_Handicap_%'))
+    for column in (
+        'Club_Scratch_Pct',
+        'Club_Handicap_Pct',
+        'National_Scratch_Pct',
+        'National_Handicap_Pct',
+    ):
+        if column in opp_joined.columns:
+            agg_cols.append(
+                pl.col(column).mean().round(2).alias(f'Opp_Avg_{column}')
+            )
     if 'Pair_Elo' in opp_joined.columns:
         agg_cols.append(pl.col('Pair_Elo').mean().round(0).cast(pl.Int32, strict=False).alias('Opp_Avg_Pair_Elo'))
 
     # Entity's averages (in the same tournaments as this opponent)
     if 'My_Rank' in opp_joined.columns:
         agg_cols.append(pl.col('My_Rank').mean().round(1).alias('My_Avg_Rank'))
-    if 'My_Scratch_%' in opp_joined.columns:
-        agg_cols.append(pl.col('My_Scratch_%').mean().round(2).alias('My_Avg_Scratch_%'))
-    if 'My_Handicap_%' in opp_joined.columns:
-        agg_cols.append(pl.col('My_Handicap_%').mean().round(2).alias('My_Avg_Handicap_%'))
+    for column in (
+        'Club_Scratch_Pct',
+        'Club_Handicap_Pct',
+        'National_Scratch_Pct',
+        'National_Handicap_Pct',
+    ):
+        own_column = f'My_{column}'
+        if own_column in opp_joined.columns:
+            agg_cols.append(
+                pl.col(own_column).mean().round(2).alias(f'My_Avg_{column}')
+            )
     if 'My_Pair_Elo' in opp_joined.columns:
         agg_cols.append(pl.col('My_Pair_Elo').mean().round(0).cast(pl.Int32, strict=False).alias('My_Avg_Pair_Elo'))
 
@@ -1102,28 +1195,45 @@ def process_tournaments_to_elo(
             p1_name = result.get('player1_name', '')
             p2_name = result.get('player2_name', '')
             
-            # Get percentages. Provisional Scratch and Handicap availability is
-            # independent; an unresolved category must never become a synthetic
-            # zero or 50%.
-            raw_pct_value = result.get('percentage')
-            try:
-                raw_pct = (
-                    float(raw_pct_value) if raw_pct_value is not None else None
+            # Resolve each Elo track independently. National values are preferred,
+            # with organizer/club values used only when that same category exists.
+            canonical_scores = {}
+            for score_column in (
+                'Club_Scratch_Pct',
+                'Club_Handicap_Pct',
+                'National_Scratch_Pct',
+                'National_Handicap_Pct',
+            ):
+                score_value = result.get(score_column)
+                try:
+                    canonical_scores[score_column] = (
+                        float(score_value) if score_value is not None else None
+                    )
+                except (ValueError, TypeError):
+                    canonical_scores[score_column] = None
+
+            scratch_pct = canonical_scores['National_Scratch_Pct']
+            scratch_source = 'National_Scratch_Pct'
+            if scratch_pct is None:
+                scratch_pct = canonical_scores['Club_Scratch_Pct']
+                scratch_source = (
+                    'Club_Scratch_Pct' if scratch_pct is not None else None
                 )
-            except (ValueError, TypeError):
-                raw_pct = None
+            handicap_pct = canonical_scores['National_Handicap_Pct']
+            handicap_source = 'National_Handicap_Pct'
+            if handicap_pct is None:
+                handicap_pct = canonical_scores['Club_Handicap_Pct']
+                handicap_source = (
+                    'Club_Handicap_Pct' if handicap_pct is not None else None
+                )
             scratch_score_status = str(
-                result.get('scratch_score_status') or 'official'
+                result.get('scratch_score_status')
+                or ('official' if scratch_pct is not None else 'unresolved')
             )
             handicap_score_status = str(
-                result.get('handicap_score_status') or 'scratch_only'
+                result.get('handicap_score_status')
+                or ('official' if handicap_pct is not None else 'unresolved')
             )
-            handicap_pct_raw = result.get('handicap_percentage')
-            # handicap_pct_raw may be None for scratch-only events
-            try:
-                handicap_pct = float(handicap_pct_raw) if handicap_pct_raw is not None else None
-            except (ValueError, TypeError):
-                handicap_pct = None
             
             pe_bonus_raw = result.get('pe_bonus', 0)
             try:
@@ -1131,72 +1241,35 @@ def process_tournaments_to_elo(
             except (ValueError, TypeError):
                 pe_bonus = 0.0
             
-            club_pct_raw = result.get('club_percentage')
-            try:
-                club_pct = (
-                    float(club_pct_raw)
-                    if club_pct_raw is not None
-                    else (
-                        raw_pct - pe_bonus / 10.0
-                        if raw_pct is not None
-                        else None
-                    )
-                )
-            except (ValueError, TypeError):
-                club_pct = (
-                    raw_pct - pe_bonus / 10.0
-                    if raw_pct is not None
-                    else None
-                )
-            
-            # Get scratch (unhandicapped) percentage and IV bonus
-            scratch_pct_raw = result.get('scratch_percentage')
-            try:
-                scratch_pct = (
-                    float(scratch_pct_raw)
-                    if scratch_pct_raw is not None
-                    else club_pct
-                )
-            except (ValueError, TypeError):
-                scratch_pct = club_pct
             scratch_eligible = (
                 scratch_pct is not None
                 and scratch_score_status != 'unresolved'
             )
-            handicap_uses_scratch = (
-                handicap_pct is None
-                and handicap_score_status != 'unresolved'
-                and scratch_eligible
-            )
             handicap_eligible = (
                 handicap_pct is not None
                 and handicap_score_status != 'unresolved'
-            ) or handicap_uses_scratch
+            )
             
             iv_bonus_raw = result.get('iv_bonus')
             try:
-                iv_bonus = float(iv_bonus_raw) if iv_bonus_raw is not None else (pe_bonus / 10.0)
+                iv_bonus = float(iv_bonus_raw) if iv_bonus_raw is not None else 0.0
             except (ValueError, TypeError):
-                iv_bonus = pe_bonus / 10.0
+                iv_bonus = 0.0
             
             # Get individual IV values (if available from API)
             player1_iv = result.get('player1_iv')
             player2_iv = result.get('player2_iv')
             pair_iv = result.get('pair_iv')
             
-            # We'll compute both, but use_handicap determines which is used for 'percentage' column
-            # For scratch-only events (handicap_pct is None), always use scratch
             if use_handicap:
-                percentage = (
-                    handicap_pct
-                    if handicap_pct is not None
-                    else (scratch_pct if handicap_uses_scratch else None)
-                )
+                percentage = handicap_pct if handicap_eligible else None
+                score_source = handicap_source
             else:
                 percentage = scratch_pct if scratch_eligible else None
+                score_source = scratch_source
             
-            rank_club = result.get('rank') or 0
-            rank_handicap = result.get('theoretical_rank') or 0
+            rank_club = result.get('National_Scratch_Rank') or 0
+            rank_handicap = result.get('National_Handicap_Rank') or 0
             rank = rank_handicap if use_handicap and rank_handicap is not None else rank_club
             national_rank_raw = result.get('rank')
             try:
@@ -1245,21 +1318,27 @@ def process_tournaments_to_elo(
                 'player1_name': str(p1_name),
                 'player2_name': str(p2_name),
                 'pair_name': str(pair_name),
-                'percentage': float(percentage) if percentage is not None else None,
-                'handicap_percentage': float(handicap_pct) if handicap_pct is not None else None,
-                'scratch_percentage': float(scratch_pct) if scratch_pct is not None else None,
+                'Pct_Used': float(percentage) if percentage is not None else None,
+                'Score_Source': score_source,
+                'Club_Scratch_Pct': canonical_scores['Club_Scratch_Pct'],
+                'Club_Handicap_Pct': canonical_scores['Club_Handicap_Pct'],
+                'National_Scratch_Pct': canonical_scores['National_Scratch_Pct'],
+                'National_Handicap_Pct': canonical_scores['National_Handicap_Pct'],
+                'Club_Scratch_Rank': result.get('Club_Scratch_Rank'),
+                'Club_Handicap_Rank': result.get('Club_Handicap_Rank'),
+                'National_Scratch_Rank': result.get('National_Scratch_Rank'),
+                'National_Handicap_Rank': result.get('National_Handicap_Rank'),
+                'Theoretical_Rank': result.get('Theoretical_Rank'),
+                'Scoring_Mode': str(result.get('scoring_mode') or 'unknown'),
                 'iv_bonus': float(iv_bonus),
-                'club_percentage': float(club_pct) if club_pct is not None else None,
-                'national_scratch_percentage': result.get('national_scratch_percentage'),
-                'national_handicap_percentage': result.get('national_handicap_percentage'),
-                'score_source': str(result.get('score_source') or 'national_official'),
+                'score_source': str(result.get('score_source') or 'unresolved'),
                 'score_status': str(result.get('score_status') or 'official'),
                 'scratch_score_status': scratch_score_status,
                 'handicap_score_status': handicap_score_status,
                 'score_source_url': result.get('score_source_url'),
                 'rank': int(rank) if rank is not None else 0,
                 'rank_without_handicap': int(rank_club) if rank_club is not None else 0,
-                'theoretical_rank': int(rank_handicap) if rank_handicap is not None else 0,
+                'theoretical_rank': result.get('Theoretical_Rank'),
                 'national_rank': national_rank,
                 'pe': float(pe) if pe is not None else 0.0,
                 'pe_bonus': str(pe_bonus) if pe_bonus is not None else '',
@@ -1311,15 +1390,12 @@ def process_tournaments_to_elo(
                 
                 # Handicap Elo (use scratch if handicap not available)
                 handicap_r1_before = handicap_ratings.get(p1_id, DEFAULT_ELO)
-                h_pct_for_elo = handicap_pct if handicap_pct is not None else scratch_pct
-                h_field_for_elo = handicap_field_avg if handicap_pct is not None else scratch_field_avg
-                h_strength_for_elo = handicap_field_strength if handicap_pct is not None else scratch_field_strength
                 handicap_r1_after = (
                     calculate_elo_from_percentage(
                         handicap_r1_before,
-                        h_pct_for_elo,
-                        h_field_for_elo,
-                        field_strength_scale=h_strength_for_elo,
+                        handicap_pct,
+                        handicap_field_avg,
+                        field_strength_scale=handicap_field_strength,
                     )
                     if handicap_eligible
                     else handicap_r1_before
@@ -1369,15 +1445,12 @@ def process_tournaments_to_elo(
                 
                 # Handicap Elo (use scratch if handicap not available)
                 handicap_r2_before = handicap_ratings.get(p2_id, DEFAULT_ELO)
-                h_pct_for_elo = handicap_pct if handicap_pct is not None else scratch_pct
-                h_field_for_elo = handicap_field_avg if handicap_pct is not None else scratch_field_avg
-                h_strength_for_elo = handicap_field_strength if handicap_pct is not None else scratch_field_strength
                 handicap_r2_after = (
                     calculate_elo_from_percentage(
                         handicap_r2_before,
-                        h_pct_for_elo,
-                        h_field_for_elo,
-                        field_strength_scale=h_strength_for_elo,
+                        handicap_pct,
+                        handicap_field_avg,
+                        field_strength_scale=handicap_field_strength,
                     )
                     if handicap_eligible
                     else handicap_r2_before
@@ -1478,13 +1551,19 @@ def process_tournaments_to_elo(
             'player1_name': pl.Utf8,
             'player2_name': pl.Utf8,
             'pair_name': pl.Utf8,
-            'percentage': pl.Float64,
-            'handicap_percentage': pl.Float64,
-            'scratch_percentage': pl.Float64,
+            'Pct_Used': pl.Float64,
+            'Score_Source': pl.Utf8,
+            'Club_Scratch_Pct': pl.Float64,
+            'Club_Handicap_Pct': pl.Float64,
+            'National_Scratch_Pct': pl.Float64,
+            'National_Handicap_Pct': pl.Float64,
+            'Club_Scratch_Rank': pl.Int64,
+            'Club_Handicap_Rank': pl.Int64,
+            'National_Scratch_Rank': pl.Int64,
+            'National_Handicap_Rank': pl.Int64,
+            'Theoretical_Rank': pl.Int64,
+            'Scoring_Mode': pl.Utf8,
             'iv_bonus': pl.Float64,
-            'club_percentage': pl.Float64,
-            'national_scratch_percentage': pl.Float64,
-            'national_handicap_percentage': pl.Float64,
             'score_source': pl.Utf8,
             'score_status': pl.Utf8,
             'scratch_score_status': pl.Utf8,
@@ -1636,8 +1715,8 @@ def _elo_cache_meta_paths(api_key: str, fetch_iv: bool) -> List[pathlib.Path]:
     seen: set[pathlib.Path] = set()
     paths: List[pathlib.Path] = []
     for pattern in (
-        f"elo_full_v6_{api_key}_iv_{iv}.meta.json",
-        f"elo_full_v6_{api_key}_*_iv_{iv}.meta.json",
+        f"elo_full_v9_{api_key}_iv_{iv}.meta.json",
+        f"elo_full_v9_{api_key}_*_iv_{iv}.meta.json",
     ):
         for meta_path in _FFBRIDGE_ELO_CACHE_DIR.glob(pattern):
             if meta_path not in seen:
@@ -1656,7 +1735,7 @@ def _prune_old_elo_cache(api_key: str, fetch_iv: bool, keep_key: str) -> None:
         for key in _legacy_elo_cache_keys(api_key, fetch_iv):
             if key == keep_key:
                 continue
-            for path in _elo_cache_paths(key):
+            for path in (*_elo_cache_paths(key), _elo_pair_cache_path(key)):
                 path.unlink(missing_ok=True)
             print(f"[ffbridge] pruned stale Elo cache '{key}'", flush=True)
     except Exception as exc:
@@ -1669,17 +1748,44 @@ def _read_persisted_elo_dataset(api_key: str, fetch_iv: bool) -> Optional[Dict[s
     if key is None:
         return None
     results_path, players_path, meta_path = _elo_cache_paths(key)
-    if not (results_path.exists() and players_path.exists() and meta_path.exists()):
+    pairs_path = _elo_pair_cache_path(key)
+    if not (
+        results_path.exists()
+        and players_path.exists()
+        and pairs_path.exists()
+        and meta_path.exists()
+    ):
         return None
     try:
         t0 = time.perf_counter()
         _load_debug_log_standalone(f"reading results parquet {results_path.name}", t0)
         results_df = pl.read_parquet(results_path)
+        required_score_columns = {
+            "Club_Scratch_Pct",
+            "Club_Handicap_Pct",
+            "National_Scratch_Pct",
+            "National_Handicap_Pct",
+            "Club_Scratch_Rank",
+            "Club_Handicap_Rank",
+            "National_Scratch_Rank",
+            "National_Handicap_Rank",
+            "Theoretical_Rank",
+            "Pct_Used",
+            "Score_Source",
+            "Scoring_Mode",
+        }
+        missing_score_columns = required_score_columns.difference(results_df.columns)
+        if missing_score_columns:
+            raise ValueError(
+                "Persisted FFBridge Elo results use an obsolete score schema; "
+                f"missing {sorted(missing_score_columns)}"
+            )
         _load_debug_log_standalone(
             f"results parquet loaded ({results_df.height} rows, {results_df.width} cols)",
             t0,
         )
         players_df = pl.read_parquet(players_path)
+        pairs_df = pl.read_parquet(pairs_path)
         _load_debug_log_standalone(
             f"players parquet loaded ({players_df.height} rows)",
             t0,
@@ -1690,6 +1796,7 @@ def _read_persisted_elo_dataset(api_key: str, fetch_iv: bool) -> Optional[Dict[s
         return {
             "results_df": results_df,
             "players_df": players_df,
+            "pairs_df": pairs_df,
             "scratch_ratings": meta.get("scratch_ratings", {}),
             "handicap_ratings": meta.get("handicap_ratings", {}),
             "processing_stats": meta.get(
@@ -1708,7 +1815,10 @@ def _newest_persisted_age_hours(api_key: str, fetch_iv: bool) -> Optional[float]
     for meta_path in _elo_cache_meta_paths(api_key, fetch_iv):
         results_path = meta_path.with_name(meta_path.name.replace(".meta.json", ".results.parquet"))
         players_path = meta_path.with_name(meta_path.name.replace(".meta.json", ".players.parquet"))
-        if not (results_path.exists() and players_path.exists()):
+        pairs_path = meta_path.with_name(
+            meta_path.name.replace(".meta.json", ".pairs.parquet")
+        )
+        if not (results_path.exists() and players_path.exists() and pairs_path.exists()):
             continue
         try:
             built_at = json.loads(meta_path.read_text(encoding="utf-8")).get("built_at")
@@ -1800,7 +1910,12 @@ def _needs_elo_rebuild(
     if key is None:
         return True, "missing or unreadable parquet"
     results_path, players_path, meta_path = _elo_cache_paths(key)
-    if not (results_path.exists() and players_path.exists() and meta_path.exists()):
+    if not (
+        results_path.exists()
+        and players_path.exists()
+        and _elo_pair_cache_path(key).exists()
+        and meta_path.exists()
+    ):
         return True, "missing or unreadable parquet"
     if "Lancelot" in api_key:
         try:
@@ -1880,6 +1995,7 @@ def compute_and_persist_elo_dataset(
     key = _elo_cache_key(api_key, fetch_iv)
 
     results_path, players_path, meta_path = _elo_cache_paths(key)
+    pairs_path = _elo_pair_cache_path(key)
 
     results_df, players_df, _ratings, stats = process_tournaments_to_elo(
         all_tournaments, api_module, initial_players=None,
@@ -1892,6 +2008,22 @@ def compute_and_persist_elo_dataset(
             unsafe_allow_html=True,
         )
     results_df = _apply_club_name_mapping(results_df, api_module, all_tournaments)
+    if results_df.is_empty():
+        pairs_df = pl.DataFrame()
+    else:
+        pairs_df = (
+            results_df.group_by("pair_id")
+            .agg(
+                pl.col("pair_name").sort_by("date").last(),
+                pl.col("player1_id").sort_by("date").last(),
+                pl.col("player2_id").sort_by("date").last(),
+                pl.col("scratch_pair_elo").sort_by("date").last(),
+                pl.col("handicap_pair_elo").sort_by("date").last(),
+                pl.len().alias("sessions_played"),
+                pl.col("date").max().alias("last_played"),
+            )
+            .sort("scratch_pair_elo", descending=True)
+        )
 
     scratch_ratings_dict: Dict[str, float] = {}
     handicap_ratings_dict: Dict[str, float] = {}
@@ -1910,6 +2042,7 @@ def compute_and_persist_elo_dataset(
         _FFBRIDGE_ELO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         results_df.write_parquet(results_path)
         players_df.write_parquet(players_path)
+        pairs_df.write_parquet(pairs_path)
         meta_path.write_text(json.dumps({
             "scratch_ratings": scratch_ratings_dict,
             "handicap_ratings": handicap_ratings_dict,
@@ -1928,6 +2061,7 @@ def compute_and_persist_elo_dataset(
     return {
         "results_df": results_df,
         "players_df": players_df,
+        "pairs_df": pairs_df,
         "scratch_ratings": scratch_ratings_dict,
         "handicap_ratings": handicap_ratings_dict,
         "processing_stats": stats,
@@ -2380,29 +2514,42 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                       .then(pl.col('player2_name'))
                                       .otherwise(pl.col('player1_name'))
                                       .alias('Partner'),
-                                    (pl.col('scratch_percentage') if 'scratch_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Scratch_%'),
-                                    (pl.col('handicap_percentage') if 'handicap_percentage' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_%'),
+                                    *[
+                                        pl.col(column)
+                                        .cast(pl.Float64, strict=False)
+                                        .round(2)
+                                        .alias(column)
+                                        for column in (
+                                            'Club_Scratch_Pct',
+                                            'Club_Handicap_Pct',
+                                            'National_Scratch_Pct',
+                                            'National_Handicap_Pct',
+                                        )
+                                    ],
+                                    *[
+                                        pl.col(column)
+                                        .cast(pl.Int64, strict=False)
+                                        .alias(column)
+                                        for column in (
+                                            'Club_Scratch_Rank',
+                                            'Club_Handicap_Rank',
+                                            'National_Scratch_Rank',
+                                            'National_Handicap_Rank',
+                                        )
+                                    ],
+                                    pl.col('Theoretical_Rank')
+                                    .cast(pl.Int64, strict=False),
                                     (pl.col('iv_bonus') if 'iv_bonus' in player_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(1).alias('IV_Bonus'),
                                     ((pl.col('handicap_field_strength') if use_handicap else pl.col('scratch_field_strength')) if (('handicap_field_strength' if use_handicap else 'scratch_field_strength') in player_results.columns) else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(3).alias('Field_Strength'),
                                     (pl.col('score_status') if 'score_status' in player_results.columns else pl.lit('official')).alias('Score_Status'),
-                                    (pl.col('score_source') if 'score_source' in player_results.columns else pl.lit('national_official')).alias('Score_Source'),
+                                    _resolved_score_source_expr(use_handicap).alias('Score_Source'),
+                                    pl.col('Scoring_Mode'),
                                     (pl.col('score_source_url') if 'score_source_url' in player_results.columns else pl.lit(None, dtype=pl.Utf8)).alias('Score_Source_URL'),
+                                    _resolved_score_expr(use_handicap)
+                                    .cast(pl.Float64, strict=False)
+                                    .round(2)
+                                    .alias('Pct_Used'),
                                 ]
-                                # Pct_Used follows the selected category. Scratch-only
-                                # sessions leave handicap empty instead of copying scratch.
-                                if use_handicap and 'handicap_percentage' in player_results.columns:
-                                    cols_to_select.append(
-                                        pl.col('handicap_percentage')
-                                          .cast(pl.Float64, strict=False).round(2)
-                                          .alias('Pct_Used')
-                                    )
-                                else:
-                                    # Use scratch
-                                    cols_to_select.append(
-                                        (pl.col('scratch_percentage') if 'scratch_percentage' in player_results.columns else pl.col('percentage'))
-                                          .cast(pl.Float64, strict=False).round(2).alias('Pct_Used')
-                                    )
-                                cols_to_select.append(_national_rank_expr())
                                 # Add current IV (note: this is current IV, not IV at tournament time)
                                 if 'pair_iv' in player_results.columns:
                                     cols_to_select.append(pl.col('pair_iv').alias('Current_Pair_IV'))
@@ -2582,29 +2729,42 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                     pl.col('date').str.slice(0, 10).alias('Date'),
                                     pl.col('tournament_id').alias('Event_ID'),
                                     _ffbridge_results_url_expr(),
-                                    (pl.col('scratch_percentage') if 'scratch_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Scratch_%'),
-                                    (pl.col('handicap_percentage') if 'handicap_percentage' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(2).alias('Handicap_%'),
+                                    *[
+                                        pl.col(column)
+                                        .cast(pl.Float64, strict=False)
+                                        .round(2)
+                                        .alias(column)
+                                        for column in (
+                                            'Club_Scratch_Pct',
+                                            'Club_Handicap_Pct',
+                                            'National_Scratch_Pct',
+                                            'National_Handicap_Pct',
+                                        )
+                                    ],
+                                    *[
+                                        pl.col(column)
+                                        .cast(pl.Int64, strict=False)
+                                        .alias(column)
+                                        for column in (
+                                            'Club_Scratch_Rank',
+                                            'Club_Handicap_Rank',
+                                            'National_Scratch_Rank',
+                                            'National_Handicap_Rank',
+                                        )
+                                    ],
+                                    pl.col('Theoretical_Rank')
+                                    .cast(pl.Int64, strict=False),
                                     (pl.col('iv_bonus') if 'iv_bonus' in pair_results.columns else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(1).alias('IV_Bonus'),
                                     ((pl.col('handicap_field_strength') if use_handicap else pl.col('scratch_field_strength')) if (('handicap_field_strength' if use_handicap else 'scratch_field_strength') in pair_results.columns) else pl.lit(None, dtype=pl.Float64)).cast(pl.Float64, strict=False).round(3).alias('Field_Strength'),
                                     (pl.col('score_status') if 'score_status' in pair_results.columns else pl.lit('official')).alias('Score_Status'),
-                                    (pl.col('score_source') if 'score_source' in pair_results.columns else pl.lit('national_official')).alias('Score_Source'),
+                                    _resolved_score_source_expr(use_handicap).alias('Score_Source'),
+                                    pl.col('Scoring_Mode'),
                                     (pl.col('score_source_url') if 'score_source_url' in pair_results.columns else pl.lit(None, dtype=pl.Utf8)).alias('Score_Source_URL'),
+                                    _resolved_score_expr(use_handicap)
+                                    .cast(pl.Float64, strict=False)
+                                    .round(2)
+                                    .alias('Pct_Used'),
                                 ]
-                                # Pct_Used follows the selected category. Scratch-only
-                                # sessions leave handicap empty instead of copying scratch.
-                                if use_handicap and 'handicap_percentage' in pair_results.columns:
-                                    cols_to_select.append(
-                                        pl.col('handicap_percentage')
-                                          .cast(pl.Float64, strict=False).round(2)
-                                          .alias('Pct_Used')
-                                    )
-                                else:
-                                    # Use scratch
-                                    cols_to_select.append(
-                                        (pl.col('scratch_percentage') if 'scratch_percentage' in pair_results.columns else pl.col('percentage'))
-                                          .cast(pl.Float64, strict=False).round(2).alias('Pct_Used')
-                                    )
-                                cols_to_select.append(_national_rank_expr())
                                 # Add current IV (note: this is current IV, not IV at tournament time)
                                 if 'pair_iv' in pair_results.columns:
                                     cols_to_select.append(pl.col('pair_iv').alias('Current_Pair_IV'))

@@ -44,7 +44,7 @@ IDs are pulled). To force a full re-fetch of results, delete the raw results
 cache on the volume so they are re-downloaded on the next rebuild, e.g.:
 
     # remove cached per-event results (keeps the elo_cache parquet):
-    #   Classic:  $FFBRIDGE_CACHE_DIR/cache/**/results_v3_*.json
+    #   Classic:  $FFBRIDGE_CACHE_DIR/cache/**/results_v6_*.json
     #   Lancelot: $FFBRIDGE_CACHE_DIR/lancelot_cache/**/results_*.json
     # then trigger a rebuild (redeploy, or run this builder without --if-stale).
 
@@ -157,8 +157,8 @@ def _prune_other_fetch_iv(api_key: str, fetch_iv: bool) -> None:
     cache_dir = app._FFBRIDGE_ELO_CACHE_DIR
     iv = int(fetch_iv)
     patterns = (
-        f"elo_full_v6_{api_key}_iv_{other}.results.parquet",
-        f"elo_full_v6_{api_key}_*_iv_{other}.results.parquet",
+        f"elo_full_v9_{api_key}_iv_{other}.results.parquet",
+        f"elo_full_v9_{api_key}_*_iv_{other}.results.parquet",
     )
     try:
         seen: set[pathlib.Path] = set()
@@ -170,7 +170,10 @@ def _prune_other_fetch_iv(api_key: str, fetch_iv: bool) -> None:
                 key = results_path.name[: -len(".results.parquet")]
                 if key.endswith(f"_iv_{iv}"):
                     continue
-                for path in app._elo_cache_paths(key):
+                for path in (
+                    *app._elo_cache_paths(key),
+                    app._elo_pair_cache_path(key),
+                ):
                     path.unlink(missing_ok=True)
                 print(f"[builder] pruned orphaned Elo cache '{key}' (opposite fetch_iv)", flush=True)
     except Exception as exc:

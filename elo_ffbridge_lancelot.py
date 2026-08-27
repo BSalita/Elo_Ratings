@@ -26,6 +26,8 @@ from elo_ffbridge_common import (
     VALID_SERIES_IDS,
     normalize_series_id,
     normalize_club_code,
+    ffbridge_scoring_mode,
+    fill_missing_score_ranks,
     get_cache_path,
     save_to_disk_cache,
     load_from_disk_cache,
@@ -263,13 +265,15 @@ def _official_scratch_and_handicap(
     entry: Dict[str, Any],
     *,
     session_score: Optional[float],
-    is_octopus: bool,
+    scoring_mode: str,
+    bonus_is_authoritative: bool,
 ) -> Tuple[Optional[float], Optional[float], float, str]:
     """Map a published Lancelot ranking row to scratch, handicap, and IV bonus.
 
     Verified against FFBridge and club tables (2026-08-25):
     - `sessionScore` is scratch for scratch-only series (Rondes de France, etc.).
-    - `sessionScore` is the national handicap percentage for Octopus.
+    - `sessionScore` is the national handicap percentage for registered
+      handicap schedules (Octopus, Simultanet, Roy René first Tuesday).
     - `totalBonus` is the Octopus IV handicap in percentage points.
     - `peBonus` is PE ranking points. Never convert it into a percentage.
     """
@@ -280,12 +284,9 @@ def _official_scratch_and_handicap(
         else entry.get("handicapPercentage")
     )
     total_bonus = _as_number(entry.get("totalBonus")) or 0.0
-    has_handicap_scoring = (
-        is_octopus
-        or total_bonus > 0
-        or explicit_scratch is not None
-        or explicit_handicap is not None
-    )
+    has_handicap_scoring = scoring_mode == "handicap" or any(
+        value is not None for value in (explicit_scratch, explicit_handicap)
+    ) or total_bonus > 0
     if not has_handicap_scoring or session_score is None:
         return session_score, None, 0.0, "scratch_only"
 
@@ -295,12 +296,22 @@ def _official_scratch_and_handicap(
     elif explicit_scratch is not None:
         scratch_pct = explicit_scratch
         handicap_pct = session_score
-    else:
+    elif total_bonus > 0 or bonus_is_authoritative or scoring_mode != "handicap":
         handicap_pct = (
             explicit_handicap if explicit_handicap is not None else session_score
         )
         scratch_pct = handicap_pct - total_bonus
-    return scratch_pct, handicap_pct, handicap_pct - scratch_pct, "official"
+    else:
+        handicap_pct = (
+            explicit_handicap if explicit_handicap is not None else session_score
+        )
+        scratch_pct = None
+    iv_bonus = (
+        handicap_pct - scratch_pct
+        if handicap_pct is not None and scratch_pct is not None
+        else total_bonus
+    )
+    return scratch_pct, handicap_pct, iv_bonus, "official"
 
 
 def _normalize_ranking_results(
@@ -313,9 +324,10 @@ def _normalize_ranking_results(
     results = []
     group_ids = group_ids or {}
 
-    # Check if this is an Octopus tournament (series_id 386)
     normalized_series_id = normalize_series_id(series_id)
-    is_octopus = normalized_series_id == 386
+    scoring_mode = ffbridge_scoring_mode(
+        normalized_series_id, tournament_date
+    )
     national_pending = national_ranking_is_pending(ranking)
     provisional_scores = (
         fetch_provisional_pair_percentages(
@@ -358,16 +370,20 @@ def _normalize_ranking_results(
         team_id = str(team.get('id', ''))
         if national_pending:
             provisional = provisional_scores.get(team_id, {})
-            scratch_pct = provisional.get("scratch_percentage")
-            handicap_pct = provisional.get("handicap_percentage")
-            if scratch_pct is not None and handicap_pct is not None:
-                iv_bonus = float(handicap_pct) - float(scratch_pct)
-            scratch_status = "provisional" if scratch_pct is not None else "unresolved"
+            club_scratch_pct = provisional.get("scratch_percentage")
+            club_handicap_pct = provisional.get("handicap_percentage")
+            national_scratch_pct = None
+            national_handicap_pct = None
+            if club_scratch_pct is not None and club_handicap_pct is not None:
+                iv_bonus = float(club_handicap_pct) - float(club_scratch_pct)
+            scratch_status = (
+                "provisional" if club_scratch_pct is not None else "unresolved"
+            )
             handicap_status = (
-                "provisional" if handicap_pct is not None else "unresolved"
+                "provisional" if club_handicap_pct is not None else "unresolved"
             )
             has_provisional_score = (
-                scratch_pct is not None or handicap_pct is not None
+                club_scratch_pct is not None or club_handicap_pct is not None
             )
             score_source = (
                 "club_provisional" if has_provisional_score else "unresolved"
@@ -379,18 +395,50 @@ def _normalize_ranking_results(
                 provisional.get("scratch_url")
                 or provisional.get("handicap_url")
             )
-            pct = scratch_pct
         else:
-            pct = national_pct
-            scratch_pct, handicap_pct, iv_bonus, handicap_status = (
+            club_scratch_pct = None
+            club_handicap_pct = None
+            national_scratch_pct, national_handicap_pct, iv_bonus, handicap_status = (
                 _official_scratch_and_handicap(
-                    entry, session_score=national_pct, is_octopus=is_octopus
+                    entry,
+                    session_score=national_pct,
+                    scoring_mode=scoring_mode,
+                    bonus_is_authoritative=normalized_series_id in {384, 386},
                 )
             )
-            scratch_status = "official" if scratch_pct is not None else "unresolved"
+            scratch_status = (
+                "official" if national_scratch_pct is not None else "unresolved"
+            )
             score_source = "national_official"
             score_status = "official"
             source_url = None
+
+        national_rank = (
+            entry.get("rank") if not national_pending else None
+        )
+        scratch_rank = entry.get("rankWithoutHandicap")
+        theoretical_rank = entry.get("theoreticalRank")
+        if national_pending:
+            national_handicap_rank = None
+            national_scratch_rank = None
+        elif scoring_mode == "handicap":
+            national_handicap_rank = (
+                national_rank if national_handicap_pct is not None else None
+            )
+            national_scratch_rank = (
+                scratch_rank if national_scratch_pct is not None else None
+            )
+        else:
+            national_handicap_rank = (
+                national_rank if national_handicap_pct is not None else None
+            )
+            national_scratch_rank = (
+                scratch_rank
+                if scratch_rank is not None
+                else (
+                    national_rank if national_scratch_pct is not None else None
+                )
+            )
         
         # Normalize club code using shared utility
         club_code = normalize_club_code(entry.get('simultaneousId', ''))
@@ -410,24 +458,24 @@ def _normalize_ranking_results(
             'player2_license_number': str(p2.get('ffbId') or ''),
             'player1_name': p1_name,
             'player2_name': p2_name,
-            'percentage': pct,
-            'handicap_percentage': handicap_pct,
-            'scratch_percentage': scratch_pct,
+            'Club_Scratch_Pct': club_scratch_pct,
+            'Club_Handicap_Pct': club_handicap_pct,
+            'National_Scratch_Pct': national_scratch_pct,
+            'National_Handicap_Pct': national_handicap_pct,
+            'Club_Scratch_Rank': None,
+            'Club_Handicap_Rank': None,
+            'National_Scratch_Rank': national_scratch_rank,
+            'National_Handicap_Rank': national_handicap_rank,
+            'Theoretical_Rank': theoretical_rank,
+            'scoring_mode': scoring_mode,
             'iv_bonus': iv_bonus,  # Derived IV bonus (percentage points)
-            'club_percentage': scratch_pct,
-            'national_scratch_percentage': (
-                scratch_pct if not national_pending else None
-            ),
-            'national_handicap_percentage': (
-                handicap_pct if not national_pending else None
-            ),
             'score_source': score_source,
             'score_status': score_status,
             'scratch_score_status': scratch_status,
             'handicap_score_status': handicap_status,
             'score_source_url': source_url,
             'rank': entry.get('rank', 0),
-            'theoretical_rank': entry.get('rankWithoutHandicap'),
+            'theoretical_rank': theoretical_rank,
             'pe': entry.get('pe', 0),
             'pe_bonus': str(pe_bonus_raw),
             'group_id': group_ids.get(club_code),
@@ -442,6 +490,7 @@ def _normalize_ranking_results(
             'pair_iv': None,
         })
     
+    fill_missing_score_ranks(results)
     return results
 
 

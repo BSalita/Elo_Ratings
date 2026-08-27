@@ -112,7 +112,14 @@ class FFBridgeResultsUrlTests(unittest.TestCase):
                 "group_id": ["21333"],
                 "player1_id": ["101"],
                 "player2_id": ["202"],
-                "scratch_percentage": [55.0],
+                "National_Scratch_Pct": [55.0],
+                "Club_Scratch_Pct": [None],
+                "Club_Handicap_Pct": [None],
+                "National_Handicap_Pct": [None],
+                "Club_Scratch_Rank": [None],
+                "Club_Handicap_Rank": [None],
+                "National_Scratch_Rank": [3],
+                "National_Handicap_Rank": [None],
                 "rank": [3],
                 "national_rank": [3],
             }
@@ -126,7 +133,10 @@ class FFBridgeResultsUrlTests(unittest.TestCase):
 
         row = response["sessions"][0]
         self.assertNotIn("rank", row)
-        self.assertEqual(row["national_rank"], 3)
+        self.assertNotIn("national_rank", row)
+        self.assertEqual(row["Pct_Used"], 55.0)
+        self.assertEqual(row["Score_Source"], "National_Scratch_Pct")
+        self.assertEqual(row["National_Scratch_Rank"], 3)
         self.assertEqual(
             row["Results_URL"],
             "https://www.ffbridge.fr/competitions/results/groups/"

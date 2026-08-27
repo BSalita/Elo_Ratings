@@ -68,6 +68,56 @@ SERIES_NAMES = {
     "all": "All Tournaments"
 }
 
+HANDICAP_SERIES_IDS = frozenset({384, 386})
+ROY_RENE_SERIES_ID = 5
+
+
+def ffbridge_scoring_mode(
+    series_id: Any,
+    tournament_date: str,
+) -> str:
+    """Classify an unlabeled FFBridge percentage as scratch or handicap."""
+    normalized_series_id = normalize_series_id(series_id)
+    if normalized_series_id in HANDICAP_SERIES_IDS:
+        return "handicap"
+    if normalized_series_id == ROY_RENE_SERIES_ID:
+        try:
+            day = datetime.fromisoformat(str(tournament_date)[:10]).date()
+        except (TypeError, ValueError):
+            return "scratch"
+        if day.weekday() == 1 and day.day <= 7:
+            return "handicap"
+    return "scratch"
+
+
+SCORE_RANK_COLUMNS: tuple[tuple[str, str, bool], ...] = (
+    ("National_Handicap_Pct", "National_Handicap_Rank", False),
+    ("National_Scratch_Pct", "National_Scratch_Rank", False),
+    ("Club_Handicap_Pct", "Club_Handicap_Rank", True),
+    ("Club_Scratch_Pct", "Club_Scratch_Rank", True),
+)
+
+
+def fill_missing_score_ranks(results: list[dict[str, Any]]) -> None:
+    """Fill percentage-based competition ranks without replacing official ranks."""
+    for pct_column, rank_column, by_club in SCORE_RANK_COLUMNS:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in results:
+            value = row.get(pct_column)
+            if value is None:
+                continue
+            group = str(row.get("club_code") or "") if by_club else "national"
+            groups.setdefault(group, []).append(row)
+        for rows in groups.values():
+            scores = [float(row[pct_column]) for row in rows]
+            ranks = {
+                value: 1 + sum(other > value for other in scores)
+                for value in set(scores)
+            }
+            for row in rows:
+                if row.get(rank_column) is None:
+                    row[rank_column] = ranks[float(row[pct_column])]
+
 # List of all valid tournament series IDs
 VALID_SERIES_IDS = [3, 4, 5, 140, 384, 386, 604, 868]
 

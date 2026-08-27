@@ -191,12 +191,12 @@ def elo_cache_key(api_key: str, fetch_iv: bool, n_tournaments: int = 0) -> str:
     sessions even when no new past events existed.
     """
     del n_tournaments
-    return f"elo_full_v6_{api_key}_iv_{int(fetch_iv)}"
+    return f"elo_full_v9_{api_key}_iv_{int(fetch_iv)}"
 
 
 def legacy_elo_cache_keys(api_key: str, fetch_iv: bool) -> List[str]:
     """Parquet keys from before the stable-key change (middle segment = list length)."""
-    prefix = f"elo_full_v6_{api_key}_"
+    prefix = f"elo_full_v9_{api_key}_"
     suffix = f"_iv_{int(fetch_iv)}"
     keys: List[str] = []
     for meta_path in ELO_CACHE_DIR.glob(f"{prefix}*{suffix}.meta.json"):
@@ -215,18 +215,32 @@ def elo_cache_paths(key: str) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]
     )
 
 
+def elo_pair_cache_path(key: str) -> pathlib.Path:
+    return ELO_CACHE_DIR / f"{key}.pairs.parquet"
+
+
 def resolve_elo_cache_key(api_key: str, fetch_iv: bool) -> Optional[str]:
     """Best on-disk parquet set: stable key first, else newest legacy count-keyed set."""
     stable = elo_cache_key(api_key, fetch_iv)
     results_path, players_path, meta_path = elo_cache_paths(stable)
-    if results_path.exists() and players_path.exists() and meta_path.exists():
+    if (
+        results_path.exists()
+        and players_path.exists()
+        and elo_pair_cache_path(stable).exists()
+        and meta_path.exists()
+    ):
         return stable
 
     newest_key: Optional[str] = None
     newest_dt: Optional[datetime] = None
     for key in legacy_elo_cache_keys(api_key, fetch_iv):
         results_path, players_path, meta_path = elo_cache_paths(key)
-        if not (results_path.exists() and players_path.exists() and meta_path.exists()):
+        if not (
+            results_path.exists()
+            and players_path.exists()
+            and elo_pair_cache_path(key).exists()
+            and meta_path.exists()
+        ):
             continue
         try:
             built_at = json.loads(meta_path.read_text(encoding="utf-8")).get("built_at")
@@ -561,7 +575,17 @@ def filter_valid_percentages(df: pl.DataFrame) -> pl.DataFrame:
     if df.is_empty():
         return df
 
-    pct_cols = [c for c in ("percentage", "scratch_percentage", "handicap_percentage", "club_percentage") if c in df.columns]
+    pct_cols = [
+        column
+        for column in (
+            "Pct_Used",
+            "Club_Scratch_Pct",
+            "Club_Handicap_Pct",
+            "National_Scratch_Pct",
+            "National_Handicap_Pct",
+        )
+        if column in df.columns
+    ]
     if not pct_cols:
         return df
 
@@ -574,19 +598,33 @@ def filter_valid_percentages(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def filter_score_available(df: pl.DataFrame, use_handicap: bool) -> pl.DataFrame:
-    """Exclude only categories explicitly unresolved during publication."""
+    """Keep rows that contain the requested category and are not unresolved."""
     status_column = (
         "handicap_score_status" if use_handicap else "scratch_score_status"
     )
-    if df.is_empty() or status_column not in df.columns:
+    if df.is_empty():
+        return df
+    category = "Handicap" if use_handicap else "Scratch"
+    national_column = f"National_{category}_Pct"
+    club_column = f"Club_{category}_Pct"
+    predicates = []
+    if {national_column, club_column}.issubset(df.columns):
+        predicates.append(
+            pl.coalesce(pl.col(national_column), pl.col(club_column)).is_not_null()
+        )
+    if status_column in df.columns:
+        predicates.append(
+            pl.col(status_column).is_null()
+            | (pl.col(status_column).cast(pl.Utf8) != "unresolved")
+        )
+    if not predicates:
         return df
     return df.filter(
-        pl.col(status_column).is_null()
-        | (pl.col(status_column).cast(pl.Utf8) != "unresolved")
+        pl.all_horizontal(predicates)
     )
 
 
-def score_provenance_counts(df: pl.DataFrame) -> Dict[str, int]:
+def score_provenance_counts(df: pl.DataFrame) -> Dict[str, Any]:
     """Compact score-source diagnostics for API/UI metadata."""
     if df.is_empty():
         return {
@@ -597,12 +635,29 @@ def score_provenance_counts(df: pl.DataFrame) -> Dict[str, int]:
             "provisional_handicap_rows": 0,
             "unresolved_scratch_rows": 0,
             "unresolved_handicap_rows": 0,
+            "club_scratch_rows": 0,
+            "club_handicap_rows": 0,
+            "national_scratch_rows": 0,
+            "national_handicap_rows": 0,
+            "scoring_modes": {},
         }
 
     def _count(column: str, value: str) -> int:
         if column not in df.columns:
             return 0
         return df.filter(pl.col(column).cast(pl.Utf8) == value).height
+
+    def _available(column: str) -> int:
+        if column not in df.columns:
+            return 0
+        return df.filter(pl.col(column).is_not_null()).height
+
+    scoring_modes = {}
+    if "Scoring_Mode" in df.columns:
+        scoring_modes = {
+            str(row["Scoring_Mode"]): int(row["len"])
+            for row in df.group_by("Scoring_Mode").len().to_dicts()
+        }
 
     return {
         "official_rows": _count("score_status", "official"),
@@ -620,6 +675,11 @@ def score_provenance_counts(df: pl.DataFrame) -> Dict[str, int]:
         "unresolved_handicap_rows": _count(
             "handicap_score_status", "unresolved"
         ),
+        "club_scratch_rows": _available("Club_Scratch_Pct"),
+        "club_handicap_rows": _available("Club_Handicap_Pct"),
+        "national_scratch_rows": _available("National_Scratch_Pct"),
+        "national_handicap_rows": _available("National_Handicap_Pct"),
+        "scoring_modes": scoring_modes,
     }
 
 
@@ -729,6 +789,8 @@ def aggregate_players_from_results(results_df: pl.DataFrame, use_handicap: bool)
         return pl.DataFrame()
     elo_col_p1 = "player1_handicap_elo_after" if use_handicap else "player1_scratch_elo_after"
     elo_col_p2 = "player2_handicap_elo_after" if use_handicap else "player2_scratch_elo_after"
+    scratch_expr = "COALESCE(National_Scratch_Pct, Club_Scratch_Pct)"
+    handicap_expr = "COALESCE(National_Handicap_Pct, Club_Handicap_Pct)"
     pct_expr = "handicap_percentage" if use_handicap else "scratch_percentage"
     return duckdb.sql(f"""
         WITH player_results AS (
@@ -738,8 +800,8 @@ def aggregate_players_from_results(results_df: pl.DataFrame, use_handicap: bool)
                 player1_scratch_elo_after AS scratch_elo,
                 player1_handicap_elo_after AS handicap_elo,
                 {elo_col_p1} AS elo_rating,
-                scratch_percentage,
-                handicap_percentage,
+                {scratch_expr} AS scratch_percentage,
+                {handicap_expr} AS handicap_percentage,
                 iv_bonus,
                 score_status,
                 date
@@ -751,8 +813,8 @@ def aggregate_players_from_results(results_df: pl.DataFrame, use_handicap: bool)
                 player2_scratch_elo_after AS scratch_elo,
                 player2_handicap_elo_after AS handicap_elo,
                 {elo_col_p2} AS elo_rating,
-                scratch_percentage,
-                handicap_percentage,
+                {scratch_expr} AS scratch_percentage,
+                {handicap_expr} AS handicap_percentage,
                 iv_bonus,
                 score_status,
                 date
@@ -927,7 +989,9 @@ def show_top_pairs(
         return results_df, "", None
 
     elo_col = "handicap_pair_elo" if use_handicap else "scratch_pair_elo"
-    pct_col = "handicap_percentage" if use_handicap else "scratch_percentage"
+    scratch_expr = "COALESCE(National_Scratch_Pct, Club_Scratch_Pct)"
+    handicap_expr = "COALESCE(National_Handicap_Pct, Club_Handicap_Pct)"
+    pct_col = handicap_expr if use_handicap else scratch_expr
 
     pair_elo_col_name = "HC_Pair_Elo" if use_handicap else "Pair_Elo"
     title_col_name = "Scratch_Title" if use_handicap else "Title"
@@ -1080,8 +1144,8 @@ def show_top_pairs(
                 ARG_MAX(scratch_pair_elo, date) AS avg_scratch_elo,
                 ARG_MAX(COALESCE(handicap_pair_elo, scratch_pair_elo), date) AS avg_handicap_elo,
                 ARG_MAX({elo_col}, date) AS avg_pair_elo,
-                AVG(scratch_percentage) AS avg_scratch_pct,
-                AVG(handicap_percentage) AS avg_handicap_pct,
+                AVG({scratch_expr}) AS avg_scratch_pct,
+                AVG({handicap_expr}) AS avg_handicap_pct,
                 AVG(iv_bonus) AS avg_iv_bonus,
                 AVG({pct_col}) AS avg_percentage,
                 STDDEV_SAMP({pct_col}) AS stdev_percentage,
@@ -1280,6 +1344,7 @@ def run_player_history(
     player_id: str,
     *,
     limit: int = 100,
+    score: str = "Scratch",
     api_key: Optional[str] = None,
     fetch_iv: bool = True,
 ) -> Dict[str, Any]:
@@ -1287,6 +1352,9 @@ def run_player_history(
     pid = str(player_id).strip()
     if not pid.isdigit():
         raise ValueError("player_id must contain digits only")
+    normalized_score = score.strip().lower()
+    if normalized_score not in {"scratch", "handicap"}:
+        raise ValueError("score must be either Scratch or Handicap")
     results_df, meta = load_results(api_key, fetch_iv)
     results_df = filter_valid_percentages(results_df)
     player_expr = (
@@ -1294,6 +1362,20 @@ def run_player_history(
         | (pl.col("player2_id").cast(pl.Utf8) == pid)
     )
     all_sessions = results_df.filter(player_expr)
+    category = "Handicap" if normalized_score == "handicap" else "Scratch"
+    national_column = f"National_{category}_Pct"
+    club_column = f"Club_{category}_Pct"
+    all_sessions = all_sessions.with_columns(
+        pl.coalesce(pl.col(national_column), pl.col(club_column)).alias("Pct_Used"),
+        (
+            pl.when(pl.col(national_column).is_not_null())
+            .then(pl.lit(national_column))
+            .when(pl.col(club_column).is_not_null())
+            .then(pl.lit(club_column))
+            .otherwise(None)
+            .alias("Score_Source")
+        ),
+    )
     if "group_id" in all_sessions.columns:
         all_sessions = all_sessions.with_columns(ffbridge_results_url_expr())
     else:
@@ -1303,8 +1385,12 @@ def run_player_history(
     wanted = [
         "date", "tournament_id", "club_name", "pair_id", "pair_name",
         "player1_id", "player1_name", "player2_id", "player2_name",
-        "scratch_percentage", "handicap_percentage", "iv_bonus",
-        "national_rank", "rank_without_handicap", "theoretical_rank",
+        "Club_Scratch_Pct", "Club_Handicap_Pct",
+        "National_Scratch_Pct", "National_Handicap_Pct",
+        "Club_Scratch_Rank", "Club_Handicap_Rank",
+        "National_Scratch_Rank", "National_Handicap_Rank",
+        "Theoretical_Rank",
+        "Pct_Used", "Score_Source", "Scoring_Mode", "iv_bonus",
         "score_source", "score_status", "scratch_score_status",
         "handicap_score_status", "score_source_url",
         "player1_scratch_elo_after", "player2_scratch_elo_after",
@@ -1318,6 +1404,7 @@ def run_player_history(
     )
     return {
         "player_id": pid,
+        "score": category,
         "sessions": sessions.to_dicts(),
         "total_sessions": all_sessions.height,
         "results_links": results_url_status(sessions),

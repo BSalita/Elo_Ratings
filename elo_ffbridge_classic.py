@@ -24,6 +24,8 @@ from elo_ffbridge_common import (
     SERIES_NAMES,
     VALID_SERIES_IDS,
     normalize_series_id,
+    ffbridge_scoring_mode,
+    fill_missing_score_ranks,
     get_cache_path,
     save_to_disk_cache,
     load_from_disk_cache,
@@ -53,10 +55,61 @@ print(
 )
 
 # Cache version - increment to invalidate old cached calculations
-CACHE_VERSION = "v3"  # v3: Set handicap_percentage=None for scratch-only events
+CACHE_VERSION = "v6"  # v6: canonical and theoretical ranking provenance
 
 REQUEST_TIMEOUT = 10  # seconds (reduced from 15 to fail faster on hung requests)
 REQUEST_DELAY = 0.1  # seconds between API requests
+
+
+def _as_number(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _canonical_classic_scores(
+    team: Dict[str, Any],
+    *,
+    series_id: Optional[Any],
+    tournament_date: str,
+) -> Dict[str, Any]:
+    """Normalize Classic scores without deriving percentages from PE bonus."""
+    pct = _as_number(team.get("percent"))
+    scratch_pct = next(
+        (
+            _as_number(team.get(key))
+            for key in ("percentWithoutHandicap", "clubPercent", "club_percent")
+            if team.get(key) not in (None, "")
+        ),
+        None,
+    )
+    handicap_pct = next(
+        (
+            _as_number(team.get(key))
+            for key in ("scoreHandicap", "handicapPercentage")
+            if team.get(key) not in (None, "")
+        ),
+        None,
+    )
+    scoring_mode = ffbridge_scoring_mode(series_id, tournament_date)
+    if scratch_pct is not None:
+        handicap_pct = handicap_pct if handicap_pct is not None else pct
+    elif handicap_pct is not None:
+        scratch_pct = pct
+    elif scoring_mode == "handicap":
+        handicap_pct = pct
+    else:
+        scratch_pct = pct
+    return {
+        "Club_Scratch_Pct": None,
+        "Club_Handicap_Pct": None,
+        "National_Scratch_Pct": scratch_pct,
+        "National_Handicap_Pct": handicap_pct,
+        "scoring_mode": scoring_mode,
+    }
 
 
 # -------------------------------
@@ -270,7 +323,7 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
     Returns:
         Tuple of (list of result dicts, was_cached bool)
         Each result dict has normalized keys including:
-        - percentage, handicap_percentage, scratch_percentage, iv_bonus
+        - four canonical club/national scratch/handicap percentages
         - player1_iv, player2_iv, pair_iv (if fetch_iv=True and tournament is recent)
     """
     session = get_session()
@@ -334,64 +387,24 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
                         club_name = org.get('name', '')
                         club_code = org.get('code', '')
                         
-                        try:
-                            pct = float(team.get('percent', 0))
-                        except (ValueError, TypeError):
-                            pct = 0.0
-                        
-                        # Try to find explicit scratch percentage (percentWithoutHandicap)
-                        scratch_pct_raw = None
-                        for k in ("percentWithoutHandicap", "clubPercent", "club_percent"):
-                            v = team.get(k)
-                            if v is not None and v != "":
-                                scratch_pct_raw = v
-                                break
-                        
                         pe_bonus = team.get('PE_bonus', 0)
-                        try:
-                            pe_bonus_val = float(pe_bonus or 0)
-                        except (ValueError, TypeError):
-                            pe_bonus_val = 0.0
-                        
-                        # Derive IV bonus (PE_bonus is in tenths of a percent)
-                        iv_bonus = pe_bonus_val / 10.0
-                        
-                        # Check if this is an Octopus tournament (series_id 386)
-                        is_octopus = series_id == 386
-                        
-                        # Determine scratch and handicap percentages
-                        # Only treat as handicapped if:
-                        # 1. Explicit scratch_pct_raw is provided (percent is handicap), OR
-                        # 2. It's Octopus tournament (has verified handicap scoring), OR
-                        # 3. iv_bonus > 0 (actual bonus being applied)
-                        # Otherwise, tournament only has scratch scores (handicap = scratch)
-                        
-                        if scratch_pct_raw is not None:
-                            # Explicit scratch available - percent is handicap
-                            try:
-                                scratch_pct = float(scratch_pct_raw)
-                            except (ValueError, TypeError):
-                                scratch_pct = pct
-                            handicap_pct = pct
-                        elif is_octopus:
-                            # Octopus: API's 'percent' is the SCRATCH score
-                            # Handicap score = scratch + iv_bonus
-                            scratch_pct = pct
-                            handicap_pct = pct + iv_bonus
-                        else:
-                            # No explicit scratch and not Octopus
-                            # If iv_bonus > 0, assume percent is handicap; otherwise scratch-only
-                            if iv_bonus > 0:
-                                # Assume percent is handicap, derive scratch
-                                handicap_pct = pct
-                                scratch_pct = pct - iv_bonus
-                            else:
-                                # No handicap scoring - only scratch scores
-                                # Set handicap to None to indicate scratch-only event
-                                scratch_pct = pct
-                                handicap_pct = None
-                        
-                        club_pct = scratch_pct
+                        iv_bonus = 0.0
+                        scores = _canonical_classic_scores(
+                            team,
+                            series_id=series_id,
+                            tournament_date=tournament_date,
+                        )
+                        scratch_pct = scores["National_Scratch_Pct"]
+                        handicap_pct = scores["National_Handicap_Pct"]
+                        published_rank = team.get('ranking')
+                        scratch_rank = (
+                            team.get('ranking_without_handicap')
+                            if team.get('ranking_without_handicap') is not None
+                            else team.get('rank_without_handicap')
+                        )
+                        if scores["scoring_mode"] == "scratch" and scratch_rank is None:
+                            scratch_rank = published_rank
+                        theoretical_rank = team.get('theoretical_ranking')
                         
                         # Base result dict
                         result_dict = {
@@ -401,13 +414,28 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
                             'player2_id': str(p2.get('id')),
                             'player1_name': f"{p1.get('firstname', '')} {p1.get('lastname', '')}".strip(),
                             'player2_name': f"{p2.get('firstname', '')} {p2.get('lastname', '')}".strip(),
-                            'percentage': pct,
-                            'handicap_percentage': handicap_pct,
-                            'scratch_percentage': scratch_pct,  # Derived unhandicapped score
-                            'iv_bonus': iv_bonus,  # Derived IV bonus (percentage points)
-                            'club_percentage': club_pct,
+                            **scores,
+                            'Club_Scratch_Rank': None,
+                            'Club_Handicap_Rank': None,
+                            'National_Scratch_Rank': (
+                                scratch_rank if scratch_pct is not None else None
+                            ),
+                            'National_Handicap_Rank': (
+                                published_rank if handicap_pct is not None else None
+                            ),
+                            'Theoretical_Rank': theoretical_rank,
+                            'iv_bonus': iv_bonus,
+                            'score_source': 'national_official',
+                            'score_status': 'official',
+                            'scratch_score_status': (
+                                'official' if scratch_pct is not None else 'unresolved'
+                            ),
+                            'handicap_score_status': (
+                                'official' if handicap_pct is not None else 'scratch_only'
+                            ),
+                            'score_source_url': None,
                             'rank': team.get('ranking', 0),
-                            'theoretical_rank': team.get('theoretical_ranking', 0),
+                            'theoretical_rank': theoretical_rank,
                             'pe': team.get('PE', 0),
                             'pe_bonus': str(pe_bonus),
                             'club_id': club_id,
@@ -443,6 +471,7 @@ def fetch_tournament_results(tournament_id: str, tournament_date: str = "", seri
                 if iv_status_text is not None:
                     iv_status_text.empty()
                 
+                fill_missing_score_ranks(results)
                 print(f"[Classic] Built {len(results)} results for {tournament_id}", flush=True)
                 processed_data = {'results': results}
                 save_to_disk_cache(CACHE_DIR, friendly_name, processed_data, series_id=series_id)

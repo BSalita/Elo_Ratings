@@ -21,6 +21,7 @@ def _ranking_row(
     score: float = 0.0,
     pe_bonus: float = 0,
     total_bonus: float = 0.0,
+    theoretical_rank: int | None = None,
 ) -> dict:
     return {
         "sessionScore": score,
@@ -29,7 +30,7 @@ def _ranking_row(
         "scoreHandicap": None,
         "totalScoreWithoutHandicap": None,
         "rankWithoutHandicap": None,
-        "theoreticalRank": None,
+        "theoreticalRank": theoretical_rank,
         "peBonus": pe_bonus,
         "totalBonus": total_bonus,
         "rank": 1,
@@ -126,8 +127,11 @@ class PublicationStateTests(unittest.TestCase):
             series_id=386,
             tournament_date="2026-08-24",
         )
-        self.assertEqual(rows[0]["scratch_percentage"], 54.41)
-        self.assertEqual(rows[0]["handicap_percentage"], 64.41)
+        self.assertEqual(rows[0]["Club_Scratch_Pct"], 54.41)
+        self.assertEqual(rows[0]["Club_Handicap_Pct"], 64.41)
+        self.assertEqual(rows[0]["Club_Scratch_Rank"], 1)
+        self.assertEqual(rows[0]["Club_Handicap_Rank"], 1)
+        self.assertIsNone(rows[0]["National_Scratch_Pct"])
         self.assertEqual(rows[0]["score_status"], "provisional")
 
     @patch("elo_ffbridge_lancelot.fetch_provisional_pair_percentages")
@@ -138,8 +142,8 @@ class PublicationStateTests(unittest.TestCase):
             series_id=386,
             tournament_date="2026-08-24",
         )
-        self.assertIsNone(rows[0]["scratch_percentage"])
-        self.assertIsNone(rows[0]["handicap_percentage"])
+        self.assertIsNone(rows[0]["Club_Scratch_Pct"])
+        self.assertIsNone(rows[0]["Club_Handicap_Pct"])
         self.assertEqual(rows[0]["score_status"], "unresolved")
 
     @patch("elo_ffbridge_lancelot.save_to_disk_cache")
@@ -163,7 +167,7 @@ class PublicationStateTests(unittest.TestCase):
         )
         self.assertFalse(was_cached)
         self.assertEqual(rows[0]["score_status"], "official")
-        self.assertEqual(rows[0]["scratch_percentage"], 54.41)
+        self.assertEqual(rows[0]["National_Scratch_Pct"], 54.41)
 
 
 class OfficialCategoryMappingTests(unittest.TestCase):
@@ -173,8 +177,8 @@ class OfficialCategoryMappingTests(unittest.TestCase):
             series_id=3,
             tournament_date="2026-08-25",
         )
-        self.assertEqual(rows[0]["scratch_percentage"], 65.67)
-        self.assertIsNone(rows[0]["handicap_percentage"])
+        self.assertEqual(rows[0]["National_Scratch_Pct"], 65.67)
+        self.assertIsNone(rows[0]["National_Handicap_Pct"])
         self.assertEqual(rows[0]["handicap_score_status"], "scratch_only")
         self.assertEqual(rows[0]["iv_bonus"], 0.0)
         self.assertEqual(rows[0]["pe_bonus"], "52.0")
@@ -189,22 +193,24 @@ class OfficialCategoryMappingTests(unittest.TestCase):
                     score=71.74,
                     pe_bonus=0,
                     total_bonus=10.0,
+                    theoretical_rank=42,
                 )
             ],
             series_id=386,
             tournament_date="2026-08-17",
         )
-        self.assertAlmostEqual(rows[0]["scratch_percentage"], 61.74)
-        self.assertEqual(rows[0]["handicap_percentage"], 71.74)
+        self.assertAlmostEqual(rows[0]["National_Scratch_Pct"], 61.74)
+        self.assertEqual(rows[0]["National_Handicap_Pct"], 71.74)
         self.assertEqual(rows[0]["iv_bonus"], 10.0)
         self.assertEqual(rows[0]["handicap_score_status"], "official")
+        self.assertEqual(rows[0]["Theoretical_Rank"], 42)
 
 
 class ScoreAvailabilityTests(unittest.TestCase):
     def test_schema_version_forces_full_elo_replay(self) -> None:
         self.assertTrue(
             reports.elo_cache_key("FFBridge_Lancelot_API", True).startswith(
-                "elo_full_v6_"
+                "elo_full_v9_"
             )
         )
 
@@ -219,8 +225,10 @@ class ScoreAvailabilityTests(unittest.TestCase):
                 "player2_scratch_elo_after": [1500.0, 1500.0],
                 "player1_handicap_elo_after": [1600.0, 1610.0],
                 "player2_handicap_elo_after": [1500.0, 1500.0],
-                "scratch_percentage": [65.67, 54.41],
-                "handicap_percentage": [None, 64.41],
+                "Club_Scratch_Pct": [None, 54.41],
+                "Club_Handicap_Pct": [None, 64.41],
+                "National_Scratch_Pct": [65.67, None],
+                "National_Handicap_Pct": [None, None],
                 "iv_bonus": [0.0, 10.0],
                 "score_status": ["official", "official"],
                 "date": ["2026-08-25", "2026-08-24"],
@@ -230,6 +238,32 @@ class ScoreAvailabilityTests(unittest.TestCase):
         salita = players.filter(pl.col("player_id") == "1")
         self.assertAlmostEqual(salita.item(0, "avg_scratch_pct"), 60.04)
         self.assertAlmostEqual(salita.item(0, "avg_handicap_pct"), 64.41)
+
+    def test_roy_rene_first_tuesday_is_handicap_only(self) -> None:
+        rows = lancelot._normalize_ranking_results(
+            [_ranking_row(10, "Salita", "Collins", score=82.37)],
+            series_id=5,
+            tournament_date="2025-10-07",
+        )
+        row = rows[0]
+        self.assertEqual(row["National_Handicap_Pct"], 82.37)
+        self.assertIsNone(row["National_Scratch_Pct"])
+        self.assertEqual(row["National_Handicap_Rank"], 1)
+        self.assertIsNone(row["National_Scratch_Rank"])
+        self.assertEqual(row["scoring_mode"], "handicap")
+
+    def test_ordinary_roy_rene_session_is_scratch_only(self) -> None:
+        rows = lancelot._normalize_ranking_results(
+            [_ranking_row(10, "Salita", "Collins", score=61.25)],
+            series_id=5,
+            tournament_date="2025-10-14",
+        )
+        row = rows[0]
+        self.assertEqual(row["National_Scratch_Pct"], 61.25)
+        self.assertIsNone(row["National_Handicap_Pct"])
+        self.assertEqual(row["National_Scratch_Rank"], 1)
+        self.assertIsNone(row["National_Handicap_Rank"])
+        self.assertEqual(row["scoring_mode"], "scratch")
 
     def test_unresolved_categories_are_filtered_independently(self) -> None:
         frame = pl.DataFrame(
@@ -246,6 +280,22 @@ class ScoreAvailabilityTests(unittest.TestCase):
         self.assertEqual(
             reports.score_provenance_counts(frame)["provisional_rows"], 2
         )
+
+    def test_category_filters_do_not_count_the_other_score_type(self) -> None:
+        frame = pl.DataFrame(
+            {
+                "Club_Scratch_Pct": [None, None],
+                "Club_Handicap_Pct": [None, None],
+                "National_Scratch_Pct": [61.0, None],
+                "National_Handicap_Pct": [None, 82.37],
+                "scratch_score_status": ["official", "unresolved"],
+                "handicap_score_status": ["scratch_only", "official"],
+            }
+        )
+        scratch = reports.filter_score_available(frame, use_handicap=False)
+        handicap = reports.filter_score_available(frame, use_handicap=True)
+        self.assertEqual(scratch["National_Scratch_Pct"].to_list(), [61.0])
+        self.assertEqual(handicap["National_Handicap_Pct"].to_list(), [82.37])
 
 
 if __name__ == "__main__":
