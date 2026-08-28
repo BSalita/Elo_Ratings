@@ -90,6 +90,8 @@ class PublicationStateTests(unittest.TestCase):
         )
         self.assertEqual(scores["10"]["scratch_percentage"], 54.41)
         self.assertEqual(scores["10"]["handicap_percentage"], 64.41)
+        self.assertIsNone(scores["10"]["national_scratch_percentage"])
+        self.assertEqual(scores["10"]["club_scratch_percentage"], 54.41)
 
     def test_missing_handicap_does_not_copy_scratch(self) -> None:
         ranking = [_ranking_row(10, "Salita", "Jacoupy")]
@@ -146,6 +148,7 @@ class PublicationStateTests(unittest.TestCase):
         self.assertIsNone(rows[0]["Club_Handicap_Pct"])
         self.assertEqual(rows[0]["score_status"], "unresolved")
 
+    @patch("elo_ffbridge_lancelot._fetch_organizer_scores", return_value={})
     @patch("elo_ffbridge_lancelot.save_to_disk_cache")
     @patch("elo_ffbridge_lancelot.lancelot_get")
     @patch("elo_ffbridge_lancelot.load_from_disk_cache")
@@ -154,6 +157,7 @@ class PublicationStateTests(unittest.TestCase):
         load_cache,
         get_api,
         _save_cache,
+        _organizer_scores,
     ) -> None:
         pending = [_ranking_row(10, "Salita", "Jacoupy")]
         official = [_ranking_row(10, "Salita", "Jacoupy", score=54.41)]
@@ -222,6 +226,39 @@ class OfficialCategoryMappingTests(unittest.TestCase):
         self.assertEqual(rows[0]["National_Handicap_Pct"], 71.74)
         self.assertIsNone(rows[0]["iv_bonus"])
 
+    def test_historical_organizer_score_restores_missing_national_scratch(
+        self,
+    ) -> None:
+        ranking_row = _ranking_row(
+            10,
+            "Salita",
+            "Jacoupy",
+            score=67.62,
+        )
+        ranking_row.pop("totalBonus")
+        rows = lancelot._normalize_ranking_results(
+            [ranking_row],
+            series_id=386,
+            tournament_date="2026-06-08",
+            organizer_scores={
+                "10": {
+                    "national_scratch_percentage": 54.61,
+                    "national_handicap_percentage": 67.61,
+                    "club_scratch_percentage": 54.4,
+                    "club_handicap_percentage": 67.4,
+                    "scratch_url": "http://example/s",
+                    "handicap_url": "http://example/h",
+                }
+            },
+        )
+        row = rows[0]
+        self.assertEqual(row["National_Scratch_Pct"], 54.61)
+        self.assertEqual(row["National_Handicap_Pct"], 67.62)
+        self.assertEqual(row["Club_Scratch_Pct"], 54.4)
+        self.assertEqual(row["Club_Handicap_Pct"], 67.4)
+        self.assertAlmostEqual(row["iv_bonus"], 13.01)
+
+    @patch("elo_ffbridge_lancelot._fetch_organizer_scores", return_value={})
     @patch("elo_ffbridge_lancelot.fetch_session_group_ids", return_value={})
     @patch("elo_ffbridge_lancelot.save_to_disk_cache")
     @patch("elo_ffbridge_lancelot.lancelot_get")
@@ -232,6 +269,7 @@ class OfficialCategoryMappingTests(unittest.TestCase):
         get_api,
         _save_cache,
         _group_ids,
+        _organizer_scores,
     ) -> None:
         cached = [
             _ranking_row(
@@ -270,7 +308,7 @@ class ScoreAvailabilityTests(unittest.TestCase):
     def test_schema_version_forces_full_elo_replay(self) -> None:
         self.assertTrue(
             reports.elo_cache_key("FFBridge_Lancelot_API", True).startswith(
-                "elo_full_v10_"
+                "elo_full_v11_"
             )
         )
 

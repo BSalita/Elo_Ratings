@@ -61,6 +61,7 @@ PENDING_RESULTS_CACHE_HOURS = 6
 RECENT_RESULTS_CACHE_HOURS = 6
 RECENT_RESULTS_DAYS = 90
 PROVENANCE_API_START = "2026-07-01"
+ORGANIZER_SCORE_CACHE_VERSION = "v1"
 
 # Lancelot ID to Migration ID (FFBridge series ID) mapping (shared)
 LANCELOT_TO_MIGRATION = mlBridgeFFLib.LANCELOT_TO_MIGRATION
@@ -226,6 +227,51 @@ def _missing_expected_provenance(
     )
 
 
+def _fetch_organizer_scores(
+    session_id: str,
+    ranking: List[Dict[str, Any]],
+    tournament_date: str,
+    series_id: Optional[Any],
+) -> Dict[str, Dict[str, Any]]:
+    if normalize_series_id(series_id) != 386:
+        return {}
+    cache_name = f"organizer_scores_{ORGANIZER_SCORE_CACHE_VERSION}_{session_id}"
+    cached = load_from_disk_cache(
+        CACHE_DIR,
+        cache_name,
+        max_age_hours=None,
+        series_id=series_id,
+    )
+    if isinstance(cached, dict) and "scores" in cached:
+        return cached["scores"]
+    scores = fetch_provisional_pair_percentages(
+        ranking,
+        tournament_date,
+        series_id,
+    )
+    has_score = any(
+        any(
+            row.get(column) is not None
+            for column in (
+                "national_scratch_percentage",
+                "national_handicap_percentage",
+                "club_scratch_percentage",
+                "club_handicap_percentage",
+            )
+        )
+        for row in scores.values()
+    )
+    if not has_score:
+        return scores
+    save_to_disk_cache(
+        CACHE_DIR,
+        cache_name,
+        {"scores": scores},
+        series_id=series_id,
+    )
+    return scores
+
+
 def fetch_tournament_results(session_id: str, tournament_date: str = "", series_id: Optional[Any] = None, fetch_iv: bool = False) -> Tuple[List[Dict[str, Any]], bool]:
     """
     Fetch results for a specific session from Lancelot.
@@ -271,11 +317,18 @@ def fetch_tournament_results(session_id: str, tournament_date: str = "", series_
             )
         if cached_data:
             group_ids = fetch_session_group_ids(session_id)
+            organizer_scores = _fetch_organizer_scores(
+                session_id,
+                cached_data,
+                tournament_date,
+                series_id,
+            )
             return _normalize_ranking_results(
                 cached_data,
                 series_id=series_id,
                 tournament_date=tournament_date,
                 group_ids=group_ids,
+                organizer_scores=organizer_scores,
             ), True
     
     # Fetch from API
@@ -284,11 +337,18 @@ def fetch_tournament_results(session_id: str, tournament_date: str = "", series_
     if data and isinstance(data, list):
         save_to_disk_cache(CACHE_DIR, friendly_name, data, series_id=series_id)
         group_ids = fetch_session_group_ids(session_id)
+        organizer_scores = _fetch_organizer_scores(
+            session_id,
+            data,
+            tournament_date,
+            series_id,
+        )
         return _normalize_ranking_results(
             data,
             series_id=series_id,
             tournament_date=tournament_date,
             group_ids=group_ids,
+            organizer_scores=organizer_scores,
         ), False
     
     return [], False
@@ -376,6 +436,7 @@ def _normalize_ranking_results(
     series_id: Optional[Any] = None,
     tournament_date: str = "",
     group_ids: Optional[Dict[str, str]] = None,
+    organizer_scores: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Normalize Lancelot ranking data to common result format."""
     results = []
@@ -386,7 +447,7 @@ def _normalize_ranking_results(
         normalized_series_id, tournament_date
     )
     national_pending = national_ranking_is_pending(ranking)
-    provisional_scores = (
+    provisional_scores = organizer_scores or (
         fetch_provisional_pair_percentages(
             ranking, tournament_date, normalized_series_id
         )
@@ -422,25 +483,54 @@ def _normalize_ranking_results(
         pe_bonus_raw = float(entry.get('peBonus') or 0)
         # peBonus is PE ranking points, not a percentage adjustment.
         # Octopus IV handicap lives in totalBonus (percentage points).
-        iv_bonus = float(_as_number(entry.get('totalBonus')) or 0.0)
+        iv_bonus = _as_number(entry.get('totalBonus'))
 
         team_id = str(team.get('id', ''))
+        organizer = provisional_scores.get(team_id, {})
+        organizer_national_scratch = organizer.get(
+            "national_scratch_percentage"
+        )
+        organizer_national_handicap = organizer.get(
+            "national_handicap_percentage"
+        )
+        organizer_club_scratch = organizer.get("club_scratch_percentage")
+        organizer_club_handicap = organizer.get("club_handicap_percentage")
+        if (
+            "club_scratch_percentage" not in organizer
+            and organizer.get("scratch_percentage") is not None
+        ):
+            organizer_club_scratch = organizer.get("scratch_percentage")
+        if (
+            "club_handicap_percentage" not in organizer
+            and organizer.get("handicap_percentage") is not None
+        ):
+            organizer_club_handicap = organizer.get("handicap_percentage")
+
         if national_pending:
-            provisional = provisional_scores.get(team_id, {})
-            club_scratch_pct = provisional.get("scratch_percentage")
-            club_handicap_pct = provisional.get("handicap_percentage")
-            national_scratch_pct = None
-            national_handicap_pct = None
-            if club_scratch_pct is not None and club_handicap_pct is not None:
-                iv_bonus = float(club_handicap_pct) - float(club_scratch_pct)
+            club_scratch_pct = organizer_club_scratch
+            club_handicap_pct = organizer_club_handicap
+            national_scratch_pct = organizer_national_scratch
+            national_handicap_pct = organizer_national_handicap
+            resolved_scratch = (
+                national_scratch_pct
+                if national_scratch_pct is not None
+                else club_scratch_pct
+            )
+            resolved_handicap = (
+                national_handicap_pct
+                if national_handicap_pct is not None
+                else club_handicap_pct
+            )
+            if resolved_scratch is not None and resolved_handicap is not None:
+                iv_bonus = float(resolved_handicap) - float(resolved_scratch)
             scratch_status = (
-                "provisional" if club_scratch_pct is not None else "unresolved"
+                "provisional" if resolved_scratch is not None else "unresolved"
             )
             handicap_status = (
-                "provisional" if club_handicap_pct is not None else "unresolved"
+                "provisional" if resolved_handicap is not None else "unresolved"
             )
             has_provisional_score = (
-                club_scratch_pct is not None or club_handicap_pct is not None
+                resolved_scratch is not None or resolved_handicap is not None
             )
             score_source = (
                 "club_provisional" if has_provisional_score else "unresolved"
@@ -449,12 +539,12 @@ def _normalize_ranking_results(
                 "provisional" if has_provisional_score else "unresolved"
             )
             source_url = (
-                provisional.get("scratch_url")
-                or provisional.get("handicap_url")
+                organizer.get("scratch_url")
+                or organizer.get("handicap_url")
             )
         else:
-            club_scratch_pct = None
-            club_handicap_pct = None
+            club_scratch_pct = organizer_club_scratch
+            club_handicap_pct = organizer_club_handicap
             national_scratch_pct, national_handicap_pct, iv_bonus, handicap_status = (
                 _official_scratch_and_handicap(
                     entry,
@@ -463,12 +553,31 @@ def _normalize_ranking_results(
                     bonus_is_authoritative=normalized_series_id in {384, 386},
                 )
             )
+            if national_scratch_pct is None:
+                national_scratch_pct = organizer_national_scratch
+            if national_handicap_pct is None:
+                national_handicap_pct = organizer_national_handicap
+            if (
+                iv_bonus is None
+                and national_scratch_pct is not None
+                and national_handicap_pct is not None
+            ):
+                iv_bonus = (
+                    float(national_handicap_pct) - float(national_scratch_pct)
+                )
             scratch_status = (
                 "official" if national_scratch_pct is not None else "unresolved"
             )
-            score_source = "national_official"
+            score_source = (
+                "national_and_organizer_official"
+                if organizer
+                else "national_official"
+            )
             score_status = "official"
-            source_url = None
+            source_url = (
+                organizer.get("scratch_url")
+                or organizer.get("handicap_url")
+            )
 
         national_rank = (
             entry.get("rank") if not national_pending else None

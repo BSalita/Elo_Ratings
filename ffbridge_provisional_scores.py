@@ -11,6 +11,7 @@ from __future__ import annotations
 import html
 import re
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Callable, Dict, Iterable, Optional
 from urllib.parse import urljoin
@@ -103,19 +104,38 @@ def _default_get_text(url: str) -> str:
     return response.text
 
 
+def _category_texts(
+    date_yyyy_mm_dd: str,
+    category: str,
+    get_text: Callable[[str], str],
+) -> tuple[str, str, Optional[str]]:
+    main_url = _octopus_url(date_yyyy_mm_dd, category)
+    if main_url is None:
+        return "", "", None
+    main_html = get_text(main_url)
+    club_urls = [
+        urljoin(main_url, html.unescape(relative_url))
+        for relative_url in dict.fromkeys(_CLUB_LINK_RE.findall(main_html))
+    ]
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(club_urls)))) as executor:
+        club_pages = list(executor.map(get_text, club_urls))
+    return (
+        _page_text(main_html),
+        " ".join(_page_text(page) for page in club_pages),
+        main_url,
+    )
+
+
 def _category_text(
     date_yyyy_mm_dd: str,
     category: str,
     get_text: Callable[[str], str],
 ) -> tuple[str, Optional[str]]:
-    main_url = _octopus_url(date_yyyy_mm_dd, category)
-    if main_url is None:
-        return "", None
-    main_html = get_text(main_url)
-    pages = [main_html]
-    for relative_url in dict.fromkeys(_CLUB_LINK_RE.findall(main_html)):
-        pages.append(get_text(urljoin(main_url, html.unescape(relative_url))))
-    return " ".join(_page_text(page) for page in pages), main_url
+    """Backward-compatible combined organizer text."""
+    national_text, club_text, main_url = _category_texts(
+        date_yyyy_mm_dd, category, get_text
+    )
+    return " ".join((national_text, club_text)), main_url
 
 
 def _find_pair_percentage(page_text: str, surname1: str, surname2: str) -> Optional[float]:
@@ -160,10 +180,10 @@ def fetch_provisional_pair_percentages(
 
     fetch_text = get_text or _default_get_text
     try:
-        scratch_text, scratch_url = _category_text(
+        national_scratch_text, club_scratch_text, scratch_url = _category_texts(
             tournament_date, "scratch", fetch_text
         )
-        handicap_text, handicap_url = _category_text(
+        national_handicap_text, club_handicap_text, handicap_url = _category_texts(
             tournament_date, "handicap", fetch_text
         )
     except requests.RequestException as exc:
@@ -182,19 +202,41 @@ def fetch_provisional_pair_percentages(
         team_id = str(team.get("id") or "")
         if not team_id:
             continue
-        scratch = _find_pair_percentage(
-            scratch_text,
+        national_scratch = _find_pair_percentage(
+            national_scratch_text,
             str(player1.get("lastName") or ""),
             str(player2.get("lastName") or ""),
         )
-        handicap = _find_pair_percentage(
-            handicap_text,
+        national_handicap = _find_pair_percentage(
+            national_handicap_text,
+            str(player1.get("lastName") or ""),
+            str(player2.get("lastName") or ""),
+        )
+        club_scratch = _find_pair_percentage(
+            club_scratch_text,
+            str(player1.get("lastName") or ""),
+            str(player2.get("lastName") or ""),
+        )
+        club_handicap = _find_pair_percentage(
+            club_handicap_text,
             str(player1.get("lastName") or ""),
             str(player2.get("lastName") or ""),
         )
         scores[team_id] = {
-            "scratch_percentage": scratch,
-            "handicap_percentage": handicap,
+            "scratch_percentage": (
+                club_scratch
+                if club_scratch is not None
+                else national_scratch
+            ),
+            "handicap_percentage": (
+                club_handicap
+                if club_handicap is not None
+                else national_handicap
+            ),
+            "national_scratch_percentage": national_scratch,
+            "national_handicap_percentage": national_handicap,
+            "club_scratch_percentage": club_scratch,
+            "club_handicap_percentage": club_handicap,
             "scratch_url": scratch_url,
             "handicap_url": handicap_url,
         }

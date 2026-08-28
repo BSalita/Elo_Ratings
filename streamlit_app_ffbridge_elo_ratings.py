@@ -1715,8 +1715,8 @@ def _elo_cache_meta_paths(api_key: str, fetch_iv: bool) -> List[pathlib.Path]:
     seen: set[pathlib.Path] = set()
     paths: List[pathlib.Path] = []
     for pattern in (
-        f"elo_full_v10_{api_key}_iv_{iv}.meta.json",
-        f"elo_full_v10_{api_key}_*_iv_{iv}.meta.json",
+        f"elo_full_v11_{api_key}_iv_{iv}.meta.json",
+        f"elo_full_v11_{api_key}_*_iv_{iv}.meta.json",
     ):
         for meta_path in _FFBRIDGE_ELO_CACHE_DIR.glob(pattern):
             if meta_path not in seen:
