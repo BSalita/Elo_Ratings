@@ -13,6 +13,18 @@ from ffbridge_provisional_scores import (
 )
 
 
+def _club_row(player1: str, player2: str, pct: str) -> str:
+    return (
+        "<tr class=text_res>"
+        "<td align=right>1</td><td align=right>1</td><td align=right>1</td>"
+        "<td align=center>EO</td>"
+        f"<td align=left>{player1}</td><td align=left>{player2}</td>"
+        f"<td align=right> {pct}%</td>"
+        "<td align=right>0</td><td align=right>0</td>"
+        "</tr>"
+    )
+
+
 def _ranking_row(
     team_id: int,
     surname1: str,
@@ -77,8 +89,8 @@ class PublicationStateTests(unittest.TestCase):
             '&v_codeseance=lo260824>Levallois</a>'
         )
         main_h = main_s.replace("classement=s", "classement=h")
-        club_s = "JACOUPY Christian SALITA Robert 54.41%"
-        club_h = "JACOUPY Christian SALITA Robert 64.41%"
+        club_s = _club_row("JACOUPY Christian", "SALITA Robert", "54.41")
+        club_h = _club_row("JACOUPY Christian", "SALITA Robert", "64.41")
 
         def get_text(url: str) -> str:
             if "resseance" in url:
@@ -105,8 +117,8 @@ class PublicationStateTests(unittest.TestCase):
             if "resseance" in url:
                 return main_h if "classement=h" in url else main_s
             if "classement=h" in url:
-                return "OTHER Pair 51.00%"
-            return "JACOUPY Christian SALITA Robert 54.41%"
+                return _club_row("OTHER Pair", "UNKNOWN Name", "51.00")
+            return _club_row("JACOUPY Christian", "SALITA Robert", "54.41")
 
         scores = fetch_provisional_pair_percentages(
             ranking, "2026-08-24", 386, get_text=get_text

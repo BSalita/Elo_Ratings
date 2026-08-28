@@ -17,6 +17,7 @@ import streamlit as st
 import polars as pl
 
 from ffbridge_provisional_scores import (
+    BI_SERIES_IDS,
     fetch_provisional_pair_percentages,
     national_ranking_is_pending,
 )
@@ -233,7 +234,7 @@ def _fetch_organizer_scores(
     tournament_date: str,
     series_id: Optional[Any],
 ) -> Dict[str, Dict[str, Any]]:
-    if normalize_series_id(series_id) != 386:
+    if normalize_series_id(series_id) not in BI_SERIES_IDS:
         return {}
     cache_name = f"organizer_scores_{ORGANIZER_SCORE_CACHE_VERSION}_{session_id}"
     cached = load_from_disk_cache(
@@ -628,8 +629,8 @@ def _normalize_ranking_results(
             'Club_Handicap_Pct': club_handicap_pct,
             'National_Scratch_Pct': national_scratch_pct,
             'National_Handicap_Pct': national_handicap_pct,
-            'Club_Scratch_Rank': None,
-            'Club_Handicap_Rank': None,
+            'Club_Scratch_Rank': organizer.get("club_scratch_rank"),
+            'Club_Handicap_Rank': organizer.get("club_handicap_rank"),
             'National_Scratch_Rank': national_scratch_rank,
             'National_Handicap_Rank': national_handicap_rank,
             'Theoretical_Rank': theoretical_rank,
