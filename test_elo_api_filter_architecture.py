@@ -122,7 +122,7 @@ class FirstPartyApiBoundaryTests(unittest.TestCase):
             self.assertIn("tournament_contains", parameters)
         self.assertEqual(
             elo_mcp_server.MCP_SCHEMA_VERSION,
-            "2026-08-25-tournament-v2",
+            "2026-08-28-score-provenance-v3",
         )
 
     @patch("elo_mcp_server.requests.get")
@@ -144,6 +144,18 @@ class FirstPartyApiBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(params["tournament_contains"], "Simultane Octopus")
         self.assertEqual(params["player_number"], "123")
+
+    @patch("elo_mcp_server.requests.get")
+    def test_ffbridge_health_mcp_calls_health_api(self, mock_get: Mock) -> None:
+        response = Mock()
+        response.json.return_value = {"status": "ok"}
+        mock_get.return_value = response
+
+        self.assertEqual(elo_mcp_server.ffbridge_health(), {"status": "ok"})
+        self.assertEqual(
+            mock_get.call_args.args[0],
+            f"{elo_mcp_server.FFBRIDGE_API_BASE_URL}/health",
+        )
 
     @patch("elo_mcp_server.requests.get")
     def test_acbl_mcp_passes_all_sidebar_filters_to_our_api(

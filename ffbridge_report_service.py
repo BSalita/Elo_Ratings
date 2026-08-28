@@ -77,6 +77,7 @@ DATE_RANGE_OPTIONS = (
 DEFAULT_TOP_N = 250
 DEFAULT_MIN_GAMES = 10
 DEFAULT_PRIOR_SESSIONS = 50
+ELO_DATASET_SCHEMA_VERSION = 11
 
 API_BACKEND_KEYS = {
     "FFBridge Classic API": "FFBridge_Classic_API",
@@ -509,6 +510,10 @@ def dataset_info(api_key: Optional[str] = None, fetch_iv: bool = True) -> Dict[s
         date_min, date_max = day.min(), day.max()
     return {
         "api_key": api_key or default_api_key(),
+        "dataset_schema_version": ELO_DATASET_SCHEMA_VERSION,
+        "dataset_cache_key": elo_cache_key(
+            api_key_for_backend(api_key), fetch_iv
+        ),
         "built_at": meta.get("built_at"),
         "result_rows": results_df.height,
         "date_min": date_min,
@@ -639,6 +644,7 @@ def score_provenance_counts(df: pl.DataFrame) -> Dict[str, Any]:
             "club_handicap_rows": 0,
             "national_scratch_rows": 0,
             "national_handicap_rows": 0,
+            "score_sources": {},
             "scoring_modes": {},
         }
 
@@ -657,6 +663,12 @@ def score_provenance_counts(df: pl.DataFrame) -> Dict[str, Any]:
         scoring_modes = {
             str(row["Scoring_Mode"]): int(row["len"])
             for row in df.group_by("Scoring_Mode").len().to_dicts()
+        }
+    score_sources = {}
+    if "score_source" in df.columns:
+        score_sources = {
+            str(row["score_source"]): int(row["len"])
+            for row in df.group_by("score_source").len().to_dicts()
         }
 
     return {
@@ -679,6 +691,7 @@ def score_provenance_counts(df: pl.DataFrame) -> Dict[str, Any]:
         "club_handicap_rows": _available("Club_Handicap_Pct"),
         "national_scratch_rows": _available("National_Scratch_Pct"),
         "national_handicap_rows": _available("National_Handicap_Pct"),
+        "score_sources": score_sources,
         "scoring_modes": scoring_modes,
     }
 
@@ -1332,6 +1345,7 @@ def run_leaderboard_report(
         "date_to": date_to,
         "filtered_result_rows": results_df.height,
         "dataset_built_at": meta.get("built_at"),
+        "dataset_schema_version": ELO_DATASET_SCHEMA_VERSION,
         "score_provenance": provenance,
         "results_links": ffbridge_results_link_status(results_df),
         "quality": quality_status,
@@ -1409,4 +1423,5 @@ def run_player_history(
         "total_sessions": all_sessions.height,
         "results_links": results_url_status(sessions),
         "dataset_built_at": meta.get("built_at"),
+        "dataset_schema_version": ELO_DATASET_SCHEMA_VERSION,
     }

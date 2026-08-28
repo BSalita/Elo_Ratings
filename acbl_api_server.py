@@ -29,7 +29,7 @@ DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-07-19-strata-filter"
+API_BUILD_TAG = "2026-08-28-interface-metadata"
 
 # Module-level caches to avoid re-reading parquet files on every request.
 # Keys are source paths; values are the cached objects.
@@ -47,7 +47,7 @@ _FRAME_LOCK = _threading.Lock()
 _REPORT_LOCK = _threading.Lock()
 _DB_CON: duckdb.DuckDBPyConnection | None = None
 
-app = FastAPI(title="ACBL Elo API", version="1.0.0")
+app = FastAPI(title="ACBL Elo API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1846,6 +1846,7 @@ def health() -> dict:
     return {
         "status": "ok",
         "service": "acbl-api",
+        "api_version": app.version,
         "memory": get_memory_usage_dict(),
         "server": runtime,
         "frame_cache": runtime.get("frame_cache", {}),

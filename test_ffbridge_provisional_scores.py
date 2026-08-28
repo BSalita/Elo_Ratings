@@ -379,6 +379,24 @@ class ScoreAvailabilityTests(unittest.TestCase):
             reports.score_provenance_counts(frame)["provisional_rows"], 2
         )
 
+    def test_score_provenance_reports_source_counts(self) -> None:
+        frame = pl.DataFrame(
+            {
+                "score_source": [
+                    "national_official",
+                    "national_and_organizer_official",
+                    "national_and_organizer_official",
+                ]
+            }
+        )
+        self.assertEqual(
+            reports.score_provenance_counts(frame)["score_sources"],
+            {
+                "national_official": 1,
+                "national_and_organizer_official": 2,
+            },
+        )
+
     def test_category_filters_do_not_count_the_other_score_type(self) -> None:
         frame = pl.DataFrame(
             {
