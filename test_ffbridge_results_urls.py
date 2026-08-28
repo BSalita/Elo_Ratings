@@ -12,7 +12,7 @@ import ffbridge_report_service as reports
 from streamlit_app_ffbridge_elo_ratings import (
     _ffbridge_results_url_expr,
     _move_url_columns_to_end,
-    _results_cache_has_complete_group_links,
+    _results_cache_has_group_link_schema,
 )
 
 
@@ -146,26 +146,22 @@ class FFBridgeResultsUrlTests(unittest.TestCase):
         self.assertEqual(response["results_links"]["status"], "available")
         self.assertEqual(response["results_links"]["linked_rows"], 1)
 
-    def test_empty_group_id_cache_requires_link_backfill(self) -> None:
+    def test_group_link_schema_does_not_require_every_result_to_be_linkable(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "results.parquet"
             pl.DataFrame(
                 {"group_id": [None, ""], "tournament_id": ["1", "2"]},
                 schema={"group_id": pl.String, "tournament_id": pl.String},
             ).write_parquet(path)
-            self.assertFalse(_results_cache_has_complete_group_links(path))
+            self.assertTrue(_results_cache_has_group_link_schema(path))
 
             pl.DataFrame(
-                {"group_id": [None, "21333"], "tournament_id": ["1", "2"]},
-                schema={"group_id": pl.String, "tournament_id": pl.String},
+                {"tournament_id": ["1", "2"]},
+                schema={"tournament_id": pl.String},
             ).write_parquet(path)
-            self.assertFalse(_results_cache_has_complete_group_links(path))
-
-            pl.DataFrame(
-                {"group_id": ["21291", "21333"], "tournament_id": ["1", "2"]},
-                schema={"group_id": pl.String, "tournament_id": pl.String},
-            ).write_parquet(path)
-            self.assertTrue(_results_cache_has_complete_group_links(path))
+            self.assertFalse(_results_cache_has_group_link_schema(path))
 
 
 if __name__ == "__main__":

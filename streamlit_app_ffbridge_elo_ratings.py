@@ -1876,25 +1876,9 @@ def _fetch_tournament_list_resilient(
     return [], "none"
 
 
-def _results_cache_has_complete_group_links(results_path: pathlib.Path) -> bool:
-    if "group_id" not in pl.read_parquet_schema(results_path):
-        return False
-    return not bool(
-        pl.scan_parquet(results_path)
-        .select(
-            (
-                pl.col("group_id")
-                .cast(pl.Utf8)
-                .fill_null("")
-                .str.strip_chars()
-                == ""
-            )
-            .any()
-            .alias("has_missing_group_links")
-        )
-        .collect()
-        .item()
-    )
+def _results_cache_has_group_link_schema(results_path: pathlib.Path) -> bool:
+    """Whether the cache supports links; individual results may be un-linkable."""
+    return "group_id" in pl.read_parquet_schema(results_path)
 
 
 def _needs_elo_rebuild(
@@ -1919,8 +1903,8 @@ def _needs_elo_rebuild(
         return True, "missing or unreadable parquet"
     if "Lancelot" in api_key:
         try:
-            if not _results_cache_has_complete_group_links(results_path):
-                return True, "results cache has missing FFBridge group links"
+            if not _results_cache_has_group_link_schema(results_path):
+                return True, "results cache predates FFBridge group links"
         except Exception:
             return True, "unreadable parquet schema"
 

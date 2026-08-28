@@ -351,7 +351,8 @@ def acbl_report(
     rating_method ('Latest'/'Avg'/'Max'/'Moving Avg'), date_from (ISO date),
     online_filter ('All'/'Local Only'/'Online Only'), strata (event MP-limit
     bucket), prior_sessions (Bayesian shrinkage weight, 0 disables),
-    min_skill_z (elite skill gate; <= -90 disables).
+    min_skill_z (optional elite skill gate; disabled by default, values above
+    -90 enable it).
     """
     return _acbl_get(
         "/acbl/report",

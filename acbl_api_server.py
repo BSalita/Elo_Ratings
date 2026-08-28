@@ -29,7 +29,7 @@ DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-08-28-interface-metadata"
+API_BUILD_TAG = "2026-08-28-skill-gate-opt-in"
 
 # Module-level caches to avoid re-reading parquet files on every request.
 # Keys are source paths; values are the cached objects.
@@ -352,19 +352,18 @@ _SHRINKAGE_META_CACHE: dict[str, dict | None] = {}
 # /acbl/report client may override via the prior_sessions query parameter.
 SHRINKAGE_DEFAULT_PRIOR_SESSIONS = 50
 
-# Elite skill gate. The leaderboard's headline Elo is a strong *within-field*
+# Optional elite skill gate. The leaderboard's headline Elo is a strong *within-field*
 # predictor, but a player/pair who only dominates weak fields can still reach
 # the top ranks (the "Zubatch" failure mode). We therefore gate the top ranks
 # by a field-INDEPENDENT skill signal: the pool z-score of card play
-# (DD_Tricks_Diff) + par bidding (Par_Suit, Par_Contract). Players/pairs below
-# ``SKILL_GATE_DEFAULT_Z`` are excluded from the leaderboard (their Elo can't
-# be trusted as 'elite' because their absolute card play is only average).
+# (DD_Tricks_Diff) + par bidding (Par_Suit, Par_Contract). The gate is disabled
+# by default so Elo-qualified players are not silently removed; callers may
+# opt in by passing a threshold greater than ``SKILL_GATE_DISABLED``.
 # A field-relative "tested against stronger cohorts" gate was prototyped and
 # rejected: a strong individual is by construction rated above their field
-# mean, so it is structurally unobservable from this data. Set the
-# ``min_skill_z`` query param <= SKILL_GATE_DISABLED to turn the gate off.
-SKILL_GATE_DEFAULT_Z = 0.5
+# mean, so it is structurally unobservable from this data.
 SKILL_GATE_DISABLED = -90.0
+SKILL_GATE_DEFAULT_Z = SKILL_GATE_DISABLED
 
 
 def _skill_gate_clause(min_skill_z: float, *, col: str = "Skill_Z") -> str:
@@ -1879,7 +1878,8 @@ def acbl_report(
     ),
     min_skill_z: float = Query(
         SKILL_GATE_DEFAULT_Z, ge=-100.0, le=5.0,
-        description="Elite skill gate: exclude players/pairs whose field-"
+        description="Optional elite skill gate (disabled by default): exclude "
+                    "players/pairs whose field-"
                     "independent card-play+bidding z-score (over the qualifying "
                     "pool) is below this. Higher = stricter. Set <= -90 to "
                     "disable (show all qualifying entities).",
