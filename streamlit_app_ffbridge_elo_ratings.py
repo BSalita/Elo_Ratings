@@ -1252,9 +1252,9 @@ def process_tournaments_to_elo(
             
             iv_bonus_raw = result.get('iv_bonus')
             try:
-                iv_bonus = float(iv_bonus_raw) if iv_bonus_raw is not None else 0.0
+                iv_bonus = float(iv_bonus_raw) if iv_bonus_raw is not None else None
             except (ValueError, TypeError):
-                iv_bonus = 0.0
+                iv_bonus = None
             
             # Get individual IV values (if available from API)
             player1_iv = result.get('player1_iv')
@@ -1330,7 +1330,7 @@ def process_tournaments_to_elo(
                 'National_Handicap_Rank': result.get('National_Handicap_Rank'),
                 'Theoretical_Rank': result.get('Theoretical_Rank'),
                 'Scoring_Mode': str(result.get('scoring_mode') or 'unknown'),
-                'iv_bonus': float(iv_bonus),
+                'iv_bonus': float(iv_bonus) if iv_bonus is not None else None,
                 'score_source': str(result.get('score_source') or 'unresolved'),
                 'score_status': str(result.get('score_status') or 'official'),
                 'scratch_score_status': scratch_score_status,
@@ -1715,8 +1715,8 @@ def _elo_cache_meta_paths(api_key: str, fetch_iv: bool) -> List[pathlib.Path]:
     seen: set[pathlib.Path] = set()
     paths: List[pathlib.Path] = []
     for pattern in (
-        f"elo_full_v9_{api_key}_iv_{iv}.meta.json",
-        f"elo_full_v9_{api_key}_*_iv_{iv}.meta.json",
+        f"elo_full_v10_{api_key}_iv_{iv}.meta.json",
+        f"elo_full_v10_{api_key}_*_iv_{iv}.meta.json",
     ):
         for meta_path in _FFBRIDGE_ELO_CACHE_DIR.glob(pattern):
             if meta_path not in seen:

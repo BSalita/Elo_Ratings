@@ -205,12 +205,72 @@ class OfficialCategoryMappingTests(unittest.TestCase):
         self.assertEqual(rows[0]["handicap_score_status"], "official")
         self.assertEqual(rows[0]["Theoretical_Rank"], 42)
 
+    def test_missing_octopus_bonus_does_not_copy_handicap_into_scratch(self) -> None:
+        ranking_row = _ranking_row(
+            10,
+            "Salita",
+            "Jacoupy",
+            score=71.74,
+        )
+        ranking_row.pop("totalBonus")
+        rows = lancelot._normalize_ranking_results(
+            [ranking_row],
+            series_id=386,
+            tournament_date="2026-06-08",
+        )
+        self.assertIsNone(rows[0]["National_Scratch_Pct"])
+        self.assertEqual(rows[0]["National_Handicap_Pct"], 71.74)
+        self.assertIsNone(rows[0]["iv_bonus"])
+
+    @patch("elo_ffbridge_lancelot.fetch_session_group_ids", return_value={})
+    @patch("elo_ffbridge_lancelot.save_to_disk_cache")
+    @patch("elo_ffbridge_lancelot.lancelot_get")
+    @patch("elo_ffbridge_lancelot.load_from_disk_cache")
+    def test_recent_finalized_ranking_is_revalidated(
+        self,
+        load_cache,
+        get_api,
+        _save_cache,
+        _group_ids,
+    ) -> None:
+        cached = [
+            _ranking_row(
+                10,
+                "Salita",
+                "Jacoupy",
+                score=71.74,
+                total_bonus=10.0,
+                theoretical_rank=42,
+            )
+        ]
+        refreshed = cached + [
+            _ranking_row(
+                11,
+                "Other",
+                "Pair",
+                score=65.0,
+                total_bonus=5.0,
+                theoretical_rank=30,
+            )
+        ]
+        load_cache.side_effect = [cached, None]
+        get_api.return_value = refreshed
+
+        rows, was_cached = lancelot.fetch_tournament_results(
+            "300751",
+            tournament_date="2026-08-24",
+            series_id=386,
+        )
+
+        self.assertFalse(was_cached)
+        self.assertEqual(len(rows), 2)
+
 
 class ScoreAvailabilityTests(unittest.TestCase):
     def test_schema_version_forces_full_elo_replay(self) -> None:
         self.assertTrue(
             reports.elo_cache_key("FFBridge_Lancelot_API", True).startswith(
-                "elo_full_v9_"
+                "elo_full_v10_"
             )
         )
 

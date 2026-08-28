@@ -24,9 +24,9 @@ What a rebuild does (and does NOT) refresh
 ------------------------------------------
 - Tournament LIST: fully re-fetched from the API (``force_refresh=True``) to
   discover new event IDs.
-- Event RESULTS (raw data): INCREMENTAL. Finalized events retain their on-disk
-  cache, while Lancelot rankings identified as unpublished zero shells expire
-  after six hours and are re-fetched.
+- Event RESULTS (raw data): INCREMENTAL. Lancelot rankings from the last 90 days
+  and unpublished zero shells expire after six hours because FFBridge revises
+  row counts, bonuses, and theoretical ranks after initial publication.
 - Elo ratings: FULL recompute from scratch over the entire history every time
   (``initial_players=None``). Elo is order-dependent, so a newly inserted event
   can shift the whole downstream chain — ratings are replayed, not appended.
@@ -37,19 +37,16 @@ What a rebuild does (and does NOT) refresh
   Lancelot, migration/Classic, and license identifiers without coupling its
   consumers to the Elo result schema.
 
-NUANCE — revised/corrected past events are NOT picked up. Because event results
-are cached with no expiry, if FFBridge later re-scores or amends an event we
-already fetched, a normal rebuild will not notice it (only genuinely new event
-IDs are pulled). To force a full re-fetch of results, delete the raw results
-cache on the volume so they are re-downloaded on the next rebuild, e.g.:
+NUANCE — revisions older than the 90-day revalidation window are not picked up.
+To force a full re-fetch of older results, delete the raw results cache on the
+volume so it is re-downloaded on the next rebuild, e.g.:
 
     # remove cached per-event results (keeps the elo_cache parquet):
     #   Classic:  $FFBRIDGE_CACHE_DIR/cache/**/results_v6_*.json
     #   Lancelot: $FFBRIDGE_CACHE_DIR/lancelot_cache/**/results_*.json
     # then trigger a rebuild (redeploy, or run this builder without --if-stale).
 
-Finalized results remain immutable in normal operation. Delete their raw cache
-entry explicitly if an already-published event is amended upstream.
+Older finalized results remain immutable in normal operation.
 
 Usage:
     python build_ffbridge_elo_parquets.py                 # force build all backends
@@ -157,8 +154,8 @@ def _prune_other_fetch_iv(api_key: str, fetch_iv: bool) -> None:
     cache_dir = app._FFBRIDGE_ELO_CACHE_DIR
     iv = int(fetch_iv)
     patterns = (
-        f"elo_full_v9_{api_key}_iv_{other}.results.parquet",
-        f"elo_full_v9_{api_key}_*_iv_{other}.results.parquet",
+        f"elo_full_v10_{api_key}_iv_{other}.results.parquet",
+        f"elo_full_v10_{api_key}_*_iv_{other}.results.parquet",
     )
     try:
         seen: set[pathlib.Path] = set()

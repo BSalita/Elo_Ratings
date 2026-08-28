@@ -9,6 +9,7 @@ No authentication required - public access.
 import os
 import re
 import pathlib
+from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any
 
 import requests
@@ -57,6 +58,9 @@ print(
 REQUEST_TIMEOUT = 10  # seconds (reduced from 30 to fail faster on hung requests)
 REQUEST_DELAY = 0.1  # seconds between API requests
 PENDING_RESULTS_CACHE_HOURS = 6
+RECENT_RESULTS_CACHE_HOURS = 6
+RECENT_RESULTS_DAYS = 90
+PROVENANCE_API_START = "2026-07-01"
 
 # Lancelot ID to Migration ID (FFBridge series ID) mapping (shared)
 LANCELOT_TO_MIGRATION = mlBridgeFFLib.LANCELOT_TO_MIGRATION
@@ -195,6 +199,33 @@ def _fetch_sessions_for_series(lancelot_id: int, migration_id: int, limit: Optio
     return all_sessions[:limit] if limit else all_sessions
 
 
+def _is_recent_result(tournament_date: str) -> bool:
+    try:
+        session_day = datetime.fromisoformat(tournament_date[:10]).date()
+    except (TypeError, ValueError):
+        return False
+    age_days = (datetime.now().date() - session_day).days
+    return 0 <= age_days <= RECENT_RESULTS_DAYS
+
+
+def _missing_expected_provenance(
+    ranking: List[Dict[str, Any]],
+    tournament_date: str,
+    series_id: Optional[Any],
+) -> bool:
+    if tournament_date[:10] < PROVENANCE_API_START:
+        return False
+    rows = [row for row in ranking if isinstance(row, dict)]
+    if not rows or national_ranking_is_pending(rows):
+        return False
+    if not any(row.get("theoreticalRank") is not None for row in rows):
+        return True
+    return (
+        ffbridge_scoring_mode(series_id, tournament_date) == "handicap"
+        and not any(row.get("totalBonus") is not None for row in rows)
+    )
+
+
 def fetch_tournament_results(session_id: str, tournament_date: str = "", series_id: Optional[Any] = None, fetch_iv: bool = False) -> Tuple[List[Dict[str, Any]], bool]:
     """
     Fetch results for a specific session from Lancelot.
@@ -213,18 +244,29 @@ def fetch_tournament_results(session_id: str, tournament_date: str = "", series_
     date_part = date_match.group(1) if date_match else ""
     friendly_name = f"ranking_{session_id}_{date_part}" if date_part else f"ranking_{session_id}"
     
-    # Finalized national results are immutable for normal operation. Pending
-    # zero-shell rankings get a short TTL so later national publication replaces
-    # provisional club values on the next full Elo replay.
+    # FFBridge updates row counts, bonuses, and theoretical ranks after a
+    # ranking first appears. Revalidate recent finalized sessions as well as
+    # pending zero shells; older complete rankings remain immutable.
     cached_data = load_from_disk_cache(
         CACHE_DIR, friendly_name, max_age_hours=None, series_id=series_id
     )
     if cached_data:
-        if national_ranking_is_pending(cached_data):
+        if _missing_expected_provenance(
+            cached_data, tournament_date, series_id
+        ):
+            cached_data = None
+        elif national_ranking_is_pending(cached_data):
             cached_data = load_from_disk_cache(
                 CACHE_DIR,
                 friendly_name,
                 max_age_hours=PENDING_RESULTS_CACHE_HOURS,
+                series_id=series_id,
+            )
+        elif _is_recent_result(tournament_date):
+            cached_data = load_from_disk_cache(
+                CACHE_DIR,
+                friendly_name,
+                max_age_hours=RECENT_RESULTS_CACHE_HOURS,
                 series_id=series_id,
             )
         if cached_data:
@@ -267,7 +309,7 @@ def _official_scratch_and_handicap(
     session_score: Optional[float],
     scoring_mode: str,
     bonus_is_authoritative: bool,
-) -> Tuple[Optional[float], Optional[float], float, str]:
+) -> Tuple[Optional[float], Optional[float], Optional[float], str]:
     """Map a published Lancelot ranking row to scratch, handicap, and IV bonus.
 
     Verified against FFBridge and club tables (2026-08-25):
@@ -283,11 +325,17 @@ def _official_scratch_and_handicap(
         if entry.get("scoreHandicap") is not None
         else entry.get("handicapPercentage")
     )
-    total_bonus = _as_number(entry.get("totalBonus")) or 0.0
-    has_handicap_scoring = scoring_mode == "handicap" or any(
+    total_bonus_value = _as_number(entry.get("totalBonus"))
+    if session_score is None:
+        return None, None, None, "unresolved"
+    has_explicit_handicap = any(
         value is not None for value in (explicit_scratch, explicit_handicap)
-    ) or total_bonus > 0
-    if not has_handicap_scoring or session_score is None:
+    )
+    if (
+        scoring_mode != "handicap"
+        and not has_explicit_handicap
+        and not (total_bonus_value is not None and total_bonus_value > 0)
+    ):
         return session_score, None, 0.0, "scratch_only"
 
     if explicit_scratch is not None and explicit_handicap is not None:
@@ -296,20 +344,29 @@ def _official_scratch_and_handicap(
     elif explicit_scratch is not None:
         scratch_pct = explicit_scratch
         handicap_pct = session_score
-    elif total_bonus > 0 or bonus_is_authoritative or scoring_mode != "handicap":
+    elif explicit_handicap is not None:
+        handicap_pct = explicit_handicap
+        scratch_pct = (
+            handicap_pct - total_bonus_value
+            if total_bonus_value is not None
+            and (bonus_is_authoritative or total_bonus_value > 0)
+            else None
+        )
+    elif total_bonus_value is not None and (
+        bonus_is_authoritative or total_bonus_value > 0
+    ):
+        total_bonus = total_bonus_value
         handicap_pct = (
             explicit_handicap if explicit_handicap is not None else session_score
         )
         scratch_pct = handicap_pct - total_bonus
     else:
-        handicap_pct = (
-            explicit_handicap if explicit_handicap is not None else session_score
-        )
+        handicap_pct = session_score
         scratch_pct = None
     iv_bonus = (
         handicap_pct - scratch_pct
         if handicap_pct is not None and scratch_pct is not None
-        else total_bonus
+        else None
     )
     return scratch_pct, handicap_pct, iv_bonus, "official"
 
