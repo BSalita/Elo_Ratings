@@ -11,6 +11,7 @@ import os
 import pathlib
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
@@ -21,7 +22,8 @@ import requests
 
 SCHEMA_VERSION = 1
 DEFAULT_SOURCE_DIR = pathlib.Path(r"E:\bridge\data\ffbridge\data")
-DEFAULT_CUTOFF = date(2025, 1, 1)
+DEFAULT_CUTOFF = date.today()
+DEFAULT_DISCOVERY_START = date(2026, 1, 1)
 BOARD_FILENAME = "ffbridge_quality_boards.parquet"
 PLAYER_FILENAME = "ffbridge_quality_players.parquet"
 PAIR_FILENAME = "ffbridge_quality_pairs.parquet"
@@ -165,6 +167,88 @@ def load_session_metadata(
     return sessions
 
 
+def discover_session_metadata(
+    source_dir: pathlib.Path = DEFAULT_SOURCE_DIR,
+    *,
+    start_date: date = DEFAULT_DISCOVERY_START,
+    cutoff: date | None = None,
+    timeout: float = 30.0,
+    delay: float = 0.1,
+) -> int:
+    """Discover Lancelot sessions in a date window and cache their metadata."""
+    if cutoff is None:
+        cutoff = date.today()
+    if start_date > cutoff:
+        raise ValueError(
+            f"Discovery start {start_date.isoformat()} is after cutoff "
+            f"{cutoff.isoformat()}"
+        )
+
+    ffbridge = _import_ffbridge_lib()
+    sessions_dir = pathlib.Path(source_dir) / "competitions" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    writes = 0
+    seen_ids: set[str] = set()
+
+    with requests.Session() as http:
+        for lancelot_series_id in sorted(ffbridge.LANCELOT_TO_MIGRATION):
+            page = 1
+            while True:
+                payload = ffbridge.get_simultaneous_sessions_page(
+                    lancelot_series_id,
+                    page=page,
+                    per_page=80,
+                    timeout=timeout,
+                    rate_limit_delay=delay,
+                    session=http,
+                )
+                if not isinstance(payload, Mapping):
+                    raise ValueError(
+                        f"Session discovery returned non-object for series "
+                        f"{lancelot_series_id}, page {page}"
+                    )
+                items = payload.get("items")
+                if not isinstance(items, list):
+                    raise ValueError(
+                        f"Session discovery lacks items for series "
+                        f"{lancelot_series_id}, page {page}"
+                    )
+                for item in items:
+                    if not isinstance(item, Mapping):
+                        raise ValueError(
+                            f"Malformed session metadata for series "
+                            f"{lancelot_series_id}, page {page}"
+                        )
+                    session_id = _clean_identifier(item.get("id"))
+                    if session_id is None or session_id in seen_ids:
+                        continue
+                    seen_ids.add(session_id)
+                    session_day = _session_date(item)
+                    if not start_date <= session_day <= cutoff:
+                        continue
+                    path = sessions_dir / f"{session_id}.json"
+                    if path.is_file():
+                        continue
+                    metadata = dict(item)
+                    metadata["series_id"] = ffbridge.LANCELOT_TO_MIGRATION[
+                        lancelot_series_id
+                    ]
+                    metadata["lancelot_series_id"] = lancelot_series_id
+                    _atomic_write_json(metadata, path)
+                    writes += 1
+
+                pagination = payload.get("pagination") or {}
+                if not isinstance(pagination, Mapping):
+                    raise ValueError(
+                        f"Malformed pagination for series {lancelot_series_id}, "
+                        f"page {page}"
+                    )
+                if not pagination.get("has_next_page", False):
+                    break
+                page += 1
+    return writes
+
+
 def training_session_ids(training_parquet: pathlib.Path) -> set[str]:
     path = pathlib.Path(training_parquet)
     if not path.is_file():
@@ -185,6 +269,7 @@ def _ranking_team_ids(ranking: Any, path: pathlib.Path) -> tuple[str, ...]:
     if not isinstance(ranking, list):
         raise ValueError(f"Ranking must be a JSON list: {path}")
     ids: set[str] = set()
+    ns_ids: set[str] = set()
     for row in ranking:
         if not isinstance(row, dict):
             raise ValueError(f"Ranking rows must be objects: {path}")
@@ -192,7 +277,17 @@ def _ranking_team_ids(ranking: Any, path: pathlib.Path) -> tuple[str, ...]:
         team_id = _clean_identifier(team.get("id") if isinstance(team, dict) else None)
         if team_id is not None:
             ids.add(team_id)
-    return tuple(sorted(ids))
+            orientation = str(
+                row.get("orientation")
+                or (team.get("orientation") if isinstance(team, dict) else "")
+                or ""
+            ).upper()
+            if orientation == "NS":
+                ns_ids.add(team_id)
+    # A team-score response contains the full four-seat lineup, so one endpoint
+    # per table is sufficient. In ordinary simultaneous pairs sessions the NS
+    # ranking rows provide exactly that covering set.
+    return tuple(sorted(ns_ids or ids))
 
 
 def audit_historical_cache(
@@ -266,6 +361,7 @@ def fetch_missing_artifacts(
     timeout: float = 30.0,
     delay: float = 0.1,
     max_attempts: int = 4,
+    workers: int = 8,
 ) -> int:
     """Fetch only audit-reported missing files and write them to the raw cache."""
     ffbridge = _import_ffbridge_lib()
@@ -314,6 +410,7 @@ def fetch_missing_artifacts(
                 team_ids = _ranking_team_ids(ranking, ranking_path)
             else:
                 team_ids = session.expected_team_ids
+            missing_team_ids = []
             for team_id in team_ids:
                 score_path = (
                     source_dir
@@ -326,13 +423,24 @@ def fetch_missing_artifacts(
                 )
                 if score_path.is_file():
                     continue
+                missing_team_ids.append(team_id)
+
+            def fetch_team_scores(team_id: str) -> int:
+                score_path = (
+                    source_dir
+                    / "results"
+                    / "teams"
+                    / team_id
+                    / "session"
+                    / session.session_id
+                    / "scores.json"
+                )
                 scores = fetch(
                     ffbridge.get_team_session_scores,
                     int(team_id),
                     int(session.session_id),
                     timeout=timeout,
                     rate_limit_delay=delay,
-                    session=http,
                 )
                 if not isinstance(scores, list):
                     raise ValueError(
@@ -340,7 +448,11 @@ def fetch_missing_artifacts(
                         f"team={team_id}"
                     )
                 _atomic_write_json(scores, score_path)
-                writes += 1
+                return 1
+
+            if missing_team_ids:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    writes += sum(executor.map(fetch_team_scores, missing_team_ids))
     return writes
 
 

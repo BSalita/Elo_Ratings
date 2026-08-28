@@ -17,6 +17,7 @@ from ffbridge_quality_pipeline import (
     augment_raw_session,
     build_pair_sidecar,
     build_player_sidecar,
+    discover_session_metadata,
     flatten_team_scores,
     normalize_quality_frame,
     resolve_output_dir,
@@ -101,6 +102,48 @@ def _dates() -> pl.DataFrame:
 
 
 class FFBridgeQualityPipelineTests(unittest.TestCase):
+    def test_discover_session_metadata_writes_only_requested_dates(self) -> None:
+        class FakeFFBridge:
+            LANCELOT_TO_MIGRATION = {27: 386}
+
+            @staticmethod
+            def get_simultaneous_sessions_page(
+                _series_id: int, *, page: int, **_kwargs: object
+            ) -> dict[str, object]:
+                pages = {
+                    1: {
+                        "items": [
+                            {"id": 10, "date": "2025-12-31T00:00:00+01:00"},
+                            {"id": 11, "date": "2026-01-02T00:00:00+01:00"},
+                        ],
+                        "pagination": {"has_next_page": True},
+                    },
+                    2: {
+                        "items": [
+                            {"id": 12, "date": "2026-02-01T00:00:00+01:00"},
+                        ],
+                        "pagination": {"has_next_page": False},
+                    },
+                }
+                return pages[page]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = pathlib.Path(temporary)
+            with mock.patch(
+                "ffbridge_quality_pipeline._import_ffbridge_lib",
+                return_value=FakeFFBridge,
+            ):
+                writes = discover_session_metadata(
+                    source,
+                    start_date=date(2026, 1, 1),
+                    cutoff=date(2026, 1, 31),
+                    delay=0,
+                )
+            self.assertEqual(writes, 1)
+            path = source / "competitions" / "sessions" / "11.json"
+            self.assertTrue(path.is_file())
+            self.assertEqual(json.loads(path.read_text())["series_id"], 386)
+
     def test_audit_respects_cutoff_and_compares_raw_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             source = pathlib.Path(temporary) / "source"
@@ -125,12 +168,37 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
                 [],
             )
 
-            report = audit_historical_cache(source)
+            report = audit_historical_cache(source, cutoff=date(2025, 1, 1))
             self.assertEqual([session.session_id for session in report.sessions], ["2", "1"])
             self.assertTrue(report.sessions[0].complete)
             self.assertFalse(report.sessions[0].in_training)
             self.assertTrue(report.sessions[1].in_training)
             self.assertEqual(report.to_dict()["summary"]["sessions_through_cutoff"], 2)
+
+    def test_audit_requires_one_team_endpoint_per_table(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = pathlib.Path(temporary)
+            _training(source / "ffbridge_training_data_df.parquet", [])
+            _write_json(
+                source / "competitions" / "sessions" / "1.json",
+                {"id": 1, "date": "2026-01-02"},
+            )
+            _write_json(
+                source / "results" / "sessions" / "1" / "ranking.json",
+                [
+                    {
+                        "orientation": "NS",
+                        "team": {"id": 10, "orientation": "NS"},
+                    },
+                    {
+                        "orientation": "EW",
+                        "team": {"id": 20, "orientation": "EW"},
+                    },
+                ],
+            )
+
+            report = audit_historical_cache(source, cutoff=date(2026, 1, 2))
+            self.assertEqual(report.sessions[0].expected_team_ids, ("10",))
 
     def test_legacy_quality_derivation_and_pair_keys(self) -> None:
         result = normalize_quality_frame(_quality_input(), session_dates=_dates())

@@ -25,7 +25,7 @@ FFBRIDGE_API_BASE_URL = os.environ.get(
     "FFBRIDGE_API_BASE_URL", "http://localhost:8511"
 ).rstrip("/")
 ELO_MCP_PORT = int(os.environ.get("ELO_MCP_PORT", "8510"))
-MCP_SCHEMA_VERSION = "2026-08-28-leaderboard-defaults-v4"
+MCP_SCHEMA_VERSION = "2026-08-28-ffbridge-board-results-v1"
 
 # Payload cap: MCP responses are JSON over a single HTTP exchange; thousands of
 # rows are fine, tens of thousands are not.
@@ -314,6 +314,28 @@ def ffbridge_player_history(
             "limit": min(limit, _MAX_HISTORY_ROWS),
             "score": score,
             "api_backend": api_backend,
+        },
+    )
+
+
+@mcp.tool()
+def ffbridge_board_results(
+    session_id: str,
+    board_number: int,
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    """All published scores for one board across every club in an FFBridge
+    simultaneous session. session_id identifies the national session;
+    board_number is the board within it. Results include contracts, declarers,
+    scores, percentages, pair/player identities, club codes, and the PBN deal.
+    Responses are cached; force_refresh=True re-downloads the ranking and team
+    score files from Lancelot."""
+    return _ffbridge_get(
+        "/ffbridge/board-results",
+        {
+            "session_id": session_id,
+            "board_number": board_number,
+            "force_refresh": force_refresh,
         },
     )
 

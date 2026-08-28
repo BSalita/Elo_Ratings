@@ -238,6 +238,29 @@ class OfficialCategoryMappingTests(unittest.TestCase):
         self.assertEqual(rows[0]["National_Handicap_Pct"], 71.74)
         self.assertIsNone(rows[0]["iv_bonus"])
 
+    def test_organizer_theoretical_rank_fills_when_lancelot_omits_it(self) -> None:
+        ranking_row = _ranking_row(10, "Salita", "Jacoupy", score=54.41)
+        ranking_row["theoreticalRank"] = None
+        rows = lancelot._normalize_ranking_results(
+            [ranking_row],
+            series_id=386,
+            tournament_date="2026-06-08",
+            organizer_scores={"10": {"theoretical_rank": 80}},
+        )
+        self.assertEqual(rows[0]["Theoretical_Rank"], 80)
+
+    def test_lancelot_theoretical_rank_is_not_replaced_by_organizer(self) -> None:
+        ranking_row = _ranking_row(
+            10, "Salita", "Jacoupy", score=54.41, theoretical_rank=42
+        )
+        rows = lancelot._normalize_ranking_results(
+            [ranking_row],
+            series_id=386,
+            tournament_date="2026-07-02",
+            organizer_scores={"10": {"theoretical_rank": 80}},
+        )
+        self.assertEqual(rows[0]["Theoretical_Rank"], 42)
+
     def test_historical_organizer_score_restores_missing_national_scratch(
         self,
     ) -> None:

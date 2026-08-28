@@ -161,6 +161,7 @@ class MatchAndBackfillTests(unittest.TestCase):
         self.assertEqual(scores["10"]["club_scratch_percentage"], 54.41)
         self.assertEqual(scores["10"]["club_handicap_percentage"], 64.41)
         self.assertEqual(scores["10"]["club_scratch_rank"], 5)
+        self.assertEqual(scores["10"]["theoretical_rank"], 80)
         self.assertIsNone(scores["10"]["national_scratch_percentage"])
 
     def test_simultanet_series_is_accepted(self) -> None:
@@ -209,6 +210,7 @@ class MatchAndBackfillTests(unittest.TestCase):
                 "player2_name": ["Robert Salita", "Other Person"],
                 "Club_Scratch_Pct": [None, 50.0],
                 "Club_Handicap_Pct": [None, None],
+                "Theoretical_Rank": [None, 9],
             }
         )
 
@@ -221,6 +223,7 @@ class MatchAndBackfillTests(unittest.TestCase):
         self.assertEqual(filled["Club_Scratch_Pct"].to_list(), [54.41, 50.0])
         self.assertEqual(filled["Club_Handicap_Pct"].to_list(), [64.41, None])
         self.assertEqual(filled["Club_Scratch_Rank"].to_list(), [5, None])
+        self.assertEqual(filled["Theoretical_Rank"].to_list(), [80, 9])
 
 
 if __name__ == "__main__":

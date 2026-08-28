@@ -62,7 +62,7 @@ PENDING_RESULTS_CACHE_HOURS = 6
 RECENT_RESULTS_CACHE_HOURS = 6
 RECENT_RESULTS_DAYS = 90
 PROVENANCE_API_START = "2026-07-01"
-ORGANIZER_SCORE_CACHE_VERSION = "v1"
+ORGANIZER_SCORE_CACHE_VERSION = "v2"
 
 # Lancelot ID to Migration ID (FFBridge series ID) mapping (shared)
 LANCELOT_TO_MIGRATION = mlBridgeFFLib.LANCELOT_TO_MIGRATION
@@ -258,6 +258,7 @@ def _fetch_organizer_scores(
                 "national_handicap_percentage",
                 "club_scratch_percentage",
                 "club_handicap_percentage",
+                "theoretical_rank",
             )
         )
         for row in scores.values()
@@ -585,6 +586,8 @@ def _normalize_ranking_results(
         )
         scratch_rank = entry.get("rankWithoutHandicap")
         theoretical_rank = entry.get("theoreticalRank")
+        if theoretical_rank is None:
+            theoretical_rank = organizer.get("theoretical_rank")
         if national_pending:
             national_handicap_rank = None
             national_scratch_rank = None

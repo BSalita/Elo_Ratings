@@ -1,4 +1,4 @@
-"""Backfill Club_Scratch_Pct / Club_Handicap_Pct from bridgeinter.net.
+"""Backfill Club_Scratch_Pct, Club_Handicap_Pct, and Theoretical_Rank from bridgeinter.net.
 
 Reads an Elo results parquet, fills null club percentages for Monday Octopus,
 Thursday Octopus, and Friday Simultanet, and writes the updated frame.
@@ -52,6 +52,9 @@ def main() -> int:
         "club_handicap": df.filter(pl.col("Club_Handicap_Pct").is_not_null()).height
         if "Club_Handicap_Pct" in df.columns
         else 0,
+        "theoretical_rank": df.filter(pl.col("Theoretical_Rank").is_not_null()).height
+        if "Theoretical_Rank" in df.columns
+        else 0,
         "rows": df.height,
     }
     filled = bi.fill_missing_club_pcts(
@@ -63,11 +66,13 @@ def main() -> int:
     after = {
         "club_scratch": filled.filter(pl.col("Club_Scratch_Pct").is_not_null()).height,
         "club_handicap": filled.filter(pl.col("Club_Handicap_Pct").is_not_null()).height,
+        "theoretical_rank": filled.filter(pl.col("Theoretical_Rank").is_not_null()).height,
         "rows": filled.height,
     }
     print(
         f"club_scratch {before['club_scratch']} -> {after['club_scratch']}  "
-        f"club_handicap {before['club_handicap']} -> {after['club_handicap']}",
+        f"club_handicap {before['club_handicap']} -> {after['club_handicap']}  "
+        f"theoretical_rank {before['theoretical_rank']} -> {after['theoretical_rank']}",
         flush=True,
     )
     if args.dry_run:

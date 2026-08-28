@@ -6,15 +6,17 @@ import json
 import pathlib
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import polars as pl
 
 from ffbridge_quality_pipeline import (
     DEFAULT_CUTOFF,
+    DEFAULT_DISCOVERY_START,
     DEFAULT_SOURCE_DIR,
     audit_historical_cache,
     build_historical_fragments,
+    discover_session_metadata,
     fetch_missing_artifacts,
     load_identity_map,
     load_session_metadata,
@@ -30,6 +32,33 @@ def _parse_date(value: str) -> date:
         return date.fromisoformat(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"Expected YYYY-MM-DD, got {value!r}") from exc
+
+
+def _quality_cache_is_fresh(
+    output_dir: pathlib.Path,
+    cutoff: date,
+    max_age_hours: float,
+) -> tuple[bool, str]:
+    metadata_path = output_dir / "ffbridge_quality_metadata.json"
+    if not metadata_path.is_file():
+        return False, "metadata missing"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        generated_at = datetime.fromisoformat(
+            str(metadata["generated_at"]).replace("Z", "+00:00")
+        )
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        return False, f"metadata invalid: {exc}"
+    if generated_at.tzinfo is None:
+        generated_at = generated_at.replace(tzinfo=timezone.utc)
+    age_hours = (
+        datetime.now(timezone.utc) - generated_at.astimezone(timezone.utc)
+    ).total_seconds() / 3600
+    if metadata.get("cutoff") != cutoff.isoformat():
+        return False, f"cutoff is {metadata.get('cutoff')!r}"
+    if age_hours >= max_age_hours:
+        return False, f"cache is {age_hours:.1f}h old"
+    return True, f"cache is fresh ({age_hours:.1f}h old)"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -50,7 +79,13 @@ def _parser() -> argparse.ArgumentParser:
         "--cutoff",
         type=_parse_date,
         default=DEFAULT_CUTOFF,
-        help="Inclusive historical cutoff (default: 2025-01-01).",
+        help="Inclusive historical cutoff (default: today).",
+    )
+    parser.add_argument(
+        "--discover-since",
+        type=_parse_date,
+        default=DEFAULT_DISCOVERY_START,
+        help="Discover Lancelot session metadata from this date (default: 2026-01-01).",
     )
     parser.add_argument(
         "--output-dir",
@@ -65,8 +100,26 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fetch-missing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fetch audit-reported missing rankings and team scores (default: enabled).",
+    )
+    parser.add_argument(
+        "--if-stale",
         action="store_true",
-        help="Explicitly fetch audit-reported missing rankings and team scores.",
+        help="Skip discovery and rebuilding when today's cache is still fresh.",
+    )
+    parser.add_argument(
+        "--max-age-hours",
+        type=float,
+        default=20.0,
+        help="Freshness threshold used with --if-stale (default: 20).",
+    )
+    parser.add_argument(
+        "--fetch-workers",
+        type=int,
+        default=8,
+        help="Concurrent team-score downloads (default: 8).",
     )
     parser.add_argument(
         "--no-progress",
@@ -88,16 +141,41 @@ def main(argv: list[str] | None = None) -> int:
             if args.training_parquet is not None
             else source_dir / "ffbridge_training_data_df.parquet"
         )
+        output_dir = (
+            resolve_output_dir(args.output_dir).resolve()
+            if not args.audit_only
+            else None
+        )
+        if args.if_stale and not args.audit_only:
+            assert output_dir is not None
+            fresh, reason = _quality_cache_is_fresh(
+                output_dir, args.cutoff, args.max_age_hours
+            )
+            if fresh:
+                print(f"[quality-builder] {reason}; skipping", flush=True)
+                return 0
+            print(f"[quality-builder] rebuilding: {reason}", flush=True)
+
+        if not args.audit_only:
+            discovered = discover_session_metadata(
+                source_dir,
+                start_date=args.discover_since,
+                cutoff=args.cutoff,
+            )
+            print(
+                f"[quality-builder] discovered {discovered} new session metadata file(s)",
+                flush=True,
+            )
         audit = audit_historical_cache(source_dir, training_path, args.cutoff)
-        if args.fetch_missing:
-            writes = fetch_missing_artifacts(audit)
+        if args.fetch_missing and not args.audit_only:
+            writes = fetch_missing_artifacts(audit, workers=args.fetch_workers)
             print(f"[quality-builder] fetched {writes} missing artifact(s)", flush=True)
             audit = audit_historical_cache(source_dir, training_path, args.cutoff)
         if args.audit_only:
             print(json.dumps(audit.to_dict(), indent=2, sort_keys=True), flush=True)
             return 0
 
-        output_dir = resolve_output_dir(args.output_dir).resolve()
+        assert output_dir is not None
         uncovered_incomplete = [
             session.session_id
             for session in audit.sessions

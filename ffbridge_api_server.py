@@ -7,11 +7,12 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
 
+import ffbridge_board_service as boards
 import ffbridge_report_service as reports
 
 
-FFBRIDGE_API_BUILD_TAG = "2026-08-28-best-effort-results-links"
-app = FastAPI(title="FFBridge Elo API", version="1.2.0")
+FFBRIDGE_API_BUILD_TAG = "2026-08-28-nationwide-board-results"
+app = FastAPI(title="FFBridge Elo API", version="1.3.0")
 
 
 def _run(callable_, /, **kwargs):
@@ -143,6 +144,21 @@ def player_history(
         limit=limit,
         score=score,
         api_key=api_backend,
+    )
+
+
+@app.get("/ffbridge/board-results")
+def board_results(
+    session_id: str = Query(..., pattern=r"^\d+$"),
+    board_number: int = Query(..., ge=1),
+    force_refresh: bool = Query(False),
+) -> dict:
+    """Return all published results for one board across all session clubs."""
+    return _run(
+        boards.get_board_results,
+        session_id=session_id,
+        board_number=board_number,
+        force_refresh=force_refresh,
     )
 
 
