@@ -10,8 +10,8 @@ from fastapi import FastAPI, HTTPException, Query
 import ffbridge_report_service as reports
 
 
-FFBRIDGE_API_BUILD_TAG = "2026-08-28-organizer-score-backfill"
-app = FastAPI(title="FFBridge Elo API", version="1.1.0")
+FFBRIDGE_API_BUILD_TAG = "2026-08-28-best-effort-results-links"
+app = FastAPI(title="FFBridge Elo API", version="1.2.0")
 
 
 def _run(callable_, /, **kwargs):
@@ -37,6 +37,7 @@ def health() -> dict:
         "result_rows": info.get("result_rows"),
         "score_provenance": info.get("score_provenance", {}),
         "results_links": info.get("results_links", {}),
+        "results_link_policy": info.get("results_link_policy"),
         "quality_status": info.get("quality_status"),
     }
 

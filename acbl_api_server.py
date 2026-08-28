@@ -47,7 +47,7 @@ _FRAME_LOCK = _threading.Lock()
 _REPORT_LOCK = _threading.Lock()
 _DB_CON: duckdb.DuckDBPyConnection | None = None
 
-app = FastAPI(title="ACBL Elo API", version="1.1.0")
+app = FastAPI(title="ACBL Elo API", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1852,6 +1852,10 @@ def health() -> dict:
         "dual_frame_cache": runtime.get("dual_frame_cache"),
         "cached_frame_gb": round(_cached_frame_bytes() / (1024 ** 3), 2),
         "build_tag": API_BUILD_TAG,
+        "skill_gate": {
+            "enabled_by_default": SKILL_GATE_DEFAULT_Z > SKILL_GATE_DISABLED,
+            "default_min_skill_z": SKILL_GATE_DEFAULT_Z,
+        },
     }
 
 

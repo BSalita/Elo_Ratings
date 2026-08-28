@@ -122,7 +122,7 @@ class FirstPartyApiBoundaryTests(unittest.TestCase):
             self.assertIn("tournament_contains", parameters)
         self.assertEqual(
             elo_mcp_server.MCP_SCHEMA_VERSION,
-            "2026-08-28-score-provenance-v3",
+            "2026-08-28-leaderboard-defaults-v4",
         )
 
     @patch("elo_mcp_server.requests.get")
@@ -156,6 +156,20 @@ class FirstPartyApiBoundaryTests(unittest.TestCase):
             mock_get.call_args.args[0],
             f"{elo_mcp_server.FFBRIDGE_API_BASE_URL}/health",
         )
+
+    @patch("ffbridge_api_server.reports.dataset_info")
+    def test_ffbridge_health_exposes_best_effort_link_policy(
+        self,
+        dataset_info: Mock,
+    ) -> None:
+        dataset_info.return_value = {
+            "dataset_schema_version": 11,
+            "dataset_cache_key": "elo_full_v11_test",
+            "results_link_policy": "best_effort",
+        }
+        response = ffbridge_api_server.health()
+        self.assertEqual(response["api_version"], "1.2.0")
+        self.assertEqual(response["results_link_policy"], "best_effort")
 
     @patch("elo_mcp_server.requests.get")
     def test_acbl_mcp_passes_all_sidebar_filters_to_our_api(

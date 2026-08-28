@@ -522,6 +522,7 @@ def dataset_info(api_key: Optional[str] = None, fetch_iv: bool = True) -> Dict[s
         "processing_stats": meta.get("processing_stats", {}),
         "score_provenance": score_provenance_counts(results_df),
         "results_links": ffbridge_results_link_status(results_df),
+        "results_link_policy": "best_effort",
         "quality": quality_status,
         "quality_status": quality_status["status"],
         "quality_cutoff": quality_status.get("cutoff"),

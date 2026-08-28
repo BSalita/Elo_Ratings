@@ -25,7 +25,7 @@ FFBRIDGE_API_BASE_URL = os.environ.get(
     "FFBRIDGE_API_BASE_URL", "http://localhost:8511"
 ).rstrip("/")
 ELO_MCP_PORT = int(os.environ.get("ELO_MCP_PORT", "8510"))
-MCP_SCHEMA_VERSION = "2026-08-28-score-provenance-v3"
+MCP_SCHEMA_VERSION = "2026-08-28-leaderboard-defaults-v4"
 
 # Payload cap: MCP responses are JSON over a single HTTP exchange; thousands of
 # rows are fine, tens of thousands are not.
@@ -76,8 +76,8 @@ def ffbridge_dataset_info(api_backend: Optional[str] = None) -> Dict[str, Any]:
     """Summary of the FFBridge Elo dataset: build time, result-row count,
     covered date range, available club names (for the club filter of the
     leaderboard tools), dataset schema/cache identity, score-source and
-    unresolved-score counts, result-link coverage, quality status, and valid
-    date_range choices."""
+    unresolved-score counts, best-effort result-link coverage, quality status,
+    and valid date_range choices."""
     return _ffbridge_get(
         "/ffbridge/dataset-info", {"api_backend": api_backend}
     )
@@ -321,7 +321,7 @@ def ffbridge_player_history(
 # -------------------------------
 @mcp.tool()
 def acbl_health() -> Dict[str, Any]:
-    """Health and memory status of the ACBL Elo API server (acbl-api)."""
+    """ACBL API health, memory status, and active default Skill_Z gate policy."""
     return _acbl_get("/health", {})
 
 
