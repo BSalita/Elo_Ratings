@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import ast
-import inspect
-import pathlib
 import unittest
 from unittest.mock import Mock, patch
 
 import polars as pl
 
-import elo_mcp_server
 import ffbridge_api_server
 from ffbridge_report_service import filter_results, resolve_series_id
 from elo_filter_common import (
@@ -91,72 +87,6 @@ class SharedFilterTests(unittest.TestCase):
 
 
 class FirstPartyApiBoundaryTests(unittest.TestCase):
-    def test_mcp_has_no_report_or_data_library_imports(self) -> None:
-        source_path = pathlib.Path(elo_mcp_server.__file__)
-        tree = ast.parse(source_path.read_text(encoding="utf-8"))
-        imported = {
-            alias.name
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.Import, ast.ImportFrom))
-            for alias in node.names
-        }
-        forbidden = {
-            "polars",
-            "duckdb",
-            "ffbridge_report_service",
-            "acbl_api_server",
-            "elo_ffbridge_classic",
-            "elo_ffbridge_lancelot",
-        }
-        self.assertTrue(imported.isdisjoint(forbidden), imported & forbidden)
-
-    def test_mcp_schema_exposes_tournament_filters(self) -> None:
-        for tool in (
-            elo_mcp_server.ffbridge_top_players,
-            elo_mcp_server.ffbridge_top_pairs,
-            elo_mcp_server.ffbridge_top_players_v2,
-            elo_mcp_server.ffbridge_top_pairs_v2,
-        ):
-            parameters = inspect.signature(tool).parameters
-            self.assertIn("tournament", parameters)
-            self.assertIn("tournament_contains", parameters)
-        self.assertEqual(
-            elo_mcp_server.MCP_SCHEMA_VERSION,
-            "2026-08-28-leaderboard-defaults-v4",
-        )
-
-    @patch("elo_mcp_server.requests.get")
-    def test_ffbridge_mcp_calls_our_rest_api(self, mock_get: Mock) -> None:
-        response = Mock()
-        response.json.return_value = {"rows": []}
-        mock_get.return_value = response
-
-        elo_mcp_server.ffbridge_top_players(
-            tournament_contains="Simultane Octopus",
-            player_number="123",
-        )
-
-        url = mock_get.call_args.args[0]
-        params = mock_get.call_args.kwargs["params"]
-        self.assertEqual(
-            url,
-            f"{elo_mcp_server.FFBRIDGE_API_BASE_URL}/ffbridge/report",
-        )
-        self.assertEqual(params["tournament_contains"], "Simultane Octopus")
-        self.assertEqual(params["player_number"], "123")
-
-    @patch("elo_mcp_server.requests.get")
-    def test_ffbridge_health_mcp_calls_health_api(self, mock_get: Mock) -> None:
-        response = Mock()
-        response.json.return_value = {"status": "ok"}
-        mock_get.return_value = response
-
-        self.assertEqual(elo_mcp_server.ffbridge_health(), {"status": "ok"})
-        self.assertEqual(
-            mock_get.call_args.args[0],
-            f"{elo_mcp_server.FFBRIDGE_API_BASE_URL}/health",
-        )
-
     @patch("ffbridge_api_server.reports.dataset_info")
     def test_ffbridge_health_exposes_best_effort_link_policy(
         self,
@@ -170,32 +100,6 @@ class FirstPartyApiBoundaryTests(unittest.TestCase):
         response = ffbridge_api_server.health()
         self.assertEqual(response["api_version"], "1.2.0")
         self.assertEqual(response["results_link_policy"], "best_effort")
-
-    @patch("elo_mcp_server.requests.get")
-    def test_acbl_mcp_passes_all_sidebar_filters_to_our_api(
-        self,
-        mock_get: Mock,
-    ) -> None:
-        response = Mock()
-        response.json.return_value = {"rows": []}
-        mock_get.return_value = response
-
-        elo_mcp_server.acbl_report(
-            date_range="Last 1 year",
-            player_name="Alice",
-            player_number="123",
-            masterpoints_range="50-100",
-        )
-
-        url = mock_get.call_args.args[0]
-        params = mock_get.call_args.kwargs["params"]
-        self.assertEqual(
-            url,
-            f"{elo_mcp_server.ACBL_API_BASE_URL}/acbl/report",
-        )
-        self.assertEqual(params["date_range"], "Last 1 year")
-        self.assertEqual(params["player_number"], "123")
-        self.assertEqual(params["masterpoints_range"], "50-100")
 
     @patch("ffbridge_api_server.reports.run_leaderboard_report")
     def test_ffbridge_api_delegates_to_shared_report_service(

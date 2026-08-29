@@ -105,7 +105,7 @@ from elo_filter_common import filter_ffbridge_leaderboard
 import elo_ffbridge_classic as classic_api
 import elo_ffbridge_lancelot as lancelot_api
 
-# Headless report core shared with elo_mcp_server.py: persisted-parquet cache
+# Headless report core exposed through the Elo API and MortyBridgeBot: persisted-parquet cache
 # resolution, date ranges, percentage filter, and the leaderboard SQL live in
 # ffbridge_report_service (single source of truth for ranking logic).
 from ffbridge_report_service import (

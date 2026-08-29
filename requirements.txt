@@ -13,9 +13,6 @@ requests
 fastapi
 uvicorn
 
-# MCP server (elo_mcp_server.py, streamable HTTP transport)
-mcp
-
 # Data processing and analysis
 pandas
 polars
