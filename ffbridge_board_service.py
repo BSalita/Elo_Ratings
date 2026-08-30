@@ -156,6 +156,9 @@ def _normalized_score(
         "Pair_EW": team_field("EW", "label"),
         "Club_Code_NS": team_field("NS", "simultaneousId"),
         "Club_Code_EW": team_field("EW", "simultaneousId"),
+        # Session-level Lancelot `rank` for this pair (national handicap
+        # position on handicap series), copied onto every board row. Not a
+        # board rank and not a scratch rank.
         "National_Rank_NS": team_field("NS", "rank"),
         "National_Rank_EW": team_field("EW", "rank"),
     }

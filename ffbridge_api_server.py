@@ -9,10 +9,11 @@ from fastapi import FastAPI, HTTPException, Query
 
 import ffbridge_board_service as boards
 import ffbridge_report_service as reports
+import ffbridge_session_ranking_service as rankings
 
 
-FFBRIDGE_API_BUILD_TAG = "2026-08-28-nationwide-board-results"
-app = FastAPI(title="FFBridge Elo API", version="1.3.0")
+FFBRIDGE_API_BUILD_TAG = "2026-08-30-session-ranking"
+app = FastAPI(title="FFBridge Elo API", version="1.4.0")
 
 
 def _run(callable_, /, **kwargs):
@@ -159,6 +160,23 @@ def board_results(
         session_id=session_id,
         board_number=board_number,
         force_refresh=force_refresh,
+    )
+
+
+@app.get("/ffbridge/session-ranking")
+def session_ranking(
+    session_id: str = Query(..., pattern=r"^\d+$"),
+    scope: str = Query("national", pattern="^(national|club)$"),
+    club_code: str | None = Query(None),
+    api_backend: str | None = Query(None),
+) -> dict:
+    """Official per-pair scratch and handicap ranking for one FFBridge session."""
+    return _run(
+        rankings.get_session_ranking,
+        session_id=session_id,
+        scope=scope,
+        club_code=club_code,
+        api_key=api_backend,
     )
 
 
