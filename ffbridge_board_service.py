@@ -16,10 +16,10 @@ _MLBRIDGE = next(
 )
 if _MLBRIDGE is None:
     raise FileNotFoundError("mlBridge not found at ./mlBridge or ../mlBridge")
-if str(_MLBRIDGE) not in sys.path:
-    sys.path.insert(0, str(_MLBRIDGE))
+if str(_MLBRIDGE.parent) not in sys.path:
+    sys.path.insert(0, str(_MLBRIDGE.parent))
 
-import mlBridgeFFLib  # noqa: E402
+from mlBridge import mlBridgeFFLib  # noqa: E402
 
 
 DATA_ROOT = pathlib.Path(

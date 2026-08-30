@@ -19,12 +19,12 @@ _MLBRIDGE_PATH = next(
 )
 if _MLBRIDGE_PATH is None:
     raise FileNotFoundError("mlBridge not found at ./mlBridge or ../mlBridge")
-_MLBRIDGE_DIR = str(_MLBRIDGE_PATH)
-if _MLBRIDGE_DIR not in sys.path:
-    sys.path.append(_MLBRIDGE_DIR)
+_PKG_ROOT = str(_MLBRIDGE_PATH.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.append(_PKG_ROOT)
 
-import mlBridgeBILib  # noqa: E402
-from mlBridgeBILib import (  # noqa: E402
+from mlBridge import mlBridgeBILib  # noqa: E402
+from mlBridge.mlBridgeBILib import (  # noqa: E402
     BI_SERIES_IDS,
     BRIDGEINTER_BASE_URL,
     OCTOPUS_SERIES_ID,

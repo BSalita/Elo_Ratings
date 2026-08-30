@@ -18,7 +18,9 @@ pandas
 polars
 duckdb
 psycopg[binary]
-# Needed when importing the mlBridge package (monorepo_src.pth -> ../mlBridge)
+# The deployment image clones the published mlBridge repository. Its package
+# initializer imports mlBridgeLib and mlBridgeAcblLib eagerly, so these remain
+# required until the lazy initializer is published there.
 scikit-learn
 sqlalchemy
 sqlalchemy-utils

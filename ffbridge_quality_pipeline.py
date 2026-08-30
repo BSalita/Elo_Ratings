@@ -10,6 +10,7 @@ import logging
 import os
 import pathlib
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -86,21 +87,52 @@ def _read_json(path: pathlib.Path) -> Any:
         raise ValueError(f"Cannot read valid JSON from {path}: {exc}") from exc
 
 
-def _atomic_write_json(value: Any, path: pathlib.Path) -> None:
+def _atomic_write_json(
+    value: Any,
+    path: pathlib.Path,
+    *,
+    skip_if_exists: bool = False,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
     )
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        for attempt in range(10):
+            if skip_if_exists and path.is_file():
+                return
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _atomic_write_parquet(frame: pl.DataFrame, path: pathlib.Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    frame.write_parquet(temporary)
-    os.replace(temporary, path)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        frame.write_parquet(temporary)
+        for attempt in range(10):
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _clean_identifier(value: Any) -> str | None:
@@ -234,7 +266,7 @@ def discover_session_metadata(
                         lancelot_series_id
                     ]
                     metadata["lancelot_series_id"] = lancelot_series_id
-                    _atomic_write_json(metadata, path)
+                    _atomic_write_json(metadata, path, skip_if_exists=True)
                     writes += 1
 
                 pagination = payload.get("pagination") or {}
@@ -348,9 +380,9 @@ def _import_ffbridge_lib() -> Any:
     )
     if mlbridge is None:
         raise FileNotFoundError("mlBridge not found at ./mlBridge or ../mlBridge")
-    if str(mlbridge) not in sys.path:
-        sys.path.insert(0, str(mlbridge))
-    import mlBridgeFFLib  # type: ignore
+    if str(mlbridge.parent) not in sys.path:
+        sys.path.insert(0, str(mlbridge.parent))
+    from mlBridge import mlBridgeFFLib  # type: ignore
 
     return mlBridgeFFLib
 
@@ -405,7 +437,7 @@ def fetch_missing_artifacts(
                     raise ValueError(
                         f"Ranking fetch returned non-list for {session.session_id}"
                     )
-                _atomic_write_json(ranking, ranking_path)
+                _atomic_write_json(ranking, ranking_path, skip_if_exists=True)
                 writes += 1
                 team_ids = _ranking_team_ids(ranking, ranking_path)
             else:
@@ -447,7 +479,7 @@ def fetch_missing_artifacts(
                         f"Scores fetch returned non-list for session={session.session_id}, "
                         f"team={team_id}"
                     )
-                _atomic_write_json(scores, score_path)
+                _atomic_write_json(scores, score_path, skip_if_exists=True)
                 return 1
 
             if missing_team_ids:
@@ -1140,12 +1172,15 @@ def augment_raw_session(raw: pl.DataFrame) -> pl.DataFrame:
         raise NoQualityRowsError(
             "Raw session has no board rows with both a PBN deal and contract"
         )
-    mlbridge_root = pathlib.Path(__file__).resolve().parent.parent / "mlBridge"
-    if not mlbridge_root.is_dir():
-        raise FileNotFoundError(f"mlBridge not found: {mlbridge_root}")
-    for import_path in (mlbridge_root, mlbridge_root.parent):
-        if str(import_path) not in sys.path:
-            sys.path.insert(0, str(import_path))
+    _here = pathlib.Path(__file__).resolve().parent
+    mlbridge_root = next(
+        (path for path in (_here / "mlBridge", _here.parent / "mlBridge") if path.is_dir()),
+        None,
+    )
+    if mlbridge_root is None:
+        raise FileNotFoundError("mlBridge not found at ./mlBridge or ../mlBridge")
+    if str(mlbridge_root.parent) not in sys.path:
+        sys.path.insert(0, str(mlbridge_root.parent))
     from mlBridge import mlBridgeFFLib  # type: ignore
     from mlBridge.mlBridgeAugmentLib import AllAugmentations  # type: ignore
 
@@ -1155,6 +1190,21 @@ def augment_raw_session(raw: pl.DataFrame) -> pl.DataFrame:
             f"mlBridge conversion changed row count from {prepared.height} "
             f"to {converted.height}"
         )
+    if "BidSuit" in converted.columns:
+        invalid_suits = sorted(
+            set(
+                converted["BidSuit"]
+                .drop_nulls()
+                .cast(pl.String)
+                .str.to_uppercase()
+                .to_list()
+            )
+            - {"C", "D", "H", "S", "N"}
+        )
+        if invalid_suits:
+            raise NoQualityRowsError(
+                f"Raw session has unsupported contract denominations: {invalid_suits}"
+            )
     converted = converted.with_columns(
         prepared["session_id"].alias("session_id"),
         prepared["group_id"].alias("group_id"),
@@ -1216,6 +1266,23 @@ def build_historical_fragments(
         except NoQualityRowsError as exc:
             unsupported.append(
                 {"session_id": session.session_id, "reason": str(exc)}
+            )
+            continue
+        except ValueError as exc:
+            if not str(exc).startswith("Malformed score row in session "):
+                raise
+            unsupported.append(
+                {"session_id": session.session_id, "reason": str(exc)}
+            )
+            continue
+        except KeyError as exc:
+            if "DD_" not in str(exc):
+                raise
+            unsupported.append(
+                {
+                    "session_id": session.session_id,
+                    "reason": f"Unsupported double-dummy lookup: {exc}",
+                }
             )
             continue
         _atomic_write_parquet(fragment, fragment_path)

@@ -16,8 +16,8 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
 # Shared FFBridge API client + converters. Prefer ./mlBridge (Docker clone),
-# else ../mlBridge (monorepo). Imported as a top-level module to avoid the
-# mlBridge package __init__, which needs deps this project doesn't have.
+# else ../mlBridge (monorepo). The package root (mlBridge's parent) goes on
+# sys.path; the package __init__ is lazy, so this import stays cheap.
 _ROOT = pathlib.Path(__file__).resolve().parent
 _MLBRIDGE_PATH = next(
     (p for p in (_ROOT / "mlBridge", _ROOT.parent / "mlBridge") if p.is_dir()),
@@ -25,10 +25,10 @@ _MLBRIDGE_PATH = next(
 )
 if _MLBRIDGE_PATH is None:
     raise FileNotFoundError("mlBridge not found at ./mlBridge or ../mlBridge")
-_MLBRIDGE_DIR = str(_MLBRIDGE_PATH)
-if _MLBRIDGE_DIR not in sys.path:
-    sys.path.append(_MLBRIDGE_DIR)
-import mlBridgeFFLib  # noqa: E402
+_PKG_ROOT = str(_MLBRIDGE_PATH.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.append(_PKG_ROOT)
+from mlBridge import mlBridgeFFLib  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

@@ -23,10 +23,10 @@ _MLBRIDGE = next(
     for path in (_ROOT / "mlBridge", _ROOT.parent / "mlBridge")
     if path.is_dir()
 )
-if str(_MLBRIDGE) not in sys.path:
-    sys.path.append(str(_MLBRIDGE))
+if str(_MLBRIDGE.parent) not in sys.path:
+    sys.path.append(str(_MLBRIDGE.parent))
 
-import mlBridgeBILib as bi  # noqa: E402
+from mlBridge import mlBridgeBILib as bi  # noqa: E402
 
 
 def main() -> int:

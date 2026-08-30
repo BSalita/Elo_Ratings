@@ -1,0 +1,11 @@
+---
+description: Prohibit deployments and Cloudflare tunnels on this system
+alwaysApply: true
+---
+
+# Local System Safety
+
+- Never deploy any service from this system.
+- Never start, configure, restart, or otherwise use a Cloudflare tunnel from this system.
+- Code changes, tests, commits, and pushes are allowed when the user requests them.
+- Leave deployment and tunnel operations for another system.
