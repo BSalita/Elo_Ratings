@@ -23,6 +23,13 @@ from elo_filter_common import (
     fuzzy_text_score,
 )
 from elo_session_common import results_url_status
+from ffbridge_quality_pipeline import (
+    BOARD_FILENAME as QUALITY_BOARD_FILENAME,
+    QUALITY_METRIC_DEFINITIONS,
+    SCHEMA_VERSION as QUALITY_SCHEMA_VERSION,
+    build_pair_sidecar,
+    build_player_sidecar,
+)
 
 # Directory for the persisted (precomputed) Elo dataset parquets. In production
 # set FFBRIDGE_CACHE_DIR to a persistent mount (e.g. /data/ffbridge) so the raw
@@ -39,6 +46,7 @@ else:
 
 QUALITY_PLAYERS_PATH = QUALITY_CACHE_DIR / "ffbridge_quality_players.parquet"
 QUALITY_PAIRS_PATH = QUALITY_CACHE_DIR / "ffbridge_quality_pairs.parquet"
+QUALITY_BOARDS_PATH = QUALITY_CACHE_DIR / QUALITY_BOARD_FILENAME
 QUALITY_METADATA_PATH = QUALITY_CACHE_DIR / "ffbridge_quality_metadata.json"
 
 _QUALITY_METRIC_COLUMNS = (
@@ -264,7 +272,7 @@ _RESULTS_CACHE: Dict[Tuple[str, bool], Tuple[str, float, pl.DataFrame, Dict[str,
 _QUALITY_CACHE: Dict[
     pathlib.Path,
     Tuple[
-        Tuple[int, int, int],
+        Tuple[int, ...],
         pl.DataFrame,
         pl.DataFrame,
         Dict[str, Any],
@@ -356,8 +364,9 @@ def load_quality_sidecars(
     ).resolve()
     players_path = quality_dir / QUALITY_PLAYERS_PATH.name
     pairs_path = quality_dir / QUALITY_PAIRS_PATH.name
+    boards_path = quality_dir / QUALITY_BOARDS_PATH.name
     metadata_path = quality_dir / QUALITY_METADATA_PATH.name
-    paths = (players_path, pairs_path, metadata_path)
+    paths = (boards_path, players_path, pairs_path, metadata_path)
     present = tuple(path.exists() for path in paths)
     if not any(present):
         return None, None, {
@@ -392,6 +401,12 @@ def load_quality_sidecars(
             f"Incompatible FFBridge quality metadata {metadata_path}: "
             "non-empty string 'cutoff' is required"
         )
+    schema_version = metadata.get("schema_version")
+    if schema_version != QUALITY_SCHEMA_VERSION:
+        raise ValueError(
+            f"Incompatible FFBridge quality metadata {metadata_path}: "
+            f"schema_version must be {QUALITY_SCHEMA_VERSION}, got {schema_version!r}"
+        )
 
     try:
         players = _validate_quality_frame(
@@ -416,6 +431,62 @@ def load_quality_sidecars(
         flush=True,
     )
     return players, pairs, status
+
+
+def load_filtered_quality_sidecars(
+    results_df: pl.DataFrame,
+    cache_dir: Optional[pathlib.Path] = None,
+) -> Tuple[Optional[pl.DataFrame], Optional[pl.DataFrame], Dict[str, Any]]:
+    """Build role-aware quality aggregates for exactly the selected sessions."""
+    _all_players, _all_pairs, status = load_quality_sidecars(cache_dir)
+    if status["status"] != "available" or results_df.is_empty():
+        return None, None, status
+    if "tournament_id" not in results_df.columns:
+        raise ValueError("Filtered FFBridge results lack tournament_id")
+
+    quality_dir = (
+        pathlib.Path(cache_dir) if cache_dir is not None else QUALITY_CACHE_DIR
+    ).resolve()
+    session_ids = (
+        results_df.get_column("tournament_id")
+        .cast(pl.String)
+        .drop_nulls()
+        .unique()
+        .to_list()
+    )
+    if not session_ids:
+        return None, None, {**status, "filtered_board_rows": 0}
+    board_scan = pl.scan_parquet(quality_dir / QUALITY_BOARDS_PATH.name).filter(
+        pl.col("session_id").cast(pl.String).is_in(session_ids)
+    )
+    if "team_id" in results_df.columns:
+        selected_teams = (
+            results_df.select(
+                pl.col("tournament_id").cast(pl.String).alias("session_id"),
+                pl.col("team_id").cast(pl.String),
+            )
+            .drop_nulls()
+            .unique()
+        )
+        board_scan = board_scan.join(
+            selected_teams.lazy(),
+            on=["session_id", "team_id"],
+            how="inner",
+        )
+    board_quality = board_scan.collect()
+    scoped_status = {
+        **status,
+        "filter_scope": "selected_sessions",
+        "filtered_session_count": len(session_ids),
+        "filtered_board_rows": board_quality.height,
+    }
+    if board_quality.is_empty():
+        return None, None, scoped_status
+    return (
+        build_player_sidecar(board_quality),
+        build_pair_sidecar(board_quality),
+        scoped_status,
+    )
 
 
 def _attach_quality_sidecar(
@@ -481,7 +552,9 @@ def _attach_quality_sidecar(
         .cast(pl.Int32)
         .alias("Quality_Rank"),
         (pl.col("par_suit_rate") * 100).round(1).alias("Par_Suit_Rate_Pct"),
-        (pl.col("par_contract_rate") * 100).round(1).alias("Par_Contract_Rate_Pct"),
+        ((pl.col("par_contract_rate") + 1) * 50)
+        .round(1)
+        .alias("Par_Contract_Rate_Pct"),
         (pl.col("sacrifice_rate") * 100).round(1).alias("Sacrifice_Rate_Pct"),
         pl.col("dd_tricks_diff_avg").round(2).alias("DD_Tricks_Diff_Avg"),
     )
@@ -526,6 +599,7 @@ def dataset_info(api_key: Optional[str] = None, fetch_iv: bool = True) -> Dict[s
         "quality": quality_status,
         "quality_status": quality_status["status"],
         "quality_cutoff": quality_status.get("cutoff"),
+        "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
         "date_range_options": list(DATE_RANGE_OPTIONS),
         "api_backends": list(API_BACKEND_KEYS),
         "tournament_series": [
@@ -1286,7 +1360,6 @@ def run_leaderboard_report(
 
     normalized_series_id = resolve_series_id(series_id)
     results_df, meta = load_results(api_key, fetch_iv)
-    quality_players, quality_pairs, quality_status = load_quality_sidecars()
     results_df = filter_valid_percentages(results_df)
     results_df = filter_results(
         results_df,
@@ -1299,6 +1372,9 @@ def run_leaderboard_report(
     )
     provenance = score_provenance_counts(results_df)
     results_df = filter_score_available(results_df, use_handicap)
+    quality_players, quality_pairs, quality_status = load_filtered_quality_sidecars(
+        results_df
+    )
 
     if rating == "Players":
         players_df = aggregate_players_from_results(results_df, use_handicap)
@@ -1352,6 +1428,7 @@ def run_leaderboard_report(
         "quality": quality_status,
         "quality_status": quality_status["status"],
         "quality_cutoff": quality_status.get("cutoff"),
+        "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
     }
 
 

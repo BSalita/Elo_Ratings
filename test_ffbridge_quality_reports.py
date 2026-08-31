@@ -1,10 +1,12 @@
 import json
 import os
+from datetime import date
 
 import polars as pl
 import pytest
 
 import ffbridge_report_service as reports
+from ffbridge_quality_pipeline import SCHEMA_VERSION
 
 
 def _players() -> pl.DataFrame:
@@ -38,6 +40,47 @@ def _quality(id_column: str, ids: list[str]) -> pl.DataFrame:
     )
 
 
+def _board_quality() -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "session_id": ["10", "20"],
+            "board_id": ["100", "200"],
+            "Board": [1, 1],
+            "group_id": ["1", "2"],
+            "team_id": ["10", "20"],
+            "Date": [date(2026, 1, 1), date(2026, 2, 1)],
+            "Pair_Declarer_Direction": ["NS", "EW"],
+            "Declarer_Direction": ["N", "E"],
+            "Player_ID_N": ["1", "1"],
+            "Player_ID_E": ["2", "2"],
+            "Player_ID_S": ["3", "3"],
+            "Player_ID_W": ["4", "4"],
+            "Pair_ID_NS": ["1_3", "1_3"],
+            "Pair_ID_EW": ["2_4", "2_4"],
+            "Is_Par_Suit": [True, False],
+            "Is_Sacrifice": [False, True],
+            "Sacrifice_Opportunity": [False, True],
+            "Par_Contract_Score_NS": [1, -1],
+            "Par_Contract_Score_EW": [-1, 1],
+            "DD_Tricks_Diff": [2, -2],
+        }
+    ).with_columns(pl.col("Date").cast(pl.Date))
+
+
+def _write_quality_cache(path) -> None:
+    _board_quality().write_parquet(path / reports.QUALITY_BOARDS_PATH.name)
+    _quality("player_id", ["1"]).write_parquet(
+        path / reports.QUALITY_PLAYERS_PATH.name
+    )
+    _quality("pair_id", ["1_3"]).write_parquet(
+        path / reports.QUALITY_PAIRS_PATH.name
+    )
+    (path / reports.QUALITY_METADATA_PATH.name).write_text(
+        json.dumps({"cutoff": "2026-08-01", "schema_version": SCHEMA_VERSION}),
+        encoding="utf-8",
+    )
+
+
 def test_player_quality_uses_full_qualifying_population_and_preserves_elo() -> None:
     quality = _quality("player_id", ["1", "2", "3"])
     table, _sql, _anchor = reports.show_top_players(
@@ -52,7 +95,18 @@ def test_player_quality_uses_full_qualifying_population_and_preserves_elo() -> N
     assert table.get_column("Player_Elo").to_list() == [1400, 1300]
     assert table.get_column("Quality_Rank").to_list() == [1, 3]
     assert table.row(0, named=True)["Par_Suit_Rate_Pct"] == 90.0
+    assert table.row(0, named=True)["Par_Contract_Rate_Pct"] == 95.0
     assert table.row(0, named=True)["Sacrifice_Rank"] == 3
+
+
+def test_public_metric_definitions_describe_role_and_filter_scope() -> None:
+    definitions = reports.QUALITY_METRIC_DEFINITIONS
+
+    assert "declarer only" in definitions["DD_Tricks_Diff_Avg"]["attribution"]
+    assert "directional DD score" in definitions["Par_Contract_Rate_Pct"]["formula"]
+    assert "all declarations" in definitions["Par_Suit_Rate_Pct"]["formula"]
+    assert "negative-par declarations" in definitions["Sacrifice_Rate_Pct"]["formula"]
+    assert "leaderboard filters" in definitions["filter_scope"]
 
 
 def test_unmatched_player_quality_values_and_ranks_stay_null() -> None:
@@ -124,14 +178,7 @@ def test_missing_quality_cache_is_explicitly_unavailable(tmp_path) -> None:
 
 def test_quality_cache_reuses_frames_then_reloads_on_mtime_change(tmp_path) -> None:
     players_path = tmp_path / reports.QUALITY_PLAYERS_PATH.name
-    pairs_path = tmp_path / reports.QUALITY_PAIRS_PATH.name
-    metadata_path = tmp_path / reports.QUALITY_METADATA_PATH.name
-    _quality("player_id", ["1"]).write_parquet(players_path)
-    _quality("pair_id", ["1"]).write_parquet(pairs_path)
-    metadata_path.write_text(
-        json.dumps({"cutoff": "2026-08-01"}),
-        encoding="utf-8",
-    )
+    _write_quality_cache(tmp_path)
 
     players_before, pairs_before, status = reports.load_quality_sidecars(tmp_path)
     players_cached, pairs_cached, _cached_status = reports.load_quality_sidecars(tmp_path)
@@ -152,6 +199,7 @@ def test_quality_cache_reuses_frames_then_reloads_on_mtime_change(tmp_path) -> N
 
 
 def test_incompatible_quality_cache_raises(tmp_path) -> None:
+    _board_quality().write_parquet(tmp_path / reports.QUALITY_BOARDS_PATH.name)
     pl.DataFrame(
         {
             "player_id": ["1"],
@@ -165,9 +213,62 @@ def test_incompatible_quality_cache_raises(tmp_path) -> None:
         tmp_path / reports.QUALITY_PAIRS_PATH.name
     )
     (tmp_path / reports.QUALITY_METADATA_PATH.name).write_text(
-        json.dumps({"cutoff": "2026-08-01"}),
+        json.dumps({"cutoff": "2026-08-01", "schema_version": SCHEMA_VERSION}),
         encoding="utf-8",
     )
 
     with pytest.raises(ValueError, match="par_suit_rate must be numeric"):
+        reports.load_quality_sidecars(tmp_path)
+
+
+def test_filtered_quality_uses_only_selected_sessions(tmp_path) -> None:
+    _write_quality_cache(tmp_path)
+    selected = pl.DataFrame({"tournament_id": ["10"]})
+
+    players, pairs, status = reports.load_filtered_quality_sidecars(
+        selected, tmp_path
+    )
+
+    assert status["filtered_session_count"] == 1
+    assert status["filtered_board_rows"] == 1
+    assert players is not None
+    assert pairs is not None
+    declarer = players.filter(pl.col("player_id") == "1").row(0, named=True)
+    defender = players.filter(pl.col("player_id") == "2").row(0, named=True)
+    assert declarer["dd_tricks_diff_avg"] == 2.0
+    assert defender["dd_tricks_diff_avg"] is None
+    assert declarer["par_suit_rate"] == 1.0
+    assert pairs.filter(pl.col("pair_id") == "1_3").item(
+        0, "dd_tricks_diff_avg"
+    ) == 2.0
+
+
+def test_filtered_quality_uses_only_selected_teams_within_session(tmp_path) -> None:
+    _write_quality_cache(tmp_path)
+    _board_quality().with_columns(
+        pl.lit("10").alias("session_id")
+    ).write_parquet(tmp_path / reports.QUALITY_BOARDS_PATH.name)
+    selected = pl.DataFrame(
+        {"tournament_id": ["10"], "team_id": ["10"]}
+    )
+
+    players, _pairs, status = reports.load_filtered_quality_sidecars(
+        selected, tmp_path
+    )
+
+    assert status["filtered_board_rows"] == 1
+    assert players is not None
+    assert players.filter(pl.col("player_id") == "1").item(
+        0, "dd_tricks_diff_avg"
+    ) == 2.0
+
+
+def test_schema_v1_quality_cache_is_rejected(tmp_path) -> None:
+    _write_quality_cache(tmp_path)
+    (tmp_path / reports.QUALITY_METADATA_PATH.name).write_text(
+        json.dumps({"cutoff": "2026-08-01", "schema_version": 1}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="schema_version must be 2"):
         reports.load_quality_sidecars(tmp_path)

@@ -96,10 +96,14 @@ class FirstPartyApiBoundaryTests(unittest.TestCase):
             "dataset_schema_version": 11,
             "dataset_cache_key": "elo_full_v11_test",
             "results_link_policy": "best_effort",
+            "quality_metric_definitions": {"filter_scope": "test"},
         }
         response = ffbridge_api_server.health()
-        self.assertEqual(response["api_version"], "1.2.0")
+        self.assertEqual(response["api_version"], "1.5.0")
         self.assertEqual(response["results_link_policy"], "best_effort")
+        self.assertEqual(
+            response["quality_metric_definitions"], {"filter_scope": "test"}
+        )
 
     @patch("ffbridge_api_server.reports.run_leaderboard_report")
     def test_ffbridge_api_delegates_to_shared_report_service(

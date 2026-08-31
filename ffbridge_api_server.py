@@ -12,8 +12,8 @@ import ffbridge_report_service as reports
 import ffbridge_session_ranking_service as rankings
 
 
-FFBRIDGE_API_BUILD_TAG = "2026-08-30-session-ranking"
-app = FastAPI(title="FFBridge Elo API", version="1.4.0")
+FFBRIDGE_API_BUILD_TAG = "2026-08-31-role-aware-quality"
+app = FastAPI(title="FFBridge Elo API", version="1.5.0")
 
 
 def _run(callable_, /, **kwargs):
@@ -41,6 +41,7 @@ def health() -> dict:
         "results_links": info.get("results_links", {}),
         "results_link_policy": info.get("results_link_policy"),
         "quality_status": info.get("quality_status"),
+        "quality_metric_definitions": info.get("quality_metric_definitions", {}),
     }
 
 
@@ -72,7 +73,7 @@ def leaderboard_report(
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> dict:
-    """Return Elo rows with deployed quality metrics and quality-cache status."""
+    """Return filtered Elo rows with role-aware bridge-quality metrics."""
     tournament_filters = [
         value
         for value in (

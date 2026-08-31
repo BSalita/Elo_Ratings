@@ -121,6 +121,7 @@ from ffbridge_report_service import (
     filter_results as _filter_ffbridge_results,
     ffbridge_results_url_expr as _ffbridge_results_url_expr,
     legacy_elo_cache_keys as _legacy_elo_cache_keys,
+    load_filtered_quality_sidecars as _load_filtered_quality_sidecars,
     load_quality_sidecars as _load_quality_sidecars,
     resolve_elo_cache_key as _resolve_elo_cache_key,
     show_top_players,
@@ -2089,6 +2090,13 @@ def load_ffbridge_elo_dataset(
 
 
 @st.cache_data(show_spinner=False)
+def _cached_filtered_quality_sidecars(
+    results_df: pl.DataFrame,
+) -> Tuple[Optional[pl.DataFrame], Optional[pl.DataFrame], dict]:
+    return _load_filtered_quality_sidecars(results_df)
+
+
+@st.cache_data(show_spinner=False)
 def _cached_top_players_both(
     players_df: pl.DataFrame,
     top_n: int,
@@ -2347,6 +2355,9 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
     score_type = st.session_state.get("elo_score_type", "Scratch")
     use_handicap = score_type == "Handicap"
     results_df = _filter_score_available(ctx["results_df"], use_handicap)
+    quality_players, quality_pairs, quality_status = (
+        _cached_filtered_quality_sidecars(results_df)
+    )
     players_df = _aggregate_players_from_results_cached(results_df, use_handicap)
     _load_debug_log(
         f"leaderboard panel: aggregated players ({players_df.height} rows, "
@@ -2415,7 +2426,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
             _load_debug_log("leaderboard panel: running top players SQL (hc+sc)")
             hc_players, sc_players, sql_h, sql_s, anchor_h, anchor_s = _cached_top_players_both(
                 players_df, top_n, min_games, int(prior_sessions),
-                ctx.get("quality_players"),
+                quality_players,
             )
             _load_debug_log(
                 f"leaderboard panel: top players ready "
@@ -2634,7 +2645,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
             _load_debug_log("leaderboard panel: running top pairs SQL (hc+sc)")
             hc_pairs, sc_pairs, sql_h, sql_s, anchor_h, anchor_s = _cached_top_pairs_both(
                 results_df, top_n, min_games, int(prior_sessions),
-                ctx.get("quality_pairs"),
+                quality_pairs,
             )
             _load_debug_log(
                 f"leaderboard panel: top pairs ready "
@@ -3226,7 +3237,6 @@ def _load_main_content(
         date_to=date_to,
     )
     _load_debug_log(f"sidebar filters applied ({results_df.height} rows)")
-
     global _FFBRIDGE_CLUB_OPTIONS
     if not full_results_df.is_empty() and "club_name" in full_results_df.columns:
         unique_clubs = sorted(
@@ -3287,8 +3297,6 @@ def _load_main_content(
         "player_metrics_sc": player_metrics_sc,
         "pair_metrics_hc": pair_metrics_hc,
         "pair_metrics_sc": pair_metrics_sc,
-        "quality_players": quality_players,
-        "quality_pairs": quality_pairs,
         "quality_status": quality_status,
     }
     del players_df_hc, players_df_sc

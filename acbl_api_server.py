@@ -29,7 +29,37 @@ DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-08-28-skill-gate-opt-in"
+API_BUILD_TAG = "2026-08-30-role-aware-quality-metrics"
+
+QUALITY_METRIC_DEFINITIONS = {
+    "DD_Tricks_Diff_Avg": {
+        "label": "T-DD",
+        "population": "Declarations only; credited to the declarer and declaring pair.",
+        "calculation": "Mean DD_Tricks_Diff (actual tricks minus double-dummy tricks).",
+    },
+    "Par_Contract_Rate_Pct": {
+        "label": "Par Contract success percentage",
+        "population": "Every pair direction on every board; credited to both pair members.",
+        "calculation": (
+            "Directional score is +1 when DD_Score_NS/EW >= Par_NS/EW, otherwise -1; "
+            "rows with a missing DD or par score are excluded. Displayed as "
+            "(mean signed score + 1) * 50."
+        ),
+    },
+    "Par_Suit_Rate_Pct": {
+        "label": "Par Suit percentage",
+        "population": "All declarations; credited to the declaring pair and both pair members.",
+        "calculation": "Hit when BidSuit occurs in the Strain fields of ParContracts.",
+    },
+    "Sacrifice_Rate_Pct": {
+        "label": "Sacrifice percentage",
+        "population": (
+            "Declarations where the declaring direction's Par_Declarer is negative; "
+            "credited to the declaring pair and both pair members."
+        ),
+        "calculation": "Hit when DD_Score_Declarer equals negative Par_Declarer.",
+    },
+}
 
 # Module-level caches to avoid re-reading parquet files on every request.
 # Keys are source paths; values are the cached objects.
@@ -907,7 +937,9 @@ def get_elo_column_names(elo_rating_type: str) -> dict:
 def _required_columns_for_mode(rating_type: str, elo_rating_type: str) -> list[str]:
     cols = {
         "Date", "session_id", "is_virtual_game", "strata_bucket", "Pct_NS", "Round", "Board",
-        "DD_Tricks_Diff", "Is_Par_Suit", "Is_Par_Contract", "Is_Sacrifice",
+        "DD_Tricks_Diff", "Declarer_Direction", "Declarer_Pair_Direction",
+        "BidSuit", "ParContracts", "DD_Score_NS", "DD_Score_EW",
+        "Par_NS", "Par_EW", "DD_Score_Declarer", "Par_Declarer",
         "Pair_Number_NS", "Pair_Number_EW",
     }
     for p in "NESW":
@@ -1262,6 +1294,53 @@ _QUALITY_SCORE_EXPR_PAIR = (
 )
 
 
+def _directional_quality_sql(direction: str, *, declarer_seat: str | None = None) -> str:
+    """Board-level quality values for one NS/EW direction.
+
+    Pair metrics are null outside their defined populations so DuckDB AVG uses
+    the intended denominator. T-DD is additionally restricted to one seat in
+    player SQL and to the declaring direction in pair SQL.
+    """
+    if direction not in {"NS", "EW"}:
+        raise ValueError(f"Invalid pair direction: {direction!r}")
+    dd_score = f"DD_Score_{direction}"
+    par_score = f"Par_{direction}"
+    tdd_condition = (
+        f"Declarer_Direction = '{declarer_seat}'"
+        if declarer_seat is not None
+        else f"Declarer_Pair_Direction = '{direction}'"
+    )
+    return f"""
+        CASE
+          WHEN {dd_score} IS NULL OR {par_score} IS NULL THEN NULL
+          WHEN {dd_score} >= {par_score} THEN 1
+          ELSE -1
+        END AS Par_Contract_Value,
+        CASE
+          WHEN Declarer_Pair_Direction = '{direction}' THEN
+            CASE
+              WHEN BidSuit IS NOT NULL AND ParContracts IS NOT NULL
+                   AND list_contains(
+                     list_transform(ParContracts, par_contract -> par_contract.Strain),
+                     BidSuit
+                   )
+              THEN 1 ELSE 0
+            END
+          ELSE NULL
+        END AS Par_Suit_Value,
+        CASE
+          WHEN Declarer_Pair_Direction = '{direction}' AND Par_Declarer < 0 THEN
+            CASE
+              WHEN DD_Score_Declarer IS NOT NULL
+                   AND DD_Score_Declarer = Par_Declarer
+              THEN 1 ELSE 0
+            END
+          ELSE NULL
+        END AS Sacrifice_Value,
+        CASE WHEN {tdd_condition} THEN DD_Tricks_Diff ELSE NULL END AS TDD_Value
+    """.strip()
+
+
 def generate_top_players_sql(
     top_n: int,
     min_sessions: int,
@@ -1297,11 +1376,12 @@ def generate_top_players_sql(
     union_parts = []
     for pos in "NESW":
         elo_col = player_pattern.format(pos=pos)
+        direction = "NS" if pos in "NS" else "EW"
         union_parts.append(
             f"""
             SELECT Date, session_id, {round_col}, Board, Player_ID_{pos} AS Player_ID, Player_Name_{pos} AS Player_Name,
                    MasterPoints_{pos} AS MasterPoints, {elo_col} AS Elo_R_Player,
-                   Is_Par_Suit, Is_Par_Contract, Is_Sacrifice, DD_Tricks_Diff
+                   {_directional_quality_sql(direction, declarer_seat=pos)}
             FROM self
             WHERE Player_ID_{pos} IS NOT NULL AND {elo_col} IS NOT NULL AND NOT isnan({elo_col})
             """
@@ -1323,10 +1403,10 @@ def generate_top_players_sql(
         MAX(MasterPoints) AS MasterPoints,
         {rating_expr} AS Player_Elo_Raw_Float,
         COUNT(DISTINCT session_id) AS Sessions_Played,
-        AVG(CAST(Is_Par_Suit AS INTEGER)) AS Par_Suit_Rate,
-        AVG(CAST(Is_Par_Contract AS INTEGER)) AS Par_Contract_Rate,
-        AVG(CAST(Is_Sacrifice AS INTEGER)) AS Sacrifice_Rate,
-        AVG(DD_Tricks_Diff) AS DD_Tricks_Diff_Avg
+        AVG(Par_Suit_Value) AS Par_Suit_Rate,
+        AVG(Par_Contract_Value) AS Par_Contract_Rate,
+        AVG(Sacrifice_Value) AS Sacrifice_Rate,
+        AVG(TDD_Value) AS DD_Tricks_Diff_Avg
       FROM player_positions
       GROUP BY Player_ID
       HAVING COUNT(DISTINCT session_id) >= {min_sessions}
@@ -1382,7 +1462,7 @@ def generate_top_players_sql(
       Quality_Rank,
       ROUND(Par_Suit_Rate * 100, 1) AS Par_Suit_Rate_Pct,
       Par_Suit_Rank,
-      ROUND(Par_Contract_Rate * 100, 1) AS Par_Contract_Rate_Pct,
+      ROUND((Par_Contract_Rate + 1) * 50, 1) AS Par_Contract_Rate_Pct,
       Par_Contract_Rank,
       ROUND(Sacrifice_Rate * 100, 1) AS Sacrifice_Rate_Pct,
       Sacrifice_Rank,
@@ -1452,7 +1532,7 @@ def generate_top_pairs_sql(
         (COALESCE(MasterPoints_N, 0) + COALESCE(MasterPoints_S, 0)) / 2.0 AS Avg_MPs,
         SQRT(COALESCE(MasterPoints_N, 0) * COALESCE(MasterPoints_S, 0)) AS Geo_MPs,
         {avg_elo_ns} AS Avg_Player_Elo,
-        Is_Par_Suit, Is_Par_Contract, Is_Sacrifice, DD_Tricks_Diff
+        {_directional_quality_sql("NS")}
       FROM self
       WHERE {pair_ns_col} IS NOT NULL AND NOT isnan({pair_ns_col})
       UNION ALL
@@ -1464,7 +1544,7 @@ def generate_top_pairs_sql(
         (COALESCE(MasterPoints_E, 0) + COALESCE(MasterPoints_W, 0)) / 2.0 AS Avg_MPs,
         SQRT(COALESCE(MasterPoints_E, 0) * COALESCE(MasterPoints_W, 0)) AS Geo_MPs,
         {avg_elo_ew} AS Avg_Player_Elo,
-        Is_Par_Suit, Is_Par_Contract, Is_Sacrifice, DD_Tricks_Diff
+        {_directional_quality_sql("EW")}
       FROM self
       WHERE {pair_ew_col} IS NOT NULL AND NOT isnan({pair_ew_col})
     ),
@@ -1474,10 +1554,10 @@ def generate_top_pairs_sql(
         AVG(Avg_MPs) AS Avg_MPs, AVG(Geo_MPs) AS Geo_MPs,
         COUNT(DISTINCT session_id) AS Sessions,
         AVG(Avg_Player_Elo) AS Avg_Player_Elo,
-        AVG(CAST(Is_Par_Suit AS INTEGER)) AS Par_Suit_Rate,
-        AVG(CAST(Is_Par_Contract AS INTEGER)) AS Par_Contract_Rate,
-        AVG(CAST(Is_Sacrifice AS INTEGER)) AS Sacrifice_Rate,
-        AVG(DD_Tricks_Diff) AS DD_Tricks_Diff_Avg
+        AVG(Par_Suit_Value) AS Par_Suit_Rate,
+        AVG(Par_Contract_Value) AS Par_Contract_Rate,
+        AVG(Sacrifice_Value) AS Sacrifice_Rate,
+        AVG(TDD_Value) AS DD_Tricks_Diff_Avg
       FROM pair_partnerships
       GROUP BY Pair_IDs
       HAVING COUNT(DISTINCT session_id) >= {min_sessions}
@@ -1536,7 +1616,7 @@ def generate_top_pairs_sql(
       CAST(Avg_MPs AS INTEGER) AS Avg_MPs, Avg_MPs_Rank, Geo_MPs_Rank, CAST(Sessions AS INTEGER) AS Sessions,
       Quality_Rank,
       ROUND(Par_Suit_Rate * 100, 1) AS Par_Suit_Rate_Pct, Par_Suit_Rank,
-      ROUND(Par_Contract_Rate * 100, 1) AS Par_Contract_Rate_Pct, Par_Contract_Rank,
+      ROUND((Par_Contract_Rate + 1) * 50, 1) AS Par_Contract_Rate_Pct, Par_Contract_Rank,
       ROUND(Sacrifice_Rate * 100, 1) AS Sacrifice_Rate_Pct, Sacrifice_Rank,
       ROUND(DD_Tricks_Diff_Avg, 2) AS DD_Tricks_Diff_Avg, DD_Tricks_Diff_Rank
     FROM pair_scaled
@@ -1856,6 +1936,7 @@ def health() -> dict:
             "enabled_by_default": SKILL_GATE_DEFAULT_Z > SKILL_GATE_DISABLED,
             "default_min_skill_z": SKILL_GATE_DEFAULT_Z,
         },
+        "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
     }
 
 
@@ -2001,6 +2082,7 @@ def acbl_report(
                     "applied": min_skill_z > SKILL_GATE_DISABLED,
                     "metric": "pool z-score of DD_Tricks_Diff + Par_Suit + Par_Contract",
                 },
+                "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
                 "perf": perf,
                 "server": _server_runtime_info(),
             }

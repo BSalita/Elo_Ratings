@@ -14,6 +14,8 @@ from ffbridge_quality_pipeline import (
     DEFAULT_CUTOFF,
     DEFAULT_DISCOVERY_START,
     DEFAULT_SOURCE_DIR,
+    QUALITY_BOARD_COLUMNS,
+    SCHEMA_VERSION,
     audit_historical_cache,
     build_historical_fragments,
     discover_session_metadata,
@@ -56,6 +58,11 @@ def _quality_cache_is_fresh(
     ).total_seconds() / 3600
     if metadata.get("cutoff") != cutoff.isoformat():
         return False, f"cutoff is {metadata.get('cutoff')!r}"
+    if metadata.get("schema_version") != SCHEMA_VERSION:
+        return False, (
+            f"schema is {metadata.get('schema_version')!r}, "
+            f"expected {SCHEMA_VERSION}"
+        )
     if age_hours >= max_age_hours:
         return False, f"cache is {age_hours:.1f}h old"
     return True, f"cache is fresh ({age_hours:.1f}h old)"
@@ -176,16 +183,19 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         assert output_dir is not None
-        uncovered_incomplete = [
-            session.session_id
+        incomplete_unsupported = [
+            {
+                "session_id": session.session_id,
+                "reason": "Incomplete raw cache after fetch (missing ranking or team scores)",
+            }
             for session in audit.sessions
             if not session.in_training and not session.complete
         ]
-        if uncovered_incomplete:
-            raise FileNotFoundError(
-                "Sessions absent from training have incomplete raw caches. "
-                "Run --audit-only, then explicitly use --fetch-missing if desired. "
-                f"First IDs: {uncovered_incomplete[:20]}"
+        if incomplete_unsupported:
+            print(
+                f"[quality-builder] skipping {len(incomplete_unsupported)} "
+                "incomplete session(s)",
+                flush=True,
             )
 
         metadata = load_session_metadata(source_dir, args.cutoff)
@@ -212,8 +222,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         if fragments:
             board_quality = pl.concat(
-                [board_quality, *fragments],
-                how="vertical_relaxed",
+                [
+                    board_quality.select(*QUALITY_BOARD_COLUMNS),
+                    *[fragment.select(*QUALITY_BOARD_COLUMNS) for fragment in fragments],
+                ],
+                how="vertical",
             ).sort(["Date", "session_id", "Board", "board_id"])
         metadata_result = write_quality_artifacts(
             board_quality,
@@ -222,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
             source_dir=source_dir,
             audit=audit,
             unmapped_seat_count=unmapped,
-            unsupported_sessions=unsupported,
+            unsupported_sessions=[*unsupported, *incomplete_unsupported],
         )
         print(
             f"[quality-builder] wrote {metadata_result['board_rows']} board rows, "

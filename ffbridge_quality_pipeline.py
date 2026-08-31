@@ -21,7 +21,7 @@ import polars as pl
 import requests
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_SOURCE_DIR = pathlib.Path(r"E:\bridge\data\ffbridge\data")
 DEFAULT_CUTOFF = date.today()
 DEFAULT_DISCOVERY_START = date(2026, 1, 1)
@@ -30,13 +30,48 @@ PLAYER_FILENAME = "ffbridge_quality_players.parquet"
 PAIR_FILENAME = "ffbridge_quality_pairs.parquet"
 METADATA_FILENAME = "ffbridge_quality_metadata.json"
 FRAGMENT_DIRNAME = "session_fragments"
+SEATS = ("N", "E", "S", "W")
 QUALITY_COLUMNS = (
     "Is_Par_Suit",
-    "Is_Par_Contract",
     "Is_Sacrifice",
+    "Sacrifice_Opportunity",
+    "Par_Contract_Score_NS",
+    "Par_Contract_Score_EW",
     "DD_Tricks_Diff",
 )
-SEATS = ("N", "E", "S", "W")
+QUALITY_BOARD_COLUMNS = (
+    "session_id",
+    "board_id",
+    "Board",
+    "group_id",
+    "team_id",
+    "Date",
+    "Pair_Declarer_Direction",
+    "Declarer_Direction",
+    *(f"Player_ID_{seat}" for seat in SEATS),
+    "Pair_ID_NS",
+    "Pair_ID_EW",
+    *QUALITY_COLUMNS,
+)
+QUALITY_METRIC_DEFINITIONS = {
+    "DD_Tricks_Diff_Avg": {
+        "formula": "mean(Tricks - DD_Tricks)",
+        "attribution": "declarer only; declaring partnership in pair reports",
+    },
+    "Par_Contract_Rate_Pct": {
+        "formula": "success percentage derived from +1 when directional DD score >= directional par, otherwise -1",
+        "attribution": "both partnerships on every board",
+    },
+    "Par_Suit_Rate_Pct": {
+        "formula": "par-strain declarations / all declarations",
+        "attribution": "declaring partnership",
+    },
+    "Sacrifice_Rate_Pct": {
+        "formula": "DD score equals negative directional par / negative-par declarations",
+        "attribution": "declaring partnership",
+    },
+    "filter_scope": "same sessions and teams selected by the leaderboard filters",
+}
 
 
 @dataclass(frozen=True)
@@ -114,6 +149,11 @@ def _atomic_write_json(
                 time.sleep(0.1 * (attempt + 1))
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _fragment_schema_is_current(path: pathlib.Path) -> bool:
+    """Reuse a session fragment only when it already has schema-v2 columns."""
+    return set(QUALITY_BOARD_COLUMNS).issubset(pl.read_parquet_schema(path))
 
 
 def _atomic_write_parquet(frame: pl.DataFrame, path: pathlib.Path) -> None:
@@ -414,6 +454,11 @@ def fetch_missing_artifacts(
         for attempt in range(1, max_attempts + 1):
             try:
                 return call(*args, **kwargs)
+            except requests.HTTPError as exc:
+                status = getattr(exc.response, "status_code", None)
+                if status == 404 or attempt == max_attempts:
+                    raise
+                time.sleep(min(30.0, float(2 ** (attempt - 1))))
             except requests.RequestException:
                 if attempt == max_attempts:
                     raise
@@ -426,13 +471,18 @@ def fetch_missing_artifacts(
                 source_dir / "results" / "sessions" / session.session_id / "ranking.json"
             )
             if not session.ranking_present:
-                ranking = fetch(
-                    ffbridge.get_session_ranking,
-                    int(session.session_id),
-                    timeout=timeout,
-                    rate_limit_delay=delay,
-                    session=http,
-                )
+                try:
+                    ranking = fetch(
+                        ffbridge.get_session_ranking,
+                        int(session.session_id),
+                        timeout=timeout,
+                        rate_limit_delay=delay,
+                        session=http,
+                    )
+                except requests.HTTPError as exc:
+                    if getattr(exc.response, "status_code", None) == 404:
+                        continue
+                    raise
                 if not isinstance(ranking, list):
                     raise ValueError(
                         f"Ranking fetch returned non-list for {session.session_id}"
@@ -467,13 +517,18 @@ def fetch_missing_artifacts(
                     / session.session_id
                     / "scores.json"
                 )
-                scores = fetch(
-                    ffbridge.get_team_session_scores,
-                    int(team_id),
-                    int(session.session_id),
-                    timeout=timeout,
-                    rate_limit_delay=delay,
-                )
+                try:
+                    scores = fetch(
+                        ffbridge.get_team_session_scores,
+                        int(team_id),
+                        int(session.session_id),
+                        timeout=timeout,
+                        rate_limit_delay=delay,
+                    )
+                except requests.HTTPError as exc:
+                    if getattr(exc.response, "status_code", None) == 404:
+                        return 0
+                    raise
                 if not isinstance(scores, list):
                     raise ValueError(
                         f"Scores fetch returned non-list for session={session.session_id}, "
@@ -596,39 +651,75 @@ def _dynamic_dd_score_expr(frame: pl.DataFrame) -> pl.Expr:
     return pl.coalesce(expressions)
 
 
-def _dynamic_max_same_suit_expr(frame: pl.DataFrame) -> pl.Expr:
-    by_context: list[pl.Expr] = []
-    for suit in "SHDCN":
-        for direction in SEATS:
-            columns = [
-                next(
-                    (
-                        name
-                        for name in (
-                            f"DDScore_{level}{suit}_{direction}",
-                            f"DD_Score_{level}{suit}_{direction}",
-                        )
-                        if name in frame.columns
-                    ),
-                    None,
-                )
-                for level in range(1, 8)
-            ]
-            columns = [column for column in columns if column is not None]
-            if columns:
-                by_context.append(
-                    pl.when(
-                        (pl.col("BidSuit") == suit)
-                        & (pl.col("Declarer_Direction") == direction)
-                    ).then(
-                        pl.max_horizontal(
-                            *[pl.col(column).cast(pl.Int32, strict=False) for column in columns]
-                        )
-                    )
-                )
-    if not by_context:
-        raise ValueError("No same-suit DD score columns are available")
-    return pl.coalesce(by_context)
+def _extract_par_strains(value: Any) -> list[str]:
+    """Return canonical strains from training strings or augmented structs."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("["):
+            try:
+                return _extract_par_strains(json.loads(text))
+            except json.JSONDecodeError:
+                pass
+        values: list[Any] = [part for part in text.split(",") if part.strip()]
+    elif isinstance(value, Mapping):
+        values = [value]
+    elif isinstance(value, pl.Series):
+        values = value.to_list()
+    elif isinstance(value, Sequence):
+        values = list(value)
+    else:
+        values = [value]
+
+    strains: set[str] = set()
+    for item in values:
+        if isinstance(item, Mapping):
+            strain = str(item.get("Strain") or item.get("strain") or "").upper()
+            if strain in {"C", "D", "H", "S", "N"}:
+                strains.add(strain)
+            continue
+        contract = str(item).strip().upper()
+        for character in contract:
+            if character.isdigit() or character.isspace():
+                continue
+            if character in {"C", "D", "H", "S", "N"}:
+                strains.add(character)
+            break
+    return sorted(strains)
+
+
+def _par_strains_expr(frame: pl.DataFrame) -> pl.Expr:
+    column = next(
+        (name for name in ("ParContracts", "ParContract") if name in frame.columns),
+        None,
+    )
+    if column is None:
+        raise ValueError("ParContracts or ParContract is required for Par Suit")
+    return pl.col(column).map_elements(
+        _extract_par_strains,
+        return_dtype=pl.List(pl.String),
+    )
+
+
+def _par_suit_hit(value: Mapping[str, Any]) -> bool:
+    suit = str(value.get("BidSuit") or "").upper()
+    return suit in (value.get("_Par_Strains") or [])
+
+
+def _directional_par_contract_score(
+    dd_column: str,
+    par_column: str,
+) -> pl.Expr:
+    dd_score = pl.col(dd_column).cast(pl.Int32, strict=False)
+    par_score = pl.col(par_column).cast(pl.Int32, strict=False)
+    return (
+        pl.when(dd_score.is_null() | par_score.is_null())
+        .then(None)
+        .when(dd_score >= par_score)
+        .then(pl.lit(1, dtype=pl.Int8))
+        .otherwise(pl.lit(-1, dtype=pl.Int8))
+    )
 
 
 def normalize_quality_frame(
@@ -687,17 +778,35 @@ def normalize_quality_frame(
         .cast(pl.Int32, strict=False)
         .alias("Par_Declarer"),
         _dynamic_dd_score_expr(out).alias("_DD_Score_Declarer"),
-        _dynamic_max_same_suit_expr(out).alias("_DD_Score_Max_Declarer"),
+        _par_strains_expr(out).alias("_Par_Strains"),
     ).with_columns(
-        (pl.col("Par_Declarer") == pl.col("_DD_Score_Max_Declarer")).alias(
-            "Is_Par_Suit"
-        ),
-        (pl.col("Par_Declarer") == pl.col("_DD_Score_Declarer")).alias(
-            "Is_Par_Contract"
-        ),
+        pl.when(pl.col("Pair_Declarer_Direction") == "NS")
+        .then(pl.col("_DD_Score_Declarer"))
+        .when(pl.col("Pair_Declarer_Direction") == "EW")
+        .then(-pl.col("_DD_Score_Declarer"))
+        .otherwise(None)
+        .cast(pl.Int32, strict=False)
+        .alias("_DD_Score_NS"),
+        pl.struct(["BidSuit", "_Par_Strains"]).map_elements(
+            _par_suit_hit,
+            return_dtype=pl.Boolean,
+        ).alias("Is_Par_Suit"),
+    ).with_columns(
+        (-pl.col("_DD_Score_NS")).cast(pl.Int32).alias("_DD_Score_EW"),
+    ).with_columns(
+        _directional_par_contract_score(
+            "_DD_Score_NS", "ParScore_NS"
+        ).alias("Par_Contract_Score_NS"),
+        _directional_par_contract_score(
+            "_DD_Score_EW", "ParScore_EW"
+        ).alias("Par_Contract_Score_EW"),
+        (
+            pl.col("Par_Declarer").is_not_null()
+            & (pl.col("Par_Declarer") < 0)
+        ).alias("Sacrifice_Opportunity"),
         (
             (pl.col("Par_Declarer") == pl.col("_DD_Score_Declarer"))
-            & (pl.col("_DD_Score_Declarer") < 0)
+            & (pl.col("Par_Declarer") < 0)
         ).alias("Is_Sacrifice"),
         _pair_expr("Player_ID_N", "Player_ID_S").alias("Pair_ID_NS"),
         _pair_expr("Player_ID_E", "Player_ID_W").alias("Pair_ID_EW"),
@@ -722,18 +831,7 @@ def normalize_quality_frame(
             out = out.with_columns(pl.lit(None, dtype=pl.String).alias(column))
         else:
             out = out.with_columns(pl.col(column).cast(pl.String, strict=False))
-    selected = out.select(
-        "session_id",
-        "board_id",
-        "Board",
-        "group_id",
-        "team_id",
-        "Date",
-        *(f"Player_ID_{seat}" for seat in SEATS),
-        "Pair_ID_NS",
-        "Pair_ID_EW",
-        *QUALITY_COLUMNS,
-    )
+    selected = out.select(*QUALITY_BOARD_COLUMNS)
     identity_columns = [f"Player_ID_{seat}" for seat in SEATS]
     selected = selected.filter(
         pl.any_horizontal(
@@ -787,6 +885,8 @@ def normalize_training_parquet(
         "Declarer_Direction",
         "BidLvl",
         "BidSuit",
+        "ParContract",
+        "ParContracts",
         "DDTricks",
         "DDTricks_Diff",
         "DD_Tricks",
@@ -874,16 +974,16 @@ def _quality_aggregates(frame: pl.DataFrame, id_column: str) -> pl.DataFrame:
         .agg(
             pl.len().cast(pl.UInt32).alias("Board_Rows"),
             pl.col("session_id").n_unique().cast(pl.UInt32).alias("Sessions"),
-            pl.col("Is_Par_Suit").cast(pl.Float64).mean().alias("par_suit_rate"),
-            pl.col("Is_Par_Contract")
-            .cast(pl.Float64)
-            .mean()
-            .alias("par_contract_rate"),
-            pl.col("Is_Sacrifice").cast(pl.Float64).mean().alias("sacrifice_rate"),
-            pl.col("DD_Tricks_Diff")
-            .cast(pl.Float64)
-            .mean()
-            .alias("dd_tricks_diff_avg"),
+            pl.col("_par_suit_hit").cast(pl.Float64).mean().alias("par_suit_rate"),
+            pl.col("_par_contract_score").cast(pl.Float64).mean().alias(
+                "par_contract_rate"
+            ),
+            pl.col("_sacrifice_hit").cast(pl.Float64).mean().alias(
+                "sacrifice_rate"
+            ),
+            pl.col("_dd_tricks_diff").cast(pl.Float64).mean().alias(
+                "dd_tricks_diff_avg"
+            ),
         )
         .with_columns(
             _rank_desc("par_suit_rate", "Par_Suit_Rank"),
@@ -901,7 +1001,24 @@ def build_player_sidecar(board_quality: pl.DataFrame) -> pl.DataFrame:
             board_quality.select(
                 pl.col(f"Player_ID_{seat}").alias("player_id"),
                 "session_id",
-                *QUALITY_COLUMNS,
+                pl.when(pl.col("Pair_Declarer_Direction") == ("NS" if seat in "NS" else "EW"))
+                .then(pl.col("Is_Par_Suit"))
+                .otherwise(None)
+                .alias("_par_suit_hit"),
+                pl.col(
+                    "Par_Contract_Score_NS" if seat in "NS" else "Par_Contract_Score_EW"
+                ).alias("_par_contract_score"),
+                pl.when(
+                    (pl.col("Pair_Declarer_Direction") == ("NS" if seat in "NS" else "EW"))
+                    & pl.col("Sacrifice_Opportunity")
+                )
+                .then(pl.col("Is_Sacrifice"))
+                .otherwise(None)
+                .alias("_sacrifice_hit"),
+                pl.when(pl.col("Declarer_Direction") == seat)
+                .then(pl.col("DD_Tricks_Diff"))
+                .otherwise(None)
+                .alias("_dd_tricks_diff"),
             )
             for seat in SEATS
         ],
@@ -916,9 +1033,26 @@ def build_pair_sidecar(board_quality: pl.DataFrame) -> pl.DataFrame:
             board_quality.select(
                 pl.col(pair_column).alias("pair_id"),
                 "session_id",
-                *QUALITY_COLUMNS,
+                pl.when(pl.col("Pair_Declarer_Direction") == side)
+                .then(pl.col("Is_Par_Suit"))
+                .otherwise(None)
+                .alias("_par_suit_hit"),
+                pl.col(f"Par_Contract_Score_{side}").alias(
+                    "_par_contract_score"
+                ),
+                pl.when(
+                    (pl.col("Pair_Declarer_Direction") == side)
+                    & pl.col("Sacrifice_Opportunity")
+                )
+                .then(pl.col("Is_Sacrifice"))
+                .otherwise(None)
+                .alias("_sacrifice_hit"),
+                pl.when(pl.col("Pair_Declarer_Direction") == side)
+                .then(pl.col("DD_Tricks_Diff"))
+                .otherwise(None)
+                .alias("_dd_tricks_diff"),
             )
-            for pair_column in ("Pair_ID_NS", "Pair_ID_EW")
+            for pair_column, side in (("Pair_ID_NS", "NS"), ("Pair_ID_EW", "EW"))
         ],
         how="vertical",
     ).filter(pl.col("pair_id").is_not_null())
@@ -1252,8 +1386,8 @@ def build_historical_fragments(
     unsupported: list[dict[str, str]] = []
     for session in iterator:
         fragment_path = fragment_dir / f"{session.session_id}.parquet"
-        if fragment_path.is_file():
-            fragments.append(pl.read_parquet(fragment_path))
+        if fragment_path.is_file() and _fragment_schema_is_current(fragment_path):
+            fragments.append(pl.read_parquet(fragment_path).select(*QUALITY_BOARD_COLUMNS))
             continue
         try:
             raw, unmapped = load_raw_session(pathlib.Path(report.source_dir), session)
@@ -1316,10 +1450,8 @@ def write_quality_artifacts(
     authoritative_unmapped = sum(
         board_quality[f"Player_ID_{seat}"].null_count() for seat in SEATS
     )
-    if unmapped_seat_count is not None and unmapped_seat_count > authoritative_unmapped:
-        raise ValueError(
-            "Raw unmapped seat count exceeds null seats in normalized board output"
-        )
+    # Raw unmapped seats can exceed output nulls: identity mapping fills some
+    # IDs, and rows with no usable identity are dropped before this write.
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1329,8 +1461,10 @@ def write_quality_artifacts(
         "player_rows": player_quality.height,
         "pair_rows": pair_quality.height,
         "unmapped_seat_count": authoritative_unmapped,
+        "raw_unmapped_seat_count": unmapped_seat_count,
         "unsupported_session_count": len(unsupported_sessions),
         "unsupported_sessions": [dict(item) for item in unsupported_sessions],
+        "metric_definitions": QUALITY_METRIC_DEFINITIONS,
         "audit_summary": audit.to_dict()["summary"],
         "files": {
             "board": board_path.name,

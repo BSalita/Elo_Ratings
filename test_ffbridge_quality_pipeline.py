@@ -12,7 +12,9 @@ import polars as pl
 from ffbridge_quality_pipeline import (
     AuditReport,
     NoQualityRowsError,
+    QUALITY_BOARD_COLUMNS,
     SessionAudit,
+    _fragment_schema_is_current,
     audit_historical_cache,
     augment_raw_session,
     build_pair_sidecar,
@@ -53,8 +55,9 @@ def _quality_input() -> pl.DataFrame:
             "Declarer_Direction": "N",
             "BidLvl": "4",
             "BidSuit": "S",
-            "ParScore_NS": 420,
-            "ParScore_EW": -420,
+            "ParContract": ["4SN"],
+            "ParScore_NS": 400,
+            "ParScore_EW": -400,
             "DDTricks": 10,
             "DDTricks_Diff": 1,
             "DDScore_1S_N": 80,
@@ -79,6 +82,7 @@ def _quality_input() -> pl.DataFrame:
             "Declarer_Direction": "E",
             "BidLvl": "5",
             "BidSuit": "H",
+            "ParContract": ["4SE"],
             "ParScore_NS": 100,
             "ParScore_EW": -100,
             "DDTricks": 10,
@@ -204,12 +208,62 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
         result = normalize_quality_frame(_quality_input(), session_dates=_dates())
         self.assertEqual(result["DD_Tricks_Diff"].to_list(), [1, -2])
         self.assertEqual(result["Is_Par_Suit"].to_list(), [True, False])
-        self.assertEqual(result["Is_Par_Contract"].to_list(), [True, True])
+        self.assertEqual(result["Par_Contract_Score_NS"].to_list(), [1, 1])
+        self.assertEqual(result["Par_Contract_Score_EW"].to_list(), [-1, 1])
         self.assertEqual(result["Is_Sacrifice"].to_list(), [False, True])
+        self.assertEqual(result["Sacrifice_Opportunity"].to_list(), [False, True])
+        self.assertEqual(
+            result["Pair_Declarer_Direction"].to_list(), ["NS", "EW"]
+        )
+        self.assertEqual(result["Declarer_Direction"].to_list(), ["N", "E"])
         self.assertEqual(result["Pair_ID_NS"].to_list(), ["20_3", "8_9"])
         self.assertEqual(result["Pair_ID_EW"].to_list(), ["11_40", "11_40"])
         self.assertEqual(stable_pair_id("20", "3"), "20_3")
         self.assertEqual(result.schema["Player_ID_N"], pl.String)
+
+    def test_augmented_struct_par_contracts_supply_par_strains(self) -> None:
+        frame = _quality_input().head(1).drop("ParContract").with_columns(
+            pl.Series(
+                "ParContracts",
+                [
+                    [
+                        {
+                            "Level": "4",
+                            "Strain": "S",
+                            "Doubled": "",
+                            "Pair_Direction": "NS",
+                            "Result": 0,
+                        }
+                    ]
+                ],
+            )
+        )
+
+        result = normalize_quality_frame(frame, session_dates=_dates())
+
+        self.assertTrue(result["Is_Par_Suit"][0])
+
+    def test_stale_v1_fragments_are_rejected_until_regenerated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            current = pathlib.Path(temporary) / "current.parquet"
+            stale = pathlib.Path(temporary) / "stale.parquet"
+            normalize_quality_frame(_quality_input(), session_dates=_dates()).write_parquet(
+                current
+            )
+            pl.DataFrame(
+                {
+                    "session_id": ["1"],
+                    "Is_Par_Contract": [True],
+                    "DD_Tricks_Diff": [1],
+                }
+            ).write_parquet(stale)
+
+            self.assertTrue(_fragment_schema_is_current(current))
+            self.assertFalse(_fragment_schema_is_current(stale))
+            self.assertEqual(
+                list(normalize_quality_frame(_quality_input(), session_dates=_dates()).columns),
+                list(QUALITY_BOARD_COLUMNS),
+            )
 
     def test_identity_uses_migration_id_and_never_fabricates_alias(self) -> None:
         scores = [
@@ -326,15 +380,27 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
         players = build_player_sidecar(quality)
         pairs = build_pair_sidecar(quality)
         player_20 = players.filter(pl.col("player_id") == "20").row(0, named=True)
-        player_9 = players.filter(pl.col("player_id") == "9").row(0, named=True)
+        player_40 = players.filter(pl.col("player_id") == "40").row(0, named=True)
         self.assertEqual(player_20["dd_tricks_diff_avg"], 1.0)
-        self.assertEqual(player_9["dd_tricks_diff_avg"], -2.0)
-        self.assertLess(
-            player_20["DD_Tricks_Diff_Rank"], player_9["DD_Tricks_Diff_Rank"]
+        self.assertIsNone(
+            players.filter(pl.col("player_id") == "9").item(
+                0, "dd_tricks_diff_avg"
+            )
         )
+        self.assertEqual(player_40["dd_tricks_diff_avg"], -2.0)
+        self.assertLess(
+            player_20["DD_Tricks_Diff_Rank"],
+            player_40["DD_Tricks_Diff_Rank"],
+        )
+        self.assertEqual(player_20["par_suit_rate"], 1.0)
+        self.assertEqual(player_40["par_suit_rate"], 0.0)
+        self.assertEqual(player_40["sacrifice_rate"], 1.0)
         repeated_pair = pairs.filter(pl.col("pair_id") == "11_40").row(0, named=True)
         self.assertEqual(repeated_pair["Board_Rows"], 2)
-        self.assertAlmostEqual(repeated_pair["dd_tricks_diff_avg"], -0.5)
+        self.assertEqual(repeated_pair["dd_tricks_diff_avg"], -2.0)
+        self.assertEqual(repeated_pair["par_contract_rate"], 0.0)
+        self.assertEqual(repeated_pair["par_suit_rate"], 0.0)
+        self.assertEqual(repeated_pair["sacrifice_rate"], 1.0)
 
     def test_atomic_metadata_is_written_last_and_describes_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -364,10 +430,15 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
                 cutoff=date(2025, 1, 1),
                 source_dir=root / "source",
                 audit=report,
+                unmapped_seat_count=99,
             )
             out = root / "out"
             parsed = json.loads((out / "ffbridge_quality_metadata.json").read_text())
             self.assertEqual(parsed, metadata)
+            self.assertEqual(parsed["schema_version"], 2)
+            self.assertIn("Sacrifice_Rate_Pct", parsed["metric_definitions"])
+            self.assertEqual(parsed["raw_unmapped_seat_count"], 99)
+            self.assertGreaterEqual(parsed["raw_unmapped_seat_count"], parsed["unmapped_seat_count"])
             self.assertEqual(parsed["board_rows"], 2)
             self.assertTrue(all((out / name).is_file() for name in parsed["files"].values()))
             self.assertFalse(list(out.glob(".*.tmp")))
