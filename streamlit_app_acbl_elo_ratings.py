@@ -66,6 +66,7 @@ from acbl_strata import STRATA_DEFAULT, STRATA_OPTIONS
 from elo_common import (
     ASSISTANT_LOGO_URL,
     apply_app_theme,
+    coerce_bool,
     coerce_int,
     coerce_numeric_columns,
     init_url_params_to_state,
@@ -113,6 +114,7 @@ def _fetch_remote_report_table(
     online_filter: str,
     prior_sessions: int = 50,
     strata: str = STRATA_DEFAULT,
+    platinum_events: bool = False,
 ) -> tuple[pl.DataFrame, dict]:
     """Fetch pre-aggregated report rows from the ACBL API service.
 
@@ -138,6 +140,7 @@ def _fetch_remote_report_table(
         "online_filter": online_filter,
         "strata": strata,
         "prior_sessions": int(prior_sessions),
+        "platinum_events": bool(platinum_events),
     }
 
     timeout_connect = int(os.getenv("ACBL_API_CONNECT_TIMEOUT_SECONDS", "15"))
@@ -215,6 +218,7 @@ def _fetch_remote_detail_table(
     player_id: str | None = None,
     pair_ids: str | None = None,
     strata: str = STRATA_DEFAULT,
+    platinum_events: bool = False,
 ) -> pl.DataFrame:
     """Fetch session-level detail rows from the ACBL API service."""
     base_url = _acbl_api_base_url()
@@ -230,6 +234,7 @@ def _fetch_remote_detail_table(
         "strata": strata,
         "player_id": player_id,
         "pair_ids": pair_ids,
+        "platinum_events": bool(platinum_events),
     }
 
     timeout_seconds = int(os.getenv("ACBL_API_TIMEOUT_SECONDS", "180"))
@@ -678,6 +683,7 @@ def _acbl_report_fetch_signature(
     online_filter: str,
     prior_sessions: int,
     strata: str = STRATA_DEFAULT,
+    platinum_events: bool = False,
 ) -> str:
     return json.dumps(
         {
@@ -692,6 +698,7 @@ def _acbl_report_fetch_signature(
             "online_filter": online_filter,
             "strata": strata,
             "prior_sessions": int(prior_sessions),
+            "platinum_events": bool(platinum_events),
         },
         sort_keys=True,
     )
@@ -710,11 +717,13 @@ def _acbl_report_cache_key(
     masterpoints_filter: str,
     prior_sessions: int,
     strata: str = STRATA_DEFAULT,
+    platinum_events: bool = False,
 ) -> str:
+    plat = "plat1" if platinum_events else "plat0"
     return (
         f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_"
         f"{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_"
-        f"{online_filter}_{strata}_{masterpoints_filter}_prior{prior_sessions}"
+        f"{online_filter}_{strata}_{masterpoints_filter}_prior{prior_sessions}_{plat}"
     )
 
 
@@ -729,6 +738,7 @@ def _acbl_leaderboard_aggrid_key(
     name_filter: str,
     player_number_filter: str,
     strata: str = STRATA_DEFAULT,
+    platinum_events: bool = False,
 ) -> str:
     """Stable AgGrid key — omit club_or_tournament and API date_range so Club/Tournament toggles update in place."""
     import re as _re
@@ -737,9 +747,10 @@ def _acbl_leaderboard_aggrid_key(
     elo_part = _re.sub(r"[^\w\-]", "_", elo_rating_type)[:32]
     mp_part = _re.sub(r"[^\w\-]", "_", masterpoints_filter)[:24]
     strata_part = _re.sub(r"[^\w\-]", "_", strata)[:24]
+    plat = "plat1" if platinum_events else "plat0"
     return (
         f"acbl_table_{rating_type}_top{top_n}_min{min_sessions}_{rating_method}_"
-        f"{elo_part}_{online_filter}_{strata_part}_mp{mp_part}_name_{nf}_number_{pnf}"
+        f"{elo_part}_{online_filter}_{strata_part}_mp{mp_part}_name_{nf}_number_{pnf}_{plat}"
     )
 
 
@@ -880,6 +891,11 @@ ACBL_URL_PARAMS = {
         "parser": coerce_int(0, 1000),
         "default": 50,
     },
+    "platinum": {
+        "session_key": "acbl_platinum_events",
+        "parser": coerce_bool,
+        "default": False,
+    },
 }
 
 
@@ -898,6 +914,7 @@ def _acbl_report_panel() -> None:
     online_filter = ctx["online_filter"]
     strata = ctx.get("strata", STRATA_DEFAULT)
     club_or_tournament = ctx["club_or_tournament"]
+    platinum_events = bool(ctx.get("platinum_events", False))
 
     prior_sessions = int(st.session_state.get("acbl_prior_sessions", 50))
     masterpoints_filter = st.session_state.get("masterpoints_filter", "All")
@@ -913,6 +930,7 @@ def _acbl_report_panel() -> None:
         online_filter=online_filter,
         prior_sessions=prior_sessions,
         strata=strata,
+        platinum_events=platinum_events,
     )
     cached_fetch = st.session_state.get("_acbl_report_fetch_cache")
     if (
@@ -943,6 +961,7 @@ def _acbl_report_panel() -> None:
                     online_filter=online_filter,
                     prior_sessions=prior_sessions,
                     strata=strata,
+                    platinum_events=platinum_events,
                 )
         except Exception as exc:
             st.error(str(exc))
@@ -981,6 +1000,24 @@ def _acbl_report_panel() -> None:
             shrink_msg = "📐 Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo."
         st.caption(shrink_msg)
 
+    platinum_info = remote_payload.get("platinum_events", {}) if isinstance(remote_payload, dict) else {}
+    if platinum_events and isinstance(platinum_info, dict):
+        plat_events = platinum_info.get("events") or []
+        plat_names = [
+            str(row.get("event_name") or row.get("event_id") or "").strip()
+            for row in plat_events
+            if isinstance(row, dict)
+        ]
+        plat_names = [name for name in plat_names if name]
+        names_text = ", ".join(plat_names) if plat_names else "none found"
+        st.caption(
+            "**Platinum Events** is on: rankings use only events whose ACBL "
+            f"`mp_color` is Platinum ({platinum_info.get('event_count', len(plat_events))} "
+            f"events: {names_text}). Regional, sectional, and other non-platinum "
+            "events are excluded. These events are sparse — lower "
+            "Minimum sessions played if the table is empty."
+        )
+
     # Explain the Quality_Rank sidecar column so users understand what it
     # measures and when to look at it.
     st.caption(
@@ -1014,10 +1051,11 @@ def _acbl_report_panel() -> None:
     st.session_state.current_dataset_type = dataset_type
 
     method_desc = f"{rating_method} method"
+    platinum_suffix = " — Platinum Events" if platinum_events else ""
     if rating_type == "Players":
-        title = f"Top {top_n} ACBL {club_or_tournament} Players by {elo_rating_type} ({method_desc})"
+        title = f"Top {top_n} ACBL {club_or_tournament} Players by {elo_rating_type} ({method_desc}){platinum_suffix}"
     elif rating_type == "Pairs":
-        title = f"Top {top_n} ACBL {club_or_tournament} Pairs by {elo_rating_type} ({method_desc})"
+        title = f"Top {top_n} ACBL {club_or_tournament} Pairs by {elo_rating_type} ({method_desc}){platinum_suffix}"
     else:
         raise ValueError(f"Invalid rating type: {rating_type}")
 
@@ -1045,6 +1083,7 @@ def _acbl_report_panel() -> None:
             online_filter, st.session_state.get('masterpoints_filter', 'All'),
             int(st.session_state.get('acbl_prior_sessions', 50)),
             strata=strata,
+            platinum_events=platinum_events,
         )
         st.session_state.acbl_report_cache_key = cache_key
         st.session_state.acbl_club_or_tournament = club_or_tournament
@@ -1165,6 +1204,7 @@ def _acbl_report_panel() -> None:
                 st.session_state.get('player_name_filter', ''),
                 st.session_state.get('player_number_filter', ''),
                 strata=strata,
+                platinum_events=platinum_events,
             )
         
             grid_response = AgGrid(
@@ -1200,6 +1240,7 @@ def _acbl_report_panel() -> None:
                                     online_filter=online_filter,
                                     player_id=player_id,
                                     strata=strata,
+                                    platinum_events=platinum_events,
                                 )
                                 if detail.is_empty():
                                     st.info("No session data found for this player.")
@@ -1246,6 +1287,7 @@ def _acbl_report_panel() -> None:
                                     online_filter=online_filter,
                                     pair_ids=pair_ids,
                                     strata=strata,
+                                    platinum_events=platinum_events,
                                 )
                                 if detail.is_empty():
                                     st.info("No session data found for this pair.")
@@ -1462,6 +1504,19 @@ def main():
             horizontal=True,
             key="event_type",
         )
+        if club_or_tournament == "Tournament":
+            platinum_events = st.toggle(
+                "Platinum Events",
+                value=False,
+                key="acbl_platinum_events",
+                persist_state="session",
+                help=(
+                    "Rank players and pairs using only tournament events that "
+                    "award platinum masterpoints. Every other event is ignored."
+                ),
+            )
+        else:
+            platinum_events = False
         rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=True, key="rating_type")
         top_n = st.number_input(
             "Top N players or pairs",
@@ -1671,6 +1726,7 @@ def main():
         "date_from": date_from,
         "online_filter": online_filter,
         "strata": strata,
+        "platinum_events": bool(platinum_events),
     }
 
     # -------------------------------
@@ -1688,6 +1744,7 @@ def main():
         "date_range_choice": date_range_choice,
         "online_filter": online_filter,
         "strata": strata,
+        "platinum_events": bool(platinum_events),
     }
     
     # Check if settings have changed since last report

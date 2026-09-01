@@ -12,6 +12,7 @@ import duckdb
 import polars as pl
 import psutil
 
+from acbl_platinum import load_platinum_events, platinum_event_ids
 from acbl_strata import STRATA_DEFAULT, strata_label_to_bucket
 from elo_filter_common import acbl_date_from_for_range, filter_acbl_leaderboard
 from elo_session_common import acbl_results_url_expr, results_url_status
@@ -29,7 +30,7 @@ DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-08-30-role-aware-quality-metrics"
+API_BUILD_TAG = "2026-09-01-platinum-events"
 
 QUALITY_METRIC_DEFINITIONS = {
     "DD_Tricks_Diff_Avg": {
@@ -68,6 +69,7 @@ _FRAME_CACHE: dict[str, pl.DataFrame] = {}
 _FRAME_CACHE_TIMES: dict[str, float] = {}
 # Full-dataset Date bounds captured once at frame load (avoids per-request scans).
 _FRAME_DATE_BOUNDS: dict[str, tuple[datetime | None, datetime | None]] = {}
+_PLATINUM_EVENTS_CACHE: pl.DataFrame | None = None
 
 import threading as _threading
 _DB_LOCK = _threading.Lock()
@@ -853,11 +855,57 @@ def _require_strata_column(df: pl.DataFrame | pl.LazyFrame, *, names: set[str] |
         )
 
 
+def _sql_string_list(values: list[str]) -> str:
+    escaped = [value.replace("'", "''") for value in values]
+    return "(" + ", ".join(f"'{value}'" for value in escaped) + ")"
+
+
+def _cached_platinum_events() -> pl.DataFrame:
+    global _PLATINUM_EVENTS_CACHE
+    if _PLATINUM_EVENTS_CACHE is None:
+        _PLATINUM_EVENTS_CACHE = load_platinum_events(DATA_ROOT)
+    return _PLATINUM_EVENTS_CACHE
+
+
+def _reject_club_platinum(club_or_tournament: str, platinum_events: bool) -> None:
+    if platinum_events and club_or_tournament.lower() != "tournament":
+        raise HTTPException(
+            status_code=400,
+            detail="platinum_events applies only to club_or_tournament=tournament.",
+        )
+
+
+def _require_platinum_event_ids() -> list[str]:
+    ids = platinum_event_ids(_cached_platinum_events())
+    if not ids:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "No tournament events with mp_color=Platinum were found. "
+                "Provide the tournament board-results parquet "
+                "(ACBL_TOURNAMENT_BOARD_RESULTS) or "
+                "acbl_tournament_platinum_events.parquet in DATA_ROOT."
+            ),
+        )
+    return ids
+
+
+def _apply_platinum_event_filter(df: pl.DataFrame) -> pl.DataFrame:
+    if "event_id" not in df.columns:
+        raise HTTPException(
+            status_code=500,
+            detail="Elo parquet is missing event_id; cannot filter platinum events.",
+        )
+    ids = _require_platinum_event_ids()
+    return df.filter(pl.col("event_id").cast(pl.Utf8).is_in(ids))
+
+
 def _self_filter_sql_clauses(
     full_df: pl.DataFrame,
     date_from: datetime | None,
     online_filter: str,
     strata: str,
+    platinum_events: bool = False,
 ) -> list[str]:
     clauses: list[str] = []
     if date_from is not None and "Date" in full_df.columns:
@@ -871,6 +919,13 @@ def _self_filter_sql_clauses(
         _require_strata_column(full_df)
         # Bucket ids are controlled constants (no user free-text).
         clauses.append(f"strata_bucket = '{bucket}'")
+    if platinum_events:
+        if "event_id" not in full_df.columns:
+            raise HTTPException(
+                status_code=500,
+                detail="Elo parquet is missing event_id; cannot filter platinum events.",
+            )
+        clauses.append(f"event_id IN {_sql_string_list(_require_platinum_event_ids())}")
     if "Pct_NS" in full_df.columns:
         clauses.append("(Pct_NS IS NULL OR (Pct_NS >= 0 AND Pct_NS <= 1))")
     return clauses
@@ -883,6 +938,7 @@ def _prepare_self_view(
     date_from: datetime | None,
     online_filter: str,
     strata: str = STRATA_DEFAULT,
+    platinum_events: bool = False,
 ) -> tuple[int | None, str]:
     """Register the cached full frame and expose filtered rows as temp view ``self``.
 
@@ -890,7 +946,9 @@ def _prepare_self_view(
     frame; DuckDB reads columns lazily from the registered Arrow buffer.
     Row counts and date ranges come from load-time metadata (no COUNT scans).
     """
-    where_clauses = _self_filter_sql_clauses(full_df, date_from, online_filter, strata)
+    where_clauses = _self_filter_sql_clauses(
+        full_df, date_from, online_filter, strata, platinum_events=platinum_events,
+    )
     where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
     with _DB_LOCK:
         try:
@@ -1972,12 +2030,20 @@ def acbl_report(
     player_name: str | None = Query(None),
     player_number: str | None = Query(None, pattern=r"^\d*$"),
     masterpoints_range: str = Query("All"),
+    platinum_events: bool = Query(
+        False,
+        description=(
+            "Tournament only: rank using only events whose mp_color is Platinum. "
+            "Excludes every other tournament event."
+        ),
+    ),
 ) -> dict:
     with _REPORT_LOCK:
         started_at = datetime.now()
         t0 = time.perf_counter()
         try:
             t_parse_start = time.perf_counter()
+            _reject_club_platinum(club_or_tournament, platinum_events)
             effective_date_from = date_from or (
                 acbl_date_from_for_range(date_range) if date_range else None
             )
@@ -1995,6 +2061,7 @@ def acbl_report(
             con = _get_db_connection()
             input_rows, date_range = _prepare_self_view(
                 con, full_df, source_path, parsed_date_from, online_filter, strata,
+                platinum_events=platinum_events,
             )
             t_filter_end = time.perf_counter()
 
@@ -2083,6 +2150,16 @@ def acbl_report(
                     "metric": "pool z-score of DD_Tricks_Diff + Par_Suit + Par_Contract",
                 },
                 "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
+                "platinum_events": {
+                    "applied": bool(platinum_events),
+                    "event_count": (
+                        len(platinum_event_ids(_cached_platinum_events()))
+                        if platinum_events else 0
+                    ),
+                    "events": (
+                        _cached_platinum_events().to_dicts() if platinum_events else []
+                    ),
+                },
                 "perf": perf,
                 "server": _server_runtime_info(),
             }
@@ -2117,6 +2194,10 @@ def acbl_detail(
     strata: str = Query(STRATA_DEFAULT),
     player_id: str | None = Query(None),
     pair_ids: str | None = Query(None),
+    platinum_events: bool = Query(
+        False,
+        description="Tournament only: restrict session history to platinum-awarding events.",
+    ),
 ) -> dict:
     """Return board detail with the published session Results_URL."""
     with _REPORT_LOCK:
@@ -2124,6 +2205,7 @@ def acbl_detail(
         t0 = time.perf_counter()
         try:
             t_parse_start = time.perf_counter()
+            _reject_club_platinum(club_or_tournament, platinum_events)
             parsed_date_from = None if not date_from else datetime.fromisoformat(date_from)
             t_parse_end = time.perf_counter()
 
@@ -2144,6 +2226,8 @@ def acbl_detail(
             if bucket is not None:
                 _require_strata_column(df)
                 df = df.filter(pl.col("strata_bucket") == bucket)
+            if platinum_events:
+                df = _apply_platinum_event_filter(df)
             t_filter_end = time.perf_counter()
 
             t_build_start = time.perf_counter()

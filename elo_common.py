@@ -492,6 +492,18 @@ def coerce_numeric_columns(pdf):
 # -------------------------------
 # URL Query Parameter Sync Helpers
 # -------------------------------
+def coerce_bool(raw: object) -> bool:
+    """Parse a URL/query flag. Accepts true/false/1/0/yes/no/on/off."""
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off", ""):
+        return False
+    raise ValueError(f"invalid boolean {raw!r}")
+
+
 def coerce_int(min_value: int | None = None, max_value: int | None = None, step: int | None = None):
     """Build a parser that coerces a string to int, optionally clamped and snapped to step.
 
