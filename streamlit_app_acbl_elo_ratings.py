@@ -1011,7 +1011,7 @@ def _acbl_report_panel() -> None:
         plat_names = [name for name in plat_names if name]
         names_text = ", ".join(plat_names) if plat_names else "none found"
         st.caption(
-            "**Platinum Events** is on: rankings use only events whose ACBL "
+            "**Platinum Events Only** is on: rankings use only events whose ACBL "
             f"`mp_color` is Platinum ({platinum_info.get('event_count', len(plat_events))} "
             f"events: {names_text}). Regional, sectional, and other non-platinum "
             "events are excluded. These events are sparse — lower "
@@ -1051,7 +1051,7 @@ def _acbl_report_panel() -> None:
     st.session_state.current_dataset_type = dataset_type
 
     method_desc = f"{rating_method} method"
-    platinum_suffix = " — Platinum Events" if platinum_events else ""
+    platinum_suffix = " — Platinum Events Only" if platinum_events else ""
     if rating_type == "Players":
         title = f"Top {top_n} ACBL {club_or_tournament} Players by {elo_rating_type} ({method_desc}){platinum_suffix}"
     elif rating_type == "Pairs":
@@ -1506,7 +1506,7 @@ def main():
         )
         if club_or_tournament == "Tournament":
             platinum_events = st.toggle(
-                "Platinum Events",
+                "Platinum Events Only",
                 value=False,
                 key="acbl_platinum_events",
                 persist_state="session",
