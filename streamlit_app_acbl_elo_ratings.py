@@ -1938,7 +1938,7 @@ def main():
                 )
                 # Enable shrink_to_fit for both Player and Pair reports to prevent truncation
                 # really want title, from date to be centered with reduced line spacing between them.
-                pdf_bytes = create_pdf([f"## {title}", f"### From {date_range}", "### Created by https://elo.7nt.info", table_df], title, max_rows=int(top_n), max_cols=None, rows_per_page=(21, 28), shrink_to_fit=True)
+                pdf_bytes = create_pdf([f"## {title}", f"### From {date_range}", "### Created by https://acbl-elo.7nt.info", table_df], title, max_rows=int(top_n), max_cols=None, rows_per_page=(21, 28), shrink_to_fit=True)
             except Exception as e:
                 st.error(f"❌ PDF Creation Failed: {e}")
                 st.error("Unable to create PDF file. Please try again or contact support if the problem persists.")

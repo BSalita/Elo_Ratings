@@ -3359,8 +3359,12 @@ def _load_main_content(
                     ),
                 )
                 pdf_bytes = create_pdf(
-                    [f"# {title}\n\nProcessed on {datetime.now().strftime('%Y-%m-%d %H:%M')}", 
-                     pdf_df],
+                    [
+                        f"# {title}",
+                        f"### Processed on {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                        "### Created by https://ffbridge-elo.7nt.info",
+                        pdf_df,
+                    ],
                     title=title,
                     shrink_to_fit=True
                 )
