@@ -83,14 +83,19 @@ from elo_common import (
     get_elo_title,
     CHESS_DISPLAY_MEAN,
     CHESS_DISPLAY_SD,
+    apply_aggrid_sort_model,
     apply_app_theme,
+    apply_sort_model_to_grid_options,
     calculate_aggrid_height,
     coerce_int,
     coerce_numeric_columns,
+    default_leaderboard_sort_model,
+    LEADERBOARD_SORT_MODEL_KEY,
     init_url_params_to_state,
     leaderboard_aggrid_viewport_height,
     LEADERBOARD_PAGE_SIZE,
     LEADERBOARD_ROW_HEIGHT,
+    remember_leaderboard_sort,
     render_app_footer,
     footer_streamlit_app_diagnostics_line,
     get_cache_diagnostic_line,
@@ -541,7 +546,13 @@ def _leaderboard_aggrid_key(
     )
 
 
-def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = True) -> Dict[str, Any]:
+def build_selectable_aggrid(
+    df: pl.DataFrame,
+    key: str,
+    *,
+    render_links: bool = True,
+    persist_sort: bool = False,
+) -> Dict[str, Any]:
     """Build an AgGrid with single-click row selection (streamlit-aggrid)."""
     display_df = df.to_pandas(use_pyarrow_extension_array=False)
     coerce_numeric_columns(display_df)
@@ -565,9 +576,6 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = 
                 type=['numericColumn', 'numberColumnFilter'],
                 comparator=numeric_comparator,
             )
-    sort_col = 'Rank' if 'Rank' in display_df.columns else None
-    if sort_col is not None:
-        gb.configure_column(sort_col, sort='asc')
     if 'Games' in display_df.columns:
         gb.configure_column('Games', width=100)
     if render_links:
@@ -578,8 +586,18 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = 
     grid_options['headerHeight'] = 50
     grid_options['domLayout'] = 'normal'
     height = leaderboard_aggrid_viewport_height(len(display_df), page_size, pagination=True)
+    default_sort = default_leaderboard_sort_model(display_df.columns)
+    update_on = ["selectionChanged"]
+    if persist_sort:
+        sort_model = remember_leaderboard_sort(
+            st.session_state, key, None, default_sort,
+        )
+        apply_sort_model_to_grid_options(grid_options, sort_model)
+        update_on.append("sortChanged")
+    elif default_sort:
+        apply_sort_model_to_grid_options(grid_options, default_sort)
 
-    return AgGrid(
+    response = AgGrid(
         display_df,
         gridOptions=grid_options,
         columns_auto_size_mode=ColumnsAutoSizeMode.NO_AUTOSIZE,
@@ -588,8 +606,13 @@ def build_selectable_aggrid(df: pl.DataFrame, key: str, *, render_links: bool = 
         data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
         key=key,
         allow_unsafe_jscode=True,
-        update_on=["selectionChanged"],
+        update_on=update_on,
     )
+    if persist_sort:
+        remember_leaderboard_sort(
+            st.session_state, key, response, default_sort,
+        )
+    return response
 
 
 def _resolved_score_expr(use_handicap: bool) -> pl.Expr:
@@ -2484,7 +2507,9 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                         date_range_choice,
                     )
                     _load_debug_log(f"leaderboard panel: rendering AgGrid ({top_players.height} rows)")
-                    grid_response = build_selectable_aggrid(top_players, dynamic_key, render_links=False)
+                    grid_response = build_selectable_aggrid(
+                        top_players, dynamic_key, render_links=False, persist_sort=True,
+                    )
                     _load_debug_log("leaderboard panel: AgGrid render returned")
 
                     selected_rows = grid_response.get('selected_rows', None)
@@ -2703,7 +2728,9 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                         date_range_choice,
                     )
                     _load_debug_log(f"leaderboard panel: rendering AgGrid ({top_pairs.height} rows)")
-                    grid_response = build_selectable_aggrid(top_pairs, dynamic_key, render_links=False)
+                    grid_response = build_selectable_aggrid(
+                        top_pairs, dynamic_key, render_links=False, persist_sort=True,
+                    )
                     _load_debug_log("leaderboard panel: AgGrid render returned")
 
                     selected_rows = grid_response.get('selected_rows', None)
@@ -3032,6 +3059,7 @@ def main():
 
         # PDF Export
         generate_pdf = st.button("Export Report to PDF File", width='stretch')
+        st.caption("PDF uses the leaderboard's last column sort.")
         st.sidebar.markdown('<p style="color: #ffc107; font-weight: 600;">Morty\'s Automated Postmortem Apps</p>', unsafe_allow_html=True)
         st.sidebar.markdown("[ACBL Postmortem](https://acbl.postmortem.chat)")
         st.sidebar.markdown("[French ffbridge Postmortem](https://ffbridge.postmortem.chat)")
@@ -3323,9 +3351,16 @@ def _load_main_content(
         if 'display_df' in st.session_state and not st.session_state.display_df.is_empty():
             with st.spinner("Preparing PDF export..."):
                 title = st.session_state.get('report_title', 'Unofficial FFBridge Elo Ratings')
+                pdf_df = apply_aggrid_sort_model(
+                    st.session_state.display_df,
+                    st.session_state.get(LEADERBOARD_SORT_MODEL_KEY)
+                    or default_leaderboard_sort_model(
+                        st.session_state.display_df.columns
+                    ),
+                )
                 pdf_bytes = create_pdf(
                     [f"# {title}\n\nProcessed on {datetime.now().strftime('%Y-%m-%d %H:%M')}", 
-                     st.session_state.display_df],
+                     pdf_df],
                     title=title,
                     shrink_to_fit=True
                 )

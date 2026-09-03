@@ -491,6 +491,128 @@ def coerce_numeric_columns(pdf):
 
 
 # -------------------------------
+# AgGrid sort persistence (PDF follows the last grid sort)
+# -------------------------------
+LEADERBOARD_SORT_MODEL_KEY = "_leaderboard_sort_model"
+LEADERBOARD_SORT_GRID_KEY = "_leaderboard_sort_grid_key"
+
+
+def default_leaderboard_sort_model(columns) -> list[dict]:
+    """Default screen/PDF order: Elo rank ascending."""
+    names = list(columns)
+    for col in ("Player_Elo_Rank", "Pair_Elo_Rank", "Rank"):
+        if col in names:
+            return [{"colId": col, "sort": "asc"}]
+    return []
+
+
+def _normalize_sort_model(model) -> list[dict] | None:
+    """Return ``[{colId, sort}]`` or None when the grid has not reported sort."""
+    if model is None:
+        return None
+    if not isinstance(model, list):
+        return None
+    parsed: list[dict] = []
+    indexed: list[tuple[int, dict]] = []
+    for item in model:
+        if not isinstance(item, dict):
+            continue
+        col = item.get("colId") or item.get("col_id") or item.get("field")
+        if not col:
+            continue
+        sort = str(item.get("sort") or "asc").lower()
+        if sort not in ("asc", "desc"):
+            continue
+        row = {"colId": str(col), "sort": sort}
+        sort_index = item.get("sortIndex")
+        if sort_index is None:
+            parsed.append(row)
+        else:
+            indexed.append((int(sort_index), row))
+    if indexed:
+        indexed.sort(key=lambda pair: pair[0])
+        return [row for _, row in indexed]
+    return parsed
+
+
+def aggrid_sort_model(grid_response) -> list[dict] | None:
+    """Read the current AgGrid sort, or None if the component has no sort state yet."""
+    if grid_response is None:
+        return None
+    state = getattr(grid_response, "grid_state", None)
+    if not isinstance(state, dict):
+        state = {}
+    sort_block = state.get("sort")
+    if isinstance(sort_block, dict):
+        parsed = _normalize_sort_model(sort_block.get("sortModel") or sort_block.get("sort"))
+        if parsed is not None:
+            return parsed
+    parsed = _normalize_sort_model(state.get("sortModel"))
+    if parsed is not None:
+        return parsed
+    columns_state = getattr(grid_response, "columns_state", None)
+    if isinstance(columns_state, list):
+        parsed = _normalize_sort_model(
+            [item for item in columns_state if isinstance(item, dict) and item.get("sort")]
+        )
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def remember_leaderboard_sort(session, grid_key: str, grid_response, default_model) -> list[dict]:
+    """Keep the last leaderboard sort across reruns, reset when the grid key changes."""
+    default = list(default_model or [])
+    if session.get(LEADERBOARD_SORT_GRID_KEY) != grid_key:
+        session[LEADERBOARD_SORT_GRID_KEY] = grid_key
+        session[LEADERBOARD_SORT_MODEL_KEY] = default
+    extracted = aggrid_sort_model(grid_response)
+    if extracted is not None:
+        session[LEADERBOARD_SORT_MODEL_KEY] = extracted
+    return list(session.get(LEADERBOARD_SORT_MODEL_KEY) or default)
+
+
+def apply_sort_model_to_grid_options(grid_options: dict, sort_model: list[dict]) -> dict:
+    """Pin columnDefs.sort so the grid keeps the last sort after a Streamlit rerun."""
+    model = list(sort_model or [])
+    by_col = {item["colId"]: item for item in model if item.get("colId")}
+    for col_def in grid_options.get("columnDefs") or []:
+        if not isinstance(col_def, dict):
+            continue
+        col_id = col_def.get("colId") or col_def.get("field")
+        match = by_col.get(col_id)
+        if match:
+            col_def["sort"] = match["sort"]
+            col_def["sortIndex"] = model.index(match)
+        else:
+            col_def.pop("sort", None)
+            col_def.pop("sortIndex", None)
+    return grid_options
+
+
+def apply_aggrid_sort_model(frame, sort_model):
+    """Sort a Polars or pandas frame the way the AgGrid last sorted it."""
+    model = list(sort_model or [])
+    if frame is None or not model:
+        return frame
+    is_polars = hasattr(frame, "select") and not hasattr(frame, "iloc")
+    columns = list(frame.columns)
+    by: list[str] = []
+    descending: list[bool] = []
+    for item in model:
+        col = item.get("colId")
+        if col is None or col not in columns:
+            continue
+        by.append(col)
+        descending.append(str(item.get("sort", "asc")).lower() == "desc")
+    if not by:
+        return frame
+    if is_polars:
+        return frame.sort(by, descending=descending, nulls_last=True)
+    return frame.sort_values(by, ascending=[not flag for flag in descending], na_position="last")
+
+
+# -------------------------------
 # URL Query Parameter Sync Helpers
 # -------------------------------
 def coerce_bool(raw: object) -> bool:

@@ -66,16 +66,21 @@ from acbl_strata import STRATA_DEFAULT, STRATA_OPTIONS
 from elo_common import (
     ASSISTANT_LOGO_URL,
     SKILL_GATE_DISABLED,
+    apply_aggrid_sort_model,
     apply_app_theme,
+    apply_sort_model_to_grid_options,
+    LEADERBOARD_SORT_MODEL_KEY,
     coerce_bool,
     coerce_float,
     coerce_int,
     coerce_numeric_columns,
+    default_leaderboard_sort_model,
     default_min_skill_z,
     init_url_params_to_state,
     leaderboard_aggrid_viewport_height,
     LEADERBOARD_PAGE_SIZE,
     LEADERBOARD_ROW_HEIGHT,
+    remember_leaderboard_sort,
     render_app_footer,
     footer_streamlit_app_diagnostics_line,
     sync_state_to_url_params,
@@ -1255,6 +1260,11 @@ def _acbl_report_panel() -> None:
                 platinum_events=platinum_events,
             )
         
+            default_sort = default_leaderboard_sort_model(display_df.columns)
+            sort_model = remember_leaderboard_sort(
+                st.session_state, dynamic_key, None, default_sort,
+            )
+            apply_sort_model_to_grid_options(gridOptions, sort_model)
             grid_response = AgGrid(
                 display_df,
                 gridOptions=gridOptions,
@@ -1264,7 +1274,10 @@ def _acbl_report_panel() -> None:
                 data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
                 key=dynamic_key,
                 allow_unsafe_jscode=True,
-                update_on=["selectionChanged"],
+                update_on=["selectionChanged", "sortChanged"],
+            )
+            remember_leaderboard_sort(
+                st.session_state, dynamic_key, grid_response, default_sort,
             )
         
             # --- Row-click detail view ---
@@ -1781,6 +1794,7 @@ def main():
         st.session_state.acbl_min_skill_z = min_skill_z
 
         generate_pdf = st.button("Generate PDF", type="primary")
+        st.caption("PDF uses the leaderboard's last column sort.")
         
         
         # Automated Postmortem Apps
@@ -1914,6 +1928,13 @@ def main():
                     player_name=st.session_state.get('player_name_filter', ''),
                     player_number=st.session_state.get('player_number_filter', ''),
                     masterpoints_range=st.session_state.get('masterpoints_filter', 'All'),
+                )
+                table_df = apply_aggrid_sort_model(
+                    table_df,
+                    st.session_state.get(LEADERBOARD_SORT_MODEL_KEY)
+                    or default_leaderboard_sort_model(
+                        table_df.columns if hasattr(table_df, "columns") else []
+                    ),
                 )
                 # Enable shrink_to_fit for both Player and Pair reports to prevent truncation
                 # really want title, from date to be centered with reduced line spacing between them.
