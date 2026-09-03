@@ -635,3 +635,20 @@ def render_memory_sidebar_caption(st_module) -> None:
     """Show live cgroup/process memory in the sidebar (updates each rerun)."""
     st_module.sidebar.caption(get_memory_caption_line(st_module))
 
+
+def get_report_status_caption(st_module) -> str:
+    """Memory metrics plus live DDS engine (ddss vs endplay) and version."""
+    memory = get_memory_caption_line(st_module)
+    try:
+        from mlBridge.dds_ddss import engine_caption
+
+        dds = engine_caption()
+    except Exception as exc:
+        dds = f"DDS: unknown ({exc})"
+    return f"{memory} • {dds}"
+
+
+def render_report_status_caption(st_module) -> None:
+    """Show memory + DDS engine line at the top of a postmortem report."""
+    st_module.caption(get_report_status_caption(st_module))
+
