@@ -427,6 +427,7 @@ _NUMERIC_NAME_EXACT: frozenset[str] = frozenset({
     "Club_Elo", "Tournament_Elo",
     "MasterPoints", "MasterPoint_Rank",
     "Avg_MPs", "Geo_MPs",
+    "Platinum", "Gold", "Red", "Black",
     "Quality_Rank", "Quality_Score",
     "Par_Suit_Rate_Pct", "Par_Suit_Rank",
     "Par_Contract_Rate_Pct", "Par_Contract_Rank",

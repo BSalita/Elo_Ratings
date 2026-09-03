@@ -12,6 +12,7 @@ import duckdb
 import polars as pl
 import psutil
 
+from acbl_awards import attach_award_totals, attach_session_awards, load_awards_for_players, pair_member_ids
 from acbl_platinum import load_platinum_events, platinum_event_ids
 from acbl_strata import STRATA_DEFAULT, strata_label_to_bucket
 from elo_filter_common import acbl_date_from_for_range, filter_acbl_leaderboard
@@ -30,7 +31,7 @@ DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-09-01-platinum-events"
+API_BUILD_TAG = "2026-09-03-award-columns"
 
 QUALITY_METRIC_DEFINITIONS = {
     "DD_Tricks_Diff_Avg": {
@@ -1929,6 +1930,64 @@ def _crossover_metrics(
     )
 
 
+def _leaderboard_player_ids(result_df: pl.DataFrame, rating_type: str) -> list[str]:
+    if rating_type == "Pairs":
+        if "Pair_IDs" not in result_df.columns:
+            return []
+        ids: list[str] = []
+        for pair in result_df.get_column("Pair_IDs").cast(pl.Utf8).to_list():
+            ids.extend(pair_member_ids(pair))
+        return ids
+    if "Player_ID" not in result_df.columns:
+        return []
+    return result_df.get_column("Player_ID").cast(pl.Utf8).to_list()
+
+
+def _attach_award_columns(
+    result_df: pl.DataFrame,
+    *,
+    club_or_tournament: str,
+    rating_type: str,
+    session_ids: list[str],
+) -> pl.DataFrame:
+    if result_df.is_empty():
+        return result_df
+    awards = load_awards_for_players(
+        DATA_ROOT,
+        club_or_tournament,
+        _leaderboard_player_ids(result_df, rating_type),
+    )
+    return attach_award_totals(
+        result_df,
+        awards,
+        rating_type=rating_type,
+        session_ids=session_ids,
+    )
+
+
+def _attach_detail_awards(
+    detail: pl.DataFrame,
+    *,
+    club_or_tournament: str,
+    rating_type: str,
+    player_id: str | None,
+    pair_ids: str | None,
+) -> pl.DataFrame:
+    if detail.is_empty():
+        return detail
+    if rating_type == "Pairs":
+        ids = pair_member_ids(str(pair_ids or ""))
+    else:
+        ids = [str(player_id)] if player_id else []
+    awards = load_awards_for_players(DATA_ROOT, club_or_tournament, ids)
+    return attach_session_awards(
+        detail,
+        awards,
+        player_id=None if rating_type == "Pairs" else player_id,
+        pair_ids=pair_ids if rating_type == "Pairs" else None,
+    )
+
+
 def _attach_crossover_columns(
     result_df: pl.DataFrame,
     *,
@@ -2085,12 +2144,21 @@ def acbl_report(
                     )
                 with _DB_LOCK:
                     result_df = con.execute(generated_sql).pl()
+                    session_ids_df = con.execute(
+                        "SELECT DISTINCT CAST(session_id AS VARCHAR) AS session_id FROM self"
+                    ).pl()
             finally:
                 _teardown_self_view(con)
                 _reset_duckdb_connection()
             t_sql_end = time.perf_counter()
 
             t_xover_start = time.perf_counter()
+            result_df = _attach_award_columns(
+                result_df,
+                club_or_tournament=club_or_tournament,
+                rating_type=rating_type,
+                session_ids=session_ids_df.get_column("session_id").to_list(),
+            )
             result_df = _attach_crossover_columns(
                 result_df,
                 club_or_tournament=club_or_tournament,
@@ -2239,6 +2307,13 @@ def acbl_detail(
                 if not pair_ids:
                     raise HTTPException(status_code=400, detail="pair_ids is required for Pairs detail.")
                 detail = _build_pair_detail(df, pair_ids=str(pair_ids), elo_rating_type=elo_rating_type)
+            detail = _attach_detail_awards(
+                detail,
+                club_or_tournament=club_or_tournament,
+                rating_type=rating_type,
+                player_id=player_id,
+                pair_ids=pair_ids,
+            )
             if club_or_tournament == "club":
                 if "Event_ID" in detail.columns:
                     detail = detail.with_columns(acbl_results_url_expr("club"))

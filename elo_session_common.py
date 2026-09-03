@@ -194,6 +194,15 @@ def summarize_acbl_sessions(
             .cast(pl.Int32, strict=False)
             .alias("Elo_End")
         )
+    for color in ("Platinum", "Gold", "Red", "Black"):
+        if color in ordered.columns:
+            aggregations.append(
+                pl.col(color)
+                .drop_nulls()
+                .first()
+                .cast(pl.Float64, strict=False)
+                .alias(color)
+            )
 
     summary = ordered.group_by("Session", maintain_order=True).agg(aggregations)
     if "Elo_Start" in summary.columns and "Elo_End" in summary.columns:
@@ -226,6 +235,10 @@ def summarize_acbl_sessions(
         "Elo_Start",
         "Elo_End",
         "Elo_Delta",
+        "Platinum",
+        "Gold",
+        "Red",
+        "Black",
         "Results_URL",
     ]
     return summary.select(

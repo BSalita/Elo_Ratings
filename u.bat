@@ -16,6 +16,8 @@ for %%F in (
     acbl_tournament_pair_elo_ratings.parquet
     acbl_club_elo_shrinkage.json
     acbl_tournament_elo_shrinkage.json
+    acbl_club_player_awards.parquet
+    acbl_tournament_player_awards.parquet
 ) do (
     xcopy "%acbl_source%\%%F" "data\" /D /Y
     if errorlevel 1 exit /b 1
@@ -68,6 +70,8 @@ for %%F in (
     acbl_tournament_pair_elo_ratings.parquet
     acbl_club_elo_shrinkage.json
     acbl_tournament_elo_shrinkage.json
+    acbl_club_player_awards.parquet
+    acbl_tournament_player_awards.parquet
 ) do (
     xcopy "data\%%F" "%prod_elo%\" /D /Y
     if errorlevel 1 exit /b 1
