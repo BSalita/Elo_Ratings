@@ -65,10 +65,13 @@ from streamlitlib.streamlitlib import (
 from acbl_strata import STRATA_DEFAULT, STRATA_OPTIONS
 from elo_common import (
     ASSISTANT_LOGO_URL,
+    SKILL_GATE_DISABLED,
     apply_app_theme,
     coerce_bool,
+    coerce_float,
     coerce_int,
     coerce_numeric_columns,
+    default_min_skill_z,
     init_url_params_to_state,
     leaderboard_aggrid_viewport_height,
     LEADERBOARD_PAGE_SIZE,
@@ -115,12 +118,14 @@ def _fetch_remote_report_table(
     prior_sessions: int = 50,
     strata: str = STRATA_DEFAULT,
     platinum_events: bool = False,
+    min_skill_z: float | None = None,
 ) -> tuple[pl.DataFrame, dict]:
     """Fetch pre-aggregated report rows from the ACBL API service.
 
     ``prior_sessions`` is the Bayesian shrinkage prior weight passed through
     to the API; 0 disables shrinkage (Published == Raw). Default matches
-    the API server's default.
+    the API server's default. ``min_skill_z`` is the Skill_Z gate; omit to
+    use the API per-source default (tournament 0.0, club 0.7).
     """
     base_url = _acbl_api_base_url()
     if base_url is None:
@@ -141,7 +146,12 @@ def _fetch_remote_report_table(
         "strata": strata,
         "prior_sessions": int(prior_sessions),
         "platinum_events": bool(platinum_events),
+        "min_skill_z": (
+            None if min_skill_z is None else float(min_skill_z)
+        ),
     }
+    if params["min_skill_z"] is None:
+        params.pop("min_skill_z")
 
     timeout_connect = int(os.getenv("ACBL_API_CONNECT_TIMEOUT_SECONDS", "15"))
     timeout_read = int(os.getenv("ACBL_API_TIMEOUT_SECONDS", "600"))
@@ -691,6 +701,7 @@ def _acbl_report_fetch_signature(
     prior_sessions: int,
     strata: str = STRATA_DEFAULT,
     platinum_events: bool = False,
+    min_skill_z: float | None = None,
 ) -> str:
     return json.dumps(
         {
@@ -706,6 +717,7 @@ def _acbl_report_fetch_signature(
             "strata": strata,
             "prior_sessions": int(prior_sessions),
             "platinum_events": bool(platinum_events),
+            "min_skill_z": None if min_skill_z is None else float(min_skill_z),
         },
         sort_keys=True,
     )
@@ -725,12 +737,14 @@ def _acbl_report_cache_key(
     prior_sessions: int,
     strata: str = STRATA_DEFAULT,
     platinum_events: bool = False,
+    min_skill_z: float | None = None,
 ) -> str:
     plat = "plat1" if platinum_events else "plat0"
+    skill = "off" if min_skill_z is None or float(min_skill_z) <= SKILL_GATE_DISABLED else f"{float(min_skill_z):.2f}"
     return (
         f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_"
         f"{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_"
-        f"{online_filter}_{strata}_{masterpoints_filter}_prior{prior_sessions}_{plat}"
+        f"{online_filter}_{strata}_{masterpoints_filter}_prior{prior_sessions}_{plat}_z{skill}"
     )
 
 
@@ -903,6 +917,16 @@ ACBL_URL_PARAMS = {
         "parser": coerce_bool,
         "default": False,
     },
+    "skill_gate": {
+        "session_key": "acbl_skill_gate_on",
+        "parser": coerce_bool,
+        "default": True,
+    },
+    "min_skill_z": {
+        "session_key": "acbl_min_skill_z",
+        "parser": coerce_float(-90.0, 5.0),
+        "default": 0.7,
+    },
 }
 
 
@@ -922,6 +946,7 @@ def _acbl_report_panel() -> None:
     strata = ctx.get("strata", STRATA_DEFAULT)
     club_or_tournament = ctx["club_or_tournament"]
     platinum_events = bool(ctx.get("platinum_events", False))
+    min_skill_z = float(ctx.get("min_skill_z", default_min_skill_z(club_or_tournament)))
 
     prior_sessions = int(st.session_state.get("acbl_prior_sessions", 50))
     masterpoints_filter = st.session_state.get("masterpoints_filter", "All")
@@ -938,6 +963,7 @@ def _acbl_report_panel() -> None:
         prior_sessions=prior_sessions,
         strata=strata,
         platinum_events=platinum_events,
+        min_skill_z=min_skill_z,
     )
     cached_fetch = st.session_state.get("_acbl_report_fetch_cache")
     if (
@@ -969,6 +995,7 @@ def _acbl_report_panel() -> None:
                     prior_sessions=prior_sessions,
                     strata=strata,
                     platinum_events=platinum_events,
+                    min_skill_z=min_skill_z,
                 )
         except Exception as exc:
             st.error(str(exc))
@@ -1006,6 +1033,19 @@ def _acbl_report_panel() -> None:
         else:
             shrink_msg = "📐 Shrinkage disabled (prior_sessions=0). Headline shows Raw Elo."
         st.caption(shrink_msg)
+
+    skill_info = remote_payload.get("skill_gate", {}) if isinstance(remote_payload, dict) else {}
+    if skill_info:
+        applied = skill_info.get("applied", False)
+        z_used = skill_info.get("min_skill_z")
+        if applied:
+            st.caption(
+                f"🎯 Skill gate on: rows with Skill_Z < **{z_used}** are hidden "
+                "(field-independent card play + par bidding). "
+                "Uncheck **Skill gate** in the sidebar to show everyone."
+            )
+        else:
+            st.caption("🎯 Skill gate off. Headline includes every Elo-qualified row.")
 
     platinum_info = remote_payload.get("platinum_events", {}) if isinstance(remote_payload, dict) else {}
     if platinum_events and isinstance(platinum_info, dict):
@@ -1091,6 +1131,7 @@ def _acbl_report_panel() -> None:
             int(st.session_state.get('acbl_prior_sessions', 50)),
             strata=strata,
             platinum_events=platinum_events,
+            min_skill_z=min_skill_z,
         )
         st.session_state.acbl_report_cache_key = cache_key
         st.session_state.acbl_club_or_tournament = club_or_tournament
@@ -1694,6 +1735,51 @@ def main():
             ),
         )
 
+        skill_gate_on = st.checkbox(
+            "Skill gate",
+            value=True,
+            key="acbl_skill_gate_on",
+            help=(
+                "Hide players/pairs whose field-independent Skill_Z "
+                "(card play + par bidding) is below the threshold. "
+                "Tournament default 0.0 drops Thomas-class last-board spikes. "
+                "Club default 0.7 drops Zubatch-class local inflation. "
+                "Uncheck to show the raw Elo list."
+            ),
+        )
+        event_kind = club_or_tournament.lower()
+        default_z = default_min_skill_z(event_kind)
+        slider_key = f"acbl_min_skill_z_{event_kind}"
+        if slider_key not in st.session_state:
+            shared = st.session_state.get("acbl_min_skill_z")
+            if (
+                shared is not None
+                and float(shared) > SKILL_GATE_DISABLED
+                and 0.0 <= float(shared) <= 2.0
+            ):
+                st.session_state[slider_key] = float(shared)
+            else:
+                st.session_state[slider_key] = default_z
+        min_skill_z_slider = st.slider(
+            "Minimum Skill_Z",
+            min_value=0.0,
+            max_value=2.0,
+            value=default_z,
+            step=0.05,
+            key=slider_key,
+            disabled=not skill_gate_on,
+            help=(
+                "Pool z-score of DD_Tricks_Diff + Par_Suit + Par_Contract. "
+                "Higher is stricter."
+            ),
+        )
+        min_skill_z = (
+            float(SKILL_GATE_DISABLED)
+            if not skill_gate_on
+            else float(min_skill_z_slider)
+        )
+        st.session_state.acbl_min_skill_z = min_skill_z
+
         generate_pdf = st.button("Generate PDF", type="primary")
         
         
@@ -1734,6 +1820,7 @@ def main():
         "online_filter": online_filter,
         "strata": strata,
         "platinum_events": bool(platinum_events),
+        "min_skill_z": float(min_skill_z),
     }
 
     # -------------------------------
@@ -1752,6 +1839,7 @@ def main():
         "online_filter": online_filter,
         "strata": strata,
         "platinum_events": bool(platinum_events),
+        "min_skill_z": float(min_skill_z),
     }
     
     # Check if settings have changed since last report

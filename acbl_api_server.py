@@ -21,6 +21,10 @@ from elo_common import (
     CHESS_DISPLAY_MEAN,
     CHESS_DISPLAY_SD,
     ELO_TITLE_SQL_CASE,
+    SKILL_GATE_DEFAULT_CLUB_Z,
+    SKILL_GATE_DEFAULT_TOURNAMENT_Z,
+    SKILL_GATE_DISABLED,
+    default_min_skill_z,
     title_from_elo_expr,
     zscore_chess_sql,
 )
@@ -31,7 +35,7 @@ DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-09-03-award-columns"
+API_BUILD_TAG = "2026-09-03-skill-gate-defaults"
 
 QUALITY_METRIC_DEFINITIONS = {
     "DD_Tricks_Diff_Avg": {
@@ -385,17 +389,8 @@ _SHRINKAGE_META_CACHE: dict[str, dict | None] = {}
 # /acbl/report client may override via the prior_sessions query parameter.
 SHRINKAGE_DEFAULT_PRIOR_SESSIONS = 50
 
-# Optional elite skill gate. The leaderboard's headline Elo is a strong *within-field*
-# predictor, but a player/pair who only dominates weak fields can still reach
-# the top ranks (the "Zubatch" failure mode). We therefore gate the top ranks
-# by a field-INDEPENDENT skill signal: the pool z-score of card play
-# (DD_Tricks_Diff) + par bidding (Par_Suit, Par_Contract). The gate is disabled
-# by default so Elo-qualified players are not silently removed; callers may
-# opt in by passing a threshold greater than ``SKILL_GATE_DISABLED``.
-# A field-relative "tested against stronger cohorts" gate was prototyped and
-# rejected: a strong individual is by construction rated above their field
-# mean, so it is structurally unobservable from this data.
-SKILL_GATE_DISABLED = -90.0
+# SQL builders default to disabled so unit tests stay ungated. /acbl/report
+# applies default_min_skill_z(club_or_tournament) when the query omits it.
 SKILL_GATE_DEFAULT_Z = SKILL_GATE_DISABLED
 
 
@@ -2050,8 +2045,12 @@ def health() -> dict:
         "cached_frame_gb": round(_cached_frame_bytes() / (1024 ** 3), 2),
         "build_tag": API_BUILD_TAG,
         "skill_gate": {
-            "enabled_by_default": SKILL_GATE_DEFAULT_Z > SKILL_GATE_DISABLED,
-            "default_min_skill_z": SKILL_GATE_DEFAULT_Z,
+            "disabled_at_or_below": SKILL_GATE_DISABLED,
+            "defaults": {
+                "club": SKILL_GATE_DEFAULT_CLUB_Z,
+                "tournament": SKILL_GATE_DEFAULT_TOURNAMENT_Z,
+            },
+            "enabled_by_default": True,
         },
         "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
     }
@@ -2078,13 +2077,13 @@ def acbl_report(
         description="Bayesian shrinkage prior weight (in 'sessions equivalent'). "
                     "0 disables shrinkage (Published == Raw).",
     ),
-    min_skill_z: float = Query(
-        SKILL_GATE_DEFAULT_Z, ge=-100.0, le=5.0,
-        description="Optional elite skill gate (disabled by default): exclude "
-                    "players/pairs whose field-"
-                    "independent card-play+bidding z-score (over the qualifying "
-                    "pool) is below this. Higher = stricter. Set <= -90 to "
-                    "disable (show all qualifying entities).",
+    min_skill_z: float | None = Query(
+        None, ge=-100.0, le=5.0,
+        description="Elite skill gate on field-independent Skill_Z (card play + "
+                    "par bidding over the qualifying pool). Omitted: 0.0 for "
+                    "tournament (drops Thomas-class spikes), 0.7 for club "
+                    "(drops Zubatch-class local inflation). Higher = stricter. "
+                    "Set <= -90 to disable.",
     ),
     player_name: str | None = Query(None),
     player_number: str | None = Query(None, pattern=r"^\d*$"),
@@ -2103,6 +2102,8 @@ def acbl_report(
         try:
             t_parse_start = time.perf_counter()
             _reject_club_platinum(club_or_tournament, platinum_events)
+            if min_skill_z is None:
+                min_skill_z = default_min_skill_z(club_or_tournament)
             effective_date_from = date_from or (
                 acbl_date_from_for_range(date_range) if date_range else None
             )
@@ -2214,6 +2215,7 @@ def acbl_report(
                 },
                 "skill_gate": {
                     "min_skill_z": float(min_skill_z),
+                    "default_min_skill_z": default_min_skill_z(club_or_tournament),
                     "applied": min_skill_z > SKILL_GATE_DISABLED,
                     "metric": "pool z-score of DD_Tricks_Diff + Par_Suit + Par_Contract",
                 },

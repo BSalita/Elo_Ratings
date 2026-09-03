@@ -505,6 +505,36 @@ def coerce_bool(raw: object) -> bool:
     raise ValueError(f"invalid boolean {raw!r}")
 
 
+# ACBL leaderboard skill gate (field-independent Skill_Z).
+# Tournament 0.0 drops Thomas-class Latest spikes. Club 0.7 drops Zubatch-class
+# local inflation. <= SKILL_GATE_DISABLED shows everyone.
+SKILL_GATE_DISABLED = -90.0
+SKILL_GATE_DEFAULT_TOURNAMENT_Z = 0.0
+SKILL_GATE_DEFAULT_CLUB_Z = 0.7
+
+
+def default_min_skill_z(club_or_tournament: str) -> float:
+    """Per-source report default. ``club`` is stricter than ``tournament``."""
+    kind = str(club_or_tournament or "").strip().lower()
+    if kind == "club":
+        return SKILL_GATE_DEFAULT_CLUB_Z
+    if kind == "tournament":
+        return SKILL_GATE_DEFAULT_TOURNAMENT_Z
+    raise ValueError(f"Invalid club_or_tournament: {club_or_tournament!r}")
+
+
+def coerce_float(min_value: float | None = None, max_value: float | None = None):
+    """Build a parser that coerces a string to float, optionally clamped."""
+    def _parse(raw: str) -> float:
+        v = float(raw)
+        if min_value is not None:
+            v = max(min_value, v)
+        if max_value is not None:
+            v = min(max_value, v)
+        return v
+    return _parse
+
+
 def coerce_int(min_value: int | None = None, max_value: int | None = None, step: int | None = None):
     """Build a parser that coerces a string to int, optionally clamped and snapped to step.
 

@@ -8,10 +8,12 @@ import polars as pl
 
 from acbl_api_server import (
     QUALITY_METRIC_DEFINITIONS,
+    SKILL_GATE_DISABLED,
     _required_columns_for_mode,
     generate_top_pairs_sql,
     generate_top_players_sql,
 )
+from elo_common import default_min_skill_z
 
 
 def _quality_fixture() -> pl.DataFrame:
@@ -164,6 +166,37 @@ class AcblQualityMetricSqlTests(unittest.TestCase):
                 "Sacrifice_Rate_Pct",
             },
         )
+
+    def test_skill_gate_defaults_are_stricter_for_club(self) -> None:
+        self.assertEqual(default_min_skill_z("tournament"), 0.0)
+        self.assertEqual(default_min_skill_z("Club"), 0.7)
+        with self.assertRaises(ValueError):
+            default_min_skill_z("league")
+
+    def test_player_sql_skill_gate_is_opt_in(self) -> None:
+        ungated = generate_top_players_sql(
+            top_n=10,
+            min_sessions=1,
+            rating_method="Latest",
+            elo_rating_type="Current Rating (End of Session)",
+        )
+        self.assertNotIn("Skill_Z >=", ungated)
+        gated = generate_top_players_sql(
+            top_n=10,
+            min_sessions=1,
+            rating_method="Latest",
+            elo_rating_type="Current Rating (End of Session)",
+            min_skill_z=0.0,
+        )
+        self.assertIn("WHERE Skill_Z >= 0.0", gated)
+        disabled = generate_top_players_sql(
+            top_n=10,
+            min_sessions=1,
+            rating_method="Latest",
+            elo_rating_type="Current Rating (End of Session)",
+            min_skill_z=SKILL_GATE_DISABLED,
+        )
+        self.assertNotIn("Skill_Z >=", disabled)
 
 
 if __name__ == "__main__":
