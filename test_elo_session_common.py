@@ -5,7 +5,11 @@ from datetime import datetime
 
 import polars as pl
 
-from elo_session_common import results_url_status, summarize_acbl_sessions
+from elo_session_common import (
+    acbl_tournament_results_url,
+    results_url_status,
+    summarize_acbl_sessions,
+)
 
 
 class AcblSessionSummaryTests(unittest.TestCase):
@@ -52,27 +56,51 @@ class AcblSessionSummaryTests(unittest.TestCase):
                 "Board": [1, 2],
             }
         )
-        tournament_detail = pl.DataFrame(
+        regional_detail = pl.DataFrame(
             {
                 "Date": [datetime(2026, 1, 2)],
                 "Session": ["2509101-271B-2"],
                 "Board": [1],
             }
         )
+        nabc_detail = pl.DataFrame(
+            {
+                "Date": [datetime(2026, 3, 6)],
+                "Session": ["NABC261-SILO-4"],
+                "Board": [1],
+            }
+        )
 
         club = summarize_acbl_sessions(club_detail, "Club")
-        tournament = summarize_acbl_sessions(tournament_detail, "Tournament")
+        regional = summarize_acbl_sessions(regional_detail, "Tournament")
+        nabc = summarize_acbl_sessions(nabc_detail, "Tournament")
 
         self.assertEqual(
             club["Results_URL"][0],
             "https://my.acbl.org/club-results/details/1033402",
         )
         self.assertEqual(
-            tournament["Results_URL"][0],
-            "https://live.acbl.org/event/2509101/271B/2/summary",
+            regional["Results_URL"][0],
+            "https://web2.acbl.org/tournaments/results/2025/09/2509101.htm",
+        )
+        self.assertEqual(
+            nabc["Results_URL"][0],
+            "https://web2.acbl.org/tournaments/Results/NABC/NABC261.HTM",
         )
         self.assertEqual(club.columns[-1], "Results_URL")
-        self.assertEqual(tournament.columns[-1], "Results_URL")
+        self.assertEqual(regional.columns[-1], "Results_URL")
+        self.assertEqual(nabc.columns[-1], "Results_URL")
+
+    def test_tournament_results_url_uses_public_web2_pages(self) -> None:
+        self.assertEqual(
+            acbl_tournament_results_url("NABC261-SILO-4"),
+            "https://web2.acbl.org/tournaments/Results/NABC/NABC261.HTM",
+        )
+        self.assertEqual(
+            acbl_tournament_results_url("2509101-271B-2"),
+            "https://web2.acbl.org/tournaments/results/2025/09/2509101.htm",
+        )
+        self.assertIsNone(acbl_tournament_results_url(""))
 
     def test_club_summary_survives_legacy_detail_without_event_id(self) -> None:
         detail = pl.DataFrame(

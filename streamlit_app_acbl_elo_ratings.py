@@ -417,6 +417,13 @@ class UrlCellRenderer {
         a.style.color = '#0066cc';
         a.style.textDecoration = 'underline';
         a.textContent = v;
+        // Row selection on the session grid reruns Streamlit and swallows
+        // the default anchor navigation unless the click is stopped here.
+        a.addEventListener('click', function(e) {
+            e.stopPropagation();
+            window.open(v, '_blank', 'noopener,noreferrer');
+            e.preventDefault();
+        });
         this.eGui.appendChild(a);
     }
     getGui() {

@@ -55,4 +55,45 @@ if errorlevel 1 exit /b 1
 robocopy "%ffbridge_hier_source%\dataset" "%ffbridge_hier_destination%\dataset" /E /XO /R:2 /W:2 /NFL /NDL /NJH /NJS /NP
 if errorlevel 8 exit /b 1
 
+rem Publish the same artifacts to prod. Do not /MIR data\ — that would replace
+rem _wslc_host, which postmortem_start.ps1 stages for the container mount.
+set "prod_elo=\\X1-pro-470-1tb\c\sw\bridge\ML-Contract-Bridge\src\elo\data"
+if not exist "%prod_elo%\" exit /b 1
+for %%F in (
+    acbl_club_elo_ratings.parquet
+    acbl_tournament_elo_ratings.parquet
+    acbl_club_player_elo_ratings.parquet
+    acbl_tournament_player_elo_ratings.parquet
+    acbl_club_pair_elo_ratings.parquet
+    acbl_tournament_pair_elo_ratings.parquet
+    acbl_club_elo_shrinkage.json
+    acbl_tournament_elo_shrinkage.json
+) do (
+    xcopy "data\%%F" "%prod_elo%\" /D /Y
+    if errorlevel 1 exit /b 1
+)
+if not exist "%prod_elo%\ffbridge\quality_cache\" (
+    mkdir "%prod_elo%\ffbridge\quality_cache"
+    if errorlevel 1 exit /b 1
+)
+for %%F in (
+    ffbridge_quality_boards.parquet
+    ffbridge_quality_players.parquet
+    ffbridge_quality_pairs.parquet
+    ffbridge_quality_metadata.json
+) do (
+    xcopy "%ffbridge_quality_destination%\%%F" "%prod_elo%\ffbridge\quality_cache\" /D /Y
+    if errorlevel 1 exit /b 1
+)
+if not exist "%prod_elo%\ffbridge\postmortem_archive_hierarchical\" (
+    mkdir "%prod_elo%\ffbridge\postmortem_archive_hierarchical"
+    if errorlevel 1 exit /b 1
+)
+xcopy "%ffbridge_hier_destination%\metadata.json" "%prod_elo%\ffbridge\postmortem_archive_hierarchical\" /D /Y
+if errorlevel 1 exit /b 1
+xcopy "%ffbridge_hier_destination%\manifest.parquet" "%prod_elo%\ffbridge\postmortem_archive_hierarchical\" /D /Y
+if errorlevel 1 exit /b 1
+robocopy "%ffbridge_hier_destination%\dataset" "%prod_elo%\ffbridge\postmortem_archive_hierarchical\dataset" /E /XO /R:2 /W:2 /NFL /NDL /NJH /NJS /NP
+if errorlevel 8 exit /b 1
+
 exit /b 0

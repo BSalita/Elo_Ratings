@@ -2,7 +2,37 @@
 
 from __future__ import annotations
 
+import re
+
 import polars as pl
+
+_NABC_SESSION_RE = re.compile(r"^(NABC\d+)", re.IGNORECASE)
+_SANCTION_SESSION_RE = re.compile(r"^(\d{7})(?:-|$)")
+
+
+def acbl_tournament_results_url(session_id: str) -> str | None:
+    """Public web2 recap URL for a tournament session id.
+
+    live.acbl.org NABC event pages now send browsers to a login wall.
+    web2.acbl.org publishes the same tournaments without login.
+    """
+    session = str(session_id).strip()
+    if not session:
+        return None
+    nabc = _NABC_SESSION_RE.match(session)
+    if nabc:
+        return (
+            "https://web2.acbl.org/tournaments/Results/NABC/"
+            f"{nabc.group(1).upper()}.HTM"
+        )
+    sanction = _SANCTION_SESSION_RE.match(session)
+    if sanction:
+        code = sanction.group(1)
+        return (
+            "https://web2.acbl.org/tournaments/results/"
+            f"20{code[:2]}/{code[2:4]}/{code}.htm"
+        )
+    return None
 
 
 def results_url_status(
@@ -72,14 +102,30 @@ def acbl_results_url_expr(
         session = (
             pl.col(session_column).cast(pl.Utf8).fill_null("").str.strip_chars()
         )
+        nabc = session.str.extract(r"^(?i)(NABC\d+)", 1)
+        sanction = session.str.extract(r"^(\d{7})(?:-|$)", 1)
         return (
-            pl.when(session != "")
+            pl.when(nabc.is_not_null() & (nabc != ""))
             .then(
                 pl.concat_str(
                     [
-                        pl.lit("https://live.acbl.org/event/"),
-                        session.str.replace_all("-", "/"),
-                        pl.lit("/summary"),
+                        pl.lit("https://web2.acbl.org/tournaments/Results/NABC/"),
+                        nabc.str.to_uppercase(),
+                        pl.lit(".HTM"),
+                    ]
+                )
+            )
+            .when(sanction.is_not_null() & (sanction != ""))
+            .then(
+                pl.concat_str(
+                    [
+                        pl.lit("https://web2.acbl.org/tournaments/results/20"),
+                        sanction.str.slice(0, 2),
+                        pl.lit("/"),
+                        sanction.str.slice(2, 2),
+                        pl.lit("/"),
+                        sanction,
+                        pl.lit(".htm"),
                     ]
                 )
             )
