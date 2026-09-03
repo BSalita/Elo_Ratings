@@ -1,9 +1,11 @@
 """Identify ACBL tournament events that award platinum masterpoints.
 
-Board-result parquets carry ``mp_color`` (and ``mp_rating``). Elo rating
-parquets do not; they join back through ``event_id``. An event awards
-platinum only when ``mp_color`` is Platinum — not merely because it is
-played at an NABC, and not because ``mp_rating`` is NABC+.
+Board-result parquets carry ``mp_color`` (and ``mp_rating``). Current Elo
+extracts keep those columns so Platinum Events Only can filter the Elo
+frame directly. Older Elo parquets without ``mp_color`` still join back
+through ``event_id`` via the platinum sidecar. An event awards platinum
+only when ``mp_color`` is Platinum — not merely because it is played at
+an NABC, and not because ``mp_rating`` is NABC+.
 """
 from __future__ import annotations
 

@@ -13,7 +13,7 @@ import polars as pl
 import psutil
 
 from acbl_awards import attach_award_totals, attach_session_awards, load_awards_for_players, pair_member_ids
-from acbl_platinum import load_platinum_events, platinum_event_ids
+from acbl_platinum import load_platinum_events, platinum_event_ids, platinum_mp_color_expr
 from acbl_strata import STRATA_DEFAULT, strata_label_to_bucket
 from elo_filter_common import acbl_date_from_for_range, filter_acbl_leaderboard
 from elo_session_common import acbl_results_url_expr, results_url_status
@@ -35,7 +35,7 @@ DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-09-03-skill-gate-defaults"
+API_BUILD_TAG = "2026-09-03-elo-mp-color"
 
 QUALITY_METRIC_DEFINITIONS = {
     "DD_Tricks_Diff_Avg": {
@@ -887,6 +887,8 @@ def _require_platinum_event_ids() -> list[str]:
 
 
 def _apply_platinum_event_filter(df: pl.DataFrame) -> pl.DataFrame:
+    if "mp_color" in df.columns:
+        return df.filter(platinum_mp_color_expr())
     if "event_id" not in df.columns:
         raise HTTPException(
             status_code=500,
@@ -916,12 +918,15 @@ def _self_filter_sql_clauses(
         # Bucket ids are controlled constants (no user free-text).
         clauses.append(f"strata_bucket = '{bucket}'")
     if platinum_events:
-        if "event_id" not in full_df.columns:
+        if "mp_color" in full_df.columns:
+            clauses.append("lower(trim(CAST(mp_color AS VARCHAR))) = 'platinum'")
+        elif "event_id" not in full_df.columns:
             raise HTTPException(
                 status_code=500,
                 detail="Elo parquet is missing event_id; cannot filter platinum events.",
             )
-        clauses.append(f"event_id IN {_sql_string_list(_require_platinum_event_ids())}")
+        else:
+            clauses.append(f"event_id IN {_sql_string_list(_require_platinum_event_ids())}")
     if "Pct_NS" in full_df.columns:
         clauses.append("(Pct_NS IS NULL OR (Pct_NS >= 0 AND Pct_NS <= 1))")
     return clauses

@@ -96,6 +96,19 @@ class PlatinumAwardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             coerce_bool("maybe")
 
+    def test_self_filter_sql_uses_mp_color_when_present(self) -> None:
+        frame = pl.DataFrame({
+            "event_id": ["A", "B"],
+            "Pct_NS": [0.5, 0.6],
+            "mp_color": ["Platinum", "Gold"],
+        })
+        clauses = _self_filter_sql_clauses(
+            frame, None, "All", "All", platinum_events=True,
+        )
+        self.assertTrue(any("mp_color" in clause for clause in clauses))
+        self.assertTrue(any("platinum" in clause for clause in clauses))
+        self.assertFalse(any("event_id IN" in clause for clause in clauses))
+
     def test_self_filter_sql_includes_platinum_event_ids(self) -> None:
         from unittest.mock import patch
 
@@ -114,6 +127,16 @@ class PlatinumAwardTests(unittest.TestCase):
                 frame, None, "All", "All", platinum_events=False,
             ))
         )
+
+    def test_apply_platinum_filter_uses_mp_color(self) -> None:
+        from acbl_api_server import _apply_platinum_event_filter
+
+        frame = pl.DataFrame({
+            "event_id": ["NABC253-NAIL", "2605106-30OP"],
+            "mp_color": ["Platinum", "Gold"],
+        })
+        filtered = _apply_platinum_event_filter(frame)
+        self.assertEqual(filtered["event_id"].to_list(), ["NABC253-NAIL"])
 
     def test_sql_in_list_escapes_quotes(self) -> None:
         self.assertEqual(
