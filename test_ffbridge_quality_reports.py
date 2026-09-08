@@ -263,6 +263,60 @@ def test_filtered_quality_uses_only_selected_teams_within_session(tmp_path) -> N
     ) == 2.0
 
 
+def test_filtered_quality_reuses_identical_selection(tmp_path, monkeypatch) -> None:
+    _write_quality_cache(tmp_path)
+    selected = pl.DataFrame(
+        {"tournament_id": ["20", "10"], "team_id": ["20", "10"]}
+    )
+    original = reports._build_filtered_quality_sidecars
+    calls = 0
+
+    def counting_build(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        reports, "_build_filtered_quality_sidecars", counting_build
+    )
+    players_first, pairs_first, _status_first = (
+        reports.load_filtered_quality_sidecars(selected, tmp_path)
+    )
+    players_cached, pairs_cached, _status_cached = (
+        reports.load_filtered_quality_sidecars(
+            selected.reverse(), tmp_path
+        )
+    )
+
+    assert calls == 1
+    assert players_cached is players_first
+    assert pairs_cached is pairs_first
+
+
+def test_api_metadata_compacts_bulk_diagnostic_lists() -> None:
+    quality = reports.compact_quality_status(
+        {
+            "status": "available",
+            "unsupported_sessions": [{"session_id": "1"}, {"session_id": "2"}],
+        }
+    )
+    processing = reports.compact_processing_stats(
+        {
+            "cached": 10,
+            "missing_ids": ["1", "2"],
+            "processed_tournament_ids": ["3", "4", "5"],
+        }
+    )
+
+    assert "unsupported_sessions" not in quality
+    assert quality["unsupported_session_count"] == 2
+    assert processing == {
+        "cached": 10,
+        "missing_id_count": 2,
+        "processed_tournament_count": 3,
+    }
+
+
 def test_schema_v1_quality_cache_is_rejected(tmp_path) -> None:
     _write_quality_cache(tmp_path)
     (tmp_path / reports.QUALITY_METADATA_PATH.name).write_text(

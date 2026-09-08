@@ -281,6 +281,11 @@ _QUALITY_CACHE: Dict[
         Dict[str, Any],
     ],
 ] = {}
+_QUALITY_LOCK = threading.RLock()
+_FILTERED_QUALITY_CACHE_KEY: Optional[Tuple[Any, ...]] = None
+_FILTERED_QUALITY_CACHE_VALUE: Optional[
+    Tuple[Optional[pl.DataFrame], Optional[pl.DataFrame], Dict[str, Any]]
+] = None
 
 
 def load_results(
@@ -358,7 +363,7 @@ def _validate_quality_frame(
     return normalized
 
 
-def load_quality_sidecars(
+def _load_quality_sidecars_unlocked(
     cache_dir: Optional[pathlib.Path] = None,
 ) -> Tuple[Optional[pl.DataFrame], Optional[pl.DataFrame], Dict[str, Any]]:
     """Load quality sidecars once, reloading when any source mtime changes.
@@ -442,20 +447,73 @@ def load_quality_sidecars(
     return players, pairs, status
 
 
+def load_quality_sidecars(
+    cache_dir: Optional[pathlib.Path] = None,
+) -> Tuple[Optional[pl.DataFrame], Optional[pl.DataFrame], Dict[str, Any]]:
+    """Load quality sidecars once without concurrent duplicate parquet reads."""
+    with _QUALITY_LOCK:
+        return _load_quality_sidecars_unlocked(cache_dir)
+
+
 def load_filtered_quality_sidecars(
     results_df: pl.DataFrame,
     cache_dir: Optional[pathlib.Path] = None,
 ) -> Tuple[Optional[pl.DataFrame], Optional[pl.DataFrame], Dict[str, Any]]:
     """Build role-aware quality aggregates for exactly the selected sessions."""
-    _all_players, _all_pairs, status = load_quality_sidecars(cache_dir)
-    if status["status"] != "available" or results_df.is_empty():
-        return None, None, status
-    if "tournament_id" not in results_df.columns:
-        raise ValueError("Filtered FFBridge results lack tournament_id")
-
     quality_dir = (
         pathlib.Path(cache_dir) if cache_dir is not None else QUALITY_CACHE_DIR
     ).resolve()
+    paths = (
+        quality_dir / QUALITY_BOARDS_PATH.name,
+        quality_dir / QUALITY_PLAYERS_PATH.name,
+        quality_dir / QUALITY_PAIRS_PATH.name,
+        quality_dir / QUALITY_METADATA_PATH.name,
+    )
+    with _QUALITY_LOCK:
+        _all_players, _all_pairs, status = load_quality_sidecars(cache_dir)
+        if status["status"] != "available" or results_df.is_empty():
+            return None, None, status
+        if "tournament_id" not in results_df.columns:
+            raise ValueError("Filtered FFBridge results lack tournament_id")
+
+        signature = tuple(path.stat().st_mtime_ns for path in paths)
+        selection_columns = ["tournament_id"]
+        if "team_id" in results_df.columns:
+            selection_columns.append("team_id")
+        selection = (
+            results_df.select(
+                *[
+                    pl.col(column).cast(pl.String).alias(column)
+                    for column in selection_columns
+                ]
+            )
+            .drop_nulls()
+            .unique()
+            .sort(selection_columns)
+        )
+        selection_key = tuple(selection.iter_rows())
+        cache_key = (quality_dir, signature, tuple(selection_columns), selection_key)
+        global _FILTERED_QUALITY_CACHE_KEY, _FILTERED_QUALITY_CACHE_VALUE
+        if (
+            _FILTERED_QUALITY_CACHE_KEY == cache_key
+            and _FILTERED_QUALITY_CACHE_VALUE is not None
+        ):
+            return _FILTERED_QUALITY_CACHE_VALUE
+
+        value = _build_filtered_quality_sidecars(
+            results_df, quality_dir, status
+        )
+        _FILTERED_QUALITY_CACHE_KEY = cache_key
+        _FILTERED_QUALITY_CACHE_VALUE = value
+        return value
+
+
+def _build_filtered_quality_sidecars(
+    results_df: pl.DataFrame,
+    quality_dir: pathlib.Path,
+    status: Dict[str, Any],
+) -> Tuple[Optional[pl.DataFrame], Optional[pl.DataFrame], Dict[str, Any]]:
+    """Compute one filtered quality population while the quality lock is held."""
     session_ids = (
         results_df.get_column("tournament_id")
         .cast(pl.String)
@@ -602,6 +660,30 @@ def _quality_status_snapshot() -> Dict[str, Any]:
     }
 
 
+def compact_quality_status(status: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep API quality metadata useful without returning thousands of failures."""
+    compact = dict(status)
+    unsupported = compact.pop("unsupported_sessions", None)
+    if isinstance(unsupported, list):
+        compact["unsupported_session_count"] = compact.get(
+            "unsupported_session_count", len(unsupported)
+        )
+    return compact
+
+
+def compact_processing_stats(stats: Any) -> Dict[str, Any]:
+    """Replace bulk identifier lists in dataset metadata with their counts."""
+    compact = dict(stats) if isinstance(stats, dict) else {}
+    for field, count_field in (
+        ("missing_ids", "missing_id_count"),
+        ("processed_tournament_ids", "processed_tournament_count"),
+    ):
+        values = compact.pop(field, None)
+        if isinstance(values, list):
+            compact[count_field] = len(values)
+    return compact
+
+
 def dataset_health(api_key: Optional[str] = None, fetch_iv: bool = True) -> Dict[str, Any]:
     """Fast dataset snapshot for /health without loading result rows into RAM."""
     key_api = api_key or default_api_key()
@@ -634,7 +716,7 @@ def dataset_health(api_key: Optional[str] = None, fetch_iv: bool = True) -> Dict
         "results_links": results_links,
         "results_link_policy": "best_effort",
         "quality_status": quality_status["status"],
-        "quality": quality_status,
+        "quality": compact_quality_status(quality_status),
         "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
     }
 
@@ -667,11 +749,13 @@ def dataset_info(api_key: Optional[str] = None, fetch_iv: bool = True) -> Dict[s
         "date_min": date_min,
         "date_max": date_max,
         "clubs": clubs,
-        "processing_stats": meta.get("processing_stats", {}),
+        "processing_stats": compact_processing_stats(
+            meta.get("processing_stats", {})
+        ),
         "score_provenance": score_provenance_counts(results_df),
         "results_links": ffbridge_results_link_status(results_df),
         "results_link_policy": "best_effort",
-        "quality": quality_status,
+        "quality": compact_quality_status(quality_status),
         "quality_status": quality_status["status"],
         "quality_cutoff": quality_status.get("cutoff"),
         "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
@@ -1500,7 +1584,7 @@ def run_leaderboard_report(
         "dataset_schema_version": ELO_DATASET_SCHEMA_VERSION,
         "score_provenance": provenance,
         "results_links": ffbridge_results_link_status(results_df),
-        "quality": quality_status,
+        "quality": compact_quality_status(quality_status),
         "quality_status": quality_status["status"],
         "quality_cutoff": quality_status.get("cutoff"),
         "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
