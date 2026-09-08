@@ -652,3 +652,27 @@ def render_report_status_caption(st_module) -> None:
     """Show memory + DDS engine line at the top of a postmortem report."""
     st_module.caption(get_report_status_caption(st_module))
 
+
+try:
+    from fuzzy_name import (  # type: ignore
+        FUZZY_NAME_THRESHOLD,
+        MIN_FUZZY_LETTERS,
+        filter_name_list,
+        fuzzy_text_score,
+        name_match_rank,
+        name_query_matches,
+        normalize_fuzzy_text,
+        rank_named_records,
+    )
+except ImportError:
+    from streamlitlib.fuzzy_name import (  # noqa: F401
+        FUZZY_NAME_THRESHOLD,
+        MIN_FUZZY_LETTERS,
+        filter_name_list,
+        fuzzy_text_score,
+        name_match_rank,
+        name_query_matches,
+        normalize_fuzzy_text,
+        rank_named_records,
+    )
+
