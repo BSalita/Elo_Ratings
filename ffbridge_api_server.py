@@ -14,7 +14,7 @@ import ffbridge_session_ranking_service as rankings
 from streamlitlib.memory_usage import get_memory_usage_dict
 
 
-FFBRIDGE_API_BUILD_TAG = "2026-09-08-quality-cache"
+FFBRIDGE_API_BUILD_TAG = "2026-09-08-quality-fastpath"
 app = FastAPI(title="FFBridge Elo API", version="1.5.0")
 
 

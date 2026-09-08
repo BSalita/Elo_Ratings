@@ -556,6 +556,18 @@ def _build_filtered_quality_sidecars(
     )
 
 
+def load_report_quality_sidecars(
+    results_df: pl.DataFrame,
+    *,
+    has_population_filter: bool,
+) -> Tuple[Optional[pl.DataFrame], Optional[pl.DataFrame], Dict[str, Any]]:
+    """Use persisted all-time quality data unless report filters require a rebuild."""
+    if has_population_filter:
+        return load_filtered_quality_sidecars(results_df)
+    players, pairs, status = load_quality_sidecars()
+    return players, pairs, {**status, "filter_scope": "all_quality_sessions"}
+
+
 def _attach_quality_sidecar(
     leaderboard: pl.DataFrame,
     quality_df: Optional[pl.DataFrame],
@@ -1531,8 +1543,19 @@ def run_leaderboard_report(
     )
     provenance = score_provenance_counts(results_df)
     results_df = filter_score_available(results_df, use_handicap)
-    quality_players, quality_pairs, quality_status = load_filtered_quality_sidecars(
-        results_df
+    has_population_filter = any(
+        value is not None and str(value).strip()
+        for value in (
+            normalized_series_id,
+            tournament,
+            tournament_contains,
+            club,
+            date_from,
+            date_to,
+        )
+    )
+    quality_players, quality_pairs, quality_status = load_report_quality_sidecars(
+        results_df, has_population_filter=has_population_filter
     )
 
     if rating == "Players":

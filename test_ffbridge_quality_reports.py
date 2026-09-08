@@ -317,6 +317,33 @@ def test_api_metadata_compacts_bulk_diagnostic_lists() -> None:
     }
 
 
+def test_unfiltered_report_uses_persisted_quality_sidecars(monkeypatch) -> None:
+    players = pl.DataFrame({"player_id": ["1"]})
+    pairs = pl.DataFrame({"pair_id": ["1_2"]})
+    monkeypatch.setattr(
+        reports,
+        "load_quality_sidecars",
+        lambda: (players, pairs, {"status": "available"}),
+    )
+
+    def unexpected_filtered_load(_results_df):
+        raise AssertionError("unfiltered report rebuilt quality aggregates")
+
+    monkeypatch.setattr(
+        reports, "load_filtered_quality_sidecars", unexpected_filtered_load
+    )
+    actual_players, actual_pairs, status = (
+        reports.load_report_quality_sidecars(
+            pl.DataFrame({"tournament_id": ["10"]}),
+            has_population_filter=False,
+        )
+    )
+
+    assert actual_players is players
+    assert actual_pairs is pairs
+    assert status["filter_scope"] == "all_quality_sessions"
+
+
 def test_schema_v1_quality_cache_is_rejected(tmp_path) -> None:
     _write_quality_cache(tmp_path)
     (tmp_path / reports.QUALITY_METADATA_PATH.name).write_text(
