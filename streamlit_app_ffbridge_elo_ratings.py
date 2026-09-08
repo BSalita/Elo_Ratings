@@ -3004,7 +3004,7 @@ def main():
             "Filter by player number",
             key="elo_player_number_filter",
             placeholder="Exact player number...",
-            help="Digits-only exact match; for pairs, matches either partner's player number.",
+            help="Digits-only exact match on license, Lancelot, or Classic/migration ID; for pairs, matches either partner.",
         )
 
         date_range_choice = st.selectbox(

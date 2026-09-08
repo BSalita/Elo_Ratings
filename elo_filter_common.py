@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
-from typing import Optional
+from typing import Optional, Sequence
+import pathlib
 import re
+import sys
 import unicodedata
 
 import polars as pl
@@ -88,17 +90,63 @@ def masterpoints_bounds(range_label: Optional[str]) -> tuple[float | None, float
     raise ValueError(f"Unknown masterpoints_range {label!r}; valid: {valid}")
 
 
-def _pair_contains_number_expr(column: str, number: str) -> pl.Expr:
+def _ffbridge_index_helpers():
+    try:
+        from mlBridge.mlBridgeFFIndexLib import expand_player_aliases, load_persons
+
+        return expand_player_aliases, load_persons
+    except ImportError:
+        pass
+    root = pathlib.Path(__file__).resolve().parent
+    mlbridge = next(
+        (path for path in (root / "mlBridge", root.parent / "mlBridge") if path.is_dir()),
+        None,
+    )
+    if mlbridge is None:
+        return None
+    parent = str(mlbridge.parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    try:
+        from mlBridge.mlBridgeFFIndexLib import expand_player_aliases, load_persons
+
+        return expand_player_aliases, load_persons
+    except ImportError:
+        return None
+
+
+def expand_ffbridge_player_numbers(tokens: Sequence[str]) -> list[str]:
+    """Map a license, Lancelot, or Classic id to all known aliases."""
+    cleaned = [str(token).strip() for token in tokens if str(token).strip()]
+    if not cleaned:
+        return []
+    helpers = _ffbridge_index_helpers()
+    if helpers is None:
+        return list(dict.fromkeys(cleaned))
+    expand_player_aliases, load_persons = helpers
+    try:
+        persons = load_persons()
+    except (FileNotFoundError, OSError, ValueError):
+        return list(dict.fromkeys(cleaned))
+    return expand_player_aliases(persons, cleaned)
+
+
+def _pair_contains_number_expr(column: str, numbers: Sequence[str]) -> pl.Expr:
     parts = (
         pl.col(column)
         .cast(pl.Utf8)
         .str.replace_all("_", "-")
         .str.split("-")
     )
-    return (
-        (parts.list.get(0, null_on_oob=True) == number)
-        | (parts.list.get(1, null_on_oob=True) == number)
-    )
+    left = parts.list.get(0, null_on_oob=True)
+    right = parts.list.get(1, null_on_oob=True)
+    predicate = None
+    for number in numbers:
+        part = (left == number) | (right == number)
+        predicate = part if predicate is None else predicate | part
+    if predicate is None:
+        return pl.lit(False)
+    return predicate
 
 
 def normalize_fuzzy_text(value: object) -> str:
@@ -208,12 +256,13 @@ def filter_identity_table(
         id_column = player_id_column if rating_type == "Players" else pair_id_column
         if id_column not in result.columns:
             raise ValueError(f"Missing identity column {id_column!r}")
+        number_tokens = [number_token]
         if rating_type == "Players":
             result = result.filter(
-                pl.col(id_column).cast(pl.Utf8) == number_token
+                pl.col(id_column).cast(pl.Utf8).is_in(number_tokens)
             )
         else:
-            result = result.filter(_pair_contains_number_expr(id_column, number_token))
+            result = result.filter(_pair_contains_number_expr(id_column, number_tokens))
     return result
 
 
@@ -255,13 +304,28 @@ def filter_ffbridge_leaderboard(
     player_number: Optional[str] = None,
 ) -> pl.DataFrame:
     """FFBridge sidebar identity filters applied after the Top-N query."""
-    return filter_identity_table(
+    number_token = (player_number or "").strip()
+    if number_token and not number_token.isdigit():
+        raise ValueError("player_number must contain digits only")
+    aliases = (
+        expand_ffbridge_player_numbers([number_token]) if number_token else None
+    )
+    result = filter_identity_table(
         df,
         rating_type=rating_type,
         player_name=player_name,
-        player_number=player_number,
+        player_number=None,
         player_name_column="Player_Name",
         player_id_column="Player_ID",
         pair_name_column="Pair_Name",
         pair_id_column="Pair_ID",
     )
+    if not aliases or result.is_empty():
+        return result
+    if rating_type == "Players":
+        if "Player_ID" not in result.columns:
+            raise ValueError("Missing identity column 'Player_ID'")
+        return result.filter(pl.col("Player_ID").cast(pl.Utf8).is_in(aliases))
+    if "Pair_ID" not in result.columns:
+        raise ValueError("Missing identity column 'Pair_ID'")
+    return result.filter(_pair_contains_number_expr("Pair_ID", aliases))

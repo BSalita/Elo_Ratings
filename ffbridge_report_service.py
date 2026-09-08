@@ -17,6 +17,7 @@ import duckdb
 import polars as pl
 
 from elo_filter_common import (
+    expand_ffbridge_player_numbers,
     filter_ffbridge_leaderboard,
     filter_fuzzy_text,
     filter_normalized_substring,
@@ -1444,14 +1445,15 @@ def run_player_history(
     pid = str(player_id).strip()
     if not pid.isdigit():
         raise ValueError("player_id must contain digits only")
+    aliases = expand_ffbridge_player_numbers([pid]) or [pid]
     normalized_score = score.strip().lower()
     if normalized_score not in {"scratch", "handicap"}:
         raise ValueError("score must be either Scratch or Handicap")
     results_df, meta = load_results(api_key, fetch_iv)
     results_df = filter_valid_percentages(results_df)
     player_expr = (
-        (pl.col("player1_id").cast(pl.Utf8) == pid)
-        | (pl.col("player2_id").cast(pl.Utf8) == pid)
+        pl.col("player1_id").cast(pl.Utf8).is_in(aliases)
+        | pl.col("player2_id").cast(pl.Utf8).is_in(aliases)
     )
     all_sessions = results_df.filter(player_expr)
     category = "Handicap" if normalized_score == "handicap" else "Scratch"

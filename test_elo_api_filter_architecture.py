@@ -45,6 +45,42 @@ class SharedFilterTests(unittest.TestCase):
         )
         self.assertEqual(actual["Pair_ID"].to_list(), ["12-345"])
 
+    def test_ffbridge_number_matches_license_or_lancelot_alias(self) -> None:
+        source = pl.DataFrame(
+            {
+                "Player_Name": ["Robert SALITA", "Other"],
+                "Player_ID": ["597539", "111"],
+            }
+        )
+        with patch(
+            "elo_filter_common.expand_ffbridge_player_numbers",
+            return_value=["9500754", "246273", "597539"],
+        ):
+            actual = filter_ffbridge_leaderboard(
+                source,
+                rating_type="Players",
+                player_number="9500754",
+            )
+        self.assertEqual(actual["Player_ID"].to_list(), ["597539"])
+
+    def test_ffbridge_pair_number_matches_classic_alias(self) -> None:
+        source = pl.DataFrame(
+            {
+                "Pair_Name": ["Robert / Partner", "Other / Pair"],
+                "Pair_ID": ["597539-111", "222-333"],
+            }
+        )
+        with patch(
+            "elo_filter_common.expand_ffbridge_player_numbers",
+            return_value=["9500754", "246273", "597539"],
+        ):
+            actual = filter_ffbridge_leaderboard(
+                source,
+                rating_type="Pairs",
+                player_number="9500754",
+            )
+        self.assertEqual(actual["Pair_ID"].to_list(), ["597539-111"])
+
     def test_ffbridge_tournament_and_club_filters_are_fuzzy(self) -> None:
         source = pl.DataFrame(
             {
