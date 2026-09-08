@@ -10,6 +10,7 @@ imports here.
 import json
 import os
 import pathlib
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -1662,15 +1663,61 @@ def run_leaderboard_report(
     }
 
 
-def run_player_history(
+_PLAYER_HISTORY_COLUMNS = (
+    "date", "tournament_id", "club_name", "pair_id", "pair_name",
+    "player1_id", "player1_name", "player2_id", "player2_name",
+    "Club_Scratch_Pct", "Club_Handicap_Pct",
+    "National_Scratch_Pct", "National_Handicap_Pct",
+    "Club_Scratch_Rank", "Club_Handicap_Rank",
+    "National_Scratch_Rank", "National_Handicap_Rank",
+    "Theoretical_Rank",
+    "Pct_Used", "Score_Source", "Scoring_Mode", "iv_bonus",
+    "score_source", "score_status", "scratch_score_status",
+    "handicap_score_status", "score_source_url",
+    "player1_scratch_elo_after", "player2_scratch_elo_after",
+    "player1_handicap_elo_after", "player2_handicap_elo_after",
+    "Results_URL",
+)
+_SQL_FORBIDDEN = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|COPY|PRAGMA|ATTACH|DETACH|"
+    r"EXPORT|IMPORT|INSTALL|LOAD|CALL|SET|RESET|VACUUM|CHECKPOINT)\b",
+    re.IGNORECASE,
+)
+DEFAULT_HISTORY_SQL_LIMIT = 50
+MAX_HISTORY_SQL_LIMIT = 200
+
+
+def _require_select_sql(sql: str) -> str:
+    cleaned = (sql or "").strip().rstrip(";")
+    if not cleaned:
+        raise ValueError("sql is required")
+    if _SQL_FORBIDDEN.search(cleaned):
+        raise ValueError("Only SELECT/WITH queries against table self are allowed")
+    head = cleaned.split(None, 1)[0].upper()
+    if head not in {"SELECT", "WITH"}:
+        raise ValueError("Only SELECT/WITH queries against table self are allowed")
+    return cleaned
+
+
+def _normalize_history_date(value: Optional[str], *, field: str) -> Optional[str]:
+    if value is None or not str(value).strip():
+        return None
+    token = str(value).strip()[:10]
+    try:
+        datetime.strptime(token, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"{field} must be YYYY-MM-DD") from exc
+    return token
+
+
+def _player_history_frame(
     player_id: str,
     *,
-    limit: int = 100,
     score: str = "Scratch",
     api_key: Optional[str] = None,
     fetch_iv: bool = True,
-) -> Dict[str, Any]:
-    """Return one player's persisted per-session history."""
+) -> tuple[pl.DataFrame, Dict[str, Any], str, str]:
+    """Projected per-session history for one player. No rank/date/limit filters."""
     pid = str(player_id).strip()
     if not pid.isdigit():
         raise ValueError("player_id must contain digits only")
@@ -1705,32 +1752,144 @@ def run_player_history(
         all_sessions = all_sessions.with_columns(
             pl.lit(None, dtype=pl.Utf8).alias("Results_URL")
         )
-    wanted = [
-        "date", "tournament_id", "club_name", "pair_id", "pair_name",
-        "player1_id", "player1_name", "player2_id", "player2_name",
-        "Club_Scratch_Pct", "Club_Handicap_Pct",
-        "National_Scratch_Pct", "National_Handicap_Pct",
-        "Club_Scratch_Rank", "Club_Handicap_Rank",
-        "National_Scratch_Rank", "National_Handicap_Rank",
-        "Theoretical_Rank",
-        "Pct_Used", "Score_Source", "Scoring_Mode", "iv_bonus",
-        "score_source", "score_status", "scratch_score_status",
-        "handicap_score_status", "score_source_url",
-        "player1_scratch_elo_after", "player2_scratch_elo_after",
-        "player1_handicap_elo_after", "player2_handicap_elo_after",
-        "Results_URL",
-    ]
-    sessions = (
-        all_sessions.sort("date", descending=True)
-        .select([column for column in wanted if column in all_sessions.columns])
-        .head(limit)
+    sessions = all_sessions.select(
+        [column for column in _PLAYER_HISTORY_COLUMNS if column in all_sessions.columns]
+    )
+    return sessions, meta, category, pid
+
+
+def _apply_history_filters(
+    sessions: pl.DataFrame,
+    *,
+    category: str,
+    max_national_rank: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> pl.DataFrame:
+    filtered = sessions
+    date_from = _normalize_history_date(date_from, field="date_from")
+    date_to = _normalize_history_date(date_to, field="date_to")
+    if date_from or date_to:
+        if "date" not in filtered.columns:
+            raise ValueError("history rows have no date column")
+        date_key = pl.col("date").cast(pl.Utf8).str.slice(0, 10)
+        if date_from:
+            filtered = filtered.filter(date_key >= date_from)
+        if date_to:
+            filtered = filtered.filter(date_key <= date_to)
+    if max_national_rank is not None:
+        if max_national_rank < 1:
+            raise ValueError("max_national_rank must be >= 1")
+        rank_column = f"National_{category}_Rank"
+        if rank_column not in filtered.columns:
+            raise ValueError(f"{rank_column} is not in the history projection")
+        filtered = filtered.filter(
+            pl.col(rank_column).is_not_null() & (pl.col(rank_column) <= max_national_rank)
+        )
+    return filtered
+
+
+def run_player_history(
+    player_id: str,
+    *,
+    limit: int = 100,
+    score: str = "Scratch",
+    max_national_rank: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    api_key: Optional[str] = None,
+    fetch_iv: bool = True,
+) -> Dict[str, Any]:
+    """Return one player's persisted per-session history."""
+    sessions, meta, category, pid = _player_history_frame(
+        player_id, score=score, api_key=api_key, fetch_iv=fetch_iv
+    )
+    date_from = _normalize_history_date(date_from, field="date_from")
+    date_to = _normalize_history_date(date_to, field="date_to")
+    filtered = _apply_history_filters(
+        sessions,
+        category=category,
+        max_national_rank=max_national_rank,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    page = filtered.sort("date", descending=True).head(limit)
+    return {
+        "player_id": pid,
+        "score": category,
+        "sessions": page.to_dicts(),
+        "total_sessions": sessions.height,
+        "matched_sessions": filtered.height,
+        "max_national_rank": max_national_rank,
+        "date_from": date_from,
+        "date_to": date_to,
+        "results_links": results_url_status(page),
+        "dataset_built_at": meta.get("built_at"),
+        "dataset_schema_version": ELO_DATASET_SCHEMA_VERSION,
+    }
+
+
+def player_history_schema(
+    player_id: str,
+    *,
+    score: str = "Scratch",
+    api_key: Optional[str] = None,
+    fetch_iv: bool = True,
+) -> Dict[str, Any]:
+    """Column names and dtypes for one player's history projection (`self`)."""
+    sessions, meta, category, pid = _player_history_frame(
+        player_id, score=score, api_key=api_key, fetch_iv=fetch_iv
     )
     return {
         "player_id": pid,
         "score": category,
-        "sessions": sessions.to_dicts(),
-        "total_sessions": all_sessions.height,
-        "results_links": results_url_status(sessions),
+        "table": "self",
+        "columns": [
+            {"name": name, "dtype": str(dtype)}
+            for name, dtype in zip(sessions.columns, sessions.dtypes)
+        ],
+        "total_sessions": sessions.height,
+        "dataset_built_at": meta.get("built_at"),
+        "dataset_schema_version": ELO_DATASET_SCHEMA_VERSION,
+    }
+
+
+def run_player_history_sql(
+    player_id: str,
+    sql: str,
+    *,
+    score: str = "Scratch",
+    limit: int = DEFAULT_HISTORY_SQL_LIMIT,
+    api_key: Optional[str] = None,
+    fetch_iv: bool = True,
+) -> Dict[str, Any]:
+    """DuckDB SELECT against one player's history registered as table `self`."""
+    if limit < 1 or limit > MAX_HISTORY_SQL_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_HISTORY_SQL_LIMIT}")
+    cleaned = _require_select_sql(sql)
+    sessions, meta, category, pid = _player_history_frame(
+        player_id, score=score, api_key=api_key, fetch_iv=fetch_iv
+    )
+    connection = duckdb.connect()
+    try:
+        connection.register("self", sessions)
+        try:
+            result = connection.execute(cleaned).pl()
+        except duckdb.Error as exc:
+            raise ValueError(str(exc)) from exc
+    finally:
+        connection.close()
+    truncated = result.height > limit
+    if truncated:
+        result = result.head(limit)
+    return {
+        "player_id": pid,
+        "score": category,
+        "sql": cleaned,
+        "rows": result.to_dicts(),
+        "row_count": result.height,
+        "truncated": truncated,
+        "total_sessions": sessions.height,
         "dataset_built_at": meta.get("built_at"),
         "dataset_schema_version": ELO_DATASET_SCHEMA_VERSION,
     }

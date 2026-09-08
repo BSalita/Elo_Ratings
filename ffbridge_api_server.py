@@ -7,6 +7,7 @@ import threading
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 
 import ffbridge_board_service as boards
 import ffbridge_report_service as reports
@@ -14,8 +15,16 @@ import ffbridge_session_ranking_service as rankings
 from streamlitlib.memory_usage import get_memory_usage_dict
 
 
-FFBRIDGE_API_BUILD_TAG = "2026-09-08-report-singleflight"
+FFBRIDGE_API_BUILD_TAG = "2026-09-09-player-history-sql"
 app = FastAPI(title="FFBridge Elo API", version="1.5.0")
+
+
+class PlayerHistorySqlBody(BaseModel):
+    player_id: str = Field(..., pattern=r"^\d+$")
+    sql: str
+    score: str = Field("Scratch", pattern="^(Scratch|Handicap)$")
+    limit: int = Field(reports.DEFAULT_HISTORY_SQL_LIMIT, ge=1, le=reports.MAX_HISTORY_SQL_LIMIT)
+    api_backend: str | None = None
 
 
 def _run(callable_, /, **kwargs):
@@ -147,6 +156,9 @@ def player_history(
     player_id: str = Query(..., pattern=r"^\d+$"),
     limit: int = Query(100, ge=1, le=500),
     score: str = Query("Scratch", pattern="^(Scratch|Handicap)$"),
+    max_national_rank: int | None = Query(None, ge=1, le=5000),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
     api_backend: str | None = Query(None),
 ) -> dict:
     """Return canonical score provenance and Results_URL for newest sessions."""
@@ -155,7 +167,38 @@ def player_history(
         player_id=player_id,
         limit=limit,
         score=score,
+        max_national_rank=max_national_rank,
+        date_from=date_from,
+        date_to=date_to,
         api_key=api_backend,
+    )
+
+
+@app.get("/ffbridge/player-history/schema")
+def player_history_schema(
+    player_id: str = Query(..., pattern=r"^\d+$"),
+    score: str = Query("Scratch", pattern="^(Scratch|Handicap)$"),
+    api_backend: str | None = Query(None),
+) -> dict:
+    """Column names and dtypes for one player's history table `self`."""
+    return _run(
+        reports.player_history_schema,
+        player_id=player_id,
+        score=score,
+        api_key=api_backend,
+    )
+
+
+@app.post("/ffbridge/player-history/sql")
+def player_history_sql(body: PlayerHistorySqlBody) -> dict:
+    """DuckDB SELECT against one player's history registered as table `self`."""
+    return _run(
+        reports.run_player_history_sql,
+        player_id=body.player_id,
+        sql=body.sql,
+        score=body.score,
+        limit=body.limit,
+        api_key=body.api_backend,
     )
 
 
