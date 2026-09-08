@@ -12,6 +12,7 @@ import os
 import pathlib
 import threading
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
@@ -1491,6 +1492,53 @@ def show_top_pairs(
 # -------------------------------
 # One-call report (used by the MCP server)
 # -------------------------------
+def _serialized_latest_report(function):
+    """Single-flight identical reports and protect DuckDB's default connection."""
+    lock = threading.Lock()
+    missing = object()
+    cached_key: Any = missing
+    cached_value: Any = None
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        nonlocal cached_key, cached_value
+        api_key = kwargs.get("api_key") or default_api_key()
+        fetch_iv = kwargs.get("fetch_iv", True)
+        dataset_key = resolve_elo_cache_key(api_key, fetch_iv)
+        source_paths: List[pathlib.Path] = []
+        if dataset_key is not None:
+            results_path, _players_path, meta_path = elo_cache_paths(dataset_key)
+            source_paths.extend((results_path, meta_path))
+        source_paths.extend(
+            (
+                QUALITY_BOARDS_PATH,
+                QUALITY_PLAYERS_PATH,
+                QUALITY_PAIRS_PATH,
+                QUALITY_METADATA_PATH,
+            )
+        )
+        source_signature = tuple(
+            (str(path), path.stat().st_mtime_ns)
+            for path in source_paths
+            if path.exists()
+        )
+        call_key = (
+            args,
+            tuple(sorted(kwargs.items())),
+            source_signature,
+        )
+        with lock:
+            if cached_key == call_key:
+                return cached_value
+            value = function(*args, **kwargs)
+            cached_key = call_key
+            cached_value = value
+            return value
+
+    return wrapped
+
+
+@_serialized_latest_report
 def run_leaderboard_report(
     *,
     rating: str = "Players",

@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+import time
 from datetime import date
 
 import polars as pl
@@ -342,6 +344,32 @@ def test_unfiltered_report_uses_persisted_quality_sidecars(monkeypatch) -> None:
     assert actual_players is players
     assert actual_pairs is pairs
     assert status["filter_scope"] == "all_quality_sessions"
+
+
+def test_identical_reports_are_singleflight_cached(monkeypatch) -> None:
+    monkeypatch.setattr(reports, "resolve_elo_cache_key", lambda *_args: None)
+    calls = 0
+
+    @reports._serialized_latest_report
+    def report(*, top_n=10, api_key=None, fetch_iv=True):
+        nonlocal calls
+        calls += 1
+        time.sleep(0.1)
+        return {"top_n": top_n}
+
+    results = []
+
+    def worker() -> None:
+        results.append(report(top_n=10))
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert calls == 1
+    assert results == [{"top_n": 10}] * 6
 
 
 def test_schema_v1_quality_cache_is_rejected(tmp_path) -> None:
