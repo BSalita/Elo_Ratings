@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
@@ -10,9 +11,10 @@ from fastapi import FastAPI, HTTPException, Query
 import ffbridge_board_service as boards
 import ffbridge_report_service as reports
 import ffbridge_session_ranking_service as rankings
+from streamlitlib.memory_usage import get_memory_usage_dict
 
 
-FFBRIDGE_API_BUILD_TAG = "2026-08-31-role-aware-quality"
+FFBRIDGE_API_BUILD_TAG = "2026-09-08-liveness-health"
 app = FastAPI(title="FFBridge Elo API", version="1.5.0")
 
 
@@ -25,23 +27,31 @@ def _run(callable_, /, **kwargs):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+def _warm_dataset() -> None:
+    try:
+        reports.load_results()
+        print("[ffbridge-api] dataset warmup done", flush=True)
+    except Exception as exc:
+        print(f"[ffbridge-api] dataset warmup failed: {exc}", flush=True)
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    threading.Thread(target=_warm_dataset, name="ffbridge-api-warmup", daemon=True).start()
+
+
 @app.get("/health")
 def health() -> dict:
-    info = _run(reports.dataset_info)
+    """Liveness only. Do not load parquets here — that OOMs the shared container
+    and makes MortyBridgeBot's 2s health probe time out while Streamlit stays up.
+    Dataset details live on /ffbridge/dataset-info.
+    """
     return {
         "status": "ok",
         "service": "ffbridge-api",
         "api_version": app.version,
         "build_tag": FFBRIDGE_API_BUILD_TAG,
-        "dataset_schema_version": info.get("dataset_schema_version"),
-        "dataset_cache_key": info.get("dataset_cache_key"),
-        "dataset_built_at": info.get("built_at"),
-        "result_rows": info.get("result_rows"),
-        "score_provenance": info.get("score_provenance", {}),
-        "results_links": info.get("results_links", {}),
-        "results_link_policy": info.get("results_link_policy"),
-        "quality_status": info.get("quality_status"),
-        "quality_metric_definitions": info.get("quality_metric_definitions", {}),
+        "memory": get_memory_usage_dict(),
     }
 
 

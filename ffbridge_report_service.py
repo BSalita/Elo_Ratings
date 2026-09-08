@@ -565,6 +565,72 @@ def _attach_quality_sidecar(
     )
 
 
+def _quality_status_snapshot() -> Dict[str, Any]:
+    """Read quality metadata only; do not load sidecar parquets."""
+    paths = (
+        QUALITY_BOARDS_PATH,
+        QUALITY_PLAYERS_PATH,
+        QUALITY_PAIRS_PATH,
+        QUALITY_METADATA_PATH,
+    )
+    if not all(path.exists() for path in paths):
+        return {
+            "status": "unavailable",
+            "reason": "quality_cache_missing",
+            "cutoff": None,
+        }
+    try:
+        metadata = json.loads(QUALITY_METADATA_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {
+            "status": "unavailable",
+            "reason": "quality_metadata_unreadable",
+            "cutoff": None,
+        }
+    return {
+        "status": "available",
+        "cutoff": metadata.get("cutoff"),
+        "schema_version": metadata.get("schema_version"),
+    }
+
+
+def dataset_health(api_key: Optional[str] = None, fetch_iv: bool = True) -> Dict[str, Any]:
+    """Fast dataset snapshot for /health without loading result rows into RAM."""
+    key_api = api_key or default_api_key()
+    key = resolve_elo_cache_key(key_api, fetch_iv)
+    if key is None:
+        raise FileNotFoundError(
+            f"No persisted FFBridge Elo parquet set for api_key={key_api!r} "
+            f"fetch_iv={fetch_iv} under {ELO_CACHE_DIR}."
+        )
+    results_path, _players_path, meta_path = elo_cache_paths(key)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    result_rows = int(
+        pl.scan_parquet(results_path).select(pl.len()).collect().item()
+    )
+    quality_status = _quality_status_snapshot()
+    cached = _RESULTS_CACHE.get((key_api, fetch_iv))
+    if cached is not None and cached[0] == key:
+        results_df = cached[2]
+        score_provenance = score_provenance_counts(results_df)
+        results_links = ffbridge_results_link_status(results_df)
+    else:
+        score_provenance = {}
+        results_links = {"status": "unknown"}
+    return {
+        "dataset_schema_version": ELO_DATASET_SCHEMA_VERSION,
+        "dataset_cache_key": key,
+        "built_at": meta.get("built_at"),
+        "result_rows": result_rows,
+        "score_provenance": score_provenance,
+        "results_links": results_links,
+        "results_link_policy": "best_effort",
+        "quality_status": quality_status["status"],
+        "quality": quality_status,
+        "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
+    }
+
+
 def dataset_info(api_key: Optional[str] = None, fetch_iv: bool = True) -> Dict[str, Any]:
     """Summary of the persisted dataset (no result rows)."""
     results_df, meta = load_results(api_key, fetch_iv)
