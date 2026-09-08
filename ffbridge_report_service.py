@@ -10,6 +10,7 @@ imports here.
 import json
 import os
 import pathlib
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -270,6 +271,7 @@ def resolve_elo_cache_key(api_key: str, fetch_iv: bool) -> Optional[str]:
 # Per (api_key, fetch_iv): (cache_key, results_mtime, results_df, meta). Reloads
 # when a rebuild replaces the parquet (mtime change) or resolves to a new key.
 _RESULTS_CACHE: Dict[Tuple[str, bool], Tuple[str, float, pl.DataFrame, Dict[str, Any]]] = {}
+_RESULTS_LOCK = threading.Lock()
 _QUALITY_CACHE: Dict[
     pathlib.Path,
     Tuple[
@@ -295,18 +297,24 @@ def load_results(
             "build_ffbridge_elo_parquets.py (or let ffbridge-elo build it) first."
         )
     results_path, _players_path, meta_path = elo_cache_paths(key)
+    cache_key = (key_api, fetch_iv)
+    cached = _RESULTS_CACHE.get(cache_key)
     mtime = results_path.stat().st_mtime
-    cached = _RESULTS_CACHE.get((key_api, fetch_iv))
     if cached is not None and cached[0] == key and cached[1] == mtime:
         return cached[2], cached[3]
-    results_df = pl.read_parquet(results_path)
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    _RESULTS_CACHE[(key_api, fetch_iv)] = (key, mtime, results_df, meta)
-    print(
-        f"[ffbridge_report_service] loaded '{key}' ({results_df.height} result rows)",
-        flush=True,
-    )
-    return results_df, meta
+    with _RESULTS_LOCK:
+        mtime = results_path.stat().st_mtime
+        cached = _RESULTS_CACHE.get(cache_key)
+        if cached is not None and cached[0] == key and cached[1] == mtime:
+            return cached[2], cached[3]
+        results_df = pl.read_parquet(results_path)
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        _RESULTS_CACHE[cache_key] = (key, mtime, results_df, meta)
+        print(
+            f"[ffbridge_report_service] loaded '{key}' ({results_df.height} result rows)",
+            flush=True,
+        )
+        return results_df, meta
 
 
 def _validate_quality_frame(
