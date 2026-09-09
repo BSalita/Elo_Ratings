@@ -1364,14 +1364,19 @@ def augment_raw_session(raw: pl.DataFrame) -> pl.DataFrame:
     previous_level = augment_logger.level
     augment_logger.setLevel(logging.WARNING)
     try:
-        augmented, _ = AllAugmentations(
-            converted,
-            None,
-            sd_productions=0,
-            max_sd_adds=0,
-            output_progress=False,
-            incorporate_elo_ratings=False,
-        ).perform_all_augmentations()
+        try:
+            augmented, _ = AllAugmentations(
+                converted,
+                None,
+                sd_productions=0,
+                max_sd_adds=0,
+                output_progress=False,
+                incorporate_elo_ratings=False,
+            ).perform_all_augmentations()
+        except pl.exceptions.InvalidOperationError as exc:
+            raise NoQualityRowsError(
+                f"Unsupported declarer/contract values: {exc}"
+            ) from exc
     finally:
         augment_logger.setLevel(previous_level)
     return augmented
