@@ -1665,7 +1665,7 @@ def run_leaderboard_report(
 
 
 _PLAYER_HISTORY_COLUMNS = (
-    "date", "tournament_id", "club_name", "pair_id", "pair_name",
+    "date", "tournament_id", "tournament_name", "club_name", "pair_id", "pair_name",
     "player1_id", "player1_name", "player2_id", "player2_name",
     "Club_Scratch_Pct", "Club_Handicap_Pct",
     "National_Scratch_Pct", "National_Handicap_Pct",

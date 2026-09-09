@@ -24,6 +24,7 @@ def _history_frame() -> pl.DataFrame:
                 "2025-08-01",
             ],
             "tournament_id": [str(280000 + index) for index in range(12)],
+            "tournament_name": ["Rondes de France"] * 8 + ["Simultané Octopus"] * 4,
             "group_id": ["21333"] * 12,
             "club_name": ["BC Levallois"] * 12,
             "pair_name": ["SALITA – partner"] * 12,
@@ -55,6 +56,7 @@ class PlayerHistorySqlTests(unittest.TestCase):
 
         names = [column["name"] for column in payload["columns"]]
         self.assertIn("National_Scratch_Rank", names)
+        self.assertIn("tournament_name", names)
         self.assertEqual(payload["table"], "self")
         self.assertEqual(payload["total_sessions"], 12)
 
@@ -97,6 +99,7 @@ class PlayerHistorySqlTests(unittest.TestCase):
         self.assertEqual(payload["matched_sessions"], 10)
         self.assertEqual(len(payload["sessions"]), 10)
         self.assertEqual(payload["sessions"][0]["National_Scratch_Rank"], 2)
+        self.assertEqual(payload["sessions"][0]["tournament_name"], "Rondes de France")
 
     def test_illegal_sql_is_rejected(self) -> None:
         with patch.object(
