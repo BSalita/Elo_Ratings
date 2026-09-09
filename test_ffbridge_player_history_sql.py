@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import polars as pl
@@ -113,6 +115,57 @@ class PlayerHistorySqlTests(unittest.TestCase):
                 reports.run_player_history_sql(
                     "246273", "SELECT missing_column FROM self"
                 )
+
+    def test_values_literals_are_rejected(self) -> None:
+        with patch.object(
+            reports,
+            "load_results",
+            return_value=(_history_frame(), {"built_at": "2026-09-08T00:00:00Z"}),
+        ):
+            with self.assertRaises(ValueError) as exc:
+                reports.run_player_history_sql(
+                    "246273",
+                    "WITH sessions(session_id) AS (VALUES ('280000')) "
+                    "SELECT * FROM sessions",
+                )
+        self.assertIn("VALUES", str(exc.exception))
+
+    def test_join_club_board_results(self) -> None:
+        boards = pl.DataFrame(
+            {
+                "session_id": ["280000", "280000", "280001"],
+                "Declarer": ["246273", "1", "246273"],
+                "Declarer_Pct": [0.8, 0.4, 0.5],
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / reports.CLUB_BOARD_RESULTS_FILENAME
+            boards.write_parquet(path)
+            with patch.object(
+                reports,
+                "load_results",
+                return_value=(_history_frame(), {"built_at": "2026-09-08T00:00:00Z"}),
+            ), patch.dict(
+                "os.environ",
+                {"FFBRIDGE_STATS_CLUB_BOARD_RESULTS": str(path)},
+                clear=False,
+            ):
+                payload = reports.run_player_history_sql(
+                    "246273",
+                    """
+                    SELECT h.tournament_id,
+                           AVG(CASE WHEN s.Declarer = '246273'
+                                    THEN s.Declarer_Pct END) AS mean_declarer_pct
+                    FROM self h
+                    LEFT JOIN club_board_results s
+                      ON s.session_id = h.tournament_id
+                    GROUP BY h.tournament_id
+                    ORDER BY h.tournament_id
+                    LIMIT 2
+                    """,
+                )
+        self.assertEqual(payload["row_count"], 2)
+        self.assertAlmostEqual(payload["rows"][0]["mean_declarer_pct"], 0.8)
 
 
 if __name__ == "__main__":

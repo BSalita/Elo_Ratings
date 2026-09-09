@@ -1686,6 +1686,30 @@ _SQL_FORBIDDEN = re.compile(
 )
 DEFAULT_HISTORY_SQL_LIMIT = 50
 MAX_HISTORY_SQL_LIMIT = 200
+CLUB_BOARD_RESULTS_TABLE = "club_board_results"
+CLUB_BOARD_RESULTS_FILENAME = "ffbridge_club_board_results_augmented.parquet"
+_SQL_VALUES_LITERALS = re.compile(r"\bVALUES\s*\(", re.IGNORECASE)
+_SQL_TABLE_NAME = re.compile(
+    rf"\b{re.escape(CLUB_BOARD_RESULTS_TABLE)}\b", re.IGNORECASE
+)
+
+
+def resolve_club_board_results_path() -> Optional[pathlib.Path]:
+    env_path = (os.environ.get("FFBRIDGE_STATS_CLUB_BOARD_RESULTS") or "").strip()
+    candidates = [pathlib.Path(env_path)] if env_path else []
+    for root in (
+        os.environ.get("BRIDGESTATS_EXTRA_DATA_DIR"),
+        os.environ.get("BRIDGESTATS_FFBRIDGE_DATA_DIR"),
+        "/data/ffbridge",
+        "/app/extra-data",
+        "/app/data",
+    ):
+        if root:
+            candidates.append(pathlib.Path(root) / CLUB_BOARD_RESULTS_FILENAME)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _require_select_sql(sql: str) -> str:
@@ -1694,10 +1718,31 @@ def _require_select_sql(sql: str) -> str:
         raise ValueError("sql is required")
     if _SQL_FORBIDDEN.search(cleaned):
         raise ValueError("Only SELECT/WITH queries against table self are allowed")
+    if _SQL_VALUES_LITERALS.search(cleaned):
+        raise ValueError(
+            "Do not embed previous rows with VALUES. Rewrite the previous "
+            f"SELECT and JOIN {CLUB_BOARD_RESULTS_TABLE}."
+        )
     head = cleaned.split(None, 1)[0].upper()
     if head not in {"SELECT", "WITH"}:
         raise ValueError("Only SELECT/WITH queries against table self are allowed")
     return cleaned
+
+
+def _register_club_board_results(connection: duckdb.DuckDBPyConnection, sql: str) -> None:
+    if not _SQL_TABLE_NAME.search(sql):
+        return
+    path = resolve_club_board_results_path()
+    if path is None:
+        raise ValueError(
+            f"{CLUB_BOARD_RESULTS_TABLE} is not available. Set "
+            "FFBRIDGE_STATS_CLUB_BOARD_RESULTS to the augmented parquet."
+        )
+    escaped = str(path).replace("'", "''")
+    connection.execute(
+        f"CREATE VIEW {CLUB_BOARD_RESULTS_TABLE} AS "
+        f"SELECT * FROM read_parquet('{escaped}')"
+    )
 
 
 def _normalize_history_date(value: Optional[str], *, field: str) -> Optional[str]:
@@ -1900,6 +1945,9 @@ def player_history_schema(
         "player_id": pid,
         "score": category,
         "table": "self",
+        "join_tables": [CLUB_BOARD_RESULTS_TABLE]
+        if resolve_club_board_results_path() is not None
+        else [],
         "columns": [
             {"name": name, "dtype": str(dtype)}
             for name, dtype in zip(sessions.columns, sessions.dtypes)
@@ -1919,7 +1967,11 @@ def run_player_history_sql(
     api_key: Optional[str] = None,
     fetch_iv: bool = True,
 ) -> Dict[str, Any]:
-    """DuckDB SELECT against one player's history registered as table `self`."""
+    """DuckDB SELECT against one player's history registered as table `self`.
+
+    JOIN club_board_results on session_id = tournament_id when that parquet
+    is configured. Do not paste previous result rows into VALUES.
+    """
     if limit < 1 or limit > MAX_HISTORY_SQL_LIMIT:
         raise ValueError(f"limit must be between 1 and {MAX_HISTORY_SQL_LIMIT}")
     cleaned = _require_select_sql(sql)
@@ -1929,6 +1981,7 @@ def run_player_history_sql(
     connection = duckdb.connect()
     try:
         connection.register("self", sessions)
+        _register_club_board_results(connection, cleaned)
         try:
             result = connection.execute(cleaned).pl()
         except duckdb.Error as exc:
