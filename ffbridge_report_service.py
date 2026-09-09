@@ -1729,15 +1729,69 @@ def _require_select_sql(sql: str) -> str:
     return cleaned
 
 
+def _stats_api_base_url() -> str:
+    return (
+        os.environ.get("FFBRIDGE_STATS_API_BASE_URL")
+        or os.environ.get("BRIDGESTATS_FFBRIDGE_API_BASE_URL")
+        or "http://bridgestats-ffbridge:8525"
+    ).rstrip("/")
+
+
+def _run_history_sql_via_stats(
+    sql: str,
+    sessions: pl.DataFrame,
+    *,
+    player_id: str,
+    score: str,
+    limit: int,
+    meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    import requests
+
+    url = f"{_stats_api_base_url()}/ffbridge-stats/sql"
+    try:
+        response = requests.post(
+            url,
+            json={
+                "sql": sql,
+                "source": CLUB_BOARD_RESULTS_TABLE,
+                "limit": limit,
+                "tables": {"self": sessions.to_dicts()},
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise ValueError(
+            f"{CLUB_BOARD_RESULTS_TABLE} is not mounted on Elo and the stats "
+            f"API at {url} failed: {exc}"
+        ) from exc
+    payload = response.json()
+    if not isinstance(payload, dict) or "rows" not in payload:
+        raise ValueError(f"{CLUB_BOARD_RESULTS_TABLE} stats API returned no rows")
+    rows = payload["rows"]
+    if not isinstance(rows, list):
+        raise ValueError(f"{CLUB_BOARD_RESULTS_TABLE} stats API returned invalid rows")
+    return {
+        "player_id": player_id,
+        "score": score,
+        "sql": sql,
+        "rows": rows,
+        "row_count": len(rows),
+        "truncated": bool(payload.get("truncated")),
+        "total_sessions": sessions.height,
+        "dataset_built_at": meta.get("built_at"),
+        "dataset_schema_version": ELO_DATASET_SCHEMA_VERSION,
+        "joined_via": "ffbridge-stats",
+    }
+
+
 def _register_club_board_results(connection: duckdb.DuckDBPyConnection, sql: str) -> None:
     if not _SQL_TABLE_NAME.search(sql):
         return
     path = resolve_club_board_results_path()
     if path is None:
-        raise ValueError(
-            f"{CLUB_BOARD_RESULTS_TABLE} is not available. Set "
-            "FFBRIDGE_STATS_CLUB_BOARD_RESULTS to the augmented parquet."
-        )
+        raise FileNotFoundError(CLUB_BOARD_RESULTS_TABLE)
     escaped = str(path).replace("'", "''")
     connection.execute(
         f"CREATE VIEW {CLUB_BOARD_RESULTS_TABLE} AS "
@@ -1945,9 +1999,7 @@ def player_history_schema(
         "player_id": pid,
         "score": category,
         "table": "self",
-        "join_tables": [CLUB_BOARD_RESULTS_TABLE]
-        if resolve_club_board_results_path() is not None
-        else [],
+        "join_tables": [CLUB_BOARD_RESULTS_TABLE],
         "columns": [
             {"name": name, "dtype": str(dtype)}
             for name, dtype in zip(sessions.columns, sessions.dtypes)
@@ -1978,6 +2030,15 @@ def run_player_history_sql(
     sessions, meta, category, pid = _player_history_frame(
         player_id, score=score, api_key=api_key, fetch_iv=fetch_iv
     )
+    if _SQL_TABLE_NAME.search(cleaned) and resolve_club_board_results_path() is None:
+        return _run_history_sql_via_stats(
+            cleaned,
+            sessions,
+            player_id=pid,
+            score=category,
+            limit=limit,
+            meta=meta,
+        )
     connection = duckdb.connect()
     try:
         connection.register("self", sessions)

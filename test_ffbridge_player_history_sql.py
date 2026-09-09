@@ -167,6 +167,37 @@ class PlayerHistorySqlTests(unittest.TestCase):
         self.assertEqual(payload["row_count"], 2)
         self.assertAlmostEqual(payload["rows"][0]["mean_declarer_pct"], 0.8)
 
+    def test_join_uses_stats_api_when_parquet_is_missing(self) -> None:
+        class _Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {
+                    "rows": [{"tournament_id": "280000", "mean_declarer_pct": 0.8}],
+                    "truncated": False,
+                }
+
+        with patch.object(
+            reports,
+            "load_results",
+            return_value=(_history_frame(), {"built_at": "2026-09-08T00:00:00Z"}),
+        ), patch.object(
+            reports, "resolve_club_board_results_path", return_value=None
+        ), patch(
+            "requests.post", return_value=_Response()
+        ) as post:
+            payload = reports.run_player_history_sql(
+                "246273",
+                "SELECT h.tournament_id FROM self h "
+                "LEFT JOIN club_board_results s ON s.session_id = h.tournament_id",
+            )
+        self.assertEqual(payload["joined_via"], "ffbridge-stats")
+        self.assertEqual(payload["row_count"], 1)
+        body = post.call_args.kwargs.get("json") or post.call_args[1].get("json")
+        self.assertEqual(body["source"], "club_board_results")
+        self.assertEqual(body["tables"]["self"][0]["tournament_id"], "280000")
+
 
 if __name__ == "__main__":
     unittest.main()
