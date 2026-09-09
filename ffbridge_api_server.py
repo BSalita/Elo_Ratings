@@ -52,7 +52,7 @@ def _startup() -> None:
 @app.get("/health")
 def health() -> dict:
     """Liveness only. Do not load parquets here — that OOMs the shared container
-    and makes MortyBridgeBot's 2s health probe time out while Streamlit stays up.
+    and makes MortyBridgeMCP's 2s health probe time out while Streamlit stays up.
     Dataset details live on /ffbridge/dataset-info.
     """
     return {
