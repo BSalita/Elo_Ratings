@@ -430,9 +430,9 @@ def _import_ffbridge_lib() -> Any:
 def fetch_missing_artifacts(
     report: AuditReport,
     *,
-    timeout: float = 30.0,
+    timeout: float = 60.0,
     delay: float = 0.1,
-    max_attempts: int = 4,
+    max_attempts: int = 6,
     workers: int = 8,
 ) -> int:
     """Fetch only audit-reported missing files and write them to the raw cache."""
@@ -483,6 +483,12 @@ def fetch_missing_artifacts(
                     if getattr(exc.response, "status_code", None) == 404:
                         continue
                     raise
+                except requests.RequestException as exc:
+                    print(
+                        f"[quality-builder] skip ranking session {session.session_id}: {exc}",
+                        flush=True,
+                    )
+                    continue
                 if not isinstance(ranking, list):
                     raise ValueError(
                         f"Ranking fetch returned non-list for {session.session_id}"
@@ -529,6 +535,12 @@ def fetch_missing_artifacts(
                     if getattr(exc.response, "status_code", None) == 404:
                         return 0
                     raise
+                except requests.RequestException as exc:
+                    print(
+                        f"[quality-builder] skip team {team_id} session {session.session_id}: {exc}",
+                        flush=True,
+                    )
+                    return 0
                 if not isinstance(scores, list):
                     raise ValueError(
                         f"Scores fetch returned non-list for session={session.session_id}, "

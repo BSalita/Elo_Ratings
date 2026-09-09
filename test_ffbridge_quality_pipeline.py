@@ -8,6 +8,7 @@ from datetime import date
 from unittest import mock
 
 import polars as pl
+import requests
 
 from ffbridge_quality_pipeline import (
     AuditReport,
@@ -20,6 +21,7 @@ from ffbridge_quality_pipeline import (
     build_pair_sidecar,
     build_player_sidecar,
     discover_session_metadata,
+    fetch_missing_artifacts,
     flatten_team_scores,
     normalize_quality_frame,
     resolve_output_dir,
@@ -442,6 +444,48 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
             self.assertEqual(parsed["board_rows"], 2)
             self.assertTrue(all((out / name).is_file() for name in parsed["files"].values()))
             self.assertFalse(list(out.glob(".*.tmp")))
+
+    def test_fetch_missing_skips_read_timeout_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            report = AuditReport(
+                source_dir=str(root),
+                cutoff="2026-09-09",
+                training_session_count=0,
+                cached_session_count=1,
+                sessions=(
+                    SessionAudit(
+                        session_id="99",
+                        session_date="2026-01-02",
+                        metadata_path="99.json",
+                        in_training=False,
+                        ranking_present=True,
+                        expected_team_ids=("1", "2"),
+                        present_team_ids=(),
+                        missing_team_ids=("1", "2"),
+                    ),
+                ),
+            )
+            fake = mock.Mock()
+
+            def scores(team_id: int, session_id: int, **kwargs: object) -> list[dict[str, int]]:
+                if int(team_id) == 1:
+                    raise requests.exceptions.ReadTimeout("timed out")
+                return [{"board": 1}]
+
+            fake.get_team_session_scores.side_effect = scores
+            with mock.patch(
+                "ffbridge_quality_pipeline._import_ffbridge_lib", return_value=fake
+            ):
+                writes = fetch_missing_artifacts(
+                    report, timeout=0.01, max_attempts=1, workers=1, delay=0
+                )
+            self.assertEqual(writes, 1)
+            written = root / "results" / "teams" / "2" / "session" / "99" / "scores.json"
+            self.assertTrue(written.is_file())
+            self.assertFalse(
+                (root / "results" / "teams" / "1" / "session" / "99" / "scores.json").is_file()
+            )
 
     def test_output_dir_requires_explicit_path_or_environment(self) -> None:
         with mock.patch.dict("os.environ", {}, clear=True):

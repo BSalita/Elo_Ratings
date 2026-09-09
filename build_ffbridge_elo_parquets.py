@@ -24,7 +24,7 @@ What a rebuild does (and does NOT) refresh
 ------------------------------------------
 - Tournament LIST: fully re-fetched from the API (``force_refresh=True``) to
   discover new event IDs.
-- Event RESULTS (raw data): INCREMENTAL. Lancelot rankings from the last 90 days
+- Event RESULTS (raw data): INCREMENTAL. Lancelot rankings from the last 14 days
   and unpublished zero shells expire after six hours because FFBridge revises
   row counts, bonuses, and theoretical ranks after initial publication.
 - Elo ratings: FULL recompute from scratch over the entire history every time
@@ -37,7 +37,7 @@ What a rebuild does (and does NOT) refresh
   Lancelot, migration/Classic, and license identifiers without coupling its
   consumers to the Elo result schema.
 
-NUANCE — revisions older than the 90-day revalidation window are not picked up.
+NUANCE — revisions older than the 14-day revalidation window are not picked up.
 To force a full re-fetch of older results, delete the raw results cache on the
 volume so it is re-downloaded on the next rebuild, e.g.:
 
