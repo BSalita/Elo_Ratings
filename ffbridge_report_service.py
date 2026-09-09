@@ -20,6 +20,7 @@ import duckdb
 import polars as pl
 
 from elo_filter_common import (
+    _ffbridge_index_helpers,
     expand_ffbridge_player_numbers,
     filter_ffbridge_leaderboard,
     filter_fuzzy_text,
@@ -1787,6 +1788,61 @@ def _apply_history_filters(
             pl.col(rank_column).is_not_null() & (pl.col(rank_column) <= max_national_rank)
         )
     return filtered
+
+
+DEFAULT_PLAYER_LOOKUP_LIMIT = 10
+MAX_PLAYER_LOOKUP_LIMIT = 50
+
+
+def _index_lookup_helpers():
+    helpers = _ffbridge_index_helpers()
+    if helpers is None:
+        raise FileNotFoundError("Lancelot persons index is unavailable")
+    from mlBridge.mlBridgeFFIndexLib import lookup_person, lookup_persons_by_name
+
+    return helpers[1], lookup_person, lookup_persons_by_name
+
+
+def run_player_lookup(name: str, limit: int = DEFAULT_PLAYER_LOOKUP_LIMIT) -> Dict[str, Any]:
+    """Resolve an FFBridge name or number from the local persons index."""
+    query = str(name or "").strip()
+    if not query:
+        raise ValueError("name is required")
+    limit = max(1, min(int(limit), MAX_PLAYER_LOOKUP_LIMIT))
+    load_persons, lookup_person, lookup_persons_by_name = _index_lookup_helpers()
+    persons = load_persons()
+    if query.isdigit() or ":" in query:
+        person = lookup_person(persons, query)
+        rows = [person] if person is not None else []
+    else:
+        rows = lookup_persons_by_name(persons, query, limit=limit)
+    payload_rows = [
+        {
+            "player_id": str(row["lancelot_person_id"]),
+            "classic_person_id": (
+                str(row["classic_person_id"])
+                if row.get("classic_person_id") is not None
+                else None
+            ),
+            "license_number": (
+                str(row["license_number"])
+                if row.get("license_number") is not None
+                else None
+            ),
+            "player_name": row.get("display_name"),
+            "first_session_date": row.get("first_session_date"),
+            "last_session_date": row.get("last_session_date"),
+        }
+        for row in rows
+    ]
+    unique = len(payload_rows) == 1
+    return {
+        "query": query,
+        "rows": payload_rows,
+        "row_count": len(payload_rows),
+        "unique": unique,
+        "player_id": payload_rows[0]["player_id"] if unique else None,
+    }
 
 
 def run_player_history(

@@ -15,8 +15,8 @@ import ffbridge_session_ranking_service as rankings
 from streamlitlib.memory_usage import get_memory_usage_dict
 
 
-FFBRIDGE_API_BUILD_TAG = "2026-09-09-player-history-sql"
-app = FastAPI(title="FFBridge Elo API", version="1.5.0")
+FFBRIDGE_API_BUILD_TAG = "2026-09-09-player-lookup"
+app = FastAPI(title="FFBridge Elo API", version="1.6.0")
 
 
 class PlayerHistorySqlBody(BaseModel):
@@ -149,6 +149,15 @@ def tournaments(
         limit=limit,
         api_key=api_backend,
     )
+
+
+@app.get("/ffbridge/player-lookup")
+def player_lookup(
+    name: str = Query(..., min_length=1),
+    limit: int = Query(reports.DEFAULT_PLAYER_LOOKUP_LIMIT, ge=1, le=50),
+) -> dict:
+    """Resolve an FFBridge player name or number from the local persons index."""
+    return _run(reports.run_player_lookup, name=name, limit=limit)
 
 
 @app.get("/ffbridge/player-history")
