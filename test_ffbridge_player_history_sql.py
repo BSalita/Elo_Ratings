@@ -167,6 +167,45 @@ class PlayerHistorySqlTests(unittest.TestCase):
         self.assertEqual(payload["row_count"], 2)
         self.assertAlmostEqual(payload["rows"][0]["mean_declarer_pct"], 0.8)
 
+    def test_join_fabricates_contract_on_request(self) -> None:
+        boards = pl.DataFrame(
+            {
+                "session_id": ["280000", "280000"],
+                "BidLvl": [4, 1],
+                "BidSuit": ["H", "N"],
+                "Dbl": ["", "X"],
+                "Declarer_Direction": ["S", "W"],
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / reports.CLUB_BOARD_RESULTS_FILENAME
+            boards.write_parquet(path)
+            with patch.object(
+                reports,
+                "load_results",
+                return_value=(_history_frame(), {"built_at": "2026-09-08T00:00:00Z"}),
+            ), patch.dict(
+                "os.environ",
+                {"FFBRIDGE_STATS_CLUB_BOARD_RESULTS": str(path)},
+                clear=False,
+            ):
+                payload = reports.run_player_history_sql(
+                    "246273",
+                    """
+                    SELECT s.Contract
+                    FROM self h
+                    LEFT JOIN club_board_results s
+                      ON s.session_id = h.tournament_id
+                    WHERE h.tournament_id = '280000'
+                    ORDER BY s.Contract
+                    LIMIT 2
+                    """,
+                )
+        self.assertEqual(
+            [row["Contract"] for row in payload["rows"]],
+            ["1NXW", "4HS"],
+        )
+
     def test_join_uses_stats_api_when_parquet_is_missing(self) -> None:
         class _Response:
             def raise_for_status(self) -> None:

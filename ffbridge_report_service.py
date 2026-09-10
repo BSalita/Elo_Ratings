@@ -1793,10 +1793,31 @@ def _register_club_board_results(connection: duckdb.DuckDBPyConnection, sql: str
     if path is None:
         raise FileNotFoundError(CLUB_BOARD_RESULTS_TABLE)
     escaped = str(path).replace("'", "''")
-    connection.execute(
-        f"CREATE VIEW {CLUB_BOARD_RESULTS_TABLE} AS "
-        f"SELECT * FROM read_parquet('{escaped}')"
-    )
+    schema_names = set(pl.read_parquet_schema(str(path)).keys())
+    if re.search(r"\bContract\b", sql, re.IGNORECASE) and "Contract" not in schema_names:
+        missing = [
+            name
+            for name in ("BidLvl", "BidSuit", "Dbl", "Declarer_Direction")
+            if name not in schema_names
+        ]
+        if missing:
+            raise ValueError(
+                "Contract is not stored and cannot be fabricated; "
+                f"missing {', '.join(missing)}"
+            )
+        view_sql = (
+            "SELECT src.*, "
+            "CASE WHEN BidLvl IS NULL OR BidLvl = 0 THEN 'PASS' "
+            "ELSE CAST(BidLvl AS VARCHAR) "
+            "|| COALESCE(CAST(BidSuit AS VARCHAR), '') "
+            "|| COALESCE(CAST(Dbl AS VARCHAR), '') "
+            "|| COALESCE(CAST(Declarer_Direction AS VARCHAR), '') "
+            "END AS Contract "
+            f"FROM read_parquet('{escaped}') AS src"
+        )
+    else:
+        view_sql = f"SELECT * FROM read_parquet('{escaped}')"
+    connection.execute(f"CREATE VIEW {CLUB_BOARD_RESULTS_TABLE} AS {view_sql}")
 
 
 def _normalize_history_date(value: Optional[str], *, field: str) -> Optional[str]:
