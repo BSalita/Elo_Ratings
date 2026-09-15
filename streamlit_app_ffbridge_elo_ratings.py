@@ -1518,8 +1518,11 @@ def process_tournaments_to_elo(
             all_results.append(result_record)
 
     _elapsed = (datetime.now() - _t_start).total_seconds()
+    missing_set = {str(x) for x in cache_stats["missing_ids"]}
     cache_stats["processed_tournament_ids"] = [
-        str(t.get("id")) for t in sorted_tournaments if t.get("id") is not None
+        str(t.get("id"))
+        for t in sorted_tournaments
+        if t.get("id") is not None and str(t.get("id")) not in missing_set
     ]
     cache_stats.update({
         "official_rows": sum(
@@ -1875,6 +1878,50 @@ def _past_tournament_ids(all_tournaments: List[Dict[str, Any]]) -> set[str]:
     }
 
 
+def _recent_past_ids(
+    all_tournaments: List[Dict[str, Any]],
+    candidate_ids: set[str],
+    recent_days: int = lancelot_api.RECENT_RESULTS_DAYS,
+) -> set[str]:
+    """Candidate session IDs whose tournament date is within ``recent_days``."""
+    today = datetime.now().date()
+    recent: set[str] = set()
+    for tournament in all_tournaments:
+        tournament_id = tournament.get("id")
+        if tournament_id is None:
+            continue
+        tournament_id = str(tournament_id)
+        if tournament_id not in candidate_ids:
+            continue
+        date_text = str(tournament.get("date", ""))[:10]
+        try:
+            session_day = datetime.fromisoformat(date_text).date()
+        except ValueError:
+            continue
+        age_days = (today - session_day).days
+        if 0 <= age_days <= recent_days:
+            recent.add(tournament_id)
+    return recent
+
+
+def _elo_ids_still_needed(
+    eligible_ids: set[str],
+    processed_ids: set[str],
+    missing_ids: set[str],
+    all_tournaments: List[Dict[str, Any]],
+) -> set[str]:
+    """Past sessions that still need Elo rows.
+
+    Sessions that returned no results are retried for
+    ``RECENT_RESULTS_DAYS`` so a list entry published before Lancelot
+    imports rankings is not treated as permanently processed.
+    Older empty sessions stay skipped.
+    """
+    retry_ids = _recent_past_ids(all_tournaments, missing_ids)
+    done_ids = (processed_ids | missing_ids) - retry_ids
+    return eligible_ids - done_ids
+
+
 def _fetch_tournament_list_resilient(
     api_module,
     force_refresh: bool,
@@ -1961,13 +2008,15 @@ def _needs_elo_rebuild(
             f"{lancelot_api.PENDING_RESULTS_CACHE_HOURS}h)"
         )
     built_ids = {str(x) for x in meta.get("processed_tournament_ids", [])}
-
-    if built_ids:
-        missing = eligible_ids - built_ids
-    else:
+    skipped_ids = {
+        str(x)
+        for x in stats.get("missing_ids", [])
+        if x is not None
+    }
+    if not built_ids:
         # Backward compat: read only tournament_id column (not the full 700k+ row frame).
         try:
-            parquet_ids = set(
+            built_ids = set(
                 pl.read_parquet(results_path, columns=["tournament_id"])
                 .select(pl.col("tournament_id").cast(pl.Utf8))
                 .unique()
@@ -1976,12 +2025,9 @@ def _needs_elo_rebuild(
             )
         except Exception:
             return True, "unreadable parquet"
-        skipped_ids = {
-            str(x)
-            for x in (meta.get("processing_stats") or {}).get("missing_ids", [])
-            if x is not None
-        }
-        missing = eligible_ids - parquet_ids - skipped_ids
+    missing = _elo_ids_still_needed(
+        eligible_ids, built_ids, skipped_ids, all_tournaments,
+    )
     if missing:
         return True, f"{len(missing)} new past tournament(s) not in parquet"
     return False, ""
@@ -3122,10 +3168,9 @@ def _load_main_content(
     # Fetch all tournaments
     max_age_hours = float(os.environ.get("FFBRIDGE_ELO_MAX_AGE_HOURS", "20"))
     cache_age = _newest_persisted_age_hours(api_key, fetch_iv)
-    # Refresh the session list from the API only when persisted Elo parquet is
-    # stale. Missing parquet must still use the on-disk Lancelot session-list cache;
-    # forcing a live API fetch on cold start caused "Failed to retrieve tournament
-    # data" in production when outbound API access was slow or unavailable.
+    # Force a live list fetch when the parquet itself is stale. Lancelot also
+    # refreshes series lists after SESSION_LIST_CACHE_HOURS even without this
+    # flag, and falls back to the last good disk list if the API is empty.
     force_list_refresh = cache_age is not None and cache_age >= max_age_hours
     _load_debug_log(
         f"tournament list fetch (force_refresh={force_list_refresh}, "

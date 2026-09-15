@@ -13,12 +13,12 @@ long-running app process (the OOM/restart cause).
 
 Staleness gate (--if-stale)
 ---------------------------
-On every container start the builder runs, but with ``--if-stale`` it rebuilds a
-backend only when its persisted parquet is missing or older than
-``--max-age-hours`` (default 20h). So ordinary restarts/redeploys are a ~1s no-op
-(the app just loads the existing parquet), while a scheduled refresh crosses the
-threshold and does a full rebuild. When it does rebuild, the tournament list is
-force-refreshed from the API so newly published events are discovered.
+On every container start the builder runs, but with ``--if-stale`` it first
+force-refreshes the tournament list, then rebuilds when
+``_needs_elo_rebuild`` says so: missing parquet, age over
+``--max-age-hours`` (default 20h), pending scores due, or recent sessions
+that are new or previously returned no results. Ordinary restarts with a
+complete parquet stay a no-op after that list check.
 
 What a rebuild does (and does NOT) refresh
 ------------------------------------------
@@ -176,30 +176,6 @@ def _prune_other_fetch_iv(api_key: str, fetch_iv: bool) -> None:
         print(f"[builder] orphan prune skipped for {api_key}: {exc}", flush=True)
 
 
-def _persisted_dataset_has_pending_scores(
-    api_key: str,
-    fetch_iv: bool,
-) -> bool:
-    """Whether the current parquet metadata contains provisional/unresolved rows."""
-    for meta_path in app._elo_cache_meta_paths(api_key, fetch_iv):
-        try:
-            stats = json.loads(meta_path.read_text(encoding="utf-8")).get(
-                "processing_stats", {}
-            )
-        except (OSError, json.JSONDecodeError):
-            continue
-        if any(
-            int(stats.get(field, 0) or 0) > 0
-            for field in (
-                "provisional_rows",
-                "unresolved_scratch_rows",
-                "unresolved_handicap_rows",
-            )
-        ):
-            return True
-    return False
-
-
 def build_one(api_name: str, fetch_iv: bool, if_stale: bool = False, max_age_hours: float = 20.0) -> int:
     """Build and persist the dataset for a single API backend.
 
@@ -212,44 +188,41 @@ def build_one(api_name: str, fetch_iv: bool, if_stale: bool = False, max_age_hou
     # itself is skipped as fresh, so leftovers get reclaimed on the next deploy).
     _prune_other_fetch_iv(api_key, fetch_iv)
 
+    # Force-refresh the tournament list before the staleness gate so newly
+    # published sessions (or sessions whose rankings arrived later) can
+    # trigger a rebuild even when the parquet is younger than max_age_hours.
+    print(f"[builder] {api_name}: refreshing tournament list...", flush=True)
+    all_tournaments = api_module.fetch_tournament_list(series_id="all", limit=None, force_refresh=True)
+    if not all_tournaments:
+        all_tournaments = api_module.fetch_tournament_list(
+            series_id="all", limit=None, force_refresh=False,
+        )
+    if not all_tournaments:
+        print(f"[builder] {api_name}: no tournaments returned; skipping", flush=True)
+        return 0
+
     if if_stale:
-        age = _newest_persisted_age_hours(api_key, fetch_iv)
-        pending_refresh_due = (
-            api_module is app.lancelot_api
-            and age is not None
-            and age >= app.lancelot_api.PENDING_RESULTS_CACHE_HOURS
-            and _persisted_dataset_has_pending_scores(api_key, fetch_iv)
+        rebuild, rebuild_reason = app._needs_elo_rebuild(
+            api_key, fetch_iv, len(all_tournaments), all_tournaments, max_age_hours,
         )
         index_missing = (
             api_module is app.lancelot_api
             and not _lancelot_player_session_index_ready()
         )
-        if (
-            age is not None
-            and age < max_age_hours
-            and not index_missing
-            and not pending_refresh_due
-        ):
-            print(f"[builder] {api_name}: cache fresh ({age:.1f}h < {max_age_hours}h); skipping", flush=True)
-            return -1
-        if index_missing:
-            reason = "shared player-session index missing"
-        elif pending_refresh_due:
-            reason = (
-                f"pending scores due for refresh ({age:.1f}h >= "
-                f"{app.lancelot_api.PENDING_RESULTS_CACHE_HOURS}h)"
+        if not rebuild and not index_missing:
+            print(
+                f"[builder] {api_name}: cache fresh "
+                f"({len(all_tournaments)} tournaments); skipping",
+                flush=True,
             )
-        else:
-            reason = "missing" if age is None else f"stale ({age:.1f}h)"
+            return -1
+        reason = (
+            "shared player-session index missing"
+            if index_missing and not rebuild
+            else rebuild_reason or "missing or unreadable parquet"
+        )
         print(f"[builder] {api_name}: cache {reason}; rebuilding", flush=True)
 
-    # Force-refresh the tournament list so newly published events are discovered
-    # (the on-disk list cache never expires by design).
-    print(f"[builder] {api_name}: refreshing tournament list...", flush=True)
-    all_tournaments = api_module.fetch_tournament_list(series_id="all", limit=None, force_refresh=True)
-    if not all_tournaments:
-        print(f"[builder] {api_name}: no tournaments returned; skipping", flush=True)
-        return 0
     print(f"[builder] {api_name}: {len(all_tournaments)} tournaments; computing Elo...", flush=True)
     dataset = app.compute_and_persist_elo_dataset(
         api_module, all_tournaments, api_key, fetch_iv, show_progress=False
@@ -282,8 +255,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--if-stale", action="store_true",
-        help="Rebuild a backend only if its persisted parquet is missing or older "
-             "than --max-age-hours (default). Otherwise skip (fast no-op).",
+        help="Rebuild a backend only if _needs_elo_rebuild says so after a "
+             "fresh tournament-list fetch (missing/stale parquet, pending "
+             "scores, or recent new/empty sessions). Otherwise skip.",
     )
     parser.add_argument(
         "--max-age-hours", type=float, default=20.0,

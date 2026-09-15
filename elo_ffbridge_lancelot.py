@@ -61,6 +61,7 @@ REQUEST_DELAY = 0.1  # seconds between API requests
 PENDING_RESULTS_CACHE_HOURS = 6
 RECENT_RESULTS_CACHE_HOURS = 6
 RECENT_RESULTS_DAYS = 14
+SESSION_LIST_CACHE_HOURS = 6
 PROVENANCE_API_START = "2026-07-01"
 ORGANIZER_SCORE_CACHE_VERSION = "v2"
 
@@ -134,9 +135,10 @@ def fetch_tournament_list(series_id: Any = "all", limit: Optional[int] = None, f
     Args:
         series_id: Tournament series ID (migration ID) or "all" for all series
         limit: Maximum number of sessions per series
-        force_refresh: If True, bypass the (no-expiry) disk cache and re-fetch
-            from the API so newly published sessions are discovered. The fresh
-            list is written back to the cache.
+        force_refresh: If True, bypass the disk cache and re-fetch from the
+            API so newly published sessions are discovered. The fresh list is
+            written back to the cache. Otherwise the on-disk list is reused
+            until SESSION_LIST_CACHE_HOURS, then refreshed.
     
     Returns:
         List of session dictionaries with normalized structure
@@ -161,15 +163,21 @@ def _fetch_sessions_for_series(lancelot_id: int, migration_id: int, limit: Optio
     series_name = SERIES_NAMES.get(migration_id, f"series_{lancelot_id}")
     friendly_name = f"sessions_list_{series_name.replace(' ', '_')}"
     
-    # Check disk cache (unless forcing a refresh to discover new sessions)
+    stale_cached = load_from_disk_cache(
+        CACHE_DIR, friendly_name, max_age_hours=None, series_id=migration_id
+    )
     if not force_refresh:
-        cached_data = load_from_disk_cache(CACHE_DIR, friendly_name, max_age_hours=None, series_id=migration_id)
+        cached_data = load_from_disk_cache(
+            CACHE_DIR,
+            friendly_name,
+            max_age_hours=SESSION_LIST_CACHE_HOURS,
+            series_id=migration_id,
+        )
         if cached_data:
-            # Ensure series_id is set on each session
             for s in cached_data:
                 s['series_id'] = migration_id
             return cached_data[:limit] if limit else cached_data
-    
+
     all_sessions = []
     page = 1
     max_pages = 10
@@ -197,8 +205,15 @@ def _fetch_sessions_for_series(lancelot_id: int, migration_id: int, limit: Optio
     
     if all_sessions:
         save_to_disk_cache(CACHE_DIR, friendly_name, all_sessions, series_id=migration_id)
-    
-    return all_sessions[:limit] if limit else all_sessions
+        return all_sessions[:limit] if limit else all_sessions
+
+    # Live list fetch failed or returned empty; keep serving the last good list
+    # so a transient outage does not hide already-known sessions.
+    if stale_cached:
+        for s in stale_cached:
+            s['series_id'] = migration_id
+        return stale_cached[:limit] if limit else stale_cached
+    return []
 
 
 def _is_recent_result(tournament_date: str) -> bool:
