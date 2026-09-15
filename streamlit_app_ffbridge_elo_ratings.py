@@ -2226,10 +2226,10 @@ def initialize_session_state():
         st.session_state.first_time = False
 
 
-# Default API: Lancelot is public and currently the reliable source. Classic
-# requires a bearer token and has been intermittently unavailable; set
-# FFBRIDGE_PREFER_CLASSIC_API=1 once Classic is healthy again to default to it
-# when FFBRIDGE_BEARER_TOKEN is present.
+# Default API helper kept for Classic cleanup later. The sidebar no longer
+# offers an API selector; the UI is Lancelot-only.
+# Classic requires a bearer token; set FFBRIDGE_PREFER_CLASSIC_API=1 once
+# Classic is healthy again to default to it when FFBRIDGE_BEARER_TOKEN is present.
 def _default_ffbridge_api() -> str:
     prefer_classic = os.getenv("FFBRIDGE_PREFER_CLASSIC_API", "").strip().lower() in (
         "1", "true", "yes",
@@ -2303,12 +2303,6 @@ def _ffbridge_footer_diagnostics_lines(st_module) -> list[str]:
 # URL query param -> sidebar widget session state.
 # Keys are short, URL-friendly names; session_key matches the widget's `key=...`.
 FFBRIDGE_URL_PARAMS = {
-    "api": {
-        "session_key": "selected_api_widget",
-        "parser": str,
-        "valid_values": tuple(API_BACKENDS.keys()),
-        "default": _FFBRIDGE_DEFAULT_API,
-    },
     "tournament": {
         "session_key": "elo_tournament_selectbox",
         "parser": str,
@@ -2903,32 +2897,11 @@ def main():
             help="Switch between individual and partnership rankings"
         )
         
-        # API Backend selection
-        # Keep widget state and canonical state separate so explicit reruns do not
-        # unexpectedly reset the selected API.
-        api_options = list(API_BACKENDS.keys())
-        default_api = _default_ffbridge_api()
-        if "selected_api" not in st.session_state:
-            st.session_state.selected_api = default_api
-        if st.session_state.selected_api not in api_options:
-            st.session_state.selected_api = default_api
-        if "selected_api_widget" not in st.session_state:
-            st.session_state.selected_api_widget = st.session_state.selected_api
-        if st.session_state.selected_api_widget not in api_options:
-            st.session_state.selected_api_widget = st.session_state.selected_api
-        
-        selected_api_name = st.selectbox(
-            "Bridge API",
-            options=api_options,
-            key="selected_api_widget",
-            help=(
-                "Lancelot is the public API and the default while Classic is "
-                "unavailable. Classic requires FFBRIDGE_BEARER_TOKEN."
-            ),
-        )
+        # Lancelot-only in the UI. Classic stays in API_BACKENDS for later
+        # removal; do not expose a sidebar selector (or honor ?api=).
+        selected_api_name = "FFBridge Lancelot API"
         st.session_state.selected_api = selected_api_name
-        
-        # Get the appropriate API module
+        st.session_state.selected_api_widget = selected_api_name
         api_module = API_BACKENDS[selected_api_name]
         
         # Check authentication if required; auto-fallback to Lancelot for easier deployment.
