@@ -23,6 +23,37 @@ ACBL_DATE_RANGE_OPTIONS = (
     "Last 4 years",
     "Last 5 years",
 )
+ACBL_DATE_RANGE_ALIASES = {
+    "all time": "All time",
+    "all-time": "All time",
+    "lifetime": "All time",
+    "current year": "Last 1 year",
+    "current ffbridge year": "Last 1 year",
+    "this year": "Last 1 year",
+    "this season": "Last 1 year",
+    "cette année": "Last 1 year",
+    "cette annee": "Last 1 year",
+    "previous year": "Last 1 year",
+    "previous ffbridge year": "Last 1 year",
+    "last season": "Last 1 year",
+    "last year": "Last 1 year",
+    "last 1 year": "Last 1 year",
+    "last one year": "Last 1 year",
+    "past year": "Last 1 year",
+    "past 1 year": "Last 1 year",
+    "last 3 months": "Last 3 months",
+    "past 3 months": "Last 3 months",
+    "last 6 months": "Last 6 months",
+    "past 6 months": "Last 6 months",
+    "last 2 years": "Last 2 years",
+    "past 2 years": "Last 2 years",
+    "last 3 years": "Last 3 years",
+    "past 3 years": "Last 3 years",
+    "last 4 years": "Last 4 years",
+    "past 4 years": "Last 4 years",
+    "last 5 years": "Last 5 years",
+    "past 5 years": "Last 5 years",
+}
 
 ACBL_MASTERPOINT_RANGES = (
     (0, 5),
@@ -44,9 +75,24 @@ ACBL_MASTERPOINT_RANGES = (
 )
 
 
+def normalize_acbl_date_range(date_range: Optional[str]) -> str:
+    """Map natural-language windows onto the ACBL sidebar options."""
+    choice = (date_range or "All time").strip()
+    if not choice:
+        return "All time"
+    if choice in ACBL_DATE_RANGE_OPTIONS:
+        return choice
+    mapped = ACBL_DATE_RANGE_ALIASES.get(choice.casefold())
+    if mapped:
+        return mapped
+    raise ValueError(
+        f"Unknown ACBL date_range {choice!r}; valid: {list(ACBL_DATE_RANGE_OPTIONS)}"
+    )
+
+
 def acbl_date_from_for_range(date_range: Optional[str]) -> Optional[str]:
     """Return the sidebar-equivalent inclusive lower date bound."""
-    choice = (date_range or "All time").strip()
+    choice = normalize_acbl_date_range(date_range)
     days = {
         "All time": None,
         "Last 3 months": 90,
@@ -57,10 +103,6 @@ def acbl_date_from_for_range(date_range: Optional[str]) -> Optional[str]:
         "Last 4 years": 365 * 4,
         "Last 5 years": 365 * 5,
     }
-    if choice not in days:
-        raise ValueError(
-            f"Unknown ACBL date_range {choice!r}; valid: {list(ACBL_DATE_RANGE_OPTIONS)}"
-        )
     if days[choice] is None:
         return None
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)

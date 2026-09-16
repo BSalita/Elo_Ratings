@@ -12,12 +12,23 @@ from ffbridge_report_service import (
     resolve_series_id,
 )
 from elo_filter_common import (
+    acbl_date_from_for_range,
     filter_acbl_leaderboard,
     filter_ffbridge_leaderboard,
+    normalize_acbl_date_range,
 )
 
 
 class SharedFilterTests(unittest.TestCase):
+    def test_acbl_date_range_aliases_current_year(self) -> None:
+        self.assertEqual(normalize_acbl_date_range("current year"), "Last 1 year")
+        self.assertEqual(
+            normalize_acbl_date_range("Current FFBridge year"), "Last 1 year"
+        )
+        self.assertEqual(normalize_acbl_date_range("All time"), "All time")
+        self.assertIsNone(acbl_date_from_for_range("All time"))
+        self.assertRegex(acbl_date_from_for_range("current year") or "", r"^\d{4}-\d{2}-\d{2}$")
+
     def test_identity_lookup_ranks_full_population(self) -> None:
         self.assertEqual(report_rank_window(250, 40000), 250)
         self.assertEqual(

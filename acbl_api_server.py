@@ -2250,6 +2250,8 @@ def acbl_report(
             return response_payload
         except HTTPException:
             raise
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
             print(
                 f"[acbl-api] report failed {club_or_tournament}/{rating_type}: "
