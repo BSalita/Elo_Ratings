@@ -303,7 +303,7 @@ def filter_ffbridge_leaderboard(
     player_name: Optional[str] = None,
     player_number: Optional[str] = None,
 ) -> pl.DataFrame:
-    """FFBridge sidebar identity filters applied after the Top-N query."""
+    """FFBridge sidebar identity filters applied after ranks are assigned."""
     number_token = (player_number or "").strip()
     if number_token and not number_token.isdigit():
         raise ValueError("player_number must contain digits only")

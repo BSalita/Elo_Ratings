@@ -92,6 +92,23 @@ DEFAULT_MIN_GAMES = 10
 DEFAULT_PRIOR_SESSIONS = 50
 ELO_DATASET_SCHEMA_VERSION = 11
 
+
+def report_rank_window(
+    top_n: int,
+    population_size: int,
+    *,
+    player_name: Optional[str] = None,
+    player_number: Optional[str] = None,
+) -> int:
+    """Rank the full population when looking up a named or numbered player.
+
+    Identity filters run after the leaderboard SQL. A Top-N slice of 250
+    would hide a player at rank 251+, so look-ups must rank everyone first.
+    """
+    if (player_name or "").strip() or (player_number or "").strip():
+        return max(int(top_n), int(population_size))
+    return int(top_n)
+
 API_BACKEND_KEYS = {
     "FFBridge Classic API": "FFBridge_Classic_API",
     "FFBridge Lancelot API": "FFBridge_Lancelot_API",
@@ -1608,30 +1625,44 @@ def run_leaderboard_report(
         results_df, has_population_filter=has_population_filter
     )
 
+    name_token = (player_name or "").strip()
+    number_token = (player_number or "").strip()
     if rating == "Players":
         players_df = aggregate_players_from_results(results_df, use_handicap)
+        rank_window = report_rank_window(
+            top_n,
+            players_df.height,
+            player_name=name_token,
+            player_number=number_token,
+        )
         table, sql, prior_anchor = show_top_players(
-            players_df, top_n, min_games,
+            players_df, rank_window, min_games,
             use_handicap=use_handicap, prior_sessions=prior_sessions,
             quality_df=quality_players,
         )
     else:
+        rank_window = report_rank_window(
+            top_n,
+            results_df.height,
+            player_name=name_token,
+            player_number=number_token,
+        )
         table, sql, prior_anchor = show_top_pairs(
-            results_df, top_n, min_games,
+            results_df, rank_window, min_games,
             use_handicap=use_handicap, players_df=None,
             prior_sessions=prior_sessions,
             quality_df=quality_pairs,
         )
     del sql
 
-    name_token = (player_name or "").strip()
-    number_token = (player_number or "").strip()
     table = filter_ffbridge_leaderboard(
         table,
         rating_type=rating,
         player_name=name_token,
         player_number=number_token,
     )
+    if table.height > top_n:
+        table = table.head(top_n)
 
     return {
         "rows": table.to_dicts() if not table.is_empty() else [],

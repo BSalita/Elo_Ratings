@@ -6,7 +6,11 @@ from unittest.mock import Mock, patch
 import polars as pl
 
 import ffbridge_api_server
-from ffbridge_report_service import filter_results, resolve_series_id
+from ffbridge_report_service import (
+    filter_results,
+    report_rank_window,
+    resolve_series_id,
+)
 from elo_filter_common import (
     filter_acbl_leaderboard,
     filter_ffbridge_leaderboard,
@@ -14,6 +18,21 @@ from elo_filter_common import (
 
 
 class SharedFilterTests(unittest.TestCase):
+    def test_identity_lookup_ranks_full_population(self) -> None:
+        self.assertEqual(report_rank_window(250, 40000), 250)
+        self.assertEqual(
+            report_rank_window(250, 40000, player_number="9500754"),
+            40000,
+        )
+        self.assertEqual(
+            report_rank_window(5, 40000, player_name="SALITA"),
+            40000,
+        )
+        self.assertEqual(
+            report_rank_window(5000, 2000, player_number="9500754"),
+            5000,
+        )
+
     def test_acbl_filters_name_number_and_masterpoints(self) -> None:
         source = pl.DataFrame(
             {
