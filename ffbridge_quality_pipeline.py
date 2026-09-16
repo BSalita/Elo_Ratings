@@ -1296,7 +1296,11 @@ def load_raw_session(
 
 
 def augment_raw_session(raw: pl.DataFrame) -> pl.DataFrame:
-    """Run mlBridge augmentation when embedded DD/par data is insufficient."""
+    """Run mlBridge augmentation when embedded DD/par data is insufficient.
+
+    Single-dummy uses 10 samples per side. max_sd_adds is None so every
+    unique PBN in the session is solved; 0 would skip SD entirely.
+    """
     required = {
         "ParScore_NS",
         "ParScore_EW",
@@ -1368,8 +1372,8 @@ def augment_raw_session(raw: pl.DataFrame) -> pl.DataFrame:
             augmented, _ = AllAugmentations(
                 converted,
                 None,
-                sd_productions=0,
-                max_sd_adds=0,
+                sd_productions=10,
+                max_sd_adds=None,
                 output_progress=False,
                 incorporate_elo_ratings=False,
             ).perform_all_augmentations()
