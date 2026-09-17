@@ -1301,7 +1301,7 @@ def load_raw_session(
 
 EMBEDDED_DD_COLUMNS = tuple(f"DD_{seat}_{suit}" for seat in SEATS for suit in "SHDCN")
 _HCP_RANKS = {"A": 4, "K": 3, "Q": 2, "J": 1}
-_AUGMENT_LOCK = threading.Lock()
+_AUGMENT_LOCK = threading.RLock()
 
 
 def _has_quality_dd_scores(frame: pl.DataFrame) -> bool:
@@ -1706,6 +1706,78 @@ def _validate_converted_suits(frame: pl.DataFrame) -> None:
         )
 
 
+_HRS_DD_COLUMNS = tuple(f"DD_{seat}_{suit}" for seat in "NESW" for suit in "CDHSN")
+_HRS_PROB_COLUMNS = tuple(
+    f"Probs_{pair}_{declarer}_{strain}_{taken}"
+    for pair in ("NS", "EW")
+    for declarer in "NESW"
+    for strain in "CDHSN"
+    for taken in range(14)
+)
+_HRS_PAR_CONTRACTS = pl.List(
+    pl.Struct(
+        {
+            "Level": pl.String,
+            "Strain": pl.String,
+            "Doubled": pl.String,
+            "Pair_Direction": pl.String,
+            "Result": pl.Int16,
+        }
+    )
+)
+
+
+def _official_hrs_schema() -> dict[str, pl.DataType]:
+    """ACBL hand-records cache: DD, Par, SD probs. No EV."""
+    return {
+        "PBN": pl.String,
+        "Dealer": pl.String,
+        "Vul": pl.String,
+        **{column: pl.UInt8 for column in _HRS_DD_COLUMNS},
+        "ParScore": pl.Int16,
+        "ParNumber": pl.Int8,
+        "ParContracts": _HRS_PAR_CONTRACTS,
+        "Probs_Trials": pl.Int64,
+        **{column: pl.Float32 for column in _HRS_PROB_COLUMNS},
+    }
+
+
+def _official_hrs_cache(frame: pl.DataFrame) -> pl.DataFrame:
+    schema = _official_hrs_schema()
+    extras = [column for column in frame.columns if column not in schema]
+    if extras:
+        frame = frame.drop(extras)
+    additions = [
+        pl.lit(None, dtype=dtype).alias(column)
+        for column, dtype in schema.items()
+        if column not in frame.columns
+    ]
+    if additions:
+        frame = frame.with_columns(*additions)
+    casts = []
+    for column, dtype in schema.items():
+        if frame.schema[column] != dtype:
+            casts.append(pl.col(column).cast(dtype, strict=False))
+    if casts:
+        frame = frame.with_columns(*casts)
+    return _dedupe_hrs_cache_keys(frame.select(list(schema)))
+
+
+def _dedupe_hrs_cache_keys(cache: pl.DataFrame) -> pl.DataFrame:
+    """Keep PBN+Dealer+Vul rows; drop null-key leftovers once a real key exists."""
+    if cache.is_empty() or "Dealer" not in cache.columns:
+        return cache
+    keyed = cache.filter(pl.col("Dealer").is_not_null() & pl.col("Vul").is_not_null())
+    if keyed.is_empty():
+        return cache
+    orphans = cache.filter(
+        pl.col("Dealer").is_null() | pl.col("Vul").is_null()
+    ).join(keyed.select("PBN").unique(), on="PBN", how="anti")
+    if orphans.is_empty():
+        return keyed
+    return pl.concat([keyed, orphans], how="vertical")
+
+
 def default_hrs_cache_path(source_dir: pathlib.Path | None = None) -> pathlib.Path:
     root = pathlib.Path(source_dir or DEFAULT_SOURCE_DIR).parent
     return root / HRS_CACHE_FILENAME
@@ -1714,14 +1786,14 @@ def default_hrs_cache_path(source_dir: pathlib.Path | None = None) -> pathlib.Pa
 def load_hrs_cache(path: pathlib.Path) -> pl.DataFrame | None:
     if not pathlib.Path(path).is_file():
         return None
-    return pl.read_parquet(path)
+    return _official_hrs_cache(pl.read_parquet(path))
 
 
 def save_hrs_cache(frame: pl.DataFrame, path: pathlib.Path) -> None:
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    frame.write_parquet(temporary)
+    _official_hrs_cache(frame).write_parquet(temporary)
     temporary.replace(path)
 
 
@@ -1886,43 +1958,8 @@ def _attach_contract_types(frame: pl.DataFrame) -> pl.DataFrame:
     return augment_lib.add_contract_types(frame)
 
 
-def _cached_sd_pbns(cache: pl.DataFrame | None) -> set[str]:
-    if cache is None or cache.is_empty() or "Probs_Trials" not in cache.columns:
-        return set()
-    return {
-        pbn
-        for pbn in cache.filter(pl.col("Probs_Trials").is_not_null())["PBN"].to_list()
-        if pbn
-    }
-
-
-def _ev_join_columns(frame: pl.DataFrame) -> list[str]:
-    return [
-        column
-        for column in frame.columns
-        if _EV_SUMMARY_RE.match(column) or _EV_PAIR_MAX_RE.match(column)
-    ]
-
-
-def _cached_ev_pbns(cache: pl.DataFrame | None) -> set[str]:
-    if cache is None or cache.is_empty() or "EV_NS_NV_Max" not in cache.columns:
-        return set()
-    return {
-        pbn
-        for pbn in cache.filter(pl.col("EV_NS_NV_Max").is_not_null())["PBN"].to_list()
-        if pbn
-    }
-
-
 def _empty_hrs_cache() -> pl.DataFrame:
-    return pl.DataFrame(
-        schema={
-            "PBN": pl.String,
-            "Dealer": pl.String,
-            "Vul": pl.String,
-            "Probs_Trials": pl.Int64,
-        }
-    )
+    return pl.DataFrame(schema=_official_hrs_schema())
 
 
 def _latest_cache(
@@ -1935,7 +1972,70 @@ def _latest_cache(
             return disk
     if cache is None or cache.is_empty():
         return _empty_hrs_cache()
-    return cache
+    return _official_hrs_cache(cache)
+
+
+def _cached_sd_pbns(cache: pl.DataFrame | None) -> set[str]:
+    if cache is None or cache.is_empty() or "Probs_Trials" not in cache.columns:
+        return set()
+    return {
+        pbn
+        for pbn in cache.filter(pl.col("Probs_Trials").is_not_null())["PBN"].to_list()
+        if pbn
+    }
+
+
+def _missing_dd_par_deals(unique: pl.DataFrame, cache: pl.DataFrame) -> pl.DataFrame:
+    keys = ["PBN", "Dealer", "Vul"]
+    if cache.is_empty() or "DD_N_C" not in cache.columns:
+        return unique
+    have = cache.filter(
+        pl.col("DD_N_C").is_not_null() & pl.col("ParScore").is_not_null()
+    ).select(*keys)
+    return unique.join(have, on=keys, how="anti")
+
+
+def _upsert_dd_par_into_cache(
+    unique: pl.DataFrame,
+    cache: pl.DataFrame,
+    augment_lib: Any,
+) -> tuple[pl.DataFrame, int]:
+    """Fill ACBL cache DD/Par from unique deals. Uses Lancelot DD when present."""
+    needed = ("PBN", "Dealer", "Vul", *_HRS_DD_COLUMNS)
+    if any(column not in unique.columns for column in needed):
+        return cache, 0
+    complete = unique.filter(
+        pl.col("PBN").is_not_null()
+        & pl.col("Dealer").is_not_null()
+        & pl.col("Vul").is_not_null()
+        & pl.all_horizontal(
+            [pl.col(column).is_not_null() for column in _HRS_DD_COLUMNS]
+        )
+    ).unique(subset=["PBN", "Dealer", "Vul"], maintain_order=True)
+    todo = _missing_dd_par_deals(complete, cache)
+    if todo.is_empty():
+        return cache, 0
+    par = _par_rows_from_embedded_dd(todo, augment_lib)
+    incoming = (
+        todo.select("PBN", "Dealer", "Vul", *_HRS_DD_COLUMNS)
+        .join(par, on=["PBN", "Dealer", "Vul"], how="left")
+        .with_columns(
+            pl.col("ParContracts").list.len().cast(pl.Int8).alias("ParNumber"),
+            *[pl.col(column).cast(pl.UInt8, strict=False) for column in _HRS_DD_COLUMNS],
+            pl.col("ParScore").cast(pl.Int16, strict=False),
+            pl.col("ParContracts").cast(_HRS_PAR_CONTRACTS, strict=False),
+        )
+    )
+    augment_logger = logging.getLogger("mlBridge.mlBridgeAugmentLib")
+    previous_level = augment_logger.level
+    augment_logger.setLevel(logging.WARNING)
+    try:
+        updated = _dedupe_hrs_cache_keys(
+            augment_lib.update_hand_records_cache(cache, incoming)
+        )
+    finally:
+        augment_logger.setLevel(previous_level)
+    return updated, todo.height
 
 
 def _drop_intermediate_ev(frame: pl.DataFrame) -> pl.DataFrame:
@@ -1968,22 +2068,12 @@ def _attach_pair_ev_max(frame: pl.DataFrame) -> pl.DataFrame:
     return frame.with_columns(*exprs)
 
 
-def _merge_ev_into_cache(cache: pl.DataFrame, unique_aug: pl.DataFrame) -> pl.DataFrame:
-    ev_columns = _ev_join_columns(unique_aug)
-    if not ev_columns:
-        return cache
-    ev = unique_aug.select(["PBN", *ev_columns]).unique(subset=["PBN"], maintain_order=True)
-    overlap = [column for column in ev.columns if column != "PBN" and column in cache.columns]
-    if overlap:
-        cache = cache.drop(overlap)
-    return cache.join(ev, on="PBN", how="left")
-
-
 def _compute_ev_from_probs(
     unique: pl.DataFrame,
     cache: pl.DataFrame,
     augment_lib: Any,
 ) -> pl.DataFrame:
+    """Derive EV from cached SD probs. EV is not stored in the hand-records cache."""
     prob_columns = ["PBN"] + [
         column for column in cache.columns if column.startswith("Probs_")
     ]
@@ -2030,33 +2120,14 @@ def _estimate_sd_into_cache(
     return cache
 
 
-def _ev_from_cached_probs(
-    unique: pl.DataFrame,
-    cache: pl.DataFrame,
-    augment_lib: Any,
-) -> pl.DataFrame:
-    """Join cached EV summaries, or rebuild them from PBN-invariant SD probs."""
-    ev_columns = _ev_join_columns(cache)
-    cached_ev = _cached_ev_pbns(cache)
-    have = unique.filter(pl.col("PBN").is_in(list(cached_ev)))
-    need = unique.filter(~pl.col("PBN").is_in(list(cached_ev)))
-    parts: list[pl.DataFrame] = []
-    if have.height and ev_columns:
-        ev = cache.select(["PBN", *ev_columns]).unique(subset=["PBN"], maintain_order=True)
-        parts.append(have.join(ev, on="PBN", how="left"))
-    if need.height:
-        parts.append(_compute_ev_from_probs(need, cache, augment_lib))
-    if not parts:
-        return unique
-    if len(parts) == 1:
-        return parts[0]
-    keep = ["PBN", "Dealer", "Vul", "Board", *ev_columns]
-    keep = [
-        column
-        for column in keep
-        if all(column in part.columns for part in parts)
-    ]
-    return pl.concat([part.select(keep) for part in parts], how="vertical")
+def _unique_deal_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    columns = ["PBN", "Dealer", "Vul", "Board"]
+    columns.extend(
+        column for column in _HRS_DD_COLUMNS if column in frame.columns
+    )
+    return frame.select(columns).unique(
+        subset=["PBN", "Dealer", "Vul"], maintain_order=True
+    )
 
 
 def _attach_sd_ev_from_unique_deals(
@@ -2067,33 +2138,36 @@ def _attach_sd_ev_from_unique_deals(
     sd_productions: int,
     max_sd_adds: int | None,
 ) -> tuple[pl.DataFrame, pl.DataFrame | None]:
-    """ACBL-style unique-deal SD: cache by PBN, then join EV back."""
+    """ACBL cache (DD/Par/SD probs) on unique deals, then derive EV and join."""
     if max_sd_adds == 0:
         return frame, hrs_cache_df
     _require_columns(frame, ["PBN", "Dealer", "Vul"], "Unique-deal SD")
-    unique = (
-        frame.select("PBN", "Dealer", "Vul", "Board")
-        .unique(subset=["PBN"], maintain_order=True)
+    unique = _unique_deal_frame(frame)
+    unique_pbn = unique.unique(subset=["PBN"], maintain_order=True)
+    needed = {pbn for pbn in unique_pbn["PBN"].to_list() if pbn}
+    missing_sd = needed - _cached_sd_pbns(hrs_cache_df)
+    missing_dd = (
+        _missing_dd_par_deals(unique, hrs_cache_df)
+        if hrs_cache_df is not None
+        else unique
     )
-    needed = {pbn for pbn in unique["PBN"].to_list() if pbn}
-    cached = _cached_sd_pbns(hrs_cache_df)
-    ev_cached = _cached_ev_pbns(hrs_cache_df)
-    missing = needed - cached
-    ev_missing = needed - ev_cached
     print(
         f"[ffbridge-quality] unique deals {len(needed)}; "
-        f"SD cache hits {len(needed) - len(missing)}; "
-        f"EV cache hits {len(needed) - len(ev_missing)}; "
-        f"missing {len(missing)}",
+        f"SD cache hits {len(needed) - len(missing_sd)}; "
+        f"DD/Par missing {missing_dd.height}; "
+        f"SD missing {len(missing_sd)}",
         flush=True,
     )
     _ff_lib, augment_lib = _import_mlbridge()
-    if missing or ev_missing:
+    if missing_sd or missing_dd.height:
         with _AUGMENT_LOCK:
             hrs_cache_df = _latest_cache(hrs_cache_df, cache_file_path)
-            missing = needed - _cached_sd_pbns(hrs_cache_df)
-            if missing:
-                todo = unique.filter(pl.col("PBN").is_in(sorted(missing)))
+            hrs_cache_df, dd_added = _upsert_dd_par_into_cache(
+                unique, hrs_cache_df, augment_lib
+            )
+            missing_sd = needed - _cached_sd_pbns(hrs_cache_df)
+            if missing_sd:
+                todo = unique_pbn.filter(pl.col("PBN").is_in(sorted(missing_sd)))
                 if max_sd_adds is not None:
                     todo = todo.head(max_sd_adds)
                 hrs_cache_df = _estimate_sd_into_cache(
@@ -2103,14 +2177,11 @@ def _attach_sd_ev_from_unique_deals(
                     sd_productions=sd_productions,
                     max_sd_adds=max_sd_adds,
                 )
-            unique_aug = _ev_from_cached_probs(unique, hrs_cache_df, augment_lib)
-            hrs_cache_df = _merge_ev_into_cache(hrs_cache_df, unique_aug)
-            if cache_file_path is not None:
+            if cache_file_path is not None and (dd_added or missing_sd):
                 save_hrs_cache(hrs_cache_df, cache_file_path)
-    else:
-        if hrs_cache_df is None or hrs_cache_df.is_empty():
-            return frame, hrs_cache_df
-        unique_aug = _ev_from_cached_probs(unique, hrs_cache_df, augment_lib)
+    if hrs_cache_df is None or hrs_cache_df.is_empty():
+        return frame, hrs_cache_df
+    unique_aug = _compute_ev_from_probs(unique_pbn, hrs_cache_df, augment_lib)
     join_columns = [
         column
         for column in _unique_deal_join_columns(unique_aug)
@@ -2264,11 +2335,11 @@ def augment_raw_session(
     sd_productions: int = 10,
     max_sd_adds: int | None = None,
 ) -> pl.DataFrame:
-    """Augment a raw session the ACBL way: unique-deal SD cache, then join EV.
+    """Augment a session the ACBL way: cache DD/Par/SD probs, derive EV, join.
 
-    Lancelot's embedded DD table still avoids re-solving double dummy on the
-    full simultaneous field. Single-dummy / EV runs only on unique
-    (PBN, Dealer, Vul) rows and is cached like ACBL hand-record augmentation.
+    The hand-records cache stores only deal facts (DD, Par, SD probabilities).
+    Lancelot's embedded DD table fills those DD/Par columns. EV is computed
+    from cached Probs on unique deals and joined onto the board rows.
     """
     if _has_quality_dd_scores(raw):
         return raw

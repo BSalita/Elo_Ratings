@@ -18,6 +18,7 @@ from ffbridge_quality_pipeline import (
     _attach_board_ev_columns,
     _attach_sd_ev_from_unique_deals,
     _fragment_schema_is_current,
+    _official_hrs_cache,
     _has_embedded_dd_table,
     _import_mlbridge,
     attach_embedded_dd_metrics,
@@ -556,57 +557,89 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
         self.assertIn("EV_NS_NV_Max", out.columns)
         self.assertEqual(out.height, 2)
         self.assertIsNotNone(out["EV_NS_N_S_4_NV"][0])
-        self.assertIn("EV_NS_NV_Max", cache_out.columns)
-        self.assertEqual(cache_out.height, cache.height)
+        self.assertNotIn("EV_NS_NV_Max", cache_out.columns)
+        self.assertTrue(any(column.startswith("Probs_") for column in cache_out.columns))
 
-    def test_ev_cache_hit_joins_without_recomputing(self) -> None:
+    def test_official_hrs_cache_keeps_dd_par_probs_not_ev(self) -> None:
         pbn = "N:QJ93.J5.AKT.J732 K.AQT873.873.A65 T762.K92.QJ64.K9 A854.64.952.QT84"
+        cache = pl.DataFrame(
+            {
+                "PBN": [pbn],
+                "Dealer": ["N"],
+                "Vul": ["None"],
+                "DD_N_C": [6],
+                "Probs_Trials": [10],
+                "EV_NS_NV_Max": [450.0],
+                "EV_NS_N_S_4_NV": [400.0],
+            }
+        )
+        out = _official_hrs_cache(cache)
+        self.assertIn("PBN", out.columns)
+        self.assertIn("DD_N_C", out.columns)
+        self.assertIn("ParScore", out.columns)
+        self.assertIn("Probs_Trials", out.columns)
+        self.assertNotIn("EV_NS_NV_Max", out.columns)
+        self.assertNotIn("EV_NS_N_S_4_NV", out.columns)
+        self.assertEqual(out["DD_N_C"][0], 6)
+        self.assertEqual(out["Probs_Trials"][0], 10)
+
+    def test_unique_deal_cache_stores_embedded_dd_and_par(self) -> None:
+        pbn = "N:QJ93.J5.AKT.J732 K.AQT873.873.A65 T762.K92.QJ64.K9 A854.64.952.QT84"
+        dd = {
+            "DD_N_C": 6,
+            "DD_N_D": 8,
+            "DD_N_H": 5,
+            "DD_N_N": 6,
+            "DD_N_S": 9,
+            "DD_E_C": 7,
+            "DD_E_D": 5,
+            "DD_E_H": 7,
+            "DD_E_N": 7,
+            "DD_E_S": 4,
+            "DD_S_C": 6,
+            "DD_S_D": 8,
+            "DD_S_H": 5,
+            "DD_S_N": 6,
+            "DD_S_S": 9,
+            "DD_W_C": 7,
+            "DD_W_D": 5,
+            "DD_W_H": 7,
+            "DD_W_N": 7,
+            "DD_W_S": 4,
+        }
         frame = pl.DataFrame(
             {
                 "PBN": [pbn],
                 "Dealer": ["N"],
                 "Vul": ["None"],
                 "Board": [1],
+                **{name: [value] for name, value in dd.items()},
             }
         )
-        cache = pl.DataFrame(
-            {
-                "PBN": [pbn],
-                "Probs_Trials": [10],
-                "EV_NS_N_S_4_NV": [400.0],
-                "EV_NS_NV_Max": [450.0],
-                "EV_NS_V_Max": [500.0],
-                "EV_EW_NV_Max": [140.0],
-                "EV_EW_V_Max": [200.0],
-            }
-        )
+        cache_row: dict[str, object] = {"PBN": pbn, "Probs_Trials": 10}
+        for pair in ("NS", "EW"):
+            for declarer in pair:
+                for strain in "SHDCN":
+                    for taken in range(14):
+                        cache_row[f"Probs_{pair}_{declarer}_{strain}_{taken}"] = 1.0 / 14
+        cache = pl.DataFrame([cache_row])
         _ff_lib, augment_lib = _import_mlbridge()
-        with (
-            mock.patch.object(
-                augment_lib,
-                "AllHandRecordAugmentations",
-                side_effect=AssertionError("must skip AllHandRecordAugmentations"),
-            ),
-            mock.patch.object(
-                augment_lib,
-                "identify_best_contracts_by_ev",
-                side_effect=AssertionError("must skip identify_best_contracts_by_ev"),
-            ),
-            mock.patch.object(
-                augment_lib,
-                "add_single_dummy_expected_values",
-                side_effect=AssertionError("EV cache hit must skip EV rebuild"),
-            ),
+        with mock.patch.object(
+            augment_lib,
+            "estimate_sd_trick_distributions_for_df",
+            side_effect=AssertionError("must not re-solve SD when Probs exist"),
         ):
-            out, _cache_out = _attach_sd_ev_from_unique_deals(
+            _out, cache_out = _attach_sd_ev_from_unique_deals(
                 frame,
                 hrs_cache_df=cache,
                 cache_file_path=None,
                 sd_productions=10,
                 max_sd_adds=None,
             )
-        self.assertEqual(out["EV_NS_N_S_4_NV"][0], 400.0)
-        self.assertEqual(out["EV_NS_NV_Max"][0], 450.0)
+        assert cache_out is not None
+        self.assertEqual(cache_out["DD_N_S"][0], 9)
+        self.assertIsNotNone(cache_out["ParScore"][0])
+        self.assertNotIn("EV_NS_NV_Max", cache_out.columns)
 
     def test_player_and_pair_aggregates_rank_high_values_first(self) -> None:
         quality = normalize_quality_frame(_quality_input(), session_dates=_dates())
