@@ -5,6 +5,7 @@ choose an output directory before any artifact is written.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -117,6 +118,10 @@ class AuditReport:
 
 class NoQualityRowsError(ValueError):
     """The upstream session publishes no rows that can produce quality metrics."""
+
+
+class LancelotDDMismatchError(ValueError):
+    """Lancelot's embedded DD table does not match ddss on the audit sample."""
 
 
 def _read_json(path: pathlib.Path) -> Any:
@@ -1324,6 +1329,78 @@ def _has_embedded_dd_table(frame: pl.DataFrame) -> bool:
     )
 
 
+def _pbn_audit_key(pbn: str) -> int:
+    return int.from_bytes(hashlib.sha1(pbn.encode("utf-8")).digest()[:8], "big")
+
+
+def _select_lancelot_dd_audit_pbns(pbns: Sequence[str], rate: float) -> list[str]:
+    unique = sorted({pbn for pbn in pbns if pbn})
+    if rate <= 0 or not unique:
+        return []
+    sample_size = min(len(unique), max(1, int(round(len(unique) * rate))))
+    return sorted(unique, key=_pbn_audit_key)[:sample_size]
+
+
+def _ddss_columns_from_table(table: Any) -> dict[str, int]:
+    rows = table.to_list(player_major=True)
+    return {
+        f"DD_{seat}_{strain}": int(rows[seat_index][strain_index])
+        for seat_index, seat in enumerate(SEATS)
+        for strain_index, strain in enumerate("SHDCN")
+    }
+
+
+def _audit_lancelot_dd_sample(frame: pl.DataFrame, *, rate: float = 0.1) -> int:
+    """Compare a sample of Lancelot DD tables to ddss. Fail fast on mismatch."""
+    if rate <= 0:
+        return 0
+    _require_columns(frame, ["PBN", *EMBEDDED_DD_COLUMNS], "Lancelot DD audit")
+    unique = (
+        frame.select("PBN", *EMBEDDED_DD_COLUMNS)
+        .filter(
+            pl.col("PBN").is_not_null()
+            & pl.all_horizontal(
+                [pl.col(column).is_not_null() for column in EMBEDDED_DD_COLUMNS]
+            )
+        )
+        .unique(subset=["PBN"], maintain_order=True)
+    )
+    sample_pbns = _select_lancelot_dd_audit_pbns(unique["PBN"].to_list(), rate)
+    if not sample_pbns:
+        return 0
+    sample = unique.filter(pl.col("PBN").is_in(sample_pbns))
+    _ff_lib, augment_lib = _import_mlbridge()
+    from endplay.types import Deal
+    from mlBridge.dds_ddss import DDSS_AVAILABLE
+
+    if not DDSS_AVAILABLE:
+        raise RuntimeError("ddss DLL is required to audit Lancelot DD tables")
+    deals = [Deal(pbn) for pbn in sample["PBN"].to_list()]
+    with _AUGMENT_LOCK:
+        tables = augment_lib.solve_dd_for_deals(deals)
+    mismatches: list[str] = []
+    for rec, table in zip(sample.iter_rows(named=True), tables):
+        expected = _ddss_columns_from_table(table)
+        diffs = [
+            f"{column} Lancelot={int(rec[column])} ddss={expected[column]}"
+            for column in EMBEDDED_DD_COLUMNS
+            if int(rec[column]) != expected[column]
+        ]
+        if diffs:
+            mismatches.append(f"{rec['PBN']}: {', '.join(diffs)}")
+    print(
+        f"[ffbridge-quality] audited {len(sample_pbns)}/{unique.height} "
+        f"Lancelot DD tables against ddss",
+        flush=True,
+    )
+    if mismatches:
+        raise LancelotDDMismatchError(
+            f"Lancelot DD mismatch on {len(mismatches)}/{len(sample_pbns)} "
+            f"sampled deals:\n  " + "\n  ".join(mismatches)
+        )
+    return len(sample_pbns)
+
+
 def _needs_lancelot_convert(frame: pl.DataFrame) -> bool:
     return "board_deal" in frame.columns or "board_frequencies" in frame.columns
 
@@ -2334,6 +2411,7 @@ def augment_raw_session(
     cache_file_path: pathlib.Path | None = None,
     sd_productions: int = 10,
     max_sd_adds: int | None = None,
+    dd_audit_rate: float = 0.1,
 ) -> pl.DataFrame:
     """Augment a session the ACBL way: cache DD/Par/SD probs, derive EV, join.
 
@@ -2361,6 +2439,7 @@ def augment_raw_session(
     )
     _validate_converted_suits(work)
     if _has_embedded_dd_table(work):
+        _audit_lancelot_dd_sample(work, rate=dd_audit_rate)
         work = attach_embedded_dd_metrics(work)
         work = _attach_contract_types(work)
         cache = _resolve_hrs_cache(hrs_cache, cache_file_path)

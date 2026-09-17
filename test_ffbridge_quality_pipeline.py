@@ -12,15 +12,19 @@ import requests
 
 from ffbridge_quality_pipeline import (
     AuditReport,
+    LancelotDDMismatchError,
     NoQualityRowsError,
     QUALITY_BOARD_COLUMNS,
     SessionAudit,
     _attach_board_ev_columns,
     _attach_sd_ev_from_unique_deals,
+    _audit_lancelot_dd_sample,
+    _ddss_columns_from_table,
     _fragment_schema_is_current,
-    _official_hrs_cache,
     _has_embedded_dd_table,
     _import_mlbridge,
+    _official_hrs_cache,
+    _select_lancelot_dd_audit_pbns,
     attach_embedded_dd_metrics,
     audit_historical_cache,
     augment_raw_session,
@@ -378,7 +382,7 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
             schema={"PBN": pl.String, "Contract": pl.String},
         )
         with self.assertRaisesRegex(NoQualityRowsError, "no board rows"):
-            augment_raw_session(raw, max_sd_adds=0)
+            augment_raw_session(raw, max_sd_adds=0, dd_audit_rate=0)
 
         with self.assertRaisesRegex(NoQualityRowsError, "contain no board rows"):
             flatten_team_scores("10", [], {})
@@ -424,7 +428,7 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
             "ffbridge_quality_pipeline._full_mlbridge_augment",
             side_effect=AssertionError("AllAugmentations must not run"),
         ):
-            out = augment_raw_session(raw, max_sd_adds=0)
+            out = augment_raw_session(raw, max_sd_adds=0, dd_audit_rate=0)
         self.assertEqual(out["DD_Tricks"][0], 9)
         self.assertEqual(out["Tricks"][0], 10)
         self.assertEqual(out["DDTricks_Diff"][0], 1)
@@ -482,6 +486,34 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
         out = attach_embedded_dd_metrics(raw)
         self.assertEqual(out["DD_Tricks"][0], 13)
         self.assertGreater(out["ParScore_NS"][0], 0)
+
+    def test_lancelot_dd_audit_sample_is_ten_percent(self) -> None:
+        pbns = [f"deal-{index:02d}" for index in range(10)]
+        self.assertEqual(len(_select_lancelot_dd_audit_pbns(pbns, 0.1)), 1)
+        self.assertEqual(_select_lancelot_dd_audit_pbns(pbns, 0), [])
+        self.assertEqual(_select_lancelot_dd_audit_pbns(pbns, 0.1), _select_lancelot_dd_audit_pbns(pbns, 0.1))
+
+    def test_lancelot_dd_audit_accepts_matching_ddss_table(self) -> None:
+        from endplay.types import Deal
+
+        pbn = "N:QJ93.J5.AKT.J732 K.AQT873.873.A65 T762.K92.QJ64.K9 A854.64.952.QT84"
+        _ff_lib, augment_lib = _import_mlbridge()
+        table = augment_lib.solve_dd_for_deals([Deal(pbn)])[0]
+        columns = _ddss_columns_from_table(table)
+        frame = pl.DataFrame({"PBN": [pbn], **{name: [value] for name, value in columns.items()}})
+        self.assertEqual(_audit_lancelot_dd_sample(frame, rate=1.0), 1)
+
+    def test_lancelot_dd_audit_rejects_mismatch(self) -> None:
+        from endplay.types import Deal
+
+        pbn = "N:QJ93.J5.AKT.J732 K.AQT873.873.A65 T762.K92.QJ64.K9 A854.64.952.QT84"
+        _ff_lib, augment_lib = _import_mlbridge()
+        table = augment_lib.solve_dd_for_deals([Deal(pbn)])[0]
+        columns = _ddss_columns_from_table(table)
+        columns["DD_N_S"] = (columns["DD_N_S"] + 1) % 14
+        frame = pl.DataFrame({"PBN": [pbn], **{name: [value] for name, value in columns.items()}})
+        with self.assertRaisesRegex(LancelotDDMismatchError, "DD_N_S"):
+            _audit_lancelot_dd_sample(frame, rate=1.0)
 
     def test_board_ev_columns_use_unique_deal_summaries(self) -> None:
         frame = pl.DataFrame(
