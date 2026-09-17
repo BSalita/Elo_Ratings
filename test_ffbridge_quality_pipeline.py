@@ -15,8 +15,11 @@ from ffbridge_quality_pipeline import (
     NoQualityRowsError,
     QUALITY_BOARD_COLUMNS,
     SessionAudit,
+    _attach_board_ev_columns,
+    _attach_sd_ev_from_unique_deals,
     _fragment_schema_is_current,
     _has_embedded_dd_table,
+    _import_mlbridge,
     attach_embedded_dd_metrics,
     audit_historical_cache,
     augment_raw_session,
@@ -374,7 +377,7 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
             schema={"PBN": pl.String, "Contract": pl.String},
         )
         with self.assertRaisesRegex(NoQualityRowsError, "no board rows"):
-            augment_raw_session(raw)
+            augment_raw_session(raw, max_sd_adds=0)
 
         with self.assertRaisesRegex(NoQualityRowsError, "contain no board rows"):
             flatten_team_scores("10", [], {})
@@ -420,7 +423,7 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
             "ffbridge_quality_pipeline._full_mlbridge_augment",
             side_effect=AssertionError("AllAugmentations must not run"),
         ):
-            out = augment_raw_session(raw)
+            out = augment_raw_session(raw, max_sd_adds=0)
         self.assertEqual(out["DD_Tricks"][0], 9)
         self.assertEqual(out["Tricks"][0], 10)
         self.assertEqual(out["DDTricks_Diff"][0], 1)
@@ -478,6 +481,119 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
         out = attach_embedded_dd_metrics(raw)
         self.assertEqual(out["DD_Tricks"][0], 13)
         self.assertGreater(out["ParScore_NS"][0], 0)
+
+    def test_board_ev_columns_use_unique_deal_summaries(self) -> None:
+        frame = pl.DataFrame(
+            {
+                "session_id": ["10", "10"],
+                "Board": [1, 1],
+                "Pair_Declarer_Direction": ["NS", "EW"],
+                "Declarer_Direction": ["N", "E"],
+                "BidLvl": [4, 2],
+                "BidSuit": ["S", "H"],
+                "Vul_NS": [False, False],
+                "Vul_EW": [False, False],
+                "Score_NS": [420, -110],
+                "Score_EW": [-420, 110],
+                "EV_NS_N_S_4_NV": [400.0, 400.0],
+                "EV_EW_E_H_2_NV": [110.0, 110.0],
+                "EV_NS_NV_Max": [450.0, 450.0],
+                "EV_NS_V_Max": [500.0, 500.0],
+                "EV_EW_NV_Max": [140.0, 140.0],
+                "EV_EW_V_Max": [200.0, 200.0],
+            }
+        )
+        out = _attach_board_ev_columns(frame)
+        self.assertAlmostEqual(out["EV_Score_Declarer"][0], 400.0)
+        self.assertAlmostEqual(out["EV_Score_Declarer"][1], 110.0)
+        self.assertAlmostEqual(out["EV_Max_Declarer"][0], 450.0)
+        self.assertAlmostEqual(out["EV_Max_Declarer"][1], 140.0)
+        self.assertIn("MP_EV_Pct_Declarer", out.columns)
+        self.assertIn("MP_EV_Max_Pct_Declarer", out.columns)
+        self.assertGreaterEqual(out["MP_EV_Pct_Declarer"][0], 0.0)
+        self.assertLessEqual(out["MP_EV_Pct_Declarer"][0], 1.0)
+
+    def test_sd_cache_hit_skips_hand_record_augmenter(self) -> None:
+        pbn = "N:QJ93.J5.AKT.J732 K.AQT873.873.A65 T762.K92.QJ64.K9 A854.64.952.QT84"
+        frame = pl.DataFrame(
+            {
+                "PBN": [pbn, pbn],
+                "Dealer": ["N", "N"],
+                "Vul": ["None", "None"],
+                "Board": [1, 1],
+                "Pair_Declarer_Direction": ["NS", "EW"],
+            }
+        )
+        cache_row: dict[str, object] = {"PBN": pbn, "Probs_Trials": 10}
+        for pair in ("NS", "EW"):
+            for declarer in pair:
+                for strain in "SHDCN":
+                    for taken in range(14):
+                        cache_row[f"Probs_{pair}_{declarer}_{strain}_{taken}"] = 1.0 / 14
+        cache = pl.DataFrame([cache_row])
+        _ff_lib, augment_lib = _import_mlbridge()
+        with mock.patch.object(
+            augment_lib,
+            "AllHandRecordAugmentations",
+            side_effect=AssertionError("cache hit must skip SD"),
+        ):
+            out, cache_out = _attach_sd_ev_from_unique_deals(
+                frame,
+                hrs_cache_df=cache,
+                cache_file_path=None,
+                sd_productions=10,
+                max_sd_adds=None,
+            )
+        self.assertIn("EV_NS_N_S_4_NV", out.columns)
+        self.assertIn("EV_NS_NV_Max", out.columns)
+        self.assertEqual(out.height, 2)
+        self.assertIsNotNone(out["EV_NS_N_S_4_NV"][0])
+        self.assertIn("EV_NS_NV_Max", cache_out.columns)
+        self.assertEqual(cache_out.height, cache.height)
+
+    def test_ev_cache_hit_joins_without_recomputing(self) -> None:
+        pbn = "N:QJ93.J5.AKT.J732 K.AQT873.873.A65 T762.K92.QJ64.K9 A854.64.952.QT84"
+        frame = pl.DataFrame(
+            {
+                "PBN": [pbn],
+                "Dealer": ["N"],
+                "Vul": ["None"],
+                "Board": [1],
+            }
+        )
+        cache = pl.DataFrame(
+            {
+                "PBN": [pbn],
+                "Probs_Trials": [10],
+                "EV_NS_N_S_4_NV": [400.0],
+                "EV_NS_NV_Max": [450.0],
+                "EV_NS_V_Max": [500.0],
+                "EV_EW_NV_Max": [140.0],
+                "EV_EW_V_Max": [200.0],
+            }
+        )
+        _ff_lib, augment_lib = _import_mlbridge()
+        with (
+            mock.patch.object(
+                augment_lib,
+                "AllHandRecordAugmentations",
+                side_effect=AssertionError("cache hit must skip SD"),
+            ),
+            mock.patch.object(
+                augment_lib,
+                "add_single_dummy_expected_values",
+                side_effect=AssertionError("EV cache hit must skip EV rebuild"),
+            ),
+        ):
+            out, _cache_out = _attach_sd_ev_from_unique_deals(
+                frame,
+                hrs_cache_df=cache,
+                cache_file_path=None,
+                sd_productions=10,
+                max_sd_adds=None,
+            )
+        self.assertEqual(out["EV_NS_N_S_4_NV"][0], 400.0)
+        self.assertEqual(out["EV_NS_NV_Max"][0], 450.0)
 
     def test_player_and_pair_aggregates_rank_high_values_first(self) -> None:
         quality = normalize_quality_frame(_quality_input(), session_dates=_dates())
