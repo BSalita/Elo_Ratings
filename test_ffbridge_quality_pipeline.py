@@ -16,6 +16,8 @@ from ffbridge_quality_pipeline import (
     QUALITY_BOARD_COLUMNS,
     SessionAudit,
     _fragment_schema_is_current,
+    _has_embedded_dd_table,
+    attach_embedded_dd_metrics,
     audit_historical_cache,
     augment_raw_session,
     build_pair_sidecar,
@@ -376,6 +378,106 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
 
         with self.assertRaisesRegex(NoQualityRowsError, "contain no board rows"):
             flatten_team_scores("10", [], {})
+
+    def test_embedded_dd_table_derives_quality_columns_without_allaugmentations(
+        self,
+    ) -> None:
+        raw = pl.DataFrame(
+            {
+                "PBN": ["N:QJ93.J5.AKT.J732 K.AQT873.873.A65 T762.K92.QJ64.K9 A854.64.952.QT84"],
+                "Contract": ["4SN"],
+                "Board": [1],
+                "BidLvl": [4],
+                "BidSuit": ["S"],
+                "Declarer_Direction": ["N"],
+                "Result": [0],
+                "Dealer": ["N"],
+                "Vul": ["None"],
+                "DD_N_C": [6],
+                "DD_N_D": [8],
+                "DD_N_H": [5],
+                "DD_N_N": [6],
+                "DD_N_S": [9],
+                "DD_E_C": [7],
+                "DD_E_D": [5],
+                "DD_E_H": [7],
+                "DD_E_N": [7],
+                "DD_E_S": [4],
+                "DD_S_C": [6],
+                "DD_S_D": [8],
+                "DD_S_H": [5],
+                "DD_S_N": [6],
+                "DD_S_S": [9],
+                "DD_W_C": [7],
+                "DD_W_D": [5],
+                "DD_W_H": [7],
+                "DD_W_N": [7],
+                "DD_W_S": [4],
+            }
+        )
+        self.assertTrue(_has_embedded_dd_table(raw))
+        with mock.patch(
+            "ffbridge_quality_pipeline._full_mlbridge_augment",
+            side_effect=AssertionError("AllAugmentations must not run"),
+        ):
+            out = augment_raw_session(raw)
+        self.assertEqual(out["DD_Tricks"][0], 9)
+        self.assertEqual(out["Tricks"][0], 10)
+        self.assertEqual(out["DDTricks_Diff"][0], 1)
+        self.assertIn("ParScore_NS", out.columns)
+        self.assertIn("DDScore_4S_N", out.columns)
+        self.assertEqual(out["HCP_N"][0], 12)
+        quality = normalize_quality_frame(
+            out.with_columns(
+                pl.lit("10").alias("session_id"),
+                pl.lit("100").alias("board_id"),
+                pl.lit("7").alias("group_id"),
+                pl.lit("70").alias("team_id"),
+                *[
+                    pl.lit(str(value)).alias(f"Player_ID_{seat}")
+                    for seat, value in zip(("N", "E", "S", "W"), (20, 40, 3, 11))
+                ],
+            ),
+            session_dates=_dates(),
+        )
+        self.assertEqual(quality.height, 1)
+        self.assertTrue(set(QUALITY_BOARD_COLUMNS).issubset(quality.columns))
+
+    def test_attach_embedded_dd_metrics_sets_declarer_score(self) -> None:
+        raw = pl.DataFrame(
+            {
+                "PBN": ["N:AKQJT9.AK.AK.AKQ J.QJT98.QJT9.JT9 876.765.8765.876 5432.432.432.5432"],
+                "BidLvl": [6],
+                "BidSuit": ["S"],
+                "Declarer_Direction": ["N"],
+                "Result": [0],
+                "Dealer": ["N"],
+                "Vul": ["None"],
+                "DD_N_C": [13],
+                "DD_N_D": [13],
+                "DD_N_H": [13],
+                "DD_N_N": [13],
+                "DD_N_S": [13],
+                "DD_E_C": [0],
+                "DD_E_D": [0],
+                "DD_E_H": [0],
+                "DD_E_N": [0],
+                "DD_E_S": [0],
+                "DD_S_C": [13],
+                "DD_S_D": [13],
+                "DD_S_H": [13],
+                "DD_S_N": [13],
+                "DD_S_S": [13],
+                "DD_W_C": [0],
+                "DD_W_D": [0],
+                "DD_W_H": [0],
+                "DD_W_N": [0],
+                "DD_W_S": [0],
+            }
+        )
+        out = attach_embedded_dd_metrics(raw)
+        self.assertEqual(out["DD_Tricks"][0], 13)
+        self.assertGreater(out["ParScore_NS"][0], 0)
 
     def test_player_and_pair_aggregates_rank_high_values_first(self) -> None:
         quality = normalize_quality_frame(_quality_input(), session_dates=_dates())

@@ -1295,21 +1295,449 @@ def load_raw_session(
     return flatten_team_scores(session.session_id, all_scores, identity_map)
 
 
-def augment_raw_session(raw: pl.DataFrame) -> pl.DataFrame:
-    """Run mlBridge augmentation when embedded DD/par data is insufficient.
+EMBEDDED_DD_COLUMNS = tuple(f"DD_{seat}_{suit}" for seat in SEATS for suit in "SHDCN")
+_HCP_RANKS = {"A": 4, "K": 3, "Q": 2, "J": 1}
+_AUGMENT_LOCK = threading.Lock()
 
-    Single-dummy uses 10 samples per side. max_sd_adds is None so every
-    unique PBN in the session is solved; 0 would skip SD entirely.
-    """
-    required = {
-        "ParScore_NS",
-        "ParScore_EW",
-        "DDTricks_Diff",
-    }
+
+def _has_quality_dd_scores(frame: pl.DataFrame) -> bool:
+    required = {"ParScore_NS", "ParScore_EW", "DDTricks_Diff"}
     has_dd_scores = any(
-        column.startswith(("DDScore_", "DD_Score_")) for column in raw.columns
+        column.startswith(("DDScore_", "DD_Score_")) for column in frame.columns
     )
-    if required.issubset(raw.columns) and has_dd_scores:
+    return required.issubset(frame.columns) and has_dd_scores
+
+
+def _has_embedded_dd_table(frame: pl.DataFrame) -> bool:
+    if any(column not in frame.columns for column in EMBEDDED_DD_COLUMNS):
+        return False
+    return bool(
+        frame.select(
+            pl.all_horizontal(
+                [pl.col(column).is_not_null() for column in EMBEDDED_DD_COLUMNS]
+            ).any()
+        ).item()
+    )
+
+
+def _needs_lancelot_convert(frame: pl.DataFrame) -> bool:
+    return "board_deal" in frame.columns or "board_frequencies" in frame.columns
+
+
+def _hcp_of_cards(cards: str) -> int:
+    return sum(_HCP_RANKS.get(rank, 0) for rank in cards)
+
+
+def _quick_tricks(cards: str) -> float:
+    has_a = "A" in cards
+    has_k = "K" in cards
+    has_q = "Q" in cards
+    if has_a and has_k:
+        return 2.0
+    if has_a and has_q:
+        return 1.5
+    if has_a:
+        return 1.0
+    if has_k and has_q:
+        return 1.0
+    if has_k:
+        return 0.5
+    return 0.0
+
+
+def _distribution_points(length: int) -> int:
+    return {0: 3, 1: 2, 2: 1}.get(length, 0)
+
+
+def _hand_features_from_pbn(pbn: str) -> dict[str, Any] | None:
+    body = str(pbn).split(":", 1)[-1].strip()
+    hands = body.split()
+    if len(hands) != 4:
+        return None
+    features: dict[str, Any] = {"PBN": pbn}
+    hcp_ns = 0
+    hcp_ew = 0
+    qt_ns = 0.0
+    qt_ew = 0.0
+    dp_ns = 0
+    dp_ew = 0
+    for seat, hand in zip(SEATS, hands):
+        suits = hand.split(".")
+        if len(suits) != 4:
+            return None
+        # PBN suit order is S.H.D.C
+        suit_cards = {"S": suits[0], "H": suits[1], "D": suits[2], "C": suits[3]}
+        hcp = _hcp_of_cards(hand)
+        qt = sum(_quick_tricks(suit_cards[suit]) for suit in "SHDC")
+        dp = sum(_distribution_points(len(suit_cards[suit])) for suit in "SHDC")
+        features[f"HCP_{seat}"] = hcp
+        features[f"QT_{seat}"] = qt
+        features[f"DP_{seat}"] = dp
+        if seat == "N":
+            for suit, cards in suit_cards.items():
+                features[f"SL_N_{suit}"] = len(cards)
+                features[f"DP_N_{suit}"] = _distribution_points(len(cards))
+        if seat in {"N", "S"}:
+            hcp_ns += hcp
+            qt_ns += qt
+            dp_ns += dp
+        else:
+            hcp_ew += hcp
+            qt_ew += qt
+            dp_ew += dp
+    features["HCP_NS"] = hcp_ns
+    features["HCP_EW"] = hcp_ew
+    features["QT_NS"] = qt_ns
+    features["QT_EW"] = qt_ew
+    features["DP_NS"] = dp_ns
+    features["DP_EW"] = dp_ew
+    features["SL_N_ML_SJ"] = max(
+        features["SL_N_S"], features["SL_N_H"], features["SL_N_D"], features["SL_N_C"]
+    )
+    return features
+
+
+def _hand_feature_frame(pbns: Sequence[str]) -> pl.DataFrame:
+    rows = []
+    seen: set[str] = set()
+    for pbn in pbns:
+        if not pbn or pbn in seen:
+            continue
+        seen.add(pbn)
+        features = _hand_features_from_pbn(pbn)
+        if features is not None:
+            rows.append(features)
+    if not rows:
+        return pl.DataFrame({"PBN": []})
+    return pl.DataFrame(rows)
+
+
+def _dd_tricks_expr() -> pl.Expr:
+    expr = pl.lit(None, dtype=pl.Int32)
+    for direction in SEATS:
+        for suit in "SHDCN":
+            expr = (
+                pl.when(
+                    (pl.col("Declarer_Direction") == direction)
+                    & (pl.col("BidSuit") == suit)
+                )
+                .then(pl.col(f"DD_{direction}_{suit}").cast(pl.Int32, strict=False))
+                .otherwise(expr)
+            )
+    return expr
+
+
+def _import_mlbridge() -> tuple[Any, Any]:
+    here = pathlib.Path(__file__).resolve().parent
+    mlbridge_root = next(
+        (path for path in (here / "mlBridge", here.parent / "mlBridge") if path.is_dir()),
+        None,
+    )
+    if mlbridge_root is None:
+        raise FileNotFoundError("mlBridge not found at ./mlBridge or ../mlBridge")
+    if str(mlbridge_root.parent) not in sys.path:
+        sys.path.insert(0, str(mlbridge_root.parent))
+    from mlBridge import mlBridgeFFLib  # type: ignore
+    from mlBridge import mlBridgeAugmentLib  # type: ignore
+
+    return mlBridgeFFLib, mlBridgeAugmentLib
+
+
+def _par_rows_from_embedded_dd(frame: pl.DataFrame, augment_lib: Any) -> pl.DataFrame:
+    """Par from the Lancelot DD table. Does not re-solve the deals."""
+    needed = ("PBN", "Dealer", "Vul", *EMBEDDED_DD_COLUMNS)
+    _require_columns(frame, needed, "Embedded DD frame")
+    unique = (
+        frame.select("PBN", "Dealer", "Vul", *EMBEDDED_DD_COLUMNS)
+        .filter(
+            pl.col("PBN").is_not_null()
+            & pl.col("Dealer").is_not_null()
+            & pl.col("Vul").is_not_null()
+            & pl.all_horizontal(
+                [pl.col(column).is_not_null() for column in EMBEDDED_DD_COLUMNS]
+            )
+        )
+        .unique(subset=["PBN", "Dealer", "Vul"], maintain_order=True)
+    )
+    if unique.is_empty():
+        raise NoQualityRowsError("Embedded DD table has no complete PBN/Dealer/Vul rows")
+    par_fn = augment_lib.par
+    rows: list[dict[str, Any]] = []
+    with _AUGMENT_LOCK:
+        for rec in unique.iter_rows(named=True):
+            table = augment_lib._list_to_ddtable(
+                [
+                    [int(rec[f"DD_{direction}_{suit}"]) for suit in "SHDCN"]
+                    for direction in SEATS
+                ]
+            )
+            parlist = par_fn(
+                table,
+                augment_lib.VulToEndplayVul_d[rec["Vul"]],
+                augment_lib.DealerToEndPlayDealer_d[rec["Dealer"]],
+            )
+            contracts = [
+                {
+                    "Level": str(contract.level),
+                    "Strain": "SHDCN"[int(contract.denom)],
+                    "Doubled": contract.penalty.abbr,
+                    "Pair_Direction": (
+                        "NS" if contract.declarer.abbr in "NS" else "EW"
+                    ),
+                    "Result": contract.result,
+                }
+                for contract in parlist
+            ]
+            rows.append(
+                {
+                    "PBN": rec["PBN"],
+                    "Dealer": rec["Dealer"],
+                    "Vul": rec["Vul"],
+                    "ParScore": int(parlist.score),
+                    "ParContracts": contracts,
+                }
+            )
+    return pl.DataFrame(rows)
+
+
+def attach_embedded_dd_metrics(frame: pl.DataFrame) -> pl.DataFrame:
+    """Derive quality/Club DD columns from an already-present DD trick table."""
+    _require_columns(
+        frame,
+        [
+            "PBN",
+            "BidLvl",
+            "BidSuit",
+            "Declarer_Direction",
+            *EMBEDDED_DD_COLUMNS,
+        ],
+        "Embedded DD frame",
+    )
+    _, augment_lib = _import_mlbridge()
+    out = frame.with_columns(
+        pl.col("BidLvl").cast(pl.Int32, strict=False),
+        pl.col("BidSuit").cast(pl.String).str.to_uppercase(),
+        pl.col("Declarer_Direction")
+        .cast(pl.String)
+        .str.to_uppercase()
+        .replace({"O": "W"}),
+    )
+    if "Dealer" not in out.columns:
+        board = pl.col("Board").cast(pl.Int64, strict=False)
+        out = out.with_columns(
+            pl.when(board.is_null() | (board <= 0))
+            .then(pl.lit(None, dtype=pl.Utf8))
+            .otherwise(
+                pl.col("Board")
+                .cast(pl.Int64, strict=False)
+                .sub(1)
+                .mod(4)
+                .replace_strict({0: "N", 1: "E", 2: "S", 3: "W"})
+            )
+            .alias("Dealer")
+        )
+    if "Vul" not in out.columns:
+        raise ValueError("Vul is required to derive par from the embedded DD table")
+    if "Result" in out.columns:
+        result = pl.col("Result").cast(pl.Int32, strict=False)
+    else:
+        result = pl.lit(0, dtype=pl.Int32)
+    out = out.with_columns(
+        _dd_tricks_expr().alias("DD_Tricks"),
+        (pl.col("BidLvl") + 6 + result).alias("Tricks"),
+        pl.when(pl.col("Declarer_Direction").is_in(["N", "S"]))
+        .then(pl.lit("NS"))
+        .when(pl.col("Declarer_Direction").is_in(["E", "W"]))
+        .then(pl.lit("EW"))
+        .otherwise(None)
+        .alias("Pair_Declarer_Direction"),
+    ).with_columns(
+        (pl.col("Tricks") - pl.col("DD_Tricks"))
+        .cast(pl.Int8, strict=False)
+        .alias("DDTricks_Diff"),
+        (pl.col("Tricks") - pl.col("DD_Tricks"))
+        .cast(pl.Int8, strict=False)
+        .alias("DD_Tricks_Diff"),
+    )
+    scores_d = augment_lib.precompute_contract_score_tables()[1]
+    if "Vul_NS" not in out.columns:
+        out = out.with_columns(
+            pl.col("Vul").is_in(["N_S", "Both"]).alias("Vul_NS"),
+            pl.col("Vul").is_in(["E_W", "Both"]).alias("Vul_EW"),
+        )
+    out = out.with_columns(
+        pl.struct(
+            [
+                "BidLvl",
+                "BidSuit",
+                "DD_Tricks",
+                "Declarer_Direction",
+                "Vul_NS",
+                "Vul_EW",
+            ]
+        )
+        .map_elements(
+            lambda rec: scores_d.get(
+                (
+                    rec["BidLvl"],
+                    rec["BidSuit"],
+                    rec["DD_Tricks"],
+                    rec["Vul_NS"]
+                    if rec["Declarer_Direction"] in {"N", "S"}
+                    else rec["Vul_EW"],
+                )
+            ),
+            return_dtype=pl.Int32,
+        )
+        .alias("DD_Score_Declarer")
+    )
+    score_columns: list[pl.Expr] = []
+    contracts = (
+        out.select("BidLvl", "BidSuit", "Declarer_Direction")
+        .drop_nulls()
+        .unique()
+        .iter_rows(named=True)
+    )
+    for rec in contracts:
+        level = rec["BidLvl"]
+        suit = rec["BidSuit"]
+        direction = rec["Declarer_Direction"]
+        if level is None or suit not in set("SHDCN") or direction not in SEATS:
+            continue
+        name = f"DDScore_{int(level)}{suit}_{direction}"
+        if name in out.columns:
+            continue
+        score_columns.append(
+            pl.when(
+                (pl.col("BidLvl") == level)
+                & (pl.col("BidSuit") == suit)
+                & (pl.col("Declarer_Direction") == direction)
+            )
+            .then(pl.col("DD_Score_Declarer"))
+            .otherwise(None)
+            .alias(name)
+        )
+    if score_columns:
+        out = out.with_columns(*score_columns)
+    par_rows = _par_rows_from_embedded_dd(out, augment_lib)
+    if "ParScore" in out.columns:
+        out = out.drop("ParScore")
+    out = out.join(par_rows, on=["PBN", "Dealer", "Vul"], how="left")
+    out = out.with_columns(
+        pl.col("ParScore").alias("ParScore_NS"),
+        (-pl.col("ParScore")).alias("ParScore_EW"),
+    )
+    if "Score_NS" in out.columns and "Score_Declarer" not in out.columns:
+        out = out.with_columns(
+            pl.when(pl.col("Pair_Declarer_Direction") == "NS")
+            .then(pl.col("Score_NS"))
+            .when(pl.col("Pair_Declarer_Direction") == "EW")
+            .then(-pl.col("Score_NS"))
+            .otherwise(None)
+            .alias("Score_Declarer")
+        )
+    if "Pct_NS" in out.columns and "Declarer_Pct" not in out.columns:
+        out = out.with_columns(
+            pl.when(pl.col("Pair_Declarer_Direction") == "NS")
+            .then(pl.col("Pct_NS"))
+            .when(pl.col("Pair_Declarer_Direction") == "EW")
+            .then(pl.col("Pct_EW") if "Pct_EW" in out.columns else (1 - pl.col("Pct_NS")))
+            .otherwise(None)
+            .alias("Declarer_Pct")
+        )
+    hands = _hand_feature_frame(out["PBN"].drop_nulls().unique().to_list())
+    if hands.height:
+        overlap = [column for column in hands.columns if column != "PBN" and column in out.columns]
+        if overlap:
+            out = out.drop(overlap)
+        out = out.join(hands, on="PBN", how="left")
+    return out
+
+
+def _convert_and_reattach(prepared: pl.DataFrame) -> pl.DataFrame:
+    ff_lib, _augment_lib = _import_mlbridge()
+    converted = ff_lib.convert_ffdf_lancelot_to_mldf(prepared)
+    if converted.height != prepared.height:
+        raise ValueError(
+            f"mlBridge conversion changed row count from {prepared.height} "
+            f"to {converted.height}"
+        )
+    overlays = []
+    for column in (
+        "session_id",
+        "group_id",
+        "team_id",
+        "board_id",
+        "Date",
+        "BidLvl",
+        "BidSuit",
+        "Declarer_Direction",
+        "Result",
+        "PBN",
+        *EMBEDDED_DD_COLUMNS,
+        *(f"Player_ID_{seat}" for seat in SEATS),
+    ):
+        if column in prepared.columns:
+            overlays.append(prepared[column].alias(column))
+    if overlays:
+        converted = converted.with_columns(*overlays)
+    return converted
+
+
+def _validate_converted_suits(frame: pl.DataFrame) -> None:
+    if "BidSuit" not in frame.columns:
+        return
+    invalid_suits = sorted(
+        set(
+            frame["BidSuit"]
+            .drop_nulls()
+            .cast(pl.String)
+            .str.to_uppercase()
+            .to_list()
+        )
+        - {"C", "D", "H", "S", "N"}
+    )
+    if invalid_suits:
+        raise NoQualityRowsError(
+            f"Raw session has unsupported contract denominations: {invalid_suits}"
+        )
+
+
+def _full_mlbridge_augment(converted: pl.DataFrame) -> pl.DataFrame:
+    _ff_lib, augment_lib = _import_mlbridge()
+    augment_logger = logging.getLogger("mlBridge.mlBridgeAugmentLib")
+    previous_level = augment_logger.level
+    augment_logger.setLevel(logging.WARNING)
+    try:
+        try:
+            with _AUGMENT_LOCK:
+                augmented, _ = augment_lib.AllAugmentations(
+                    converted,
+                    None,
+                    sd_productions=10,
+                    max_sd_adds=None,
+                    output_progress=False,
+                    incorporate_elo_ratings=False,
+                ).perform_all_augmentations()
+        except pl.exceptions.InvalidOperationError as exc:
+            raise NoQualityRowsError(
+                f"Unsupported declarer/contract values: {exc}"
+            ) from exc
+    finally:
+        augment_logger.setLevel(previous_level)
+    return augmented
+
+
+def augment_raw_session(raw: pl.DataFrame) -> pl.DataFrame:
+    """Augment a raw session, preferring Lancelot's embedded DD table.
+
+    Simultaneous sessions already publish a complete DD trick table. Deriving
+    par / DD scores / hand features from that table avoids AllAugmentations,
+    which re-solves every deal and explodes EV columns across the full field
+    (minutes per session). AllAugmentations remains only when the DD table is
+    absent.
+    """
+    if _has_quality_dd_scores(raw):
         return raw
     _require_columns(raw, ["PBN", "Contract"], "Raw score frame")
     prepared = raw.filter(
@@ -1322,68 +1750,15 @@ def augment_raw_session(raw: pl.DataFrame) -> pl.DataFrame:
         raise NoQualityRowsError(
             "Raw session has no board rows with both a PBN deal and contract"
         )
-    _here = pathlib.Path(__file__).resolve().parent
-    mlbridge_root = next(
-        (path for path in (_here / "mlBridge", _here.parent / "mlBridge") if path.is_dir()),
-        None,
+    work = (
+        _convert_and_reattach(prepared)
+        if _needs_lancelot_convert(prepared)
+        else prepared
     )
-    if mlbridge_root is None:
-        raise FileNotFoundError("mlBridge not found at ./mlBridge or ../mlBridge")
-    if str(mlbridge_root.parent) not in sys.path:
-        sys.path.insert(0, str(mlbridge_root.parent))
-    from mlBridge import mlBridgeFFLib  # type: ignore
-    from mlBridge.mlBridgeAugmentLib import AllAugmentations  # type: ignore
-
-    converted = mlBridgeFFLib.convert_ffdf_lancelot_to_mldf(prepared)
-    if converted.height != prepared.height:
-        raise ValueError(
-            f"mlBridge conversion changed row count from {prepared.height} "
-            f"to {converted.height}"
-        )
-    if "BidSuit" in converted.columns:
-        invalid_suits = sorted(
-            set(
-                converted["BidSuit"]
-                .drop_nulls()
-                .cast(pl.String)
-                .str.to_uppercase()
-                .to_list()
-            )
-            - {"C", "D", "H", "S", "N"}
-        )
-        if invalid_suits:
-            raise NoQualityRowsError(
-                f"Raw session has unsupported contract denominations: {invalid_suits}"
-            )
-    converted = converted.with_columns(
-        prepared["session_id"].alias("session_id"),
-        prepared["group_id"].alias("group_id"),
-        prepared["team_id"].alias("team_id"),
-        *[
-            prepared[f"Player_ID_{seat}"].alias(f"Player_ID_{seat}")
-            for seat in SEATS
-        ],
-    )
-    augment_logger = logging.getLogger("mlBridge.mlBridgeAugmentLib")
-    previous_level = augment_logger.level
-    augment_logger.setLevel(logging.WARNING)
-    try:
-        try:
-            augmented, _ = AllAugmentations(
-                converted,
-                None,
-                sd_productions=10,
-                max_sd_adds=None,
-                output_progress=False,
-                incorporate_elo_ratings=False,
-            ).perform_all_augmentations()
-        except pl.exceptions.InvalidOperationError as exc:
-            raise NoQualityRowsError(
-                f"Unsupported declarer/contract values: {exc}"
-            ) from exc
-    finally:
-        augment_logger.setLevel(previous_level)
-    return augmented
+    _validate_converted_suits(work)
+    if _has_embedded_dd_table(work):
+        return attach_embedded_dd_metrics(work)
+    return _full_mlbridge_augment(work)
 
 
 def build_historical_fragments(
