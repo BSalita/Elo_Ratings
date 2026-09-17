@@ -487,6 +487,7 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
             {
                 "session_id": ["10", "10"],
                 "Board": [1, 1],
+                "PBN": ["N:AK.AK.AK.AKQJT9 ...", "N:AK.AK.AK.AKQJT9 ..."],
                 "Pair_Declarer_Direction": ["NS", "EW"],
                 "Declarer_Direction": ["N", "E"],
                 "BidLvl": [4, 2],
@@ -532,10 +533,17 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
                         cache_row[f"Probs_{pair}_{declarer}_{strain}_{taken}"] = 1.0 / 14
         cache = pl.DataFrame([cache_row])
         _ff_lib, augment_lib = _import_mlbridge()
-        with mock.patch.object(
-            augment_lib,
-            "AllHandRecordAugmentations",
-            side_effect=AssertionError("cache hit must skip SD"),
+        with (
+            mock.patch.object(
+                augment_lib,
+                "AllHandRecordAugmentations",
+                side_effect=AssertionError("must skip AllHandRecordAugmentations"),
+            ),
+            mock.patch.object(
+                augment_lib,
+                "identify_best_contracts_by_ev",
+                side_effect=AssertionError("must skip identify_best_contracts_by_ev"),
+            ),
         ):
             out, cache_out = _attach_sd_ev_from_unique_deals(
                 frame,
@@ -577,7 +585,12 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
             mock.patch.object(
                 augment_lib,
                 "AllHandRecordAugmentations",
-                side_effect=AssertionError("cache hit must skip SD"),
+                side_effect=AssertionError("must skip AllHandRecordAugmentations"),
+            ),
+            mock.patch.object(
+                augment_lib,
+                "identify_best_contracts_by_ev",
+                side_effect=AssertionError("must skip identify_best_contracts_by_ev"),
             ),
             mock.patch.object(
                 augment_lib,

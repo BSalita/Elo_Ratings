@@ -1735,6 +1735,53 @@ def _unique_deal_join_columns(frame: pl.DataFrame) -> list[str]:
     return list(dict.fromkeys(keep))
 
 
+def _join_ev_score_declarer(frame: pl.DataFrame) -> pl.DataFrame:
+    """Pick the played-contract EV summary without a 280-way when/then."""
+    ev_columns = [column for column in frame.columns if _EV_SUMMARY_RE.match(column)]
+    if not ev_columns or "PBN" not in frame.columns:
+        return frame.with_columns(_ev_score_declarer_expr(frame).alias("EV_Score_Declarer"))
+    long = (
+        frame.select(["PBN", *ev_columns])
+        .unique(subset=["PBN"], maintain_order=True)
+        .unpivot(
+            index="PBN",
+            on=ev_columns,
+            variable_name="_ev_col",
+            value_name="EV_Score_Declarer",
+        )
+        .with_columns(pl.col("_ev_col").str.split("_").alias("_parts"))
+        .with_columns(
+            pl.col("_parts").list.get(1).alias("Pair_Declarer_Direction"),
+            pl.col("_parts").list.get(2).alias("Declarer_Direction"),
+            pl.col("_parts").list.get(3).alias("BidSuit"),
+            pl.col("_parts").list.get(4).cast(pl.Int32).alias("_ev_level"),
+            (pl.col("_parts").list.get(5) == "V").alias("Vul_Declarer"),
+        )
+        .drop("_ev_col", "_parts")
+    )
+    work = frame
+    if "EV_Score_Declarer" in work.columns:
+        work = work.drop("EV_Score_Declarer")
+    if "Vul_Declarer" not in work.columns:
+        return work.with_columns(_ev_score_declarer_expr(work).alias("EV_Score_Declarer"))
+    work = work.with_columns(
+        pl.col("BidLvl").cast(pl.Int32, strict=False).alias("_ev_level")
+    )
+    work = work.join(
+        long,
+        on=[
+            "PBN",
+            "Pair_Declarer_Direction",
+            "Declarer_Direction",
+            "BidSuit",
+            "_ev_level",
+            "Vul_Declarer",
+        ],
+        how="left",
+    )
+    return work.drop("_ev_level")
+
+
 def _ev_score_declarer_expr(frame: pl.DataFrame) -> pl.Expr:
     expr = pl.lit(None, dtype=pl.Float32)
     for pair in ("NS", "EW"):
@@ -1867,18 +1914,58 @@ def _cached_ev_pbns(cache: pl.DataFrame | None) -> set[str]:
     }
 
 
-def _strip_ev_from_hrs_cache(cache: pl.DataFrame | None) -> pl.DataFrame | None:
-    """AllHandRecordAugmentations asserts the official DD/Par/Probs schema."""
+def _empty_hrs_cache() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "PBN": pl.String,
+            "Dealer": pl.String,
+            "Vul": pl.String,
+            "Probs_Trials": pl.Int64,
+        }
+    )
+
+
+def _latest_cache(
+    cache: pl.DataFrame | None,
+    cache_file_path: pathlib.Path | None,
+) -> pl.DataFrame:
+    if cache_file_path is not None:
+        disk = load_hrs_cache(cache_file_path)
+        if disk is not None:
+            return disk
     if cache is None or cache.is_empty():
-        return cache
-    extra = [
-        column
-        for column in cache.columns
-        if column.startswith("EV_") or column.startswith("CT_")
-    ]
-    if extra:
-        return cache.drop(extra)
+        return _empty_hrs_cache()
     return cache
+
+
+def _drop_intermediate_ev(frame: pl.DataFrame) -> pl.DataFrame:
+    drop = [
+        column
+        for column in frame.columns
+        if column.startswith("EV_")
+        and not _EV_SUMMARY_RE.match(column)
+        and not _EV_PAIR_MAX_RE.match(column)
+    ]
+    return frame.drop(drop) if drop else frame
+
+
+def _attach_pair_ev_max(frame: pl.DataFrame) -> pl.DataFrame:
+    """Pair/vulnerability max EV. Avoids identify_best_contracts_by_ev (minutes)."""
+    exprs: list[pl.Expr] = []
+    for pair in ("NS", "EW"):
+        for vul in ("V", "NV"):
+            columns = [
+                column
+                for column in frame.columns
+                if _EV_SUMMARY_RE.match(column)
+                and column.startswith(f"EV_{pair}_")
+                and column.endswith(f"_{vul}")
+            ]
+            if columns:
+                exprs.append(pl.max_horizontal(pl.col(columns)).alias(f"EV_{pair}_{vul}_Max"))
+    if not exprs:
+        return frame
+    return frame.with_columns(*exprs)
 
 
 def _merge_ev_into_cache(cache: pl.DataFrame, unique_aug: pl.DataFrame) -> pl.DataFrame:
@@ -1904,8 +1991,43 @@ def _compute_ev_from_probs(
     unique_aug = unique.join(probs, on="PBN", how="left")
     _scores_d, _scores, scores_df = augment_lib.precompute_contract_score_tables()
     unique_aug = augment_lib.add_single_dummy_expected_values(unique_aug, scores_df)
-    best = augment_lib.identify_best_contracts_by_ev(unique_aug)
-    return pl.concat([unique_aug, best], how="horizontal_extend")
+    unique_aug = _drop_intermediate_ev(unique_aug)
+    return _attach_pair_ev_max(unique_aug)
+
+
+def _estimate_sd_into_cache(
+    todo: pl.DataFrame,
+    cache: pl.DataFrame,
+    augment_lib: Any,
+    *,
+    sd_productions: int,
+    max_sd_adds: int | None,
+) -> pl.DataFrame:
+    if cache.is_empty() or "Probs_Trials" not in cache.columns:
+        cache = _empty_hrs_cache()
+    started = time.time()
+    augment_logger = logging.getLogger("mlBridge.mlBridgeAugmentLib")
+    previous_level = augment_logger.level
+    augment_logger.setLevel(logging.WARNING)
+    try:
+        _sd_dfs, sd_df = augment_lib.estimate_sd_trick_distributions_for_df(
+            todo,
+            cache,
+            sd_productions,
+            max_sd_adds,
+            None,
+            None,
+        )
+    finally:
+        augment_logger.setLevel(previous_level)
+    if sd_df is not None and not sd_df.is_empty():
+        cache = augment_lib.update_hand_records_cache(cache, sd_df)
+    elapsed = time.time() - started
+    print(
+        f"[ffbridge-quality] SD solved {todo.height} deals in {elapsed:.1f}s",
+        flush=True,
+    )
+    return cache
 
 
 def _ev_from_cached_probs(
@@ -1955,49 +2077,40 @@ def _attach_sd_ev_from_unique_deals(
     )
     needed = {pbn for pbn in unique["PBN"].to_list() if pbn}
     cached = _cached_sd_pbns(hrs_cache_df)
-    missing = sorted(needed - cached)
-    ev_hits = len(needed & _cached_ev_pbns(hrs_cache_df))
+    ev_cached = _cached_ev_pbns(hrs_cache_df)
+    missing = needed - cached
+    ev_missing = needed - ev_cached
     print(
         f"[ffbridge-quality] unique deals {len(needed)}; "
         f"SD cache hits {len(needed) - len(missing)}; "
-        f"EV cache hits {ev_hits}; missing {len(missing)}",
+        f"EV cache hits {len(needed) - len(ev_missing)}; "
+        f"missing {len(missing)}",
         flush=True,
     )
     _ff_lib, augment_lib = _import_mlbridge()
-    prior_ev: pl.DataFrame | None = None
-    if hrs_cache_df is not None and _ev_join_columns(hrs_cache_df):
-        prior_ev = hrs_cache_df.select(
-            ["PBN", *_ev_join_columns(hrs_cache_df)]
-        ).unique(subset=["PBN"], maintain_order=True)
-    if missing:
-        todo = unique.filter(pl.col("PBN").is_in(missing))
-        if max_sd_adds is not None:
-            todo = todo.head(max_sd_adds)
-        augment_logger = logging.getLogger("mlBridge.mlBridgeAugmentLib")
-        previous_level = augment_logger.level
-        augment_logger.setLevel(logging.WARNING)
-        try:
-            with _AUGMENT_LOCK:
-                augmenter = augment_lib.AllHandRecordAugmentations(
+    if missing or ev_missing:
+        with _AUGMENT_LOCK:
+            hrs_cache_df = _latest_cache(hrs_cache_df, cache_file_path)
+            missing = needed - _cached_sd_pbns(hrs_cache_df)
+            if missing:
+                todo = unique.filter(pl.col("PBN").is_in(sorted(missing)))
+                if max_sd_adds is not None:
+                    todo = todo.head(max_sd_adds)
+                hrs_cache_df = _estimate_sd_into_cache(
                     todo,
-                    _strip_ev_from_hrs_cache(hrs_cache_df),
+                    hrs_cache_df,
+                    augment_lib,
                     sd_productions=sd_productions,
-                    max_dd_adds=None,
                     max_sd_adds=max_sd_adds,
-                    output_progress=False,
-                    cache_file_path=cache_file_path,
                 )
-                _todo_aug, hrs_cache_df = augmenter.perform_all_hand_record_augmentations()
-        finally:
-            augment_logger.setLevel(previous_level)
-        if prior_ev is not None and hrs_cache_df is not None:
-            hrs_cache_df = _merge_ev_into_cache(hrs_cache_df, prior_ev)
-    if hrs_cache_df is None or hrs_cache_df.is_empty():
-        return frame, hrs_cache_df
-    unique_aug = _ev_from_cached_probs(unique, hrs_cache_df, augment_lib)
-    hrs_cache_df = _merge_ev_into_cache(hrs_cache_df, unique_aug)
-    if cache_file_path is not None:
-        save_hrs_cache(hrs_cache_df, cache_file_path)
+            unique_aug = _ev_from_cached_probs(unique, hrs_cache_df, augment_lib)
+            hrs_cache_df = _merge_ev_into_cache(hrs_cache_df, unique_aug)
+            if cache_file_path is not None:
+                save_hrs_cache(hrs_cache_df, cache_file_path)
+    else:
+        if hrs_cache_df is None or hrs_cache_df.is_empty():
+            return frame, hrs_cache_df
+        unique_aug = _ev_from_cached_probs(unique, hrs_cache_df, augment_lib)
     join_columns = [
         column
         for column in _unique_deal_join_columns(unique_aug)
@@ -2035,7 +2148,12 @@ def _attach_board_ev_columns(frame: pl.DataFrame) -> pl.DataFrame:
             .alias("Vul_Declarer")
         )
     if any(_EV_SUMMARY_RE.match(column) for column in frame.columns):
-        frame = frame.with_columns(_ev_score_declarer_expr(frame).alias("EV_Score_Declarer"))
+        if "PBN" in frame.columns:
+            frame = _join_ev_score_declarer(frame)
+        else:
+            frame = frame.with_columns(
+                _ev_score_declarer_expr(frame).alias("EV_Score_Declarer")
+            )
         frame = frame.with_columns(
             pl.when(pl.col("Pair_Declarer_Direction") == "NS")
             .then(pl.col("EV_Score_Declarer"))
