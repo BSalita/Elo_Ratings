@@ -38,7 +38,10 @@ def _history_frame() -> pl.DataFrame:
             ],
             "Club_Scratch_Pct": [None] * 12,
             "Club_Handicap_Pct": [None] * 12,
-            "National_Handicap_Pct": [None] * 12,
+            "National_Handicap_Pct": [
+                70.0, None, 80.5, None, None, None,
+                None, None, 68.0, None, None, None,
+            ],
             "Club_Scratch_Rank": [None] * 12,
             "Club_Handicap_Rank": [None] * 12,
             "National_Scratch_Rank": [2, 7, 2, 1, 9, 9, 6, 3, 7, 4, 36, 55],
@@ -236,6 +239,69 @@ class PlayerHistorySqlTests(unittest.TestCase):
         body = post.call_args.kwargs.get("json") or post.call_args[1].get("json")
         self.assertEqual(body["source"], "club_board_results")
         self.assertEqual(body["tables"]["self"][0]["tournament_id"], "280000")
+
+    def test_field_wide_sql_omits_player_filter(self) -> None:
+        extra = pl.DataFrame(
+            {
+                "date": ["2026-01-01"],
+                "tournament_id": ["290000"],
+                "tournament_name": ["Simultané Octopus"],
+                "group_id": ["1"],
+                "club_name": ["Other Club"],
+                "pair_name": ["OTHER – pair"],
+                "player1_id": ["9"],
+                "player2_id": ["8"],
+                "National_Scratch_Pct": [91.25],
+                "Club_Scratch_Pct": [None],
+                "Club_Handicap_Pct": [None],
+                "National_Handicap_Pct": [88.0],
+                "Club_Scratch_Rank": [None],
+                "Club_Handicap_Rank": [None],
+                "National_Scratch_Rank": [1],
+                "National_Handicap_Rank": [1],
+            }
+        )
+        frame = pl.concat([_history_frame(), extra], how="diagonal_relaxed")
+        with patch.object(
+            reports,
+            "load_results",
+            return_value=(frame, {"built_at": "2026-09-08T00:00:00Z"}),
+        ):
+            scratch = reports.run_player_history_sql(
+                None,
+                "SELECT pair_name, National_Scratch_Pct FROM self "
+                "WHERE National_Scratch_Pct IS NOT NULL "
+                "ORDER BY National_Scratch_Pct DESC LIMIT 3",
+            )
+            handicap = reports.run_player_history_sql(
+                None,
+                "SELECT pair_name, National_Handicap_Pct FROM self "
+                "WHERE National_Handicap_Pct IS NOT NULL "
+                "ORDER BY National_Handicap_Pct DESC LIMIT 3",
+                score="Handicap",
+            )
+        self.assertEqual(scratch["player_id"], "")
+        self.assertEqual(scratch["rows"][0]["National_Scratch_Pct"], 91.25)
+        self.assertEqual(scratch["rows"][0]["pair_name"], "OTHER – pair")
+        self.assertGreaterEqual(scratch["total_sessions"], 13)
+        self.assertEqual(handicap["score"], "Handicap")
+        self.assertEqual(handicap["rows"][0]["National_Handicap_Pct"], 88.0)
+
+    def test_field_wide_join_without_parquet_fails_fast(self) -> None:
+        with patch.object(
+            reports,
+            "load_results",
+            return_value=(_history_frame(), {"built_at": "2026-09-08T00:00:00Z"}),
+        ), patch.object(
+            reports, "resolve_club_board_results_path", return_value=None
+        ):
+            with self.assertRaises(ValueError) as exc:
+                reports.run_player_history_sql(
+                    None,
+                    "SELECT h.pair_name FROM self h "
+                    "JOIN club_board_results s ON s.session_id = h.tournament_id",
+                )
+        self.assertIn("Field-wide", str(exc.exception))
 
 
 if __name__ == "__main__":

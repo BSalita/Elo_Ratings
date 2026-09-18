@@ -1863,27 +1863,30 @@ def _normalize_history_date(value: Optional[str], *, field: str) -> Optional[str
 
 
 def _player_history_frame(
-    player_id: str,
+    player_id: Optional[str] = None,
     *,
     score: str = "Scratch",
     api_key: Optional[str] = None,
     fetch_iv: bool = True,
 ) -> tuple[pl.DataFrame, Dict[str, Any], str, str]:
-    """Projected per-session history for one player. No rank/date/limit filters."""
-    pid = str(player_id).strip()
-    if not pid.isdigit():
+    """Projected per-session history. Omit player_id for the full field."""
+    pid = str(player_id or "").strip()
+    if pid and not pid.isdigit():
         raise ValueError("player_id must contain digits only")
-    aliases = expand_ffbridge_player_numbers([pid]) or [pid]
     normalized_score = score.strip().lower()
     if normalized_score not in {"scratch", "handicap"}:
         raise ValueError("score must be either Scratch or Handicap")
     results_df, meta = load_results(api_key, fetch_iv)
     results_df = filter_valid_percentages(results_df)
-    player_expr = (
-        pl.col("player1_id").cast(pl.Utf8).is_in(aliases)
-        | pl.col("player2_id").cast(pl.Utf8).is_in(aliases)
-    )
-    all_sessions = results_df.filter(player_expr)
+    if pid:
+        aliases = expand_ffbridge_player_numbers([pid]) or [pid]
+        player_expr = (
+            pl.col("player1_id").cast(pl.Utf8).is_in(aliases)
+            | pl.col("player2_id").cast(pl.Utf8).is_in(aliases)
+        )
+        all_sessions = results_df.filter(player_expr)
+    else:
+        all_sessions = results_df
     category = "Handicap" if normalized_score == "handicap" else "Scratch"
     national_column = f"National_{category}_Pct"
     club_column = f"Club_{category}_Pct"
@@ -2037,7 +2040,7 @@ def run_player_history(
 
 
 def player_history_schema(
-    player_id: str,
+    player_id: Optional[str] = None,
     *,
     score: str = "Scratch",
     api_key: Optional[str] = None,
@@ -2063,7 +2066,7 @@ def player_history_schema(
 
 
 def run_player_history_sql(
-    player_id: str,
+    player_id: Optional[str],
     sql: str,
     *,
     score: str = "Scratch",
@@ -2071,10 +2074,11 @@ def run_player_history_sql(
     api_key: Optional[str] = None,
     fetch_iv: bool = True,
 ) -> Dict[str, Any]:
-    """DuckDB SELECT against one player's history registered as table `self`.
+    """DuckDB SELECT against history registered as table `self`.
 
-    JOIN club_board_results on session_id = tournament_id when that parquet
-    is configured. Do not paste previous result rows into VALUES.
+    Omit player_id for every pair session. JOIN club_board_results on
+    session_id = tournament_id when that parquet is configured. Do not
+    paste previous result rows into VALUES.
     """
     if limit < 1 or limit > MAX_HISTORY_SQL_LIMIT:
         raise ValueError(f"limit must be between 1 and {MAX_HISTORY_SQL_LIMIT}")
@@ -2083,6 +2087,11 @@ def run_player_history_sql(
         player_id, score=score, api_key=api_key, fetch_iv=fetch_iv
     )
     if _SQL_TABLE_NAME.search(cleaned) and resolve_club_board_results_path() is None:
+        if not pid:
+            raise ValueError(
+                "Field-wide history SQL cannot JOIN club_board_results "
+                "unless that parquet is mounted on Elo"
+            )
         return _run_history_sql_via_stats(
             cleaned,
             sessions,

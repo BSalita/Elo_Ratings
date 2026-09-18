@@ -20,7 +20,7 @@ app = FastAPI(title="FFBridge Elo API", version="1.6.0")
 
 
 class PlayerHistorySqlBody(BaseModel):
-    player_id: str = Field(..., pattern=r"^\d+$")
+    player_id: str | None = Field(default=None, pattern=r"^\d+$")
     sql: str
     score: str = Field("Scratch", pattern="^(Scratch|Handicap)$")
     limit: int = Field(reports.DEFAULT_HISTORY_SQL_LIMIT, ge=1, le=reports.MAX_HISTORY_SQL_LIMIT)
@@ -185,11 +185,11 @@ def player_history(
 
 @app.get("/ffbridge/player-history/schema")
 def player_history_schema(
-    player_id: str = Query(..., pattern=r"^\d+$"),
+    player_id: str | None = Query(None, pattern=r"^\d+$"),
     score: str = Query("Scratch", pattern="^(Scratch|Handicap)$"),
     api_backend: str | None = Query(None),
 ) -> dict:
-    """Column names and dtypes for one player's history table `self`."""
+    """Column names and dtypes for history table `self`. Omit player_id for the field."""
     return _run(
         reports.player_history_schema,
         player_id=player_id,
@@ -200,7 +200,7 @@ def player_history_schema(
 
 @app.post("/ffbridge/player-history/sql")
 def player_history_sql(body: PlayerHistorySqlBody) -> dict:
-    """DuckDB SELECT against one player's history registered as table `self`."""
+    """DuckDB SELECT against history registered as table `self`. Omit player_id for every pair."""
     return _run(
         reports.run_player_history_sql,
         player_id=body.player_id,
