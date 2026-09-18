@@ -1418,28 +1418,47 @@ def _replace_embedded_dd_with_ddss(frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def _apply_lancelot_dd_audit(
-    frame: pl.DataFrame, *, rate: float = 0.1
+    frame: pl.DataFrame, *, rate: float = 1.0
 ) -> tuple[pl.DataFrame, set[str]]:
-    """Sample Lancelot vs ddss. On any miss, replace the session's DD with ddss."""
-    unique_count, sample_count, mismatches = _lancelot_dd_sample_mismatches(
-        frame, rate=rate
-    )
-    if sample_count:
-        print(
-            f"[ffbridge-quality] audited {sample_count}/{unique_count} "
-            f"Lancelot DD tables against ddss",
-            flush=True,
-        )
-    if not mismatches:
+    """Replace every unique deal's Lancelot DD table with ddss.
+
+    ``rate <= 0`` skips the replacement (tests). Otherwise every unique PBN is
+    solved with ddss; Lancelot is never the source of truth. Mismatched PBNs
+    are returned so the hand-records cache can rewrite DD/Par.
+    """
+    if rate <= 0:
         return frame, set()
+    unique = _unique_embedded_dd_deals(frame)
+    pbns = unique["PBN"].to_list()
+    if not pbns:
+        return frame, set()
+    tables = _ddss_tables_for_pbns(pbns)
+    corrections: list[dict[str, Any]] = []
+    mismatch_pbns: set[str] = set()
+    mismatch_lines: list[str] = []
+    for rec, table in zip(unique.iter_rows(named=True), tables):
+        expected = _ddss_columns_from_table(table)
+        corrections.append({"PBN": rec["PBN"], **expected})
+        diffs = [
+            f"{column} Lancelot={int(rec[column])} ddss={expected[column]}"
+            for column in EMBEDDED_DD_COLUMNS
+            if int(rec[column]) != expected[column]
+        ]
+        if diffs:
+            mismatch_pbns.add(str(rec["PBN"]))
+            mismatch_lines.append(f"{rec['PBN']}: {', '.join(diffs)}")
     print(
-        f"[ffbridge-quality] Lancelot DD mismatch on {len(mismatches)}/"
-        f"{sample_count} sampled deals; replacing session DD with ddss:\n  "
-        + "\n  ".join(mismatches),
+        f"[ffbridge-quality] replaced {len(pbns)} Lancelot DD tables with ddss; "
+        f"{len(mismatch_pbns)} disagreed",
         flush=True,
     )
-    corrected = _replace_embedded_dd_with_ddss(frame)
-    return corrected, {pbn for pbn in corrected["PBN"].to_list() if pbn}
+    if mismatch_lines:
+        preview = "\n  ".join(mismatch_lines[:8])
+        print(f"[ffbridge-quality] Lancelot DD mismatches:\n  {preview}", flush=True)
+    work = frame.drop(
+        [column for column in EMBEDDED_DD_COLUMNS if column in frame.columns]
+    )
+    return work.join(pl.DataFrame(corrections), on="PBN", how="left"), mismatch_pbns
 
 
 def _audit_lancelot_dd_sample(frame: pl.DataFrame, *, rate: float = 0.1) -> int:
@@ -1934,6 +1953,92 @@ def save_hrs_cache(frame: pl.DataFrame, path: pathlib.Path) -> None:
     temporary.replace(path)
 
 
+def repair_hrs_cache_dd_with_ddss(
+    cache_path: pathlib.Path,
+    *,
+    dry_run: bool = False,
+    limit: int | None = None,
+    batch_size: int = 1000,
+) -> dict[str, int]:
+    """Compare every cached DD table to ddss and rewrite mismatches plus Par."""
+    from tqdm import tqdm
+
+    started = datetime.now()
+    print(
+        f"[ffbridge-quality] DD repair start {started.isoformat(timespec='seconds')}",
+        flush=True,
+    )
+    cache = load_hrs_cache(cache_path)
+    if cache is None or cache.is_empty():
+        print("[ffbridge-quality] DD repair: no cache", flush=True)
+        return {"cache_deals": 0, "mismatched_deals": 0, "rewritten": 0}
+    unique = (
+        cache.filter(
+            pl.col("PBN").is_not_null()
+            & pl.all_horizontal(
+                [pl.col(column).is_not_null() for column in EMBEDDED_DD_COLUMNS]
+            )
+        )
+        .unique(subset=["PBN"], maintain_order=True)
+    )
+    if limit is not None:
+        unique = unique.head(limit)
+    pbns = unique["PBN"].to_list()
+    by_pbn = {rec["PBN"]: rec for rec in unique.iter_rows(named=True)}
+    mismatch_pbns: list[str] = []
+    corrections: list[dict[str, Any]] = []
+    for start in tqdm(range(0, len(pbns), batch_size), desc="ddss DD repair"):
+        chunk = pbns[start : start + batch_size]
+        tables = _ddss_tables_for_pbns(chunk)
+        for pbn, table in zip(chunk, tables):
+            expected = _ddss_columns_from_table(table)
+            rec = by_pbn[pbn]
+            if any(
+                int(rec[column]) != expected[column] for column in EMBEDDED_DD_COLUMNS
+            ):
+                mismatch_pbns.append(pbn)
+                corrections.append({"PBN": pbn, **expected})
+    stats = {
+        "cache_deals": len(pbns),
+        "mismatched_deals": len(mismatch_pbns),
+        "rewritten": 0,
+    }
+    print(
+        f"[ffbridge-quality] DD repair compared {len(pbns)} deals; "
+        f"{len(mismatch_pbns)} disagreed with ddss",
+        flush=True,
+    )
+    if corrections and not dry_run:
+        corr = pl.DataFrame(corrections)
+        keep = cache.filter(~pl.col("PBN").is_in(mismatch_pbns))
+        fix = (
+            cache.filter(pl.col("PBN").is_in(mismatch_pbns))
+            .drop([column for column in EMBEDDED_DD_COLUMNS if column in cache.columns])
+            .join(corr, on="PBN", how="left")
+        )
+        _, augment_lib = _import_mlbridge()
+        par = _par_rows_from_embedded_dd(fix, augment_lib)
+        drop_par = [
+            column
+            for column in ("ParScore", "ParNumber", "ParContracts")
+            if column in fix.columns
+        ]
+        if drop_par:
+            fix = fix.drop(drop_par)
+        fix = fix.join(par, on=["PBN", "Dealer", "Vul"], how="left")
+        cache = _official_hrs_cache(pl.concat([keep, fix], how="diagonal"))
+        save_hrs_cache(cache, cache_path)
+        stats["rewritten"] = len(mismatch_pbns)
+    ended = datetime.now()
+    elapsed = (ended - started).total_seconds()
+    print(
+        f"[ffbridge-quality] DD repair end {ended.isoformat(timespec='seconds')} "
+        f"(elapsed {elapsed:.1f}s)",
+        flush=True,
+    )
+    return stats
+
+
 def _unique_deal_join_columns(frame: pl.DataFrame) -> list[str]:
     keep = ["PBN", "Dealer", "Vul"]
     for column in frame.columns:
@@ -2138,6 +2243,52 @@ def _missing_dd_par_deals(
     return unique.join(have.select(*keys), on=keys, how="anti")
 
 
+def _stale_dd_par_deals(unique: pl.DataFrame, cache: pl.DataFrame) -> pl.DataFrame:
+    """Rows whose cached DD table no longer matches the frame (ddss) table."""
+    keys = ["PBN", "Dealer", "Vul"]
+    if cache.is_empty() or unique.is_empty() or "DD_N_C" not in cache.columns:
+        return unique.head(0)
+    dd_cols = [
+        column
+        for column in _HRS_DD_COLUMNS
+        if column in unique.columns and column in cache.columns
+    ]
+    if not dd_cols:
+        return unique.head(0)
+    right = cache.select(*keys, *dd_cols).rename(
+        {column: f"{column}__cache" for column in dd_cols}
+    )
+    joined = unique.join(right, on=keys, how="inner")
+    stale_keys = joined.filter(
+        pl.any_horizontal(
+            [
+                pl.col(column).cast(pl.Int16, strict=False)
+                != pl.col(f"{column}__cache").cast(pl.Int16, strict=False)
+                for column in dd_cols
+            ]
+        )
+    ).select(*keys)
+    if stale_keys.is_empty():
+        return unique.head(0)
+    return unique.join(stale_keys, on=keys, how="semi")
+
+
+def _dd_par_deals_to_upsert(
+    unique: pl.DataFrame,
+    cache: pl.DataFrame,
+    force_pbns: set[str] | None = None,
+) -> pl.DataFrame:
+    missing = _missing_dd_par_deals(unique, cache, force_pbns=force_pbns)
+    stale = _stale_dd_par_deals(unique, cache)
+    if stale.is_empty():
+        return missing
+    if missing.is_empty():
+        return stale
+    return pl.concat([missing, stale], how="vertical").unique(
+        subset=["PBN", "Dealer", "Vul"], maintain_order=True
+    )
+
+
 def _upsert_dd_par_into_cache(
     unique: pl.DataFrame,
     cache: pl.DataFrame,
@@ -2156,7 +2307,7 @@ def _upsert_dd_par_into_cache(
             [pl.col(column).is_not_null() for column in _HRS_DD_COLUMNS]
         )
     ).unique(subset=["PBN", "Dealer", "Vul"], maintain_order=True)
-    todo = _missing_dd_par_deals(complete, cache, force_pbns=force_pbns)
+    todo = _dd_par_deals_to_upsert(complete, cache, force_pbns=force_pbns)
     if todo.is_empty():
         return cache, 0
     par = _par_rows_from_embedded_dd(todo, augment_lib)
@@ -2292,7 +2443,7 @@ def _attach_sd_ev_from_unique_deals(
     needed = {pbn for pbn in unique_pbn["PBN"].to_list() if pbn}
     missing_sd = needed - _cached_sd_pbns(hrs_cache_df)
     missing_dd = (
-        _missing_dd_par_deals(unique, hrs_cache_df, force_pbns=force_dd_pbns)
+        _dd_par_deals_to_upsert(unique, hrs_cache_df, force_pbns=force_dd_pbns)
         if hrs_cache_df is not None
         else unique
     )
@@ -2479,15 +2630,14 @@ def augment_raw_session(
     cache_file_path: pathlib.Path | None = None,
     sd_productions: int = 10,
     max_sd_adds: int | None = None,
-    dd_audit_rate: float = 0.1,
+    dd_audit_rate: float = 1.0,
 ) -> pl.DataFrame:
     """Augment a session the ACBL way: cache DD/Par/SD probs, derive EV, join.
 
     The hand-records cache stores only deal facts (DD, Par, SD probabilities).
-    Lancelot's embedded DD table fills those DD/Par columns unless a ddss
-    audit sample disagrees; then the session's DD tables are replaced with
-    ddss and Par is rewritten. EV is computed from cached Probs on unique
-    deals and joined onto the board rows.
+    ddss is the source of truth for DD/Par. Lancelot's embedded table is
+    compared and discarded. EV is computed from cached Probs on unique deals
+    and joined onto the board rows.
     """
     if _has_quality_dd_scores(raw):
         return raw

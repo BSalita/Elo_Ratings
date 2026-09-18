@@ -21,6 +21,7 @@ from ffbridge_quality_pipeline import (
     _attach_sd_ev_from_unique_deals,
     _audit_lancelot_dd_sample,
     _ddss_columns_from_table,
+    _stale_dd_par_deals,
     _fragment_schema_is_current,
     _has_embedded_dd_table,
     _import_mlbridge,
@@ -503,6 +504,9 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
         columns = _ddss_columns_from_table(table)
         frame = pl.DataFrame({"PBN": [pbn], **{name: [value] for name, value in columns.items()}})
         self.assertEqual(_audit_lancelot_dd_sample(frame, rate=1.0), 1)
+        corrected, force_pbns = _apply_lancelot_dd_audit(frame, rate=1.0)
+        self.assertEqual(int(corrected["DD_N_S"][0]), columns["DD_N_S"])
+        self.assertEqual(force_pbns, set())
 
     def test_lancelot_dd_audit_rejects_mismatch(self) -> None:
         from endplay.types import Deal
@@ -520,6 +524,20 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
             int(corrected["DD_N_S"][0]), _ddss_columns_from_table(table)["DD_N_S"]
         )
         self.assertEqual(force_pbns, {pbn})
+
+    def test_stale_dd_par_deals_detects_cache_disagreement(self) -> None:
+        row = {
+            "PBN": ["N:AK..."],
+            "Dealer": ["N"],
+            "Vul": ["None"],
+            **{f"DD_{seat}_{suit}": [7] for seat in "NESW" for suit in "CDHSN"},
+        }
+        unique = pl.DataFrame(row)
+        cache = pl.DataFrame({**row, "DD_N_S": [8], "ParScore": [100]})
+        stale = _stale_dd_par_deals(unique, cache)
+        self.assertEqual(stale.height, 1)
+        same = _stale_dd_par_deals(unique, unique.with_columns(pl.lit(100).alias("ParScore")))
+        self.assertEqual(same.height, 0)
 
     def test_board_ev_columns_use_unique_deal_summaries(self) -> None:
         frame = pl.DataFrame(
