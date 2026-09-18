@@ -6,8 +6,10 @@ import os
 import threading
 from datetime import datetime, timezone
 
+from typing import Annotated
+
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
 
 import ffbridge_board_service as boards
 import ffbridge_report_service as reports
@@ -15,12 +17,26 @@ import ffbridge_session_ranking_service as rankings
 from streamlitlib.memory_usage import get_memory_usage_dict
 
 
-FFBRIDGE_API_BUILD_TAG = "2026-09-09-player-lookup"
+FFBRIDGE_API_BUILD_TAG = "2026-09-18-field-wide-history"
 app = FastAPI(title="FFBridge Elo API", version="1.6.0")
 
 
+def _optional_digit_id(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if not text.isdigit():
+        raise ValueError("player_id must contain digits only")
+    return text
+
+
+OptionalDigitId = Annotated[str | None, BeforeValidator(_optional_digit_id)]
+
+
 class PlayerHistorySqlBody(BaseModel):
-    player_id: str | None = Field(default=None, pattern=r"^\d+$")
+    player_id: OptionalDigitId = None
     sql: str
     score: str = Field("Scratch", pattern="^(Scratch|Handicap)$")
     limit: int = Field(reports.DEFAULT_HISTORY_SQL_LIMIT, ge=1, le=reports.MAX_HISTORY_SQL_LIMIT)
@@ -185,7 +201,7 @@ def player_history(
 
 @app.get("/ffbridge/player-history/schema")
 def player_history_schema(
-    player_id: str | None = Query(None, pattern=r"^\d+$"),
+    player_id: OptionalDigitId = None,
     score: str = Query("Scratch", pattern="^(Scratch|Handicap)$"),
     api_backend: str | None = Query(None),
 ) -> dict:

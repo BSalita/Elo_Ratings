@@ -200,5 +200,36 @@ class FirstPartyApiBoundaryTests(unittest.TestCase):
         self.assertEqual(run_report.call_args.kwargs["player_number"], "123")
 
 
+class PlayerHistorySqlApiTests(unittest.TestCase):
+    def test_sql_body_treats_blank_player_id_as_field_wide(self) -> None:
+        omitted = ffbridge_api_server.PlayerHistorySqlBody(sql="SELECT 1")
+        blank = ffbridge_api_server.PlayerHistorySqlBody(sql="SELECT 1", player_id="")
+        null = ffbridge_api_server.PlayerHistorySqlBody(sql="SELECT 1", player_id=None)
+        self.assertIsNone(omitted.player_id)
+        self.assertIsNone(blank.player_id)
+        self.assertIsNone(null.player_id)
+        with self.assertRaises(Exception):
+            ffbridge_api_server.PlayerHistorySqlBody(sql="SELECT 1", player_id="abc")
+
+    def test_sql_route_accepts_omitted_blank_and_null_player_id(self) -> None:
+        stub = {"player_id": "", "rows": [{"pair_name": "A – B"}], "score": "Scratch"}
+        with patch.object(
+            ffbridge_api_server.reports,
+            "run_player_history_sql",
+            return_value=stub,
+        ) as run:
+            for raw in (
+                {"sql": "SELECT pair_name FROM self LIMIT 1"},
+                {"sql": "SELECT pair_name FROM self LIMIT 1", "player_id": ""},
+                {"sql": "SELECT pair_name FROM self LIMIT 1", "player_id": None},
+            ):
+                body = ffbridge_api_server.PlayerHistorySqlBody.model_validate(raw)
+                result = ffbridge_api_server.player_history_sql(body)
+                self.assertEqual(result["rows"][0]["pair_name"], "A – B")
+        self.assertEqual(run.call_count, 3)
+        for call in run.call_args_list:
+            self.assertIsNone(call.kwargs["player_id"])
+
+
 if __name__ == "__main__":
     unittest.main()
