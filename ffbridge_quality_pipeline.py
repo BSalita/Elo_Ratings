@@ -1350,12 +1350,9 @@ def _ddss_columns_from_table(table: Any) -> dict[str, int]:
     }
 
 
-def _audit_lancelot_dd_sample(frame: pl.DataFrame, *, rate: float = 0.1) -> int:
-    """Compare a sample of Lancelot DD tables to ddss. Fail fast on mismatch."""
-    if rate <= 0:
-        return 0
+def _unique_embedded_dd_deals(frame: pl.DataFrame) -> pl.DataFrame:
     _require_columns(frame, ["PBN", *EMBEDDED_DD_COLUMNS], "Lancelot DD audit")
-    unique = (
+    return (
         frame.select("PBN", *EMBEDDED_DD_COLUMNS)
         .filter(
             pl.col("PBN").is_not_null()
@@ -1365,19 +1362,32 @@ def _audit_lancelot_dd_sample(frame: pl.DataFrame, *, rate: float = 0.1) -> int:
         )
         .unique(subset=["PBN"], maintain_order=True)
     )
-    sample_pbns = _select_lancelot_dd_audit_pbns(unique["PBN"].to_list(), rate)
-    if not sample_pbns:
-        return 0
-    sample = unique.filter(pl.col("PBN").is_in(sample_pbns))
+
+
+def _ddss_tables_for_pbns(pbns: Sequence[str]) -> list[Any]:
     _ff_lib, augment_lib = _import_mlbridge()
     from endplay.types import Deal
     from mlBridge.dds_ddss import DDSS_AVAILABLE
 
     if not DDSS_AVAILABLE:
         raise RuntimeError("ddss DLL is required to audit Lancelot DD tables")
-    deals = [Deal(pbn) for pbn in sample["PBN"].to_list()]
+    deals = [Deal(pbn) for pbn in pbns]
     with _AUGMENT_LOCK:
-        tables = augment_lib.solve_dd_for_deals(deals)
+        return augment_lib.solve_dd_for_deals(deals)
+
+
+def _lancelot_dd_sample_mismatches(
+    frame: pl.DataFrame, *, rate: float
+) -> tuple[int, int, list[str]]:
+    """Return (unique_deals, sample_size, mismatch lines)."""
+    if rate <= 0:
+        return 0, 0, []
+    unique = _unique_embedded_dd_deals(frame)
+    sample_pbns = _select_lancelot_dd_audit_pbns(unique["PBN"].to_list(), rate)
+    if not sample_pbns:
+        return unique.height, 0, []
+    sample = unique.filter(pl.col("PBN").is_in(sample_pbns))
+    tables = _ddss_tables_for_pbns(sample["PBN"].to_list())
     mismatches: list[str] = []
     for rec, table in zip(sample.iter_rows(named=True), tables):
         expected = _ddss_columns_from_table(table)
@@ -1388,17 +1398,67 @@ def _audit_lancelot_dd_sample(frame: pl.DataFrame, *, rate: float = 0.1) -> int:
         ]
         if diffs:
             mismatches.append(f"{rec['PBN']}: {', '.join(diffs)}")
+    return unique.height, len(sample_pbns), mismatches
+
+
+def _replace_embedded_dd_with_ddss(frame: pl.DataFrame) -> pl.DataFrame:
+    """Overwrite every unique deal's Lancelot DD table with ddss."""
+    pbns = _unique_embedded_dd_deals(frame)["PBN"].to_list()
+    if not pbns:
+        return frame
+    tables = _ddss_tables_for_pbns(pbns)
+    corrections = pl.DataFrame(
+        [
+            {"PBN": pbn, **_ddss_columns_from_table(table)}
+            for pbn, table in zip(pbns, tables)
+        ]
+    )
+    work = frame.drop([column for column in EMBEDDED_DD_COLUMNS if column in frame.columns])
+    return work.join(corrections, on="PBN", how="left")
+
+
+def _apply_lancelot_dd_audit(
+    frame: pl.DataFrame, *, rate: float = 0.1
+) -> tuple[pl.DataFrame, set[str]]:
+    """Sample Lancelot vs ddss. On any miss, replace the session's DD with ddss."""
+    unique_count, sample_count, mismatches = _lancelot_dd_sample_mismatches(
+        frame, rate=rate
+    )
+    if sample_count:
+        print(
+            f"[ffbridge-quality] audited {sample_count}/{unique_count} "
+            f"Lancelot DD tables against ddss",
+            flush=True,
+        )
+    if not mismatches:
+        return frame, set()
     print(
-        f"[ffbridge-quality] audited {len(sample_pbns)}/{unique.height} "
-        f"Lancelot DD tables against ddss",
+        f"[ffbridge-quality] Lancelot DD mismatch on {len(mismatches)}/"
+        f"{sample_count} sampled deals; replacing session DD with ddss:\n  "
+        + "\n  ".join(mismatches),
         flush=True,
     )
+    corrected = _replace_embedded_dd_with_ddss(frame)
+    return corrected, {pbn for pbn in corrected["PBN"].to_list() if pbn}
+
+
+def _audit_lancelot_dd_sample(frame: pl.DataFrame, *, rate: float = 0.1) -> int:
+    """Compare a sample of Lancelot DD tables to ddss. Raise on mismatch."""
+    unique_count, sample_count, mismatches = _lancelot_dd_sample_mismatches(
+        frame, rate=rate
+    )
+    if sample_count:
+        print(
+            f"[ffbridge-quality] audited {sample_count}/{unique_count} "
+            f"Lancelot DD tables against ddss",
+            flush=True,
+        )
     if mismatches:
         raise LancelotDDMismatchError(
-            f"Lancelot DD mismatch on {len(mismatches)}/{len(sample_pbns)} "
+            f"Lancelot DD mismatch on {len(mismatches)}/{sample_count} "
             f"sampled deals:\n  " + "\n  ".join(mismatches)
         )
-    return len(sample_pbns)
+    return sample_count
 
 
 def _needs_lancelot_convert(frame: pl.DataFrame) -> bool:
@@ -2062,22 +2122,29 @@ def _cached_sd_pbns(cache: pl.DataFrame | None) -> set[str]:
     }
 
 
-def _missing_dd_par_deals(unique: pl.DataFrame, cache: pl.DataFrame) -> pl.DataFrame:
+def _missing_dd_par_deals(
+    unique: pl.DataFrame,
+    cache: pl.DataFrame,
+    force_pbns: set[str] | None = None,
+) -> pl.DataFrame:
     keys = ["PBN", "Dealer", "Vul"]
     if cache.is_empty() or "DD_N_C" not in cache.columns:
         return unique
     have = cache.filter(
         pl.col("DD_N_C").is_not_null() & pl.col("ParScore").is_not_null()
-    ).select(*keys)
-    return unique.join(have, on=keys, how="anti")
+    )
+    if force_pbns:
+        have = have.filter(~pl.col("PBN").is_in(list(force_pbns)))
+    return unique.join(have.select(*keys), on=keys, how="anti")
 
 
 def _upsert_dd_par_into_cache(
     unique: pl.DataFrame,
     cache: pl.DataFrame,
     augment_lib: Any,
+    force_pbns: set[str] | None = None,
 ) -> tuple[pl.DataFrame, int]:
-    """Fill ACBL cache DD/Par from unique deals. Uses Lancelot DD when present."""
+    """Fill ACBL cache DD/Par from unique deals. Uses the frame's DD table."""
     needed = ("PBN", "Dealer", "Vul", *_HRS_DD_COLUMNS)
     if any(column not in unique.columns for column in needed):
         return cache, 0
@@ -2089,7 +2156,7 @@ def _upsert_dd_par_into_cache(
             [pl.col(column).is_not_null() for column in _HRS_DD_COLUMNS]
         )
     ).unique(subset=["PBN", "Dealer", "Vul"], maintain_order=True)
-    todo = _missing_dd_par_deals(complete, cache)
+    todo = _missing_dd_par_deals(complete, cache, force_pbns=force_pbns)
     if todo.is_empty():
         return cache, 0
     par = _par_rows_from_embedded_dd(todo, augment_lib)
@@ -2214,6 +2281,7 @@ def _attach_sd_ev_from_unique_deals(
     cache_file_path: pathlib.Path | None,
     sd_productions: int,
     max_sd_adds: int | None,
+    force_dd_pbns: set[str] | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame | None]:
     """ACBL cache (DD/Par/SD probs) on unique deals, then derive EV and join."""
     if max_sd_adds == 0:
@@ -2224,7 +2292,7 @@ def _attach_sd_ev_from_unique_deals(
     needed = {pbn for pbn in unique_pbn["PBN"].to_list() if pbn}
     missing_sd = needed - _cached_sd_pbns(hrs_cache_df)
     missing_dd = (
-        _missing_dd_par_deals(unique, hrs_cache_df)
+        _missing_dd_par_deals(unique, hrs_cache_df, force_pbns=force_dd_pbns)
         if hrs_cache_df is not None
         else unique
     )
@@ -2240,7 +2308,7 @@ def _attach_sd_ev_from_unique_deals(
         with _AUGMENT_LOCK:
             hrs_cache_df = _latest_cache(hrs_cache_df, cache_file_path)
             hrs_cache_df, dd_added = _upsert_dd_par_into_cache(
-                unique, hrs_cache_df, augment_lib
+                unique, hrs_cache_df, augment_lib, force_pbns=force_dd_pbns
             )
             missing_sd = needed - _cached_sd_pbns(hrs_cache_df)
             if missing_sd:
@@ -2416,8 +2484,10 @@ def augment_raw_session(
     """Augment a session the ACBL way: cache DD/Par/SD probs, derive EV, join.
 
     The hand-records cache stores only deal facts (DD, Par, SD probabilities).
-    Lancelot's embedded DD table fills those DD/Par columns. EV is computed
-    from cached Probs on unique deals and joined onto the board rows.
+    Lancelot's embedded DD table fills those DD/Par columns unless a ddss
+    audit sample disagrees; then the session's DD tables are replaced with
+    ddss and Par is rewritten. EV is computed from cached Probs on unique
+    deals and joined onto the board rows.
     """
     if _has_quality_dd_scores(raw):
         return raw
@@ -2439,7 +2509,7 @@ def augment_raw_session(
     )
     _validate_converted_suits(work)
     if _has_embedded_dd_table(work):
-        _audit_lancelot_dd_sample(work, rate=dd_audit_rate)
+        work, force_dd_pbns = _apply_lancelot_dd_audit(work, rate=dd_audit_rate)
         work = attach_embedded_dd_metrics(work)
         work = _attach_contract_types(work)
         cache = _resolve_hrs_cache(hrs_cache, cache_file_path)
@@ -2449,6 +2519,7 @@ def augment_raw_session(
             cache_file_path=cache_file_path,
             sd_productions=sd_productions,
             max_sd_adds=max_sd_adds,
+            force_dd_pbns=force_dd_pbns or None,
         )
         if hrs_cache is not None:
             hrs_cache[0] = cache

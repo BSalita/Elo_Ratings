@@ -16,6 +16,7 @@ from ffbridge_quality_pipeline import (
     NoQualityRowsError,
     QUALITY_BOARD_COLUMNS,
     SessionAudit,
+    _apply_lancelot_dd_audit,
     _attach_board_ev_columns,
     _attach_sd_ev_from_unique_deals,
     _audit_lancelot_dd_sample,
@@ -514,6 +515,11 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
         frame = pl.DataFrame({"PBN": [pbn], **{name: [value] for name, value in columns.items()}})
         with self.assertRaisesRegex(LancelotDDMismatchError, "DD_N_S"):
             _audit_lancelot_dd_sample(frame, rate=1.0)
+        corrected, force_pbns = _apply_lancelot_dd_audit(frame, rate=1.0)
+        self.assertEqual(
+            int(corrected["DD_N_S"][0]), _ddss_columns_from_table(table)["DD_N_S"]
+        )
+        self.assertEqual(force_pbns, {pbn})
 
     def test_board_ev_columns_use_unique_deal_summaries(self) -> None:
         frame = pl.DataFrame(
