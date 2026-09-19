@@ -2584,7 +2584,88 @@ def _attach_board_ev_columns(frame: pl.DataFrame) -> pl.DataFrame:
             .otherwise(None)
             .alias("MP_EV_Max_Pct_Declarer")
         )
-    return frame
+    return _attach_dd_matchpoints(frame)
+
+
+def _attach_dd_matchpoints(frame: pl.DataFrame) -> pl.DataFrame:
+    """Matchpoint DD tricks at the actual contract against the board field.
+
+    ``MP_DD_Pct_Declarer`` is the matchpoint percentage the declaring side
+    would earn by taking ``DD_Tricks`` in the table's contract.
+    """
+    if "DD_Score_Declarer" not in frame.columns:
+        return frame
+    pair_col = None
+    if "Pair_Declarer_Direction" in frame.columns:
+        pair_col = "Pair_Declarer_Direction"
+    elif "Declarer_Pair_Direction" in frame.columns:
+        pair_col = "Declarer_Pair_Direction"
+    elif "Declarer_Direction" in frame.columns:
+        frame = frame.with_columns(
+            pl.when(pl.col("Declarer_Direction").is_in(["N", "S"]))
+            .then(pl.lit("NS"))
+            .when(pl.col("Declarer_Direction").is_in(["E", "W"]))
+            .then(pl.lit("EW"))
+            .otherwise(None)
+            .alias("Pair_Declarer_Direction")
+        )
+        pair_col = "Pair_Declarer_Direction"
+    if pair_col is None:
+        return frame
+    if "Score_NS" not in frame.columns:
+        if "Score_Declarer" not in frame.columns:
+            return frame
+        frame = frame.with_columns(
+            pl.when(pl.col(pair_col) == "NS")
+            .then(pl.col("Score_Declarer"))
+            .when(pl.col(pair_col) == "EW")
+            .then(-pl.col("Score_Declarer"))
+            .otherwise(None)
+            .alias("Score_NS")
+        )
+    if "Score_EW" not in frame.columns and "Score_NS" in frame.columns:
+        frame = frame.with_columns((-pl.col("Score_NS")).alias("Score_EW"))
+    frame = frame.with_columns(
+        pl.when(pl.col(pair_col) == "NS")
+        .then(pl.col("DD_Score_Declarer"))
+        .when(pl.col(pair_col) == "EW")
+        .then(-pl.col("DD_Score_Declarer"))
+        .otherwise(None)
+        .alias("DD_Score_NS"),
+        pl.when(pl.col(pair_col) == "EW")
+        .then(pl.col("DD_Score_Declarer"))
+        .when(pl.col(pair_col) == "NS")
+        .then(-pl.col("DD_Score_Declarer"))
+        .otherwise(None)
+        .alias("DD_Score_EW"),
+    )
+    drop_cols = [
+        col
+        for col in (
+            "MP_DD_Pct_Declarer",
+            "DD_Score_NS_Pct",
+            "DD_Score_EW_Pct",
+            "MP_DD_Score_NS",
+            "MP_DD_Score_EW",
+        )
+        if col in frame.columns
+    ]
+    if drop_cols:
+        frame = frame.drop(drop_cols)
+    frame = _matchpoint_against_field(
+        frame, value_col="DD_Score_NS", field_col="Score_NS", pair="NS"
+    )
+    frame = _matchpoint_against_field(
+        frame, value_col="DD_Score_EW", field_col="Score_EW", pair="EW"
+    )
+    return frame.with_columns(
+        pl.when(pl.col(pair_col) == "NS")
+        .then(pl.col("DD_Score_NS_Pct"))
+        .when(pl.col(pair_col) == "EW")
+        .then(pl.col("DD_Score_EW_Pct"))
+        .otherwise(None)
+        .alias("MP_DD_Pct_Declarer")
+    )
 
 
 def _resolve_hrs_cache(

@@ -18,6 +18,7 @@ from ffbridge_quality_pipeline import (
     SessionAudit,
     _apply_lancelot_dd_audit,
     _attach_board_ev_columns,
+    _attach_dd_matchpoints,
     _attach_sd_ev_from_unique_deals,
     _audit_lancelot_dd_sample,
     _ddss_columns_from_table,
@@ -570,6 +571,27 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
         self.assertIn("MP_EV_Max_Pct_Declarer", out.columns)
         self.assertGreaterEqual(out["MP_EV_Pct_Declarer"][0], 0.0)
         self.assertLessEqual(out["MP_EV_Pct_Declarer"][0], 1.0)
+
+    def test_mp_dd_pct_is_matchpoints_for_dd_tricks_at_contract(self) -> None:
+        frame = pl.DataFrame(
+            {
+                "session_id": ["10", "10", "10"],
+                "Board": [1, 1, 1],
+                "Pair_Declarer_Direction": ["NS", "NS", "EW"],
+                "Declarer_Direction": ["N", "S", "E"],
+                "Score_NS": [420, 170, -50],
+                "Score_EW": [-420, -170, 50],
+                "DD_Score_Declarer": [420, 170, 50],
+            }
+        )
+        out = _attach_dd_matchpoints(frame)
+        # Field NS scores: 420, 170, -50. 4H DD (+420) beats both others + ties itself.
+        self.assertAlmostEqual(out["MP_DD_Pct_Declarer"][0], 2.5 / 3)
+        # 3H DD (+170) beats -50, ties itself, loses to 420.
+        self.assertAlmostEqual(out["MP_DD_Pct_Declarer"][1], 1.5 / 3)
+        # EW +50 is the NS -50 score; EW matchpoints of +50 vs [-420, -170, 50].
+        self.assertAlmostEqual(out["MP_DD_Pct_Declarer"][2], 2.5 / 3)
+        self.assertNotEqual(out["MP_DD_Pct_Declarer"][0], out["MP_DD_Pct_Declarer"][1])
 
     def test_sd_cache_hit_skips_hand_record_augmenter(self) -> None:
         pbn = "N:QJ93.J5.AKT.J732 K.AQT873.873.A65 T762.K92.QJ64.K9 A854.64.952.QT84"
