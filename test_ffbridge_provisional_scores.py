@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import polars as pl
@@ -328,15 +329,53 @@ class OfficialCategoryMappingTests(unittest.TestCase):
         ]
         load_cache.side_effect = [cached, None]
         get_api.return_value = refreshed
+        recent_date = (datetime.now().date() - timedelta(days=12)).isoformat()
 
         rows, was_cached = lancelot.fetch_tournament_results(
             "300751",
-            tournament_date="2026-08-24",
+            tournament_date=recent_date,
             series_id=386,
         )
 
         self.assertFalse(was_cached)
         self.assertEqual(len(rows), 2)
+
+    @patch("elo_ffbridge_lancelot._fetch_organizer_scores", return_value={})
+    @patch("elo_ffbridge_lancelot.fetch_session_group_ids", return_value={})
+    @patch("elo_ffbridge_lancelot.save_to_disk_cache")
+    @patch("elo_ffbridge_lancelot.lancelot_get")
+    @patch("elo_ffbridge_lancelot.load_from_disk_cache")
+    def test_timeout_keeps_stale_ranking(
+        self,
+        load_cache,
+        get_api,
+        _save_cache,
+        _group_ids,
+        _organizer_scores,
+    ) -> None:
+        stale = [
+            _ranking_row(
+                10,
+                "Salita",
+                "Jacoupy",
+                score=64.87,
+                theoretical_rank=54,
+            )
+        ]
+        load_cache.side_effect = [stale, None]
+        get_api.return_value = None
+        recent_date = (datetime.now().date() - timedelta(days=12)).isoformat()
+
+        rows, was_cached = lancelot.fetch_tournament_results(
+            "304735",
+            tournament_date=recent_date,
+            series_id=868,
+        )
+
+        self.assertTrue(was_cached)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["National_Scratch_Pct"], 64.87)
+        get_api.assert_called_once()
 
 
 class ScoreAvailabilityTests(unittest.TestCase):
@@ -384,6 +423,57 @@ class ScoreAvailabilityTests(unittest.TestCase):
         self.assertEqual(row["National_Handicap_Rank"], 1)
         self.assertIsNone(row["National_Scratch_Rank"])
         self.assertEqual(row["scoring_mode"], "handicap")
+
+    def test_keeps_licensed_player_when_partner_is_visitor_name_string(self) -> None:
+        ranking = [
+            {
+                "sessionScore": 54.21,
+                "totalScore": 54.21,
+                "peBonus": 0,
+                "totalBonus": 0.0,
+                "rank": 745,
+                "theoreticalRank": 756,
+                "simultaneousId": 5803081,
+                "team": {
+                    "id": 15223755,
+                    "player1": "MADAR .",
+                    "player2": {
+                        "id": 100544,
+                        "migrationId": 240070,
+                        "ffbId": 2583335,
+                        "firstName": "Juliette",
+                        "lastName": "SYMCHOWICZ",
+                    },
+                },
+            },
+            {
+                "sessionScore": 50.0,
+                "totalScore": 50.0,
+                "peBonus": 0,
+                "totalBonus": 0.0,
+                "rank": 2,
+                "theoreticalRank": 2,
+                "simultaneousId": 5803081,
+                "team": {
+                    "id": 1,
+                    "player1": "ERREUR .",
+                    "player2": "ERREUR .",
+                },
+            },
+        ]
+        rows = lancelot._normalize_ranking_results(
+            ranking,
+            series_id=868,
+            tournament_date="2026-09-07",
+        )
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["player1_name"], "MADAR .")
+        self.assertEqual(row["player2_name"], "Juliette SYMCHOWICZ")
+        self.assertEqual(row["player1_id"], "")
+        self.assertEqual(row["player2_id"], "240070")
+        self.assertEqual(row["player2_lancelot_id"], "100544")
+        self.assertEqual(row["player2_license_number"], "2583335")
 
     def test_ordinary_roy_rene_session_is_scratch_only(self) -> None:
         rows = lancelot._normalize_ranking_results(

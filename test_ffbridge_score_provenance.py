@@ -118,6 +118,27 @@ def test_handicap_only_score_updates_only_handicap_elo() -> None:
     assert row["player1_scratch_elo_after"] == row["player1_scratch_elo_before"]
 
 
+def test_visitor_player1_still_copies_licensed_player2_identities() -> None:
+    row = _replay(
+        _result(
+            player1_id="",
+            player1_name="MADAR .",
+            player1_lancelot_id="",
+            player2_id="240070",
+            player2_name="Juliette SYMCHOWICZ",
+            player2_lancelot_id="100544",
+            player2_classic_person_id="240070",
+            player2_license_number="2583335",
+            National_Scratch_Pct=54.21,
+            scratch_score_status="official",
+        ),
+        use_handicap=False,
+    )
+    assert row["player1_name"] == "MADAR ."
+    assert row["player2_lancelot_id"] == "100544"
+    assert row["player2_license_number"] == "2583335"
+
+
 def test_scratch_only_score_updates_only_scratch_elo() -> None:
     row = _replay(
         _result(

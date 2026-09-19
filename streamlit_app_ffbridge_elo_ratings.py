@@ -1382,15 +1382,16 @@ def process_tournaments_to_elo(
                 'player2_current_iv': float(player2_iv) if player2_iv is not None else None,
                 'pair_iv': float(pair_iv) if pair_iv is not None else None,  # Current pair IV (sum of current player IVs)
             }
-            if result.get('player1_lancelot_id') not in (None, ''):
-                for identity_field in (
-                    'player1_lancelot_id',
-                    'player2_lancelot_id',
-                    'player1_classic_person_id',
-                    'player2_classic_person_id',
-                    'player1_license_number',
-                    'player2_license_number',
-                ):
+            identity_fields = (
+                'player1_lancelot_id',
+                'player2_lancelot_id',
+                'player1_classic_person_id',
+                'player2_classic_person_id',
+                'player1_license_number',
+                'player2_license_number',
+            )
+            if any(result.get(field) not in (None, '') for field in identity_fields):
+                for identity_field in identity_fields:
                     value = result.get(identity_field)
                     result_record[identity_field] = (
                         str(value) if value not in (None, '') else None

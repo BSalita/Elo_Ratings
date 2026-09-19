@@ -1150,6 +1150,7 @@ def flatten_team_scores(
     rows: list[dict[str, Any]] = []
     unmapped = 0
     seen_play_ids: dict[str, dict[str, Any]] = {}
+    seat_person = _import_ffbridge_lib().lancelot_seat_person
     for score in scores:
         board = score.get("board")
         lineup = score.get("lineup")
@@ -1220,9 +1221,7 @@ def flatten_team_scores(
             "S": "southPlayer",
             "W": "westPlayer",
         }.items():
-            player = lineup.get(field)
-            if not isinstance(player, Mapping):
-                player = {}
+            player = seat_person(lineup.get(field)) or {}
             prefix = f"lineup_{field}_"
             row[f"{prefix}id"] = player.get("id")
             row[f"{prefix}firstName"] = player.get("firstName")

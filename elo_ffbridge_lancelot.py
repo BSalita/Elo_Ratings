@@ -56,7 +56,7 @@ print(
     flush=True,
 )
 
-REQUEST_TIMEOUT = 10  # seconds (reduced from 30 to fail faster on hung requests)
+REQUEST_TIMEOUT = 30  # seconds; large Festival rankings often exceed 10s
 REQUEST_DELAY = 0.1  # seconds between API requests
 PENDING_RESULTS_CACHE_HOURS = 6
 RECENT_RESULTS_CACHE_HOURS = 6
@@ -102,26 +102,37 @@ def lancelot_get(endpoint: str, params: Optional[Dict] = None, add_delay: bool =
     """Make a GET request to Lancelot API with rate limiting.
 
     Thin wrapper over the shared mlBridgeFFLib client: keeps this app's
-    return-None-on-error contract and Streamlit warnings.
+    return-None-on-error contract and Streamlit warnings. Timeouts retry
+    once because Festival ranking dumps often exceed the first attempt.
     """
-    try:
-        return mlBridgeFFLib.lancelot_get(
-            endpoint,
-            params=params,
-            session=get_session(),
-            timeout=REQUEST_TIMEOUT,
-            rate_limit_delay=REQUEST_DELAY if add_delay else 0.0,
-            verbose=verbose,
-        )
-    except requests.exceptions.Timeout:
-        print(f"[Lancelot] TIMEOUT after {REQUEST_TIMEOUT}s: {endpoint}", flush=True)
-        st.warning(f"Timeout fetching {endpoint} after {REQUEST_TIMEOUT}s - skipping")
-    except requests.exceptions.HTTPError as e:
-        if verbose:
-            print(f"[Lancelot] HTTP {e.response.status_code}: {endpoint}", flush=True)
-    except Exception as e:
-        print(f"[Lancelot] ERROR: {e} for {endpoint}", flush=True)
-        st.warning(f"Lancelot API error: {e}")
+    attempts = 2
+    for attempt in range(attempts):
+        try:
+            return mlBridgeFFLib.lancelot_get(
+                endpoint,
+                params=params,
+                session=get_session(),
+                timeout=REQUEST_TIMEOUT,
+                rate_limit_delay=REQUEST_DELAY if add_delay and attempt == 0 else 0.0,
+                verbose=verbose,
+            )
+        except requests.exceptions.Timeout:
+            if attempt + 1 < attempts:
+                print(
+                    f"[Lancelot] TIMEOUT after {REQUEST_TIMEOUT}s: {endpoint}; retrying",
+                    flush=True,
+                )
+                continue
+            print(f"[Lancelot] TIMEOUT after {REQUEST_TIMEOUT}s: {endpoint}", flush=True)
+            st.warning(f"Timeout fetching {endpoint} after {REQUEST_TIMEOUT}s - skipping")
+        except requests.exceptions.HTTPError as e:
+            if verbose:
+                print(f"[Lancelot] HTTP {e.response.status_code}: {endpoint}", flush=True)
+            return None
+        except Exception as e:
+            print(f"[Lancelot] ERROR: {e} for {endpoint}", flush=True)
+            st.warning(f"Lancelot API error: {e}")
+            return None
     return None
 
 
@@ -289,6 +300,29 @@ def _fetch_organizer_scores(
     return scores
 
 
+def _results_from_ranking(
+    ranking: List[Dict[str, Any]],
+    *,
+    session_id: str,
+    tournament_date: str,
+    series_id: Optional[Any],
+) -> List[Dict[str, Any]]:
+    group_ids = fetch_session_group_ids(session_id)
+    organizer_scores = _fetch_organizer_scores(
+        session_id,
+        ranking,
+        tournament_date,
+        series_id,
+    )
+    return _normalize_ranking_results(
+        ranking,
+        series_id=series_id,
+        tournament_date=tournament_date,
+        group_ids=group_ids,
+        organizer_scores=organizer_scores,
+    )
+
+
 def fetch_tournament_results(session_id: str, tournament_date: str = "", series_id: Optional[Any] = None, fetch_iv: bool = False) -> Tuple[List[Dict[str, Any]], bool]:
     """
     Fetch results for a specific session from Lancelot.
@@ -310,9 +344,10 @@ def fetch_tournament_results(session_id: str, tournament_date: str = "", series_
     # FFBridge updates row counts, bonuses, and theoretical ranks after a
     # ranking first appears. Revalidate recent finalized sessions as well as
     # pending zero shells; older complete rankings remain immutable.
-    cached_data = load_from_disk_cache(
+    stale_cached = load_from_disk_cache(
         CACHE_DIR, friendly_name, max_age_hours=None, series_id=series_id
     )
+    cached_data = stale_cached
     if cached_data:
         if _missing_expected_provenance(
             cached_data, tournament_date, series_id
@@ -333,19 +368,11 @@ def fetch_tournament_results(session_id: str, tournament_date: str = "", series_
                 series_id=series_id,
             )
         if cached_data:
-            group_ids = fetch_session_group_ids(session_id)
-            organizer_scores = _fetch_organizer_scores(
-                session_id,
+            return _results_from_ranking(
                 cached_data,
-                tournament_date,
-                series_id,
-            )
-            return _normalize_ranking_results(
-                cached_data,
-                series_id=series_id,
+                session_id=session_id,
                 tournament_date=tournament_date,
-                group_ids=group_ids,
-                organizer_scores=organizer_scores,
+                series_id=series_id,
             ), True
     
     # Fetch from API
@@ -353,20 +380,22 @@ def fetch_tournament_results(session_id: str, tournament_date: str = "", series_
     
     if data and isinstance(data, list):
         save_to_disk_cache(CACHE_DIR, friendly_name, data, series_id=series_id)
-        group_ids = fetch_session_group_ids(session_id)
-        organizer_scores = _fetch_organizer_scores(
-            session_id,
+        return _results_from_ranking(
             data,
-            tournament_date,
-            series_id,
-        )
-        return _normalize_ranking_results(
-            data,
-            series_id=series_id,
+            session_id=session_id,
             tournament_date=tournament_date,
-            group_ids=group_ids,
-            organizer_scores=organizer_scores,
+            series_id=series_id,
         ), False
+
+    # A timeout during the 6-hour revalidation window must not drop a
+    # session that already has a stored ranking.
+    if stale_cached:
+        return _results_from_ranking(
+            stale_cached,
+            session_id=session_id,
+            tournament_date=tournament_date,
+            series_id=series_id,
+        ), True
     
     return [], False
 
@@ -480,16 +509,18 @@ def _normalize_ranking_results(
         if not isinstance(team, dict):
             continue
             
-        p1 = team.get('player1')
-        p2 = team.get('player2')
-        
-        if not isinstance(p1, dict) or not isinstance(p2, dict):
+        p1 = mlBridgeFFLib.lancelot_seat_person(team.get('player1')) or {}
+        p2 = mlBridgeFFLib.lancelot_seat_person(team.get('player2')) or {}
+        if not (
+            (p1.get('migrationId') or p1.get('id'))
+            or (p2.get('migrationId') or p2.get('id'))
+        ):
             continue
-        
-        p1_id = str(p1.get('migrationId') or p1.get('id', ''))
-        p2_id = str(p2.get('migrationId') or p2.get('id', ''))
-        p1_name = f"{p1.get('firstName', '')} {p1.get('lastName', '')}".strip()
-        p2_name = f"{p2.get('firstName', '')} {p2.get('lastName', '')}".strip()
+
+        p1_id = str(p1.get('migrationId') or p1.get('id') or '')
+        p2_id = str(p2.get('migrationId') or p2.get('id') or '')
+        p1_name = mlBridgeFFLib.lancelot_player_display_name(p1)
+        p2_name = mlBridgeFFLib.lancelot_player_display_name(p2)
         
         national_pct_raw = (
             entry.get('sessionScore')

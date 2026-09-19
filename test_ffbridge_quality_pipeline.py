@@ -323,6 +323,40 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
         self.assertEqual(row["board_frequencies"][0]["ewScore"], "")
         self.assertEqual(unmapped, 1)
 
+    def test_visitor_name_string_keeps_published_last_name(self) -> None:
+        scores = [
+            {
+                "id": 500,
+                "boardNumber": 1,
+                "contract": "1NT",
+                "declarer": "S",
+                "result": "=",
+                "board": {
+                    "id": 50,
+                    "boardNumber": 1,
+                    "deal": None,
+                    "frequencies": [],
+                },
+                "lineup": {
+                    "northPlayer": "MADAR .",
+                    "eastPlayer": {"id": 2, "firstName": "Claude", "lastName": "PETIT"},
+                    "southPlayer": {
+                        "id": 100544,
+                        "firstName": "Juliette",
+                        "lastName": "SYMCHOWICZ",
+                    },
+                    "westPlayer": {"id": 3},
+                },
+            }
+        ]
+        frame, unmapped = flatten_team_scores("304735", scores, {})
+        row = frame.to_dicts()[0]
+        self.assertIsNone(row["Player_ID_N"])
+        self.assertEqual(row["lineup_northPlayer_lastName"], "MADAR .")
+        self.assertEqual(row["lineup_southPlayer_lastName"], "SYMCHOWICZ")
+        self.assertEqual(row["Player_ID_S"], "100544")
+        self.assertEqual(unmapped, 1)
+
     def test_duplicate_endpoint_copies_are_collapsed(self) -> None:
         duplicated = pl.concat([_quality_input().head(1), _quality_input().head(1)])
         normalized = normalize_quality_frame(duplicated, session_dates=_dates())
