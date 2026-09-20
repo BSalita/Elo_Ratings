@@ -85,6 +85,7 @@ from elo_common import (
     footer_streamlit_app_diagnostics_line,
     sync_state_to_url_params,
 )
+from elo_favorites import load_favorites
 from elo_filter_common import (
     ACBL_DATE_RANGE_OPTIONS as _DATE_RANGE_OPTIONS,
     ACBL_MASTERPOINT_RANGES as MASTERPOINT_RANGES,
@@ -222,6 +223,39 @@ def _fetch_remote_report_table(
     if last_exc is not None:
         raise RuntimeError(f"ACBL API request failed for {request_url}: {last_exc}") from last_exc
     raise RuntimeError(f"ACBL API request failed for {request_url}: unknown error")
+
+
+def _fetch_remote_sql(sql: str, ctx: dict) -> tuple[pl.DataFrame, str]:
+    """Run developer SQL against the API board-level DuckDB table ``self``."""
+    base_url = _acbl_api_base_url()
+    if base_url is None:
+        raise ValueError("ACBL_API_BASE_URL is not configured")
+    date_from = ctx.get("date_from")
+    params = {
+        "club_or_tournament": str(ctx["club_or_tournament"]).lower(),
+        "rating_type": ctx["rating_type"],
+        "top_n": int(ctx["top_n"]),
+        "min_sessions": int(ctx["min_sessions"]),
+        "rating_method": ctx["rating_method"],
+        "elo_rating_type": ctx["elo_rating_type"],
+        "date_from": _acbl_date_from_param(date_from) if date_from is not None else None,
+        "online_filter": ctx["online_filter"],
+        "strata": ctx["strata"],
+        "prior_sessions": int(ctx.get("prior_sessions", 50)),
+        "platinum_events": bool(ctx.get("platinum_events", False)),
+        "min_skill_z": float(ctx["min_skill_z"]),
+    }
+    timeout_connect = int(os.getenv("ACBL_API_CONNECT_TIMEOUT_SECONDS", "15"))
+    timeout_read = int(os.getenv("ACBL_API_TIMEOUT_SECONDS", "600"))
+    response = requests.post(
+        f"{base_url}/acbl/sql",
+        params=params,
+        json={"sql": sql},
+        timeout=(timeout_connect, timeout_read),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return pl.DataFrame(payload.get("rows", [])), str(payload.get("generated_sql") or sql)
 
 
 def _fetch_remote_detail_table(
@@ -1390,7 +1424,7 @@ def _acbl_report_panel() -> None:
         if st.session_state.get('show_sql_query', False) and st.session_state.get('enable_custom_queries', False):
             st.markdown("---")
             st.markdown("### 🔍 Run Additional SQL Queries")
-            st.caption("Query the results above. Only the displayed columns are available. The results table is available as 'self'.")
+            st.caption("Query the filtered board-level table ``self`` on the API (macros like {Elo_Col_N} are substituted).")
         
         
             # Initialize SQL query history if not exists
@@ -1431,7 +1465,7 @@ def _acbl_report_panel() -> None:
                 query = st.text_input(
                     "💬 SQL Query (press Enter to execute):",
                     value='',
-                    placeholder="SELECT * FROM self WHERE Player_Elo_Score > 1500 ORDER BY Quality_Rank LIMIT 10",
+                    placeholder="SELECT Player_ID_N, Player_Name_N, {Elo_Col_N} FROM self LIMIT 20",
                     key="sql_query_text_input",
                     on_change=lambda: st.session_state.update({"execute_query_now": True})
                 )
@@ -1449,10 +1483,10 @@ def _acbl_report_panel() -> None:
                         if st.session_state.get('show_sql_query', False):
                             st.code(processed_query, language='sql')
                     
-                        # Execute query on the query results table, not the raw dataset
-                        con = get_db_connection()
-                        _db_register(con, 'self', table_df)
-                        result_df = con.execute(processed_query).pl()
+                        result_df, processed_query = _fetch_remote_sql(
+                            processed_query,
+                            st.session_state.get("_acbl_sidebar_ctx") or {},
+                        )
                     
                         # Store in history
                         st.session_state.sql_query_history.append({
@@ -1579,6 +1613,20 @@ def main():
         else:
             platinum_events = False
         rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=True, key="rating_type")
+        if "button_title" not in st.session_state:
+            st.session_state.button_title = "Leaderboard"
+        try:
+            favorites = load_favorites("acbl")
+        except FileNotFoundError as exc:
+            st.error(str(exc))
+            st.stop()
+        for button_id, button in (favorites.get("Buttons") or {}).items():
+            if st.sidebar.button(
+                button.get("title") or button_id,
+                help=button.get("help"),
+                key=f"acbl_fav_{button_id}",
+            ):
+                st.session_state.button_title = button_id
         top_n = st.number_input(
             "Top N players or pairs",
             min_value=50,
@@ -1838,6 +1886,7 @@ def main():
         "strata": strata,
         "platinum_events": bool(platinum_events),
         "min_skill_z": float(min_skill_z),
+        "prior_sessions": int(prior_sessions),
     }
 
     # -------------------------------

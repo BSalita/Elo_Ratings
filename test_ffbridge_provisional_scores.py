@@ -406,10 +406,12 @@ class ScoreAvailabilityTests(unittest.TestCase):
                 "date": ["2026-08-25", "2026-08-24"],
             }
         )
-        players = reports.aggregate_players_from_results(frame, use_handicap=False)
-        salita = players.filter(pl.col("player_id") == "1")
-        self.assertAlmostEqual(salita.item(0, "avg_scratch_pct"), 60.04)
-        self.assertAlmostEqual(salita.item(0, "avg_handicap_pct"), 64.41)
+        players, _sql, _anchor = reports.run_top_players_favorite(
+            frame, top_n=10, min_games=1, use_handicap=False
+        )
+        salita = players.filter(pl.col("Player_ID") == "1")
+        self.assertAlmostEqual(salita.item(0, "Avg_Scratch"), 60.0)
+        self.assertAlmostEqual(salita.item(0, "Avg_Handicap"), 64.4)
 
     def test_roy_rene_first_tuesday_is_handicap_only(self) -> None:
         rows = lancelot._normalize_ranking_results(

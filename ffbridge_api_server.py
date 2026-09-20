@@ -17,7 +17,7 @@ import ffbridge_session_ranking_service as rankings
 from streamlitlib.memory_usage import get_memory_usage_dict
 
 
-FFBRIDGE_API_BUILD_TAG = "2026-09-18-field-wide-history"
+FFBRIDGE_API_BUILD_TAG = "2026-09-20-elo-favorites"
 app = FastAPI(title="FFBridge Elo API", version="1.6.0")
 
 
@@ -41,6 +41,10 @@ class PlayerHistorySqlBody(BaseModel):
     score: str = Field("Scratch", pattern="^(Scratch|Handicap)$")
     limit: int = Field(reports.DEFAULT_HISTORY_SQL_LIMIT, ge=1, le=reports.MAX_HISTORY_SQL_LIMIT)
     api_backend: str | None = None
+
+
+class EloSqlBody(BaseModel):
+    sql: str = Field(..., min_length=1)
 
 
 def _run(callable_, /, **kwargs):
@@ -144,6 +148,53 @@ def leaderboard_report(
         date_range=date_range,
         date_from=date_from,
         date_to=date_to,
+    )
+
+
+@app.get("/ffbridge/favorites")
+def favorites_catalog(favorite_id: str | None = Query(None)) -> dict:
+    try:
+        return reports.list_favorites(favorite_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/ffbridge/sql")
+def elo_sql(
+    body: EloSqlBody,
+    rating_type: str = Query("Players", pattern="^(Players|Pairs)$"),
+    score: str = Query("Scratch", pattern="^(Scratch|Handicap)$"),
+    top_n: int = Query(reports.DEFAULT_TOP_N, ge=1, le=5000),
+    min_games: int = Query(reports.DEFAULT_MIN_GAMES, ge=1, le=10000),
+    prior_sessions: int = Query(reports.DEFAULT_PRIOR_SESSIONS, ge=0, le=1000),
+    api_backend: str | None = Query(None),
+    series_id: str | None = Query(None),
+    tournament: str | None = Query(None),
+    tournament_contains: str | None = Query(None),
+    club: str | None = Query(None),
+    date_range: str | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+    limit: int = Query(reports.DEFAULT_ELO_SQL_LIMIT, ge=1, le=reports.MAX_ELO_SQL_LIMIT),
+) -> dict:
+    """DuckDB SELECT against filtered session rows registered as table ``self``."""
+    return _run(
+        reports.run_elo_sql,
+        sql=body.sql,
+        rating=rating_type,
+        score=score,
+        top_n=top_n,
+        min_games=min_games,
+        prior_sessions=prior_sessions,
+        api_key=api_backend,
+        series_id=series_id,
+        tournament=tournament,
+        tournament_contains=tournament_contains,
+        club=club,
+        date_range=date_range,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
     )
 
 

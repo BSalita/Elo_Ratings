@@ -113,10 +113,10 @@ import elo_ffbridge_lancelot as lancelot_api
 # Headless report core exposed through the Elo API and MortyBridgeMCP: persisted-parquet cache
 # resolution, date ranges, percentage filter, and the leaderboard SQL live in
 # ffbridge_report_service (single source of truth for ranking logic).
+from elo_favorites import load_favorites
 from ffbridge_report_service import (
     DATE_RANGE_OPTIONS as _DATE_RANGE_OPTIONS,
     ELO_CACHE_DIR as _FFBRIDGE_ELO_CACHE_DIR,
-    aggregate_players_from_results as _aggregate_players_from_results,
     date_range_bounds as _date_range_bounds,
     elo_cache_key as _elo_cache_key,
     elo_cache_paths as _elo_cache_paths,
@@ -128,9 +128,10 @@ from ffbridge_report_service import (
     legacy_elo_cache_keys as _legacy_elo_cache_keys,
     load_filtered_quality_sidecars as _load_filtered_quality_sidecars,
     load_quality_sidecars as _load_quality_sidecars,
+    player_metrics_from_results as _player_metrics_from_results,
     resolve_elo_cache_key as _resolve_elo_cache_key,
-    show_top_players,
-    show_top_pairs,
+    run_top_players_favorite,
+    run_top_pairs_favorite,
 )
 
 # Import for version display only
@@ -2168,21 +2169,21 @@ def _cached_filtered_quality_sidecars(
 
 @st.cache_data(show_spinner=False)
 def _cached_top_players_both(
-    players_df: pl.DataFrame,
+    results_df: pl.DataFrame,
     top_n: int,
     min_games: int,
     prior_sessions: int,
     quality_df: Optional[pl.DataFrame],
 ) -> Tuple[pl.DataFrame, pl.DataFrame, str, str, Optional[float], Optional[float]]:
-    if players_df.is_empty():
+    if results_df.is_empty():
         empty = pl.DataFrame()
         return empty, empty, "", "", None, None
-    hc, sql_h, anchor_h = show_top_players(
-        players_df, top_n, min_games, use_handicap=True, prior_sessions=prior_sessions,
+    hc, sql_h, anchor_h = run_top_players_favorite(
+        results_df, top_n, min_games, use_handicap=True, prior_sessions=prior_sessions,
         quality_df=quality_df,
     )
-    sc, sql_s, anchor_s = show_top_players(
-        players_df, top_n, min_games, use_handicap=False, prior_sessions=prior_sessions,
+    sc, sql_s, anchor_s = run_top_players_favorite(
+        results_df, top_n, min_games, use_handicap=False, prior_sessions=prior_sessions,
         quality_df=quality_df,
     )
     return hc, sc, sql_h, sql_s, anchor_h, anchor_s
@@ -2199,34 +2200,22 @@ def _cached_top_pairs_both(
     if results_df.is_empty():
         empty = pl.DataFrame()
         return empty, empty, "", "", None, None
-    hc, sql_h, anchor_h = show_top_pairs(
-        results_df, top_n, min_games, use_handicap=True, players_df=None,
+    hc, sql_h, anchor_h = run_top_pairs_favorite(
+        results_df, top_n, min_games, use_handicap=True,
         prior_sessions=prior_sessions, quality_df=quality_df,
     )
-    sc, sql_s, anchor_s = show_top_pairs(
-        results_df, top_n, min_games, use_handicap=False, players_df=None,
+    sc, sql_s, anchor_s = run_top_pairs_favorite(
+        results_df, top_n, min_games, use_handicap=False,
         prior_sessions=prior_sessions, quality_df=quality_df,
     )
     return hc, sc, sql_h, sql_s, anchor_h, anchor_s
 
 
 @st.cache_data(show_spinner=False)
-def _aggregate_players_from_results_cached(
-    results_df: pl.DataFrame,
-    use_handicap: bool,
-) -> pl.DataFrame:
-    return _aggregate_players_from_results(results_df, use_handicap)
-
-
-def _player_metric_triple(players_df: pl.DataFrame, min_games: int) -> Tuple[int, float, float]:
-    metric_players = players_df.filter(pl.col('games_played') >= min_games) if not players_df.is_empty() else players_df
-    if metric_players.is_empty():
-        return 0, 0.0, 0.0
-    return (
-        len(metric_players),
-        metric_players.select(pl.col('games_played').mean()).item(),
-        metric_players.select(pl.col('elo_rating').max()).item(),
-    )
+def _cached_player_metrics(
+    results_df: pl.DataFrame, min_games: int, use_handicap: bool,
+) -> Tuple[int, float, float]:
+    return _player_metrics_from_results(results_df, min_games, use_handicap)
 
 
 def _pair_metric_triple(results_df: pl.DataFrame, min_games: int, use_handicap: bool) -> Tuple[int, float, float]:
@@ -2422,10 +2411,8 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
     quality_players, quality_pairs, quality_status = (
         _cached_filtered_quality_sidecars(results_df)
     )
-    players_df = _aggregate_players_from_results_cached(results_df, use_handicap)
     _load_debug_log(
-        f"leaderboard panel: aggregated players ({players_df.height} rows, "
-        f"handicap={use_handicap})"
+        f"leaderboard panel: quality sidecars ready (handicap={use_handicap})"
     )
     rating_type = ctx["rating_type"]
     simultaneous_type = ctx["simultaneous_type"]
@@ -2486,10 +2473,10 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
     st.session_state.full_results_df = results_df
     # Display tables
     if rating_type == "Players":
-        if not players_df.is_empty():
+        if not results_df.is_empty():
             _load_debug_log("leaderboard panel: running top players SQL (hc+sc)")
             hc_players, sc_players, sql_h, sql_s, anchor_h, anchor_s = _cached_top_players_both(
-                players_df, top_n, min_games, int(prior_sessions),
+                results_df, top_n, min_games, int(prior_sessions),
                 quality_players,
             )
             _load_debug_log(
@@ -2943,6 +2930,20 @@ def main():
             horizontal=True,
             help="Switch between individual and partnership rankings"
         )
+        if "button_title" not in st.session_state:
+            st.session_state.button_title = "Leaderboard"
+        try:
+            favorites = load_favorites("ffbridge")
+        except FileNotFoundError as exc:
+            st.error(str(exc))
+            st.stop()
+        for button_id, button in (favorites.get("Buttons") or {}).items():
+            if st.sidebar.button(
+                button.get("title") or button_id,
+                help=button.get("help"),
+                key=f"ffbridge_fav_{button_id}",
+            ):
+                st.session_state.button_title = button_id
         
         # Lancelot-only in the UI. Classic stays in API_BACKENDS for later
         # removal; do not expose a sidebar selector (or honor ?api=).
@@ -3306,20 +3307,16 @@ def _load_main_content(
             st.rerun()
         _load_debug_log(f"club list unchanged ({len(unique_clubs)} clubs)")
 
-    _load_debug_log("aggregating players (handicap)")
-    players_df_hc = (
-        _aggregate_players_from_results_cached(results_df, True)
-        if not results_df.is_empty() else pl.DataFrame()
+    _load_debug_log("computing player metric triples")
+    player_metrics_hc = (
+        _cached_player_metrics(results_df, min_games, True)
+        if not results_df.is_empty() else (0, 0.0, 0.0)
     )
-    _load_debug_log(f"aggregating players (scratch); hc={players_df_hc.height} rows")
-    players_df_sc = (
-        _aggregate_players_from_results_cached(results_df, False)
-        if not results_df.is_empty() else pl.DataFrame()
-    )
-    _load_debug_log(f"computing metric triples; sc={players_df_sc.height} player rows")
-    player_metrics_hc = _player_metric_triple(players_df_hc, min_games)
     _load_debug_log("player metrics (handicap) done")
-    player_metrics_sc = _player_metric_triple(players_df_sc, min_games)
+    player_metrics_sc = (
+        _cached_player_metrics(results_df, min_games, False)
+        if not results_df.is_empty() else (0, 0.0, 0.0)
+    )
     _load_debug_log("player metrics (scratch) done")
     if rating_type == "Pairs":
         pair_metrics_hc = _cached_pair_metric_triple(results_df, min_games, True)
@@ -3349,7 +3346,6 @@ def _load_main_content(
         "pair_metrics_sc": pair_metrics_sc,
         "quality_status": quality_status,
     }
-    del players_df_hc, players_df_sc
     _load_debug_log("leaderboard context ready; rendering panel")
 
     

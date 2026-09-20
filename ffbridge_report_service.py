@@ -27,6 +27,7 @@ from elo_filter_common import (
     filter_normalized_substring,
     fuzzy_text_score,
 )
+from elo_favorites import flatten_favorites, load_favorites, run_favorite, run_sql
 from elo_session_common import results_url_status
 from ffbridge_quality_pipeline import (
     BOARD_FILENAME as QUALITY_BOARD_FILENAME,
@@ -1060,452 +1061,165 @@ def list_tournaments(
 
 
 # -------------------------------
-# Aggregation + leaderboard SQL
+# Favorites leaderboard
 # -------------------------------
-def aggregate_players_from_results(results_df: pl.DataFrame, use_handicap: bool) -> pl.DataFrame:
-    """Aggregate per-player stats from filtered result rows (duckdb)."""
-    if results_df.is_empty():
-        return pl.DataFrame()
-    elo_col_p1 = "player1_handicap_elo_after" if use_handicap else "player1_scratch_elo_after"
-    elo_col_p2 = "player2_handicap_elo_after" if use_handicap else "player2_scratch_elo_after"
-    scratch_expr = "COALESCE(National_Scratch_Pct, Club_Scratch_Pct)"
-    handicap_expr = "COALESCE(National_Handicap_Pct, Club_Handicap_Pct)"
-    pct_expr = "handicap_percentage" if use_handicap else "scratch_percentage"
-    return duckdb.sql(f"""
-        WITH player_results AS (
-            SELECT
-                player1_id AS player_id,
-                player1_name AS player_name,
-                player1_scratch_elo_after AS scratch_elo,
-                player1_handicap_elo_after AS handicap_elo,
-                {elo_col_p1} AS elo_rating,
-                {scratch_expr} AS scratch_percentage,
-                {handicap_expr} AS handicap_percentage,
-                iv_bonus,
-                score_status,
-                date
-            FROM results_df
-            UNION ALL
-            SELECT
-                player2_id AS player_id,
-                player2_name AS player_name,
-                player2_scratch_elo_after AS scratch_elo,
-                player2_handicap_elo_after AS handicap_elo,
-                {elo_col_p2} AS elo_rating,
-                {scratch_expr} AS scratch_percentage,
-                {handicap_expr} AS handicap_percentage,
-                iv_bonus,
-                score_status,
-                date
-            FROM results_df
-        )
-        SELECT
-            player_id,
-            ARG_MAX(player_name, date) AS player_name,
-            ROUND(ARG_MAX(scratch_elo, date), 1) AS scratch_elo,
-            ROUND(ARG_MAX(COALESCE(handicap_elo, scratch_elo), date), 1) AS handicap_elo,
-            ROUND(ARG_MAX(elo_rating, date), 1) AS elo_rating,
-            COUNT(*) AS games_played,
-            SUM(CASE WHEN score_status = 'provisional' THEN 1 ELSE 0 END)
-                AS provisional_games,
-            ROUND(AVG(scratch_percentage), 2) AS avg_scratch_pct,
-            ROUND(AVG(handicap_percentage), 2) AS avg_handicap_pct,
-            ROUND(AVG(iv_bonus), 1) AS avg_iv_bonus,
-            ROUND(AVG({pct_expr}), 2) AS avg_percentage,
-            ROUND(STDDEV_SAMP({pct_expr}), 2) AS stdev_percentage
-        FROM player_results
-        GROUP BY player_id
-    """).pl()
+_FFBRIDGE_FAVORITES: dict | None = None
 
 
-def show_top_players(
-    players_df: pl.DataFrame,
+def _ffbridge_favorites() -> dict:
+    global _FFBRIDGE_FAVORITES
+    if _FFBRIDGE_FAVORITES is None:
+        _FFBRIDGE_FAVORITES = load_favorites("ffbridge")
+    return _FFBRIDGE_FAVORITES
+
+
+def ffbridge_favorites_meta(
+    *,
+    rating_type: str,
+    score: str,
+    top_n: int,
+    min_games: int,
+    prior_sessions: int,
+) -> dict:
+    use_handicap = score == "Handicap"
+    kind = "handicap" if use_handicap else "scratch"
+    if rating_type == "Players":
+        elo_col = "HC_Player_Elo" if use_handicap else "Player_Elo"
+    else:
+        elo_col = "HC_Pair_Elo" if use_handicap else "Pair_Elo"
+    pct_expr = (
+        "COALESCE(National_Handicap_Pct, Club_Handicap_Pct)"
+        if use_handicap
+        else "COALESCE(National_Scratch_Pct, Club_Scratch_Pct)"
+    )
+    return {
+        "Top_N": int(top_n),
+        "Min_Games": int(min_games),
+        "Prior_Sessions": int(prior_sessions),
+        "Rating_Type": rating_type,
+        "Elo_Kind": kind,
+        "Elo_Col_Name": elo_col,
+        "Title_Col_Name": "Scratch_Title" if use_handicap else "Title",
+        "Pct_Col": "handicap_percentage" if use_handicap else "scratch_percentage",
+        "Pair_Elo_Col": "handicap_pair_elo" if use_handicap else "scratch_pair_elo",
+        "Pct_Expr": pct_expr,
+    }
+
+
+def _drop_prior_anchor(result: pl.DataFrame) -> tuple[pl.DataFrame, Optional[float]]:
+    if result.is_empty() or "_prior_anchor" not in result.columns:
+        return result, None
+    val = result["_prior_anchor"][0]
+    prior_anchor = float(val) if val is not None else None
+    return result.drop("_prior_anchor"), prior_anchor
+
+
+def run_top_players_favorite(
+    results_df: pl.DataFrame,
     top_n: int,
     min_games: int = 5,
     use_handicap: bool = False,
     prior_sessions: int = 0,
     quality_df: Optional[pl.DataFrame] = None,
 ) -> Tuple[pl.DataFrame, str, Optional[float]]:
-    """Get top players sorted by Elo rating using SQL.
-
-    When ``prior_sessions > 0`` and a prior anchor (median Elo of the
-    qualifying subset) is available, the headline Elo is the Bayesian-shrunk
-    "Published" Elo:
-
-        Published = (games * Raw + prior_sessions * prior_anchor)
-                    / (games + prior_sessions)
-
-    Both the Published and Raw values are returned in the table; the
-    leaderboard is ordered by Published. Returns ``(df, sql, prior_anchor)``.
-    """
-    if players_df.is_empty():
-        return players_df, "", None
-
-    elo_col_name = "HC_Player_Elo" if use_handicap else "Player_Elo"
-    title_col_name = "Scratch_Title" if use_handicap else "Title"
-
-    anchor_query = f"""
-        SELECT
-            MEDIAN(elo_rating) AS anchor,
-            MEDIAN(scratch_elo) AS scratch_anchor
-        FROM players_df
-        WHERE games_played >= {min_games}
-    """
-    anchor_df = duckdb.sql(anchor_query).pl()
-    if anchor_df.is_empty():
-        prior_anchor: Optional[float] = None
-        scratch_anchor: Optional[float] = None
-    else:
-        val = anchor_df.item(0, 0)
-        prior_anchor = float(val) if val is not None else None
-        sval = anchor_df.item(0, 1)
-        scratch_anchor = float(sval) if sval is not None else None
-
-    if prior_sessions > 0 and prior_anchor is not None:
-        ps_lit = f"CAST({float(prior_sessions)!r} AS DOUBLE)"
-        anchor_lit = f"CAST({float(prior_anchor)!r} AS DOUBLE)"
-        published_expr = (
-            f"CAST(ROUND(LEAST(GREATEST("
-            f"(CAST(games_played AS DOUBLE) * CAST(elo_rating AS DOUBLE) "
-            f"+ {ps_lit} * {anchor_lit}) "
-            f"/ NULLIF(CAST(games_played AS DOUBLE) + {ps_lit}, 0)"
-            f", 0), 3500), 0) AS INTEGER)"
-        )
-    else:
-        published_expr = "CAST(ROUND(LEAST(GREATEST(elo_rating, 0), 3500), 0) AS INTEGER)"
-
-    # Titles derive from the *published* (Bayesian-shrunk) SCRATCH Elo so they
-    # always agree with the shrunk headline and never show an inflated title for
-    # a low-sample player. In scratch view this equals the headline; in handicap
-    # view it is the shrunk scratch rating (the "Scratch_Title" skill indicator).
-    if prior_sessions > 0 and scratch_anchor is not None:
-        ps_lit_s = f"CAST({float(prior_sessions)!r} AS DOUBLE)"
-        sanchor_lit = f"CAST({float(scratch_anchor)!r} AS DOUBLE)"
-        published_scratch_expr = (
-            f"CAST(ROUND(LEAST(GREATEST("
-            f"(CAST(games_played AS DOUBLE) * CAST(scratch_elo AS DOUBLE) "
-            f"+ {ps_lit_s} * {sanchor_lit}) "
-            f"/ NULLIF(CAST(games_played AS DOUBLE) + {ps_lit_s}, 0)"
-            f", 0), 3500), 0) AS INTEGER)"
-        )
-    else:
-        published_scratch_expr = "CAST(ROUND(LEAST(GREATEST(scratch_elo, 0), 3500), 0) AS INTEGER)"
-
-    title_col = f""",
-            CASE 
-                WHEN published_scratch_int >= 2600 THEN 'SGM'
-                WHEN published_scratch_int >= 2500 THEN 'GM'
-                WHEN published_scratch_int >= 2400 THEN 'IM'
-                WHEN published_scratch_int >= 2300 THEN 'FM'
-                WHEN published_scratch_int >= 2200 THEN 'CM'
-                WHEN published_scratch_int >= 2000 THEN 'Expert'
-                WHEN published_scratch_int >= 1800 THEN 'Advanced'
-                WHEN published_scratch_int >= 1600 THEN 'Intermediate'
-                WHEN published_scratch_int >= 1400 THEN 'Novice'
-                ELSE 'Beginner'
-            END AS {title_col_name}"""
-
-    query = f"""
-        WITH filtered AS (
-            SELECT *
-            FROM players_df
-            WHERE games_played >= {min_games}
-        ),
-        ranked AS (
-            SELECT
-                *,
-                CAST(ROUND(LEAST(GREATEST(elo_rating, 0), 3500), 0) AS INTEGER) AS raw_elo_int,
-                {published_expr} AS published_elo_int,
-                {published_scratch_expr} AS published_scratch_int
-            FROM filtered
-        )
-        SELECT 
-            CAST(ROW_NUMBER() OVER (ORDER BY published_elo_int DESC, games_played DESC, player_name ASC, player_id ASC) AS INTEGER) AS Rank,
-            published_elo_int AS {elo_col_name},
-            raw_elo_int AS {elo_col_name}_Raw{title_col},
-            player_id AS Player_ID,
-            player_name AS Player_Name,
-            ROUND(avg_scratch_pct, 1) AS Avg_Scratch,
-            ROUND(avg_handicap_pct, 1) AS Avg_Handicap,
-            ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,
-            ROUND(stdev_percentage, 1) AS Pct_Stdev,
-            CAST(games_played AS INTEGER) AS Games,
-            CAST(provisional_games AS INTEGER) AS Provisional_Games
-        FROM ranked
-        ORDER BY Rank ASC
-        LIMIT {max(top_n, players_df.height)}
-    """
-
-    result = duckdb.sql(query).pl()
+    """Run the Top_Players favorite against session-level ``self``."""
+    if results_df.is_empty():
+        return results_df, "", None
+    meta = ffbridge_favorites_meta(
+        rating_type="Players",
+        score="Handicap" if use_handicap else "Scratch",
+        top_n=max(int(top_n), int(results_df.height)),
+        min_games=min_games,
+        prior_sessions=prior_sessions,
+    )
+    con = duckdb.connect(config={"enable_external_access": "false"})
+    try:
+        con.register("self", results_df)
+        result, sql = run_favorite(con, _ffbridge_favorites(), "Top_Players", meta)
+    finally:
+        con.close()
+    result, prior_anchor = _drop_prior_anchor(result)
     result = _attach_quality_sidecar(
         result,
         quality_df,
         leaderboard_id="Player_ID",
         quality_id="player_id",
     ).head(top_n)
-    return result, query, prior_anchor
+    return result, sql, prior_anchor
 
 
-def show_top_pairs(
+def run_top_pairs_favorite(
     results_df: pl.DataFrame,
     top_n: int,
     min_games: int = 5,
     use_handicap: bool = False,
-    players_df: Optional[pl.DataFrame] = None,
     prior_sessions: int = 0,
     quality_df: Optional[pl.DataFrame] = None,
 ) -> Tuple[pl.DataFrame, str, Optional[float]]:
-    """Get top pairs sorted by Elo rating using SQL.
-
-    When ``prior_sessions > 0`` and a prior anchor (median pair Elo of the
-    qualifying subset) is available, the headline pair Elo is the
-    Bayesian-shrunk "Published" Elo, computed the same way as for players in
-    :func:`show_top_players`. Both Published and Raw are returned in the
-    output; the leaderboard is ordered by Published. Returns
-    ``(df, sql, prior_anchor)``.
-    """
+    """Run the Top_Pairs favorite against session-level ``self``."""
     if results_df.is_empty():
         return results_df, "", None
-
-    elo_col = "handicap_pair_elo" if use_handicap else "scratch_pair_elo"
-    scratch_expr = "COALESCE(National_Scratch_Pct, Club_Scratch_Pct)"
-    handicap_expr = "COALESCE(National_Handicap_Pct, Club_Handicap_Pct)"
-    pct_col = handicap_expr if use_handicap else scratch_expr
-
-    pair_elo_col_name = "HC_Pair_Elo" if use_handicap else "Pair_Elo"
-    title_col_name = "Scratch_Title" if use_handicap else "Title"
-
-    anchor_query = f"""
-        WITH pair_anchor AS (
-            SELECT
-                pair_id,
-                ARG_MAX({elo_col}, date) AS avg_pair_elo,
-                COUNT(*) AS games_played
-            FROM results_df
-            GROUP BY pair_id
-        )
-        SELECT MEDIAN(avg_pair_elo) AS anchor
-        FROM pair_anchor
-        WHERE games_played >= {min_games}
-    """
-    anchor_df = duckdb.sql(anchor_query).pl()
-    if anchor_df.is_empty():
-        prior_anchor: Optional[float] = None
-    else:
-        val = anchor_df.item(0, 0)
-        prior_anchor = float(val) if val is not None else None
-
-    if prior_sessions > 0 and prior_anchor is not None:
-        ps_lit = f"CAST({float(prior_sessions)!r} AS DOUBLE)"
-        anchor_lit = f"CAST({float(prior_anchor)!r} AS DOUBLE)"
-        published_expr = (
-            f"CAST(ROUND(LEAST(GREATEST("
-            f"(CAST(games_played AS DOUBLE) * CAST(avg_pair_elo AS DOUBLE) "
-            f"+ {ps_lit} * {anchor_lit}) "
-            f"/ NULLIF(CAST(games_played AS DOUBLE) + {ps_lit}, 0)"
-            f", 0), 3500), 0) AS INTEGER)"
-        )
-    else:
-        published_expr = "CAST(ROUND(LEAST(GREATEST(avg_pair_elo, 0), 3500), 0) AS INTEGER)"
-    
-    # Build Title column - use lower title of the two players based on their
-    # *published* (Bayesian-shrunk) scratch Elo, so a pair never inherits an
-    # inflated title from a low-sample partner. Each player's scratch Elo is
-    # shrunk toward the population scratch median using their own games count,
-    # mirroring the headline shrinkage.
-    scratch_anchor: Optional[float] = None
-    if players_df is not None and not players_df.is_empty():
-        sa_df = duckdb.sql(
-            f"""
-            SELECT MEDIAN(scratch_elo) AS scratch_anchor
-            FROM players_df
-            WHERE games_played >= {min_games}
-            """
-        ).pl()
-        if not sa_df.is_empty():
-            sv = sa_df.item(0, 0)
-            scratch_anchor = float(sv) if sv is not None else None
-
-    def _pub_scratch_sql(alias: str) -> str:
-        """Shrunk, chess-clamped scratch Elo for a joined player alias."""
-        if prior_sessions > 0 and scratch_anchor is not None:
-            ps_lit_s = f"CAST({float(prior_sessions)!r} AS DOUBLE)"
-            sanchor_lit = f"CAST({float(scratch_anchor)!r} AS DOUBLE)"
-            return (
-                f"CAST(ROUND(LEAST(GREATEST("
-                f"(CAST(COALESCE({alias}.games_played, 0) AS DOUBLE) "
-                f"* CAST(COALESCE({alias}.scratch_elo, 0) AS DOUBLE) "
-                f"+ {ps_lit_s} * {sanchor_lit}) "
-                f"/ NULLIF(CAST(COALESCE({alias}.games_played, 0) AS DOUBLE) + {ps_lit_s}, 0)"
-                f", 0), 3500), 0) AS INTEGER)"
-            )
-        return f"CAST(ROUND(LEAST(GREATEST(COALESCE({alias}.scratch_elo, 0), 0), 3500), 0) AS INTEGER)"
-
-    if players_df is not None and not players_df.is_empty():
-        p1_pub = _pub_scratch_sql("p1")
-        p2_pub = _pub_scratch_sql("p2")
-        # Join with players_df to get individual player scratch Elo and calculate lower title
-        title_col = """,
-            CASE 
-                -- Calculate title rank for player1 (1=SGM, 10=Beginner)
-                WHEN p1_pub_scratch >= 2600 THEN 1
-                WHEN p1_pub_scratch >= 2500 THEN 2
-                WHEN p1_pub_scratch >= 2400 THEN 3
-                WHEN p1_pub_scratch >= 2300 THEN 4
-                WHEN p1_pub_scratch >= 2200 THEN 5
-                WHEN p1_pub_scratch >= 2000 THEN 6
-                WHEN p1_pub_scratch >= 1800 THEN 7
-                WHEN p1_pub_scratch >= 1600 THEN 8
-                WHEN p1_pub_scratch >= 1400 THEN 9
-                ELSE 10
-            END AS p1_title_rank,
-            CASE 
-                -- Calculate title rank for player2 (1=SGM, 10=Beginner)
-                WHEN p2_pub_scratch >= 2600 THEN 1
-                WHEN p2_pub_scratch >= 2500 THEN 2
-                WHEN p2_pub_scratch >= 2400 THEN 3
-                WHEN p2_pub_scratch >= 2300 THEN 4
-                WHEN p2_pub_scratch >= 2200 THEN 5
-                WHEN p2_pub_scratch >= 2000 THEN 6
-                WHEN p2_pub_scratch >= 1800 THEN 7
-                WHEN p2_pub_scratch >= 1600 THEN 8
-                WHEN p2_pub_scratch >= 1400 THEN 9
-                ELSE 10
-            END AS p2_title_rank"""
-        
-        title_select = f""",
-            CASE 
-                -- Use GREATEST to get the higher rank number, which corresponds to the lower title
-                -- (Higher rank number = lower title: 1=SGM, 2=GM, ..., 10=Beginner)
-                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 1 THEN 'SGM'
-                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 2 THEN 'GM'
-                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 3 THEN 'IM'
-                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 4 THEN 'FM'
-                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 5 THEN 'CM'
-                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 6 THEN 'Expert'
-                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 7 THEN 'Advanced'
-                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 8 THEN 'Intermediate'
-                WHEN GREATEST(COALESCE(p1_title_rank, 10), COALESCE(p2_title_rank, 10)) = 9 THEN 'Novice'
-                ELSE 'Beginner'
-            END AS {title_col_name}"""
-    else:
-        # Fallback: use pair scratch Elo if players_df not available
-        title_col = f""",
-            CASE 
-                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2600 THEN 'SGM'
-                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2500 THEN 'GM'
-                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2400 THEN 'IM'
-                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2300 THEN 'FM'
-                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2200 THEN 'CM'
-                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2000 THEN 'Expert'
-                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 1800 THEN 'Advanced'
-                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 1600 THEN 'Intermediate'
-                WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 1400 THEN 'Novice'
-                ELSE 'Beginner'
-            END AS {title_col_name}"""
-        title_select = ""
-    
-    query = f"""
-        WITH pair_stats AS (
-            SELECT 
-                pair_id,
-                ARG_MAX(pair_name, date) AS pair_name,
-                ARG_MAX(player1_id, date) AS player1_id,
-                ARG_MAX(player2_id, date) AS player2_id,
-                -- Headline Elo uses Latest semantics (ARG_MAX over date) to
-                -- match show_top_players, which already uses ARG_MAX. Avoids
-                -- the early-tournament-lock-in bias that ACBL's AVG method
-                -- exposed: one lucky early session permanently inflating the
-                -- AVG even after later results regress to the pair's real
-                -- skill level. The percentage / IV / stdev aggregates below
-                -- intentionally stay as AVG because users expect "average
-                -- across all my tournaments" for those.
-                ARG_MAX(scratch_pair_elo, date) AS avg_scratch_elo,
-                ARG_MAX(COALESCE(handicap_pair_elo, scratch_pair_elo), date) AS avg_handicap_elo,
-                ARG_MAX({elo_col}, date) AS avg_pair_elo,
-                AVG({scratch_expr}) AS avg_scratch_pct,
-                AVG({handicap_expr}) AS avg_handicap_pct,
-                AVG(iv_bonus) AS avg_iv_bonus,
-                AVG({pct_col}) AS avg_percentage,
-                STDDEV_SAMP({pct_col}) AS stdev_percentage,
-                COUNT(*) AS games_played,
-                SUM(CASE WHEN score_status = 'provisional' THEN 1 ELSE 0 END)
-                    AS provisional_games
-            FROM results_df
-            GROUP BY pair_id
-        ),
-        filtered AS (
-            SELECT *
-            FROM pair_stats
-            WHERE games_played >= {min_games}
-        ),
-        ranked AS (
-            SELECT
-                *,
-                CAST(ROUND(LEAST(GREATEST(avg_pair_elo, 0), 3500), 0) AS INTEGER) AS raw_pair_elo_int,
-                {published_expr} AS published_pair_elo_int
-            FROM filtered
-        )"""
-
-    if players_df is not None and not players_df.is_empty():
-        query += f""",
-        with_player_scratch AS (
-            SELECT 
-                f.*,
-                {p1_pub} AS p1_pub_scratch,
-                {p2_pub} AS p2_pub_scratch
-            FROM ranked f
-            LEFT JOIN players_df p1 ON f.player1_id = p1.player_id
-            LEFT JOIN players_df p2 ON f.player2_id = p2.player_id
-        ),
-        with_player_titles AS (
-            SELECT 
-                w.*{title_col}
-            FROM with_player_scratch w
-        )
-        SELECT 
-            CAST(ROW_NUMBER() OVER (ORDER BY published_pair_elo_int DESC, games_played DESC, pair_name ASC, pair_id ASC) AS INTEGER) AS Rank,
-            published_pair_elo_int AS {pair_elo_col_name},
-            raw_pair_elo_int AS {pair_elo_col_name}_Raw{title_select},
-            pair_id AS Pair_ID,
-            pair_name AS Pair_Name,
-            ROUND(avg_scratch_pct, 1) AS Avg_Scratch,
-            ROUND(avg_handicap_pct, 1) AS Avg_Handicap,
-            ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,
-            ROUND(stdev_percentage, 1) AS Pct_Stdev,
-            CAST(games_played AS INTEGER) AS Games,
-            CAST(provisional_games AS INTEGER) AS Provisional_Games
-        FROM with_player_titles
-        ORDER BY Rank ASC
-        LIMIT {max(top_n, results_df.height)}
-    """
-    else:
-        query += f"""
-        SELECT 
-            CAST(ROW_NUMBER() OVER (ORDER BY published_pair_elo_int DESC, games_played DESC, pair_name ASC, pair_id ASC) AS INTEGER) AS Rank,
-            published_pair_elo_int AS {pair_elo_col_name},
-            raw_pair_elo_int AS {pair_elo_col_name}_Raw{title_col},
-            pair_id AS Pair_ID,
-            pair_name AS Pair_Name,
-            ROUND(avg_scratch_pct, 1) AS Avg_Scratch,
-            ROUND(avg_handicap_pct, 1) AS Avg_Handicap,
-            ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,
-            ROUND(stdev_percentage, 1) AS Pct_Stdev,
-            CAST(games_played AS INTEGER) AS Games,
-            CAST(provisional_games AS INTEGER) AS Provisional_Games
-        FROM ranked
-        ORDER BY Rank ASC
-        LIMIT {max(top_n, results_df.height)}
-    """
-
-    result = duckdb.sql(query).pl()
+    meta = ffbridge_favorites_meta(
+        rating_type="Pairs",
+        score="Handicap" if use_handicap else "Scratch",
+        top_n=max(int(top_n), int(results_df.height)),
+        min_games=min_games,
+        prior_sessions=prior_sessions,
+    )
+    con = duckdb.connect(config={"enable_external_access": "false"})
+    try:
+        con.register("self", results_df)
+        result, sql = run_favorite(con, _ffbridge_favorites(), "Top_Pairs", meta)
+    finally:
+        con.close()
+    result, prior_anchor = _drop_prior_anchor(result)
     result = _attach_quality_sidecar(
         result,
         quality_df,
         leaderboard_id="Pair_ID",
         quality_id="pair_id",
     ).head(top_n)
-    return result, query, prior_anchor
+    return result, sql, prior_anchor
+
+
+def player_metrics_from_results(
+    results_df: pl.DataFrame,
+    min_games: int,
+    use_handicap: bool,
+) -> Tuple[int, float, float]:
+    """Active-player count, mean games, and max latest Elo from result rows."""
+    if results_df.is_empty():
+        return 0, 0.0, 0.0
+    elo1 = "player1_handicap_elo_after" if use_handicap else "player1_scratch_elo_after"
+    elo2 = "player2_handicap_elo_after" if use_handicap else "player2_scratch_elo_after"
+    p1 = results_df.select(
+        pl.col("player1_id").alias("player_id"),
+        pl.col(elo1).alias("elo"),
+        pl.col("date"),
+    )
+    p2 = results_df.select(
+        pl.col("player2_id").alias("player_id"),
+        pl.col(elo2).alias("elo"),
+        pl.col("date"),
+    )
+    stats = (
+        pl.concat([p1, p2])
+        .sort("date")
+        .group_by("player_id")
+        .agg(
+            pl.len().alias("games_played"),
+            pl.col("elo").last().alias("elo_rating"),
+        )
+        .filter(pl.col("games_played") >= min_games)
+    )
+    if stats.is_empty():
+        return 0, 0.0, 0.0
+    return (
+        stats.height,
+        float(stats.select(pl.col("games_played").mean()).item() or 0.0),
+        float(stats.select(pl.col("elo_rating").max()).item() or 0.0),
+    )
+
 
 
 # -------------------------------
@@ -1627,30 +1341,22 @@ def run_leaderboard_report(
 
     name_token = (player_name or "").strip()
     number_token = (player_number or "").strip()
+    rank_window = report_rank_window(
+        top_n,
+        results_df.height,
+        player_name=name_token,
+        player_number=number_token,
+    )
     if rating == "Players":
-        players_df = aggregate_players_from_results(results_df, use_handicap)
-        rank_window = report_rank_window(
-            top_n,
-            players_df.height,
-            player_name=name_token,
-            player_number=number_token,
-        )
-        table, sql, prior_anchor = show_top_players(
-            players_df, rank_window, min_games,
+        table, sql, prior_anchor = run_top_players_favorite(
+            results_df, rank_window, min_games,
             use_handicap=use_handicap, prior_sessions=prior_sessions,
             quality_df=quality_players,
         )
     else:
-        rank_window = report_rank_window(
-            top_n,
-            results_df.height,
-            player_name=name_token,
-            player_number=number_token,
-        )
-        table, sql, prior_anchor = show_top_pairs(
+        table, sql, prior_anchor = run_top_pairs_favorite(
             results_df, rank_window, min_games,
-            use_handicap=use_handicap, players_df=None,
-            prior_sessions=prior_sessions,
+            use_handicap=use_handicap, prior_sessions=prior_sessions,
             quality_df=quality_pairs,
         )
     del sql
@@ -1692,6 +1398,96 @@ def run_leaderboard_report(
         "quality_status": quality_status["status"],
         "quality_cutoff": quality_status.get("cutoff"),
         "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
+    }
+
+
+DEFAULT_ELO_SQL_LIMIT = 200
+MAX_ELO_SQL_LIMIT = 5000
+
+
+def list_favorites(favorite_id: str | None = None) -> Dict[str, Any]:
+    payload = _ffbridge_favorites()
+    items = flatten_favorites(payload)
+    wanted = (favorite_id or "").strip()
+    if wanted:
+        items = [item for item in items if item["id"] == wanted]
+        if not items:
+            raise KeyError(f"Unknown favorite id {wanted!r}")
+    return {"organization": "ffbridge", "count": len(items), "favorites": items}
+
+
+def run_elo_sql(
+    sql: str,
+    *,
+    rating: str = "Players",
+    score: str = "Scratch",
+    top_n: int = DEFAULT_TOP_N,
+    min_games: int = DEFAULT_MIN_GAMES,
+    prior_sessions: int = DEFAULT_PRIOR_SESSIONS,
+    series_id: Optional[int | str] = None,
+    tournament: Optional[str] = None,
+    tournament_contains: Optional[str] = None,
+    club: Optional[str] = None,
+    date_range: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    api_key: Optional[str] = None,
+    fetch_iv: bool = True,
+    limit: int = DEFAULT_ELO_SQL_LIMIT,
+) -> Dict[str, Any]:
+    """Run SELECT/WITH against filtered session rows registered as ``self``."""
+    if rating not in ("Players", "Pairs"):
+        raise ValueError(f"rating must be 'Players' or 'Pairs', got {rating!r}")
+    if score not in ("Scratch", "Handicap"):
+        raise ValueError(f"score must be 'Scratch' or 'Handicap', got {score!r}")
+    cleaned = _require_select_sql(sql)
+    if date_range and not (date_from or date_to):
+        if date_range not in DATE_RANGE_OPTIONS:
+            raise ValueError(
+                f"Unknown date_range {date_range!r}; valid: {list(DATE_RANGE_OPTIONS)}"
+            )
+        date_from, date_to = date_range_bounds(date_range)
+    use_handicap = score == "Handicap"
+    normalized_series_id = resolve_series_id(series_id)
+    results_df, dataset_meta = load_results(api_key, fetch_iv)
+    results_df = filter_valid_percentages(results_df)
+    results_df = filter_results(
+        results_df,
+        series_id=normalized_series_id,
+        tournament=tournament,
+        tournament_contains=tournament_contains,
+        club=club,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    results_df = filter_score_available(results_df, use_handicap)
+    fav_meta = ffbridge_favorites_meta(
+        rating_type=rating,
+        score=score,
+        top_n=top_n,
+        min_games=min_games,
+        prior_sessions=prior_sessions,
+    )
+    row_limit = min(max(int(limit), 1), MAX_ELO_SQL_LIMIT)
+    con = duckdb.connect(config={"enable_external_access": "false"})
+    try:
+        con.register("self", results_df)
+        table, generated_sql = run_sql(con, cleaned, fav_meta)
+    finally:
+        con.close()
+    if table.height > row_limit:
+        table = table.head(row_limit)
+    if "_prior_anchor" in table.columns:
+        table, _anchor = _drop_prior_anchor(table)
+    return {
+        "rows": table.to_dicts() if not table.is_empty() else [],
+        "generated_sql": generated_sql,
+        "row_count": table.height,
+        "rating": rating,
+        "score": score,
+        "filtered_result_rows": results_df.height,
+        "dataset_built_at": dataset_meta.get("built_at"),
+        "dataset_schema_version": ELO_DATASET_SCHEMA_VERSION,
     }
 
 

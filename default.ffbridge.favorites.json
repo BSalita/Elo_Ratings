@@ -1,0 +1,44 @@
+{
+	"temp": "",
+	"Buttons": {
+		"Leaderboard": {
+			"title": "Leaderboard",
+			"help": "Top players or pairs by published Elo for the current sidebar filters.",
+			"comment": "@ in prompt means prompt is a key into ['SelectBoxes']['Vetted_Prompts']. {Rating_Type} is replaced from the Players/Pairs widget.",
+			"prompts": [
+				"@Top_{Rating_Type}"
+			]
+		}
+	},
+	"SelectBoxes": {
+		"Vetted_Prompts": {
+			"Top_Players": {
+				"title": "Top Players",
+				"help": "**Showing the FFBridge player leaderboard.**",
+				"prompts": [
+					{
+						"prompt": "Top players by published Elo from session-level self.",
+						"sql": "WITH player_results AS (\n  SELECT\n    player1_id AS player_id,\n    player1_name AS player_name,\n    player1_scratch_elo_after AS scratch_elo,\n    player1_handicap_elo_after AS handicap_elo,\n    player1_{Elo_Kind}_elo_after AS elo_rating,\n    COALESCE(National_Scratch_Pct, Club_Scratch_Pct) AS scratch_percentage,\n    COALESCE(National_Handicap_Pct, Club_Handicap_Pct) AS handicap_percentage,\n    iv_bonus,\n    score_status,\n    date\n  FROM self\n  UNION ALL\n  SELECT\n    player2_id AS player_id,\n    player2_name AS player_name,\n    player2_scratch_elo_after AS scratch_elo,\n    player2_handicap_elo_after AS handicap_elo,\n    player2_{Elo_Kind}_elo_after AS elo_rating,\n    COALESCE(National_Scratch_Pct, Club_Scratch_Pct) AS scratch_percentage,\n    COALESCE(National_Handicap_Pct, Club_Handicap_Pct) AS handicap_percentage,\n    iv_bonus,\n    score_status,\n    date\n  FROM self\n),\nplayer_aggregates AS (\n  SELECT\n    player_id,\n    ARG_MAX(player_name, date) AS player_name,\n    ROUND(ARG_MAX(scratch_elo, date), 1) AS scratch_elo,\n    ROUND(ARG_MAX(COALESCE(handicap_elo, scratch_elo), date), 1) AS handicap_elo,\n    ROUND(ARG_MAX(elo_rating, date), 1) AS elo_rating,\n    COUNT(*) AS games_played,\n    SUM(CASE WHEN score_status = 'provisional' THEN 1 ELSE 0 END) AS provisional_games,\n    ROUND(AVG(scratch_percentage), 2) AS avg_scratch_pct,\n    ROUND(AVG(handicap_percentage), 2) AS avg_handicap_pct,\n    ROUND(AVG(iv_bonus), 1) AS avg_iv_bonus,\n    ROUND(AVG({Pct_Col}), 2) AS avg_percentage,\n    ROUND(STDDEV_SAMP({Pct_Col}), 2) AS stdev_percentage\n  FROM player_results\n  GROUP BY player_id\n),\nfiltered AS (\n  SELECT * FROM player_aggregates WHERE games_played >= {Min_Games}\n),\nanchors AS (\n  SELECT MEDIAN(elo_rating) AS prior_anchor, MEDIAN(scratch_elo) AS scratch_anchor FROM filtered\n),\nranked AS (\n  SELECT\n    f.*,\n    a.prior_anchor AS _prior_anchor,\n    CAST(ROUND(LEAST(GREATEST(f.elo_rating, 0), 3500), 0) AS INTEGER) AS raw_elo_int,\n    CASE\n      WHEN {Prior_Sessions} <= 0 OR a.prior_anchor IS NULL\n      THEN CAST(ROUND(LEAST(GREATEST(f.elo_rating, 0), 3500), 0) AS INTEGER)\n      ELSE CAST(ROUND(LEAST(GREATEST((CAST(f.games_played AS DOUBLE) * CAST(f.elo_rating AS DOUBLE) + CAST({Prior_Sessions} AS DOUBLE) * CAST(a.prior_anchor AS DOUBLE)) / NULLIF(CAST(f.games_played AS DOUBLE) + CAST({Prior_Sessions} AS DOUBLE), 0), 0), 3500), 0) AS INTEGER)\n    END AS published_elo_int,\n    CASE\n      WHEN {Prior_Sessions} <= 0 OR a.scratch_anchor IS NULL\n      THEN CAST(ROUND(LEAST(GREATEST(f.scratch_elo, 0), 3500), 0) AS INTEGER)\n      ELSE CAST(ROUND(LEAST(GREATEST((CAST(f.games_played AS DOUBLE) * CAST(f.scratch_elo AS DOUBLE) + CAST({Prior_Sessions} AS DOUBLE) * CAST(a.scratch_anchor AS DOUBLE)) / NULLIF(CAST(f.games_played AS DOUBLE) + CAST({Prior_Sessions} AS DOUBLE), 0), 0), 3500), 0) AS INTEGER)\n    END AS published_scratch_int\n  FROM filtered f CROSS JOIN anchors a\n)\nSELECT\n  CAST(ROW_NUMBER() OVER (ORDER BY published_elo_int DESC, games_played DESC, player_name ASC, player_id ASC) AS INTEGER) AS Rank,\n  published_elo_int AS {Elo_Col_Name},\n  raw_elo_int AS {Elo_Col_Name}_Raw,\n  CASE\n    WHEN published_scratch_int >= 2600 THEN 'SGM'\n    WHEN published_scratch_int >= 2500 THEN 'GM'\n    WHEN published_scratch_int >= 2400 THEN 'IM'\n    WHEN published_scratch_int >= 2300 THEN 'FM'\n    WHEN published_scratch_int >= 2200 THEN 'CM'\n    WHEN published_scratch_int >= 2000 THEN 'Expert'\n    WHEN published_scratch_int >= 1800 THEN 'Advanced'\n    WHEN published_scratch_int >= 1600 THEN 'Intermediate'\n    WHEN published_scratch_int >= 1400 THEN 'Novice'\n    ELSE 'Beginner'\n  END AS {Title_Col_Name},\n  player_id AS Player_ID,\n  player_name AS Player_Name,\n  ROUND(avg_scratch_pct, 1) AS Avg_Scratch,\n  ROUND(avg_handicap_pct, 1) AS Avg_Handicap,\n  ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,\n  ROUND(stdev_percentage, 1) AS Pct_Stdev,\n  CAST(games_played AS INTEGER) AS Games,\n  CAST(provisional_games AS INTEGER) AS Provisional_Games,\n  _prior_anchor\nFROM ranked\nORDER BY Rank ASC\nLIMIT {Top_N}"
+					}
+				]
+			},
+			"Top_Pairs": {
+				"title": "Top Pairs",
+				"help": "**Showing the FFBridge pair leaderboard.**",
+				"prompts": [
+					{
+						"prompt": "Top pairs by published Elo from session-level self.",
+						"sql": "WITH pair_stats AS (\n  SELECT\n    pair_id,\n    ARG_MAX(pair_name, date) AS pair_name,\n    ARG_MAX(player1_id, date) AS player1_id,\n    ARG_MAX(player2_id, date) AS player2_id,\n    ARG_MAX(scratch_pair_elo, date) AS avg_scratch_elo,\n    ARG_MAX(COALESCE(handicap_pair_elo, scratch_pair_elo), date) AS avg_handicap_elo,\n    ARG_MAX({Pair_Elo_Col}, date) AS avg_pair_elo,\n    AVG(COALESCE(National_Scratch_Pct, Club_Scratch_Pct)) AS avg_scratch_pct,\n    AVG(COALESCE(National_Handicap_Pct, Club_Handicap_Pct)) AS avg_handicap_pct,\n    AVG(iv_bonus) AS avg_iv_bonus,\n    AVG({Pct_Expr}) AS avg_percentage,\n    STDDEV_SAMP({Pct_Expr}) AS stdev_percentage,\n    COUNT(*) AS games_played,\n    SUM(CASE WHEN score_status = 'provisional' THEN 1 ELSE 0 END) AS provisional_games\n  FROM self\n  GROUP BY pair_id\n),\nfiltered AS (\n  SELECT * FROM pair_stats WHERE games_played >= {Min_Games}\n),\nanchors AS (\n  SELECT MEDIAN(avg_pair_elo) AS prior_anchor FROM filtered\n),\nranked AS (\n  SELECT\n    f.*,\n    a.prior_anchor AS _prior_anchor,\n    CAST(ROUND(LEAST(GREATEST(f.avg_pair_elo, 0), 3500), 0) AS INTEGER) AS raw_pair_elo_int,\n    CASE\n      WHEN {Prior_Sessions} <= 0 OR a.prior_anchor IS NULL\n      THEN CAST(ROUND(LEAST(GREATEST(f.avg_pair_elo, 0), 3500), 0) AS INTEGER)\n      ELSE CAST(ROUND(LEAST(GREATEST((CAST(f.games_played AS DOUBLE) * CAST(f.avg_pair_elo AS DOUBLE) + CAST({Prior_Sessions} AS DOUBLE) * CAST(a.prior_anchor AS DOUBLE)) / NULLIF(CAST(f.games_played AS DOUBLE) + CAST({Prior_Sessions} AS DOUBLE), 0), 0), 3500), 0) AS INTEGER)\n    END AS published_pair_elo_int\n  FROM filtered f CROSS JOIN anchors a\n)\nSELECT\n  CAST(ROW_NUMBER() OVER (ORDER BY published_pair_elo_int DESC, games_played DESC, pair_name ASC, pair_id ASC) AS INTEGER) AS Rank,\n  published_pair_elo_int AS {Elo_Col_Name},\n  raw_pair_elo_int AS {Elo_Col_Name}_Raw,\n  CASE\n    WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2600 THEN 'SGM'\n    WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2500 THEN 'GM'\n    WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2400 THEN 'IM'\n    WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2300 THEN 'FM'\n    WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2200 THEN 'CM'\n    WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 2000 THEN 'Expert'\n    WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 1800 THEN 'Advanced'\n    WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 1600 THEN 'Intermediate'\n    WHEN CAST(ROUND(LEAST(GREATEST(avg_scratch_elo, 0), 3500), 0) AS INTEGER) >= 1400 THEN 'Novice'\n    ELSE 'Beginner'\n  END AS {Title_Col_Name},\n  pair_id AS Pair_ID,\n  pair_name AS Pair_Name,\n  ROUND(avg_scratch_pct, 1) AS Avg_Scratch,\n  ROUND(avg_handicap_pct, 1) AS Avg_Handicap,\n  ROUND(avg_iv_bonus, 1) AS Avg_IV_Bonus,\n  ROUND(stdev_percentage, 1) AS Pct_Stdev,\n  CAST(games_played AS INTEGER) AS Games,\n  CAST(provisional_games AS INTEGER) AS Provisional_Games,\n  _prior_anchor\nFROM ranked\nORDER BY Rank ASC\nLIMIT {Top_N}"
+					}
+				]
+			}
+		}
+	},
+	"ToolTips": {
+		"Player_Elo": "Published scratch Elo after Bayesian shrinkage.",
+		"HC_Player_Elo": "Published handicap Elo after Bayesian shrinkage.",
+		"Pair_Elo": "Published scratch pair Elo after Bayesian shrinkage.",
+		"HC_Pair_Elo": "Published handicap pair Elo after Bayesian shrinkage.",
+		"Quality_Rank": "Mean of Elo and field-independent quality ranks."
+	}
+}

@@ -83,10 +83,54 @@ def _write_quality_cache(path) -> None:
     )
 
 
+def _player_results() -> pl.DataFrame:
+    rows = []
+    for i in range(20):
+        rows.append(
+            {
+                "player1_id": "1",
+                "player2_id": "2",
+                "player1_name": "One",
+                "player2_name": "Two",
+                "player1_scratch_elo_after": 1400.0,
+                "player2_scratch_elo_after": 1300.0,
+                "player1_handicap_elo_after": 1400.0,
+                "player2_handicap_elo_after": 1300.0,
+                "Club_Scratch_Pct": None,
+                "Club_Handicap_Pct": None,
+                "National_Scratch_Pct": 60.0,
+                "National_Handicap_Pct": 60.0,
+                "iv_bonus": 0.0,
+                "score_status": "official",
+                "date": f"2026-01-{i + 1:02d}",
+            }
+        )
+        rows.append(
+            {
+                "player1_id": "3",
+                "player2_id": "4",
+                "player1_name": "Three",
+                "player2_name": "Four",
+                "player1_scratch_elo_after": 1200.0,
+                "player2_scratch_elo_after": 1100.0,
+                "player1_handicap_elo_after": 1200.0,
+                "player2_handicap_elo_after": 1100.0,
+                "Club_Scratch_Pct": None,
+                "Club_Handicap_Pct": None,
+                "National_Scratch_Pct": 56.0,
+                "National_Handicap_Pct": 56.0,
+                "iv_bonus": 0.0,
+                "score_status": "official",
+                "date": f"2026-01-{i + 1:02d}",
+            }
+        )
+    return pl.DataFrame(rows)
+
+
 def test_player_quality_uses_full_qualifying_population_and_preserves_elo() -> None:
     quality = _quality("player_id", ["1", "2", "3"])
-    table, _sql, _anchor = reports.show_top_players(
-        _players(),
+    table, _sql, _anchor = reports.run_top_players_favorite(
+        _player_results(),
         top_n=2,
         min_games=10,
         quality_df=quality,
@@ -112,8 +156,8 @@ def test_public_metric_definitions_describe_role_and_filter_scope() -> None:
 
 
 def test_unmatched_player_quality_values_and_ranks_stay_null() -> None:
-    table, _sql, _anchor = reports.show_top_players(
-        _players(),
+    table, _sql, _anchor = reports.run_top_players_favorite(
+        _player_results(),
         top_n=4,
         min_games=10,
         quality_df=_quality("player_id", ["1", "2", "3"]),
@@ -153,7 +197,7 @@ def test_pair_quality_rank_can_differ_from_elo_rank() -> None:
         }
     )
 
-    table, _sql, _anchor = reports.show_top_pairs(
+    table, _sql, _anchor = reports.run_top_pairs_favorite(
         results,
         top_n=3,
         min_games=1,

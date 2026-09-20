@@ -10,10 +10,10 @@ from acbl_api_server import (
     QUALITY_METRIC_DEFINITIONS,
     SKILL_GATE_DISABLED,
     _required_columns_for_mode,
-    generate_top_pairs_sql,
-    generate_top_players_sql,
+    acbl_favorites_meta,
 )
 from elo_common import default_min_skill_z
+from elo_favorites import load_favorites, process_sql_macros, run_favorite, vetted_prompt_sql
 
 
 def _quality_fixture() -> pl.DataFrame:
@@ -81,25 +81,32 @@ def _quality_fixture() -> pl.DataFrame:
     return pl.DataFrame(rows)
 
 
-def _run(sql: str) -> pl.DataFrame:
+def _meta(*, rating_type: str = "Players", min_skill_z: float = SKILL_GATE_DISABLED) -> dict:
+    return acbl_favorites_meta(
+        top_n=10,
+        min_sessions=1,
+        rating_method="Latest",
+        elo_rating_type="Current Rating (End of Session)",
+        rating_type=rating_type,
+        prior_anchor=None,
+        prior_sessions=0,
+        min_skill_z=min_skill_z,
+    )
+
+
+def _run(prompt_id: str, meta: dict) -> pl.DataFrame:
     con = duckdb.connect()
     try:
         con.register("self", _quality_fixture())
-        return con.execute(sql).pl()
+        result, _sql = run_favorite(con, load_favorites("acbl"), prompt_id, meta)
+        return result
     finally:
         con.close()
 
 
 class AcblQualityMetricSqlTests(unittest.TestCase):
     def test_player_sql_applies_pair_metrics_to_members_and_tdd_to_declarer(self) -> None:
-        result = _run(
-            generate_top_players_sql(
-                top_n=10,
-                min_sessions=1,
-                rating_method="Latest",
-                elo_rating_type="Current Rating (End of Session)",
-            )
-        )
+        result = _run("Top_Players", _meta())
         players = {row["Player_ID"]: row for row in result.to_dicts()}
 
         for player_id in ("1", "3"):
@@ -116,14 +123,7 @@ class AcblQualityMetricSqlTests(unittest.TestCase):
         self.assertIsNone(players["4"]["DD_Tricks_Diff_Avg"])
 
     def test_pair_sql_uses_directional_and_declaration_denominators(self) -> None:
-        result = _run(
-            generate_top_pairs_sql(
-                top_n=10,
-                min_sessions=1,
-                rating_method="Latest",
-                elo_rating_type="Current Rating (End of Session)",
-            )
-        )
+        result = _run("Top_Pairs", _meta(rating_type="Pairs"))
         pairs = {row["Pair_IDs"]: row for row in result.to_dicts()}
         ns = pairs["1-3"]
         ew = pairs["2-4"]
@@ -174,29 +174,13 @@ class AcblQualityMetricSqlTests(unittest.TestCase):
             default_min_skill_z("league")
 
     def test_player_sql_skill_gate_is_opt_in(self) -> None:
-        ungated = generate_top_players_sql(
-            top_n=10,
-            min_sessions=1,
-            rating_method="Latest",
-            elo_rating_type="Current Rating (End of Session)",
-        )
-        self.assertNotIn("Skill_Z >=", ungated)
-        gated = generate_top_players_sql(
-            top_n=10,
-            min_sessions=1,
-            rating_method="Latest",
-            elo_rating_type="Current Rating (End of Session)",
-            min_skill_z=0.0,
-        )
-        self.assertIn("WHERE Skill_Z >= 0.0", gated)
-        disabled = generate_top_players_sql(
-            top_n=10,
-            min_sessions=1,
-            rating_method="Latest",
-            elo_rating_type="Current Rating (End of Session)",
-            min_skill_z=SKILL_GATE_DISABLED,
-        )
-        self.assertNotIn("Skill_Z >=", disabled)
+        sql = vetted_prompt_sql(load_favorites("acbl"), "Top_Players")
+        ungated = process_sql_macros(sql, _meta(min_skill_z=SKILL_GATE_DISABLED))
+        self.assertIn("(-90.0 <= -90 OR Skill_Z >= -90.0)", ungated)
+        gated = process_sql_macros(sql, _meta(min_skill_z=0.0))
+        self.assertIn("(0.0 <= -90 OR Skill_Z >= 0.0)", gated)
+        disabled = process_sql_macros(sql, _meta(min_skill_z=SKILL_GATE_DISABLED))
+        self.assertIn("(-90.0 <= -90 OR Skill_Z >= -90.0)", disabled)
 
 
 if __name__ == "__main__":

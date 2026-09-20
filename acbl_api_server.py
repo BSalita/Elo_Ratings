@@ -20,16 +20,23 @@ from elo_session_common import acbl_results_url_expr, results_url_status
 from elo_common import (
     CHESS_DISPLAY_MEAN,
     CHESS_DISPLAY_SD,
-    ELO_TITLE_SQL_CASE,
     SKILL_GATE_DEFAULT_CLUB_Z,
     SKILL_GATE_DEFAULT_TOURNAMENT_Z,
     SKILL_GATE_DISABLED,
     default_min_skill_z,
     title_from_elo_expr,
-    zscore_chess_sql,
+)
+from elo_favorites import (
+    button_prompt_ids,
+    flatten_favorites,
+    load_favorites,
+    run_favorite,
+    run_sql,
 )
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import re
 
 DATA_ROOT = pathlib.Path(
     os.environ.get("DATA_ROOT") or (pathlib.Path(__file__).resolve().parent / "data")
@@ -37,7 +44,7 @@ DATA_ROOT = pathlib.Path(
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-09-03-elo-mp-color"
+API_BUILD_TAG = "2026-09-20-elo-favorites"
 
 QUALITY_METRIC_DEFINITIONS = {
     "DD_Tricks_Diff_Avg": {
@@ -391,39 +398,82 @@ _SHRINKAGE_META_CACHE: dict[str, dict | None] = {}
 # /acbl/report client may override via the prior_sessions query parameter.
 SHRINKAGE_DEFAULT_PRIOR_SESSIONS = 50
 
-# SQL builders default to disabled so unit tests stay ungated. /acbl/report
-# applies default_min_skill_z(club_or_tournament) when the query omits it.
+# Favorites SQL disables the skill gate at or below this value.
 SKILL_GATE_DEFAULT_Z = SKILL_GATE_DISABLED
 
-
-def _skill_gate_clause(min_skill_z: float, *, col: str = "Skill_Z") -> str:
-    """WHERE clause body for the skill gate (empty string if disabled).
-
-    NULL skill (no card-play data) fails the gate by design: no evidence of
-    competitiveness => not elite."""
-    if min_skill_z is None or min_skill_z <= SKILL_GATE_DISABLED:
-        return ""
-    return f"WHERE {col} >= {float(min_skill_z)!r}"
+_SQL_FORBIDDEN = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|COPY|PRAGMA|ATTACH|DETACH|"
+    r"EXPORT|IMPORT|INSTALL|LOAD|CALL|SET|RESET|VACUUM|CHECKPOINT)\b",
+    re.IGNORECASE,
+)
+MAX_ACBL_SQL_ROWS = 10000
+_ACBL_FAVORITES: dict | None = None
 
 
-def _skill_z_sql(prefix: str, stats_alias: str = "ss") -> str:
-    """Mean of per-metric pool z-scores: card play + two par-bidding rates.
-
-    ``prefix`` is the CTE alias holding the per-entity aggregates (e.g. pwq)."""
-    return (
-        f"( ({prefix}.DD_Tricks_Diff_Avg - {stats_alias}.m_dd) / NULLIF({stats_alias}.s_dd, 0)"
-        f" + ({prefix}.Par_Suit_Rate - {stats_alias}.m_ps) / NULLIF({stats_alias}.s_ps, 0)"
-        f" + ({prefix}.Par_Contract_Rate - {stats_alias}.m_pc) / NULLIF({stats_alias}.s_pc, 0) ) / 3.0"
-    )
+class AcblSqlBody(BaseModel):
+    sql: str = Field(..., min_length=1)
 
 
-_SKILL_STATS_CTE_TEMPLATE = """
-    {name} AS (
-      SELECT AVG(DD_Tricks_Diff_Avg) AS m_dd, STDDEV_POP(DD_Tricks_Diff_Avg) AS s_dd,
-             AVG(Par_Suit_Rate) AS m_ps, STDDEV_POP(Par_Suit_Rate) AS s_ps,
-             AVG(Par_Contract_Rate) AS m_pc, STDDEV_POP(Par_Contract_Rate) AS s_pc
-      FROM {source}
-    )"""
+def _acbl_favorites() -> dict:
+    global _ACBL_FAVORITES
+    if _ACBL_FAVORITES is None:
+        _ACBL_FAVORITES = load_favorites("acbl")
+    return _ACBL_FAVORITES
+
+
+def _require_select_sql(sql: str) -> str:
+    cleaned = (sql or "").strip().rstrip(";")
+    if not cleaned:
+        raise ValueError("sql is required")
+    if _SQL_FORBIDDEN.search(cleaned):
+        raise ValueError("Only SELECT/WITH queries against table self are allowed")
+    head = cleaned.split(None, 1)[0].upper()
+    if head not in {"SELECT", "WITH"}:
+        raise ValueError("Only SELECT/WITH queries against table self are allowed")
+    return cleaned
+
+
+def acbl_favorites_meta(
+    *,
+    top_n: int,
+    min_sessions: int,
+    rating_method: str,
+    elo_rating_type: str,
+    rating_type: str,
+    prior_anchor: float | None,
+    prior_sessions: int,
+    min_skill_z: float,
+) -> dict:
+    """Sidebar/API widgets become brace-macro values for default.acbl.favorites.json."""
+    elo_cols = get_elo_column_names(elo_rating_type)
+    player_pattern = elo_cols.get("player_pattern")
+    if rating_type == "Players" and not player_pattern:
+        raise ValueError(f"Player ratings not available for {elo_rating_type}")
+
+    def player_col(pos: str) -> str:
+        if player_pattern:
+            return player_pattern.format(pos=pos)
+        return "NULL"
+
+    suffix = ""
+    if player_pattern and "{pos}" in player_pattern:
+        suffix = player_pattern.split("{pos}", 1)[1]
+    return {
+        "Top_N": int(top_n),
+        "Min_Sessions": int(min_sessions),
+        "Prior_Sessions": int(prior_sessions),
+        "Prior_Anchor": "NULL" if prior_anchor is None else repr(float(prior_anchor)),
+        "Min_Skill_Z": float(min_skill_z),
+        "Rating_Method": rating_method,
+        "Rating_Type": rating_type,
+        "Elo_Suffix": suffix,
+        "Elo_Col_N": player_col("N"),
+        "Elo_Col_S": player_col("S"),
+        "Elo_Col_E": player_col("E"),
+        "Elo_Col_W": player_col("W"),
+        "Elo_Col_NS": elo_cols.get("pair_ns") or "NULL",
+        "Elo_Col_EW": elo_cols.get("pair_ew") or "NULL",
+    }
 
 
 def _shrinkage_sidecar_search_paths(filename: str) -> list[pathlib.Path]:
@@ -492,30 +542,6 @@ def _shrinkage_anchor(meta: dict | None, kind: str) -> float | None:
         return float(anchor)
     except (TypeError, ValueError):
         return None
-
-
-def _published_elo_sql(raw_col: str, sessions_col: str,
-                       prior_anchor: float | None, prior_sessions: int) -> str:
-    """Return a SQL expression that wraps ``raw_col`` with Bayesian shrinkage.
-
-    When the prior anchor is unavailable or ``prior_sessions`` is 0, the
-    expression collapses to ``raw_col`` so Published == Raw is preserved.
-    Otherwise:
-
-        Published = (n * raw + prior_sessions * prior_anchor)
-                    / (n + prior_sessions)
-
-    The result is cast to INTEGER (the existing display convention).
-    """
-    if prior_anchor is None or prior_sessions <= 0:
-        return f"CAST(COALESCE({raw_col}, 0) AS INTEGER)"
-    return (
-        f"CAST(ROUND("
-        f"(CAST({sessions_col} AS DOUBLE) * COALESCE({raw_col}, 0) "
-        f"+ {float(prior_sessions)} * {float(prior_anchor)}) "
-        f"/ NULLIF((CAST({sessions_col} AS DOUBLE) + {float(prior_sessions)}), 0)"
-        f") AS INTEGER)"
-    )
 
 
 def _parquet_source_for(club_or_tournament: str) -> str:
@@ -963,7 +989,8 @@ def _prepare_self_view(
         except Exception:
             pass
         con.register("_full", full_df)
-        con.execute(f"CREATE TEMP VIEW self AS SELECT * FROM _full WHERE {where_sql}")
+        select_sql = "*" if "Round" in full_df.columns else "*, CAST(NULL AS INTEGER) AS Round"
+        con.execute(f"CREATE TEMP VIEW self AS SELECT {select_sql} FROM _full WHERE {where_sql}")
     input_rows = full_df.height if not where_clauses else None
     date_range = _frame_date_range(source_path, date_from)
     return input_rows, date_range
@@ -1318,374 +1345,6 @@ def _build_pair_detail(df: pl.DataFrame, pair_ids: str, elo_rating_type: str) ->
     return detail
 
 
-def _rating_agg_expr(rating_method: str, value_col: str, *, has_round: bool) -> str:
-    """SQL aggregate expression for the chosen rating method.
-
-    ``Latest`` uses ``LAST(... ORDER BY Date, session_id, [Round,] Board)`` so the
-    result is deterministically the player's/pair's most recent end-of-board
-    Elo (DuckDB's bare ``LAST`` is non-deterministic in parallel execution).
-    ``Round`` is dropped from the ordering for parquets that don't have it
-    (the tournament parquet doesn't expose Round).
-    ``Avg`` and ``Max`` are straightforward.
-    """
-    if rating_method == "Avg":
-        return f"AVG({value_col})"
-    if rating_method == "Max":
-        return f"MAX({value_col})"
-    if rating_method == "Latest":
-        order_cols = "Date, session_id, Round, Board" if has_round else "Date, session_id, Board"
-        return f"LAST({value_col} ORDER BY {order_cols})"
-    raise ValueError(f"Invalid rating_method: {rating_method!r}")
-
-
-# Quality_Score composite: arithmetic mean of four rank columns over the
-# qualifying pool — pure Elo plus three field-independent bridge-quality
-# metrics. Pulls down players whose Elo is high but whose actual card play
-# (DD_Tricks_Diff) and bidding (Par_Suit_Rate, Par_Contract_Rate) are weak,
-# which is the Zubatch failure mode. Arithmetic mean (not geometric) so a
-# small-sample specialist with rank=1 in one metric but rank=46K in Elo
-# doesn't get artificially elevated.
-_QUALITY_SCORE_EXPR = (
-    "(CAST(Player_Elo_Rank AS DOUBLE) + CAST(Par_Suit_Rank AS DOUBLE) "
-    "+ CAST(Par_Contract_Rank AS DOUBLE) + CAST(DD_Tricks_Diff_Rank AS DOUBLE)) / 4.0"
-)
-_QUALITY_SCORE_EXPR_PAIR = (
-    "(CAST(Pair_Elo_Rank AS DOUBLE) + CAST(Par_Suit_Rank AS DOUBLE) "
-    "+ CAST(Par_Contract_Rank AS DOUBLE) + CAST(DD_Tricks_Diff_Rank AS DOUBLE)) / 4.0"
-)
-
-
-def _directional_quality_sql(direction: str, *, declarer_seat: str | None = None) -> str:
-    """Board-level quality values for one NS/EW direction.
-
-    Pair metrics are null outside their defined populations so DuckDB AVG uses
-    the intended denominator. T-DD is additionally restricted to one seat in
-    player SQL and to the declaring direction in pair SQL.
-    """
-    if direction not in {"NS", "EW"}:
-        raise ValueError(f"Invalid pair direction: {direction!r}")
-    dd_score = f"DD_Score_{direction}"
-    par_score = f"Par_{direction}"
-    tdd_condition = (
-        f"Declarer_Direction = '{declarer_seat}'"
-        if declarer_seat is not None
-        else f"Declarer_Pair_Direction = '{direction}'"
-    )
-    return f"""
-        CASE
-          WHEN {dd_score} IS NULL OR {par_score} IS NULL THEN NULL
-          WHEN {dd_score} >= {par_score} THEN 1
-          ELSE -1
-        END AS Par_Contract_Value,
-        CASE
-          WHEN Declarer_Pair_Direction = '{direction}' THEN
-            CASE
-              WHEN BidSuit IS NOT NULL AND ParContracts IS NOT NULL
-                   AND list_contains(
-                     list_transform(ParContracts, par_contract -> par_contract.Strain),
-                     BidSuit
-                   )
-              THEN 1 ELSE 0
-            END
-          ELSE NULL
-        END AS Par_Suit_Value,
-        CASE
-          WHEN Declarer_Pair_Direction = '{direction}' AND Par_Declarer < 0 THEN
-            CASE
-              WHEN DD_Score_Declarer IS NOT NULL
-                   AND DD_Score_Declarer = Par_Declarer
-              THEN 1 ELSE 0
-            END
-          ELSE NULL
-        END AS Sacrifice_Value,
-        CASE WHEN {tdd_condition} THEN DD_Tricks_Diff ELSE NULL END AS TDD_Value
-    """.strip()
-
-
-def generate_top_players_sql(
-    top_n: int,
-    min_sessions: int,
-    rating_method: str,
-    elo_rating_type: str,
-    *,
-    prior_anchor: float | None = None,
-    prior_sessions: int = 0,
-    has_round: bool = True,
-    min_skill_z: float = SKILL_GATE_DEFAULT_Z,
-) -> str:
-    """Build the top-players ranking SQL.
-
-    Emits ``Player_Elo_Raw`` (the original aggregate) and ``Player_Elo_Published``
-    (Bayesian-shrunk toward ``prior_anchor`` with weight ``prior_sessions``).
-    The existing ``Player_Elo_Score`` is kept for backward compatibility and
-    is aliased to ``Player_Elo_Published``.
-
-    Rows are ordered by ``Player_Elo_Rank`` (pure Bayesian-shrunk Elo).
-    ``Quality_Rank`` — the average of Player_Elo_Rank, Par_Suit_Rank,
-    Par_Contract_Rank, and DD_Tricks_Diff_Rank — is emitted as a sidecar
-    column (after Sessions_Played) so users can spot players whose Elo
-    position significantly outruns their field-independent quality metrics
-    (the Zubatch failure mode); sorting by Quality_Rank in the grid is one
-    click away.
-    """
-    rating_expr = _rating_agg_expr(rating_method, "Elo_R_Player", has_round=has_round)
-    elo_cols = get_elo_column_names(elo_rating_type)
-    player_pattern = elo_cols.get("player_pattern")
-    if not player_pattern:
-        raise ValueError(f"Player ratings not available for {elo_rating_type}")
-    round_col = "Round" if has_round else "NULL AS Round"
-    union_parts = []
-    for pos in "NESW":
-        elo_col = player_pattern.format(pos=pos)
-        direction = "NS" if pos in "NS" else "EW"
-        union_parts.append(
-            f"""
-            SELECT Date, session_id, {round_col}, Board, Player_ID_{pos} AS Player_ID, Player_Name_{pos} AS Player_Name,
-                   MasterPoints_{pos} AS MasterPoints, {elo_col} AS Elo_R_Player,
-                   {_directional_quality_sql(direction, declarer_seat=pos)}
-            FROM self
-            WHERE Player_ID_{pos} IS NOT NULL AND {elo_col} IS NOT NULL AND NOT isnan({elo_col})
-            """
-        )
-    published_sql = _published_elo_sql(
-        raw_col="Player_Elo_Raw_Float",
-        sessions_col="Sessions_Played",
-        prior_anchor=prior_anchor,
-        prior_sessions=prior_sessions,
-    )
-    return f"""
-    WITH player_positions AS (
-      {' UNION ALL '.join(union_parts)}
-    ),
-    player_aggregates AS (
-      SELECT
-        Player_ID,
-        LAST(Player_Name ORDER BY Date, session_id) AS Player_Name,
-        MAX(MasterPoints) AS MasterPoints,
-        {rating_expr} AS Player_Elo_Raw_Float,
-        COUNT(DISTINCT session_id) AS Sessions_Played,
-        AVG(Par_Suit_Value) AS Par_Suit_Rate,
-        AVG(Par_Contract_Value) AS Par_Contract_Rate,
-        AVG(Sacrifice_Value) AS Sacrifice_Rate,
-        AVG(TDD_Value) AS DD_Tricks_Diff_Avg
-      FROM player_positions
-      GROUP BY Player_ID
-      HAVING COUNT(DISTINCT session_id) >= {min_sessions}
-    ),
-    player_with_published AS (
-      SELECT
-        Player_ID, Player_Name, MasterPoints,
-        CAST(COALESCE(Player_Elo_Raw_Float, 0) AS INTEGER) AS Player_Elo_Raw,
-        {published_sql} AS Player_Elo_Published,
-        Sessions_Played, Par_Suit_Rate, Par_Contract_Rate, Sacrifice_Rate, DD_Tricks_Diff_Avg
-      FROM player_aggregates
-    ),
-    player_with_ranks AS (
-      SELECT
-        *,
-        CAST(ROW_NUMBER() OVER (ORDER BY Player_Elo_Published DESC, MasterPoints DESC, Player_ID ASC) AS INTEGER) AS Player_Elo_Rank,
-        CAST(RANK() OVER (ORDER BY MasterPoints DESC) AS INTEGER) AS MasterPoint_Rank,
-        CAST(RANK() OVER (ORDER BY Par_Suit_Rate DESC) AS INTEGER) AS Par_Suit_Rank,
-        CAST(RANK() OVER (ORDER BY Par_Contract_Rate DESC) AS INTEGER) AS Par_Contract_Rank,
-        CAST(RANK() OVER (ORDER BY Sacrifice_Rate DESC) AS INTEGER) AS Sacrifice_Rank,
-        CAST(RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC NULLS LAST) AS INTEGER) AS DD_Tricks_Diff_Rank
-      FROM player_with_published
-    ),
-    player_with_quality AS (
-      SELECT
-        *,
-        {_QUALITY_SCORE_EXPR} AS Quality_Score,
-        CAST(RANK() OVER (ORDER BY {_QUALITY_SCORE_EXPR} ASC) AS INTEGER) AS Quality_Rank
-      FROM player_with_ranks
-    ),
-    elo_stats AS (
-      SELECT AVG(CAST(Player_Elo_Published AS DOUBLE)) AS elo_mean,
-             STDDEV_POP(CAST(Player_Elo_Published AS DOUBLE)) AS elo_sd
-      FROM player_with_published
-    ),{_SKILL_STATS_CTE_TEMPLATE.format(name="skill_stats", source="player_with_published")},
-    player_scaled AS (
-      SELECT pwq.*,
-        {zscore_chess_sql("Player_Elo_Published", "elo_mean", "elo_sd")} AS Player_Elo_Pub_Chess,
-        {zscore_chess_sql("Player_Elo_Raw", "elo_mean", "elo_sd")} AS Player_Elo_Raw_Chess,
-        {_skill_z_sql("pwq")} AS Skill_Z
-      FROM player_with_quality pwq CROSS JOIN elo_stats CROSS JOIN skill_stats ss
-    )
-    SELECT
-      CAST(ROW_NUMBER() OVER (ORDER BY Player_Elo_Rank ASC) AS INTEGER) AS Player_Elo_Rank,
-      Player_Elo_Pub_Chess AS Player_Elo_Score,
-      Player_Elo_Raw_Chess AS Player_Elo_Raw,
-      Player_Elo_Pub_Chess AS Player_Elo_Published,
-      {ELO_TITLE_SQL_CASE.format(elo_col="Player_Elo_Pub_Chess")} AS Title,
-      ROUND(Skill_Z, 3) AS Skill_Z,
-      Player_ID, Player_Name, CAST(MasterPoints AS INTEGER) AS MasterPoints,
-      MasterPoint_Rank,
-      CAST(Sessions_Played AS INTEGER) AS Sessions_Played,
-      Quality_Rank,
-      ROUND(Par_Suit_Rate * 100, 1) AS Par_Suit_Rate_Pct,
-      Par_Suit_Rank,
-      ROUND((Par_Contract_Rate + 1) * 50, 1) AS Par_Contract_Rate_Pct,
-      Par_Contract_Rank,
-      ROUND(Sacrifice_Rate * 100, 1) AS Sacrifice_Rate_Pct,
-      Sacrifice_Rank,
-      ROUND(DD_Tricks_Diff_Avg, 2) AS DD_Tricks_Diff_Avg,
-      DD_Tricks_Diff_Rank
-    FROM player_scaled
-    {_skill_gate_clause(min_skill_z)}
-    ORDER BY Player_Elo_Rank ASC
-    LIMIT {top_n}
-    """.strip()
-
-
-def generate_top_pairs_sql(
-    top_n: int,
-    min_sessions: int,
-    rating_method: str,
-    elo_rating_type: str,
-    *,
-    prior_anchor: float | None = None,
-    prior_sessions: int = 0,
-    has_round: bool = True,
-    min_skill_z: float = SKILL_GATE_DEFAULT_Z,
-) -> str:
-    """Build the top-pairs ranking SQL.
-
-    Same Raw / Published / Quality_Rank handling as
-    :func:`generate_top_players_sql`. Rows are ordered by ``Pair_Elo_Rank``
-    (pure Bayesian-shrunk Elo); ``Quality_Rank`` is emitted as a sidecar
-    column after Sessions for users who want to spot weak-field-inflated
-    pairs.
-    """
-    rating_expr = _rating_agg_expr(rating_method, "Elo_R_Pair", has_round=has_round)
-    round_col = "Round" if has_round else "NULL AS Round"
-    elo_cols = get_elo_column_names(elo_rating_type)
-    pair_ns_col = elo_cols.get("pair_ns")
-    pair_ew_col = elo_cols.get("pair_ew")
-    player_pattern = elo_cols.get("player_pattern")
-    player_elo_n = player_pattern.format(pos="N") if player_pattern else None
-    player_elo_s = player_pattern.format(pos="S") if player_pattern else None
-    player_elo_e = player_pattern.format(pos="E") if player_pattern else None
-    player_elo_w = player_pattern.format(pos="W") if player_pattern else None
-    avg_elo_ns = (
-        f"""CASE
-            WHEN {player_elo_n} IS NOT NULL AND {player_elo_s} IS NOT NULL AND NOT isnan({player_elo_n}) AND NOT isnan({player_elo_s})
-            THEN ({player_elo_n} + {player_elo_s}) / 2.0
-            ELSE NULL
-        END"""
-        if player_elo_n is not None
-        else "NULL"
-    )
-    avg_elo_ew = (
-        f"""CASE
-            WHEN {player_elo_e} IS NOT NULL AND {player_elo_w} IS NOT NULL AND NOT isnan({player_elo_e}) AND NOT isnan({player_elo_w})
-            THEN ({player_elo_e} + {player_elo_w}) / 2.0
-            ELSE NULL
-        END"""
-        if player_elo_e is not None
-        else "NULL"
-    )
-    return f"""
-    WITH pair_partnerships AS (
-      SELECT
-        Date, session_id, {round_col}, Board,
-        CASE WHEN Player_ID_N < Player_ID_S THEN Player_ID_N || '-' || Player_ID_S ELSE Player_ID_S || '-' || Player_ID_N END AS Pair_IDs,
-        CASE WHEN Player_ID_N <= Player_ID_S THEN Player_Name_N || ' - ' || Player_Name_S ELSE Player_Name_S || ' - ' || Player_Name_N END AS Pair_Names,
-        {pair_ns_col} AS Elo_R_Pair,
-        (COALESCE(MasterPoints_N, 0) + COALESCE(MasterPoints_S, 0)) / 2.0 AS Avg_MPs,
-        SQRT(COALESCE(MasterPoints_N, 0) * COALESCE(MasterPoints_S, 0)) AS Geo_MPs,
-        {avg_elo_ns} AS Avg_Player_Elo,
-        {_directional_quality_sql("NS")}
-      FROM self
-      WHERE {pair_ns_col} IS NOT NULL AND NOT isnan({pair_ns_col})
-      UNION ALL
-      SELECT
-        Date, session_id, {round_col}, Board,
-        CASE WHEN Player_ID_E < Player_ID_W THEN Player_ID_E || '-' || Player_ID_W ELSE Player_ID_W || '-' || Player_ID_E END AS Pair_IDs,
-        CASE WHEN Player_ID_E <= Player_ID_W THEN Player_Name_E || ' - ' || Player_Name_W ELSE Player_Name_W || ' - ' || Player_Name_E END AS Pair_Names,
-        {pair_ew_col} AS Elo_R_Pair,
-        (COALESCE(MasterPoints_E, 0) + COALESCE(MasterPoints_W, 0)) / 2.0 AS Avg_MPs,
-        SQRT(COALESCE(MasterPoints_E, 0) * COALESCE(MasterPoints_W, 0)) AS Geo_MPs,
-        {avg_elo_ew} AS Avg_Player_Elo,
-        {_directional_quality_sql("EW")}
-      FROM self
-      WHERE {pair_ew_col} IS NOT NULL AND NOT isnan({pair_ew_col})
-    ),
-    pair_aggregates AS (
-      SELECT
-        Pair_IDs, LAST(Pair_Names ORDER BY Date, session_id) AS Pair_Names, {rating_expr} AS Pair_Elo_Raw_Float,
-        AVG(Avg_MPs) AS Avg_MPs, AVG(Geo_MPs) AS Geo_MPs,
-        COUNT(DISTINCT session_id) AS Sessions,
-        AVG(Avg_Player_Elo) AS Avg_Player_Elo,
-        AVG(Par_Suit_Value) AS Par_Suit_Rate,
-        AVG(Par_Contract_Value) AS Par_Contract_Rate,
-        AVG(Sacrifice_Value) AS Sacrifice_Rate,
-        AVG(TDD_Value) AS DD_Tricks_Diff_Avg
-      FROM pair_partnerships
-      GROUP BY Pair_IDs
-      HAVING COUNT(DISTINCT session_id) >= {min_sessions}
-    ),
-    pair_with_published AS (
-      SELECT
-        Pair_IDs, Pair_Names,
-        CAST(COALESCE(Pair_Elo_Raw_Float, 0) AS INTEGER) AS Pair_Elo_Raw,
-        {_published_elo_sql("Pair_Elo_Raw_Float", "Sessions", prior_anchor, prior_sessions)} AS Pair_Elo_Published,
-        Avg_MPs, Geo_MPs, Sessions, Avg_Player_Elo,
-        Par_Suit_Rate, Par_Contract_Rate, Sacrifice_Rate, DD_Tricks_Diff_Avg
-      FROM pair_aggregates
-    ),
-    pair_with_ranks AS (
-      SELECT
-        Pair_IDs, Pair_Names, Pair_Elo_Raw, Pair_Elo_Published,
-        Avg_MPs, Geo_MPs, Sessions, Avg_Player_Elo,
-        Par_Suit_Rate, Par_Contract_Rate, Sacrifice_Rate, DD_Tricks_Diff_Avg,
-        CAST(ROW_NUMBER() OVER (ORDER BY Pair_Elo_Published DESC, Avg_MPs DESC, Pair_IDs ASC) AS INTEGER) AS Pair_Elo_Rank,
-        CAST(RANK() OVER (ORDER BY Avg_Player_Elo DESC NULLS LAST) AS INTEGER) AS Avg_Elo_Rank,
-        CAST(RANK() OVER (ORDER BY Avg_MPs DESC) AS INTEGER) AS Avg_MPs_Rank,
-        CAST(RANK() OVER (ORDER BY Geo_MPs DESC) AS INTEGER) AS Geo_MPs_Rank,
-        CAST(RANK() OVER (ORDER BY Par_Suit_Rate DESC) AS INTEGER) AS Par_Suit_Rank,
-        CAST(RANK() OVER (ORDER BY Par_Contract_Rate DESC) AS INTEGER) AS Par_Contract_Rank,
-        CAST(RANK() OVER (ORDER BY Sacrifice_Rate DESC) AS INTEGER) AS Sacrifice_Rank,
-        CAST(RANK() OVER (ORDER BY DD_Tricks_Diff_Avg DESC NULLS LAST) AS INTEGER) AS DD_Tricks_Diff_Rank
-      FROM pair_with_published
-    ),
-    pair_with_quality AS (
-      SELECT
-        *,
-        {_QUALITY_SCORE_EXPR_PAIR} AS Quality_Score,
-        CAST(RANK() OVER (ORDER BY {_QUALITY_SCORE_EXPR_PAIR} ASC) AS INTEGER) AS Quality_Rank
-      FROM pair_with_ranks
-    ),
-    elo_stats AS (
-      SELECT AVG(CAST(Pair_Elo_Published AS DOUBLE)) AS elo_mean,
-             STDDEV_POP(CAST(Pair_Elo_Published AS DOUBLE)) AS elo_sd
-      FROM pair_with_published
-    ),{_SKILL_STATS_CTE_TEMPLATE.format(name="skill_stats", source="pair_with_published")},
-    pair_scaled AS (
-      SELECT pwq.*,
-        {zscore_chess_sql("Pair_Elo_Published", "elo_mean", "elo_sd")} AS Pair_Elo_Pub_Chess,
-        {zscore_chess_sql("Pair_Elo_Raw", "elo_mean", "elo_sd")} AS Pair_Elo_Raw_Chess,
-        {_skill_z_sql("pwq")} AS Skill_Z
-      FROM pair_with_quality pwq CROSS JOIN elo_stats CROSS JOIN skill_stats ss
-    )
-    SELECT
-      CAST(ROW_NUMBER() OVER (ORDER BY Pair_Elo_Rank ASC) AS INTEGER) AS Pair_Elo_Rank,
-      Pair_Elo_Pub_Chess AS Pair_Elo_Score,
-      Pair_Elo_Raw_Chess AS Pair_Elo_Raw,
-      Pair_Elo_Pub_Chess AS Pair_Elo_Published,
-      {ELO_TITLE_SQL_CASE.format(elo_col="Pair_Elo_Pub_Chess")} AS Title,
-      ROUND(Skill_Z, 3) AS Skill_Z,
-      Avg_Elo_Rank, Pair_IDs, Pair_Names,
-      CAST(Avg_MPs AS INTEGER) AS Avg_MPs, Avg_MPs_Rank, Geo_MPs_Rank, CAST(Sessions AS INTEGER) AS Sessions,
-      Quality_Rank,
-      ROUND(Par_Suit_Rate * 100, 1) AS Par_Suit_Rate_Pct, Par_Suit_Rank,
-      ROUND((Par_Contract_Rate + 1) * 50, 1) AS Par_Contract_Rate_Pct, Par_Contract_Rank,
-      ROUND(Sacrifice_Rate * 100, 1) AS Sacrifice_Rate_Pct, Sacrifice_Rank,
-      ROUND(DD_Tricks_Diff_Avg, 2) AS DD_Tricks_Diff_Avg, DD_Tricks_Diff_Rank
-    FROM pair_scaled
-    {_skill_gate_clause(min_skill_z)}
-    ORDER BY Pair_Elo_Rank ASC
-    LIMIT {top_n}
-    """.strip()
-
 
 def _other_event_type(club_or_tournament: str) -> str:
     return "tournament" if club_or_tournament.lower() == "club" else "club"
@@ -1775,7 +1434,7 @@ def _pair_ids_expr(id_a: str, id_b: str) -> pl.Expr:
 
 
 def _polars_rating_agg(rating_method: str, value_col: str = "Elo") -> pl.Expr:
-    """Polars aggregate matching ``_rating_agg_expr`` (Latest / Avg / Max)."""
+    """Polars aggregate matching favorites Latest / Avg / Max (crossover only)."""
     if rating_method == "Avg":
         return pl.col(value_col).mean()
     if rating_method == "Max":
@@ -2137,21 +1796,22 @@ def acbl_report(
                 shrinkage_meta = _load_shrinkage_meta(club_or_tournament)
                 anchor_kind = "player" if rating_type == "Players" else "pair"
                 prior_anchor = _shrinkage_anchor(shrinkage_meta, anchor_kind)
-                has_round = "Round" in full_df.columns
-                if rating_type == "Players":
-                    generated_sql = generate_top_players_sql(
-                        top_n, min_sessions, rating_method, elo_rating_type,
-                        prior_anchor=prior_anchor, prior_sessions=prior_sessions,
-                        has_round=has_round, min_skill_z=min_skill_z,
-                    )
-                else:
-                    generated_sql = generate_top_pairs_sql(
-                        top_n, min_sessions, rating_method, elo_rating_type,
-                        prior_anchor=prior_anchor, prior_sessions=prior_sessions,
-                        has_round=has_round, min_skill_z=min_skill_z,
-                    )
+                favorites = _acbl_favorites()
+                meta = acbl_favorites_meta(
+                    top_n=top_n,
+                    min_sessions=min_sessions,
+                    rating_method=rating_method,
+                    elo_rating_type=elo_rating_type,
+                    rating_type=rating_type,
+                    prior_anchor=prior_anchor,
+                    prior_sessions=prior_sessions,
+                    min_skill_z=min_skill_z,
+                )
+                prompt_ids = button_prompt_ids(favorites, "Leaderboard", meta)
                 with _DB_LOCK:
-                    result_df = con.execute(generated_sql).pl()
+                    result_df, generated_sql = run_favorite(
+                        con, favorites, prompt_ids[0], meta
+                    )
                     session_ids_df = con.execute(
                         "SELECT DISTINCT CAST(session_id AS VARCHAR) AS session_id FROM self"
                     ).pl()
@@ -2260,6 +1920,89 @@ def acbl_report(
                 f"{exc!r} mem {_cgroup_mem_summary()}",
                 flush=True,
             )
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/acbl/favorites")
+def acbl_favorites_catalog(favorite_id: str | None = Query(None)) -> dict:
+    payload = _acbl_favorites()
+    items = flatten_favorites(payload)
+    wanted = (favorite_id or "").strip()
+    if wanted:
+        items = [item for item in items if item["id"] == wanted]
+        if not items:
+            raise HTTPException(status_code=404, detail=f"Unknown favorite id {wanted!r}")
+    return {"organization": "acbl", "count": len(items), "favorites": items}
+
+
+@app.post("/acbl/sql")
+def acbl_sql(
+    body: AcblSqlBody,
+    club_or_tournament: str = Query(..., pattern="^(club|tournament)$"),
+    rating_type: str = Query("Players", pattern="^(Players|Pairs)$"),
+    top_n: int = Query(100, ge=1, le=5000),
+    min_sessions: int = Query(10, ge=1, le=10000),
+    rating_method: str = Query("Latest"),
+    elo_rating_type: str = Query("Current Rating (End of Session)"),
+    date_from: str | None = Query(None),
+    date_range: str | None = Query(None),
+    online_filter: str = Query("All"),
+    strata: str = Query(STRATA_DEFAULT),
+    prior_sessions: int = Query(SHRINKAGE_DEFAULT_PRIOR_SESSIONS, ge=0, le=1000),
+    min_skill_z: float | None = Query(None, ge=-100.0, le=5.0),
+    platinum_events: bool = Query(False),
+) -> dict:
+    """Run SELECT/WITH SQL against the filtered board-level DuckDB table ``self``."""
+    with _REPORT_LOCK:
+        try:
+            _reject_club_platinum(club_or_tournament, platinum_events)
+            if min_skill_z is None:
+                min_skill_z = default_min_skill_z(club_or_tournament)
+            effective_date_from = date_from or (
+                acbl_date_from_for_range(date_range) if date_range else None
+            )
+            parsed_date_from = (
+                None if not effective_date_from else datetime.fromisoformat(effective_date_from)
+            )
+            sql = _require_select_sql(body.sql)
+            source_path = _parquet_source_for(club_or_tournament)
+            full_df = _load_full_frame(club_or_tournament)
+            con = _get_db_connection()
+            _prepare_self_view(
+                con, full_df, source_path, parsed_date_from, online_filter, strata,
+                platinum_events=platinum_events,
+            )
+            try:
+                shrinkage_meta = _load_shrinkage_meta(club_or_tournament)
+                anchor_kind = "player" if rating_type == "Players" else "pair"
+                prior_anchor = _shrinkage_anchor(shrinkage_meta, anchor_kind)
+                meta = acbl_favorites_meta(
+                    top_n=top_n,
+                    min_sessions=min_sessions,
+                    rating_method=rating_method,
+                    elo_rating_type=elo_rating_type,
+                    rating_type=rating_type,
+                    prior_anchor=prior_anchor,
+                    prior_sessions=prior_sessions,
+                    min_skill_z=min_skill_z,
+                )
+                with _DB_LOCK:
+                    result_df, generated_sql = run_sql(con, sql, meta)
+            finally:
+                _teardown_self_view(con)
+                _reset_duckdb_connection()
+            if result_df.height > MAX_ACBL_SQL_ROWS:
+                result_df = result_df.head(MAX_ACBL_SQL_ROWS)
+            return {
+                "rows": result_df.to_dicts() if not result_df.is_empty() else [],
+                "generated_sql": generated_sql,
+                "row_count": result_df.height,
+            }
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
