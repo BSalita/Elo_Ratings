@@ -1,12 +1,17 @@
 @echo off
 set "acbl_source=e:\bridge\data\acbl"
+set "shared=%~dp0..\data"
 set "ffbridge_quality_source=e:\bridge\data\ffbridge\quality_cache"
-set "ffbridge_quality_destination=data\ffbridge\quality_cache"
+set "ffbridge_quality_destination=%shared%\ffbridge\quality_cache"
 set "ffbridge_hier_source=e:\bridge\data\ffbridge\postmortem_archive_hierarchical"
-set "ffbridge_hier_destination=data\ffbridge\postmortem_archive_hierarchical"
+set "ffbridge_hier_destination=%shared%\ffbridge\postmortem_archive_hierarchical"
 
-rem Update the canonical Elo data directory. deploy_elo_ratings.ps1 mounts this
-rem directory directly; postmortem_start.ps1 owns _wslc_host\SavedModels.
+rem Publish into the sibling src\data hub. Start scripts mount that tree.
+rem postmortem_start.ps1 owns _wslc_host\SavedModels.
+if not exist "%shared%\" (
+    mkdir "%shared%"
+    if errorlevel 1 exit /b 1
+)
 for %%F in (
     acbl_club_elo_ratings.parquet
     acbl_tournament_elo_ratings.parquet
@@ -19,7 +24,7 @@ for %%F in (
     acbl_club_player_awards.parquet
     acbl_tournament_player_awards.parquet
 ) do (
-    xcopy "%acbl_source%\%%F" "data\" /D /Y
+    xcopy "%acbl_source%\%%F" "%shared%\" /D /Y
     if errorlevel 1 exit /b 1
 )
 
@@ -57,10 +62,13 @@ if errorlevel 1 exit /b 1
 robocopy "%ffbridge_hier_source%\dataset" "%ffbridge_hier_destination%\dataset" /E /XO /R:2 /W:2 /NFL /NDL /NJH /NJS /NP
 if errorlevel 8 exit /b 1
 
-rem Publish the same artifacts to prod. Do not /MIR data\ — that would replace
-rem _wslc_host, which postmortem_start.ps1 stages for the container mount.
-set "prod_elo=\\X1-pro-470-1tb\c\sw\bridge\ML-Contract-Bridge\src\elo\data"
-if not exist "%prod_elo%\" exit /b 1
+rem Publish the same artifacts to prod src\data. Do not /MIR — that would
+rem replace _wslc_host, which postmortem_start.ps1 stages for the mount.
+set "prod_elo=\\X1-pro-470-1tb\c\sw\bridge\ML-Contract-Bridge\src\data"
+if not exist "%prod_elo%\" (
+    mkdir "%prod_elo%"
+    if errorlevel 1 exit /b 1
+)
 for %%F in (
     acbl_club_elo_ratings.parquet
     acbl_tournament_elo_ratings.parquet
@@ -73,7 +81,7 @@ for %%F in (
     acbl_club_player_awards.parquet
     acbl_tournament_player_awards.parquet
 ) do (
-    xcopy "data\%%F" "%prod_elo%\" /D /Y
+    xcopy "%shared%\%%F" "%prod_elo%\" /D /Y
     if errorlevel 1 exit /b 1
 )
 if not exist "%prod_elo%\ffbridge\quality_cache\" (
