@@ -31,7 +31,9 @@ from elo_common import (
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-DATA_ROOT = pathlib.Path(__file__).resolve().parent / "data"
+DATA_ROOT = pathlib.Path(
+    os.environ.get("DATA_ROOT") or (pathlib.Path(__file__).resolve().parent / "data")
+)
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
