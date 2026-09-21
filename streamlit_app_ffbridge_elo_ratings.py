@@ -113,7 +113,6 @@ import elo_ffbridge_lancelot as lancelot_api
 # Headless report core exposed through the Elo API and MortyBridgeMCP: persisted-parquet cache
 # resolution, date ranges, percentage filter, and the leaderboard SQL live in
 # ffbridge_report_service (single source of truth for ranking logic).
-from elo_favorites import load_favorites
 from ffbridge_report_service import (
     DATE_RANGE_OPTIONS as _DATE_RANGE_OPTIONS,
     ELO_CACHE_DIR as _FFBRIDGE_ELO_CACHE_DIR,
@@ -2930,21 +2929,7 @@ def main():
             horizontal=True,
             help="Switch between individual and partnership rankings"
         )
-        if "button_title" not in st.session_state:
-            st.session_state.button_title = "Leaderboard"
-        try:
-            favorites = load_favorites("ffbridge")
-        except FileNotFoundError as exc:
-            st.error(str(exc))
-            st.stop()
-        for button_id, button in (favorites.get("Buttons") or {}).items():
-            if st.sidebar.button(
-                button.get("title") or button_id,
-                help=button.get("help"),
-                key=f"ffbridge_fav_{button_id}",
-            ):
-                st.session_state.button_title = button_id
-        
+
         # Lancelot-only in the UI. Classic stays in API_BACKENDS for later
         # removal; do not expose a sidebar selector (or honor ?api=).
         selected_api_name = "FFBridge Lancelot API"

@@ -85,7 +85,6 @@ from elo_common import (
     footer_streamlit_app_diagnostics_line,
     sync_state_to_url_params,
 )
-from elo_favorites import load_favorites
 from elo_filter_common import (
     ACBL_DATE_RANGE_OPTIONS as _DATE_RANGE_OPTIONS,
     ACBL_MASTERPOINT_RANGES as MASTERPOINT_RANGES,
@@ -1613,20 +1612,6 @@ def main():
         else:
             platinum_events = False
         rating_type = st.radio("Rating type", options=["Players", "Pairs"], index=0, horizontal=True, key="rating_type")
-        if "button_title" not in st.session_state:
-            st.session_state.button_title = "Leaderboard"
-        try:
-            favorites = load_favorites("acbl")
-        except FileNotFoundError as exc:
-            st.error(str(exc))
-            st.stop()
-        for button_id, button in (favorites.get("Buttons") or {}).items():
-            if st.sidebar.button(
-                button.get("title") or button_id,
-                help=button.get("help"),
-                key=f"acbl_fav_{button_id}",
-            ):
-                st.session_state.button_title = button_id
         top_n = st.number_input(
             "Top N players or pairs",
             min_value=50,
