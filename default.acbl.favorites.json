@@ -14,6 +14,7 @@
 		"Vetted_Prompts": {
 			"Top_Players": {
 				"title": "Top Players",
+				"row_click": "Show all games by {Player_Name}.",
 				"help": "**Showing the ACBL player leaderboard.**",
 				"prompts": [
 					{
@@ -24,6 +25,7 @@
 			},
 			"Top_Pairs": {
 				"title": "Top Pairs",
+				"row_click": "Show all games by the pair {Pair_Names}.",
 				"help": "**Showing the ACBL pair leaderboard.**",
 				"prompts": [
 					{
