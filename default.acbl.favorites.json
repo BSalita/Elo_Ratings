@@ -4,7 +4,7 @@
 		"Leaderboard": {
 			"title": "Leaderboard",
 			"help": "Top players or pairs by published Elo for the current sidebar filters.",
-			"comment": "@ in prompt means prompt is a key into ['SelectBoxes']['Vetted_Prompts']. {Rating_Type} is replaced from the Players/Pairs widget.",
+			"comment": "@ in prompt means prompt is a key into ['SelectBoxes']['Vetted_Prompts']. {Rating_Type} is replaced from the Players/Pairs widget. Optional prompt key Output is Grid, Deal, or Info; missing Output stays Grid.",
 			"prompts": [
 				"@Top_{Rating_Type}"
 			]
