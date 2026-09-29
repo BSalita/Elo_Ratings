@@ -7,5 +7,5 @@ alwaysApply: true
 
 - Never deploy any service from this system.
 - Never start, configure, restart, or otherwise use a Cloudflare tunnel from this system.
-- Code changes, tests, commits, and pushes are allowed when the user requests them.
+- Code changes, tests, commits, and pushes are allowed. Commit and push finished work automatically (see auto-commit-push).
 - Leave deployment and tunnel operations for another system.

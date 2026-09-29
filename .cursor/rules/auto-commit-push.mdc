@@ -1,0 +1,14 @@
+---
+description: Commit and push finished work without waiting to be asked
+alwaysApply: true
+---
+
+# Commit and Push Automatically
+
+When a task changes code or config and the relevant tests pass, commit and push before replying. Do not wait for the user to ask.
+
+- Stage only the files the task changed. Leave unrelated edits and scratch files uncommitted (`.tmp/`, `__pycache__/`, `$null`, workspace and profile files).
+- Match the existing message style: one sentence ending in a period, saying what changed and why.
+- Push the current branch to `origin`.
+- Do not commit when tests fail, when the change is incomplete, or when the user asked only for analysis. Say why in the reply.
+- Committing and pushing is not deploying. Deployment and tunnel rules still apply.
