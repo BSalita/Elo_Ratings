@@ -1,13 +1,14 @@
 """Clone Elo: the rating a player would have partnered with a copy of themselves.
 
 A pair rating is ``R0 + c_A + c_B``. ``Clone_Elo(A) = R0 + 2·c_A``. Contributions
-come from a ridge regression over every pair session, so a partner's strength is
-measured by how that partner does with everyone else.
+come from a ridge regression of session log-odds over every pair session, so a
+partner's strength is measured by how that partner does with everyone else.
 
-``k_scale`` defaults to the classic ``400/ln(10)`` points per natural-log odds.
-When the session rows carry current Elo, the default instead estimates that
-factor from those ratings so ``Clone_Elo`` and ``Partner_Effect`` share the
-stored Elo scale (FFBridge's chess-standardized columns, or ACBL's ``Elo_R_*``).
+``k_scale`` converts log-odds to rating points. When the session rows carry
+current Elo and ``k_scale`` is not given, ``Clone_Elo`` for ``ok`` players is
+matched to the mean and SD of those players' current Elo, so ``Clone_Elo`` and
+``Partner_Effect`` share the stored Elo scale. Otherwise the classic
+``400/ln(10)`` is used.
 """
 
 from __future__ import annotations
@@ -23,7 +24,8 @@ import polars as pl
 K_SCALE_400 = 400.0 / math.log(10)
 DEFAULT_R0 = 1500.0
 DEFAULT_TAU_DAYS = 365.0
-DEFAULT_RIDGE_LAMBDA = 10.0
+# Best held-out MAE on FFBridge 2023-2026 scratch and handicap (tried 1, 3, 10, 30, 100).
+DEFAULT_RIDGE_LAMBDA = 3.0
 DEFAULT_MIN_SESSIONS = 20
 DEFAULT_MIN_PARTNERS = 3
 _PCT_LO = 0.5
@@ -91,12 +93,27 @@ def _player_id_expr(column: str) -> pl.Expr:
         pl.when(
             text.is_null()
             | (text == "")
-            | lowered.is_in(["none", "nan", "null", "<na>"])
+            | lowered.is_in(["none", "nan", "null", "<na>", "0"])
         )
         .then(pl.lit(""))
         .otherwise(text.str.replace(r"\.0$", ""))
         .alias(column)
     )
+
+
+def _date_expr(frame: pl.DataFrame, column: str) -> pl.Expr:
+    """Calendar date from Date, Datetime, or ISO text such as ``2026-09-28T00:00:00+02:00``."""
+    dtype = frame.schema[column]
+    source = pl.col(column)
+    if dtype == pl.Date:
+        expr = source
+    elif isinstance(dtype, pl.Datetime):
+        expr = source.dt.date()
+    elif dtype == pl.Utf8:
+        expr = source.str.slice(0, 10).str.to_date("%Y-%m-%d", strict=True)
+    else:
+        raise ValueError(f"Clone sessions need a date column, got {column} as {dtype}")
+    return expr.alias("date")
 
 
 def _require_score(score: str) -> str:
@@ -131,7 +148,7 @@ def _sessions_from_ffbridge(sessions_df: pl.DataFrame, score: str) -> pl.DataFra
     return sessions_df.select(
         _player_id_expr("player1_id").alias("player_a"),
         _player_id_expr("player2_id").alias("player_b"),
-        pl.col("date").cast(pl.Date, strict=False).alias("date"),
+        _date_expr(sessions_df, "date"),
         pl.col(pct_col).cast(pl.Float64, strict=False).alias("pct"),
         elo_a_expr.alias("elo_a"),
         elo_b_expr.alias("elo_b"),
@@ -160,7 +177,7 @@ def _sessions_from_acbl_boards(boards: pl.DataFrame) -> pl.DataFrame:
                 _player_id_expr(a).alias("player_a"),
                 _player_id_expr(b).alias("player_b"),
                 pl.col("session_id").cast(pl.Utf8),
-                pl.col("Date").cast(pl.Date, strict=False).alias("date"),
+                _date_expr(boards, "Date"),
                 pct_expr.alias("pct"),
                 elo_a_expr.alias("elo_a"),
                 elo_b_expr.alias("elo_b"),
@@ -192,7 +209,7 @@ def _canonical_sessions(sessions_df: pl.DataFrame, score: str) -> pl.DataFrame:
         return sessions_df.select(
             _player_id_expr("player_a"),
             _player_id_expr("player_b"),
-            pl.col(date_col).cast(pl.Date, strict=False).alias("date"),
+            _date_expr(sessions_df, date_col),
             pl.col("pct").cast(pl.Float64, strict=False).alias("pct"),
             elo_a.alias("elo_a"),
             elo_b.alias("elo_b"),
@@ -217,9 +234,11 @@ def _prepare_sessions(
     *,
     tau_days: Optional[float],
 ) -> pl.DataFrame:
+    # Exactly 0 or 100 is an unscored placeholder (FFBridge handicap shells), not a result.
     prepared = sessions.filter(
         pl.col("pct").is_not_null()
-        & pl.col("pct").is_between(0.0, 100.0)
+        & (pl.col("pct") > 0.0)
+        & (pl.col("pct") < 100.0)
         & ~((pl.col("player_a") == "") & (pl.col("player_b") == ""))
         & (pl.col("player_a") != pl.col("player_b"))
     )
@@ -289,26 +308,19 @@ def _latest_elos(frame: pl.DataFrame) -> dict[str, float]:
     return dict(zip(latest["player_id"].to_list(), latest["elo"].to_list(), strict=True))
 
 
-def _calibrate_k(pair_elo: np.ndarray, logit: np.ndarray, weights: np.ndarray) -> Optional[float]:
-    mask = np.isfinite(pair_elo) & np.isfinite(logit) & np.isfinite(weights) & (weights > 0)
+def _match_scale(two_c: np.ndarray, current: np.ndarray) -> Optional[tuple[float, float]]:
+    """``(k_scale, r0)`` so ``r0 + k_scale * two_c`` has the mean and SD of ``current``."""
+    mask = np.isfinite(two_c) & np.isfinite(current)
     if int(mask.sum()) < _CALIBRATE_MIN_ROWS:
         return None
-    x = logit[mask]
-    y = pair_elo[mask]
-    w = weights[mask]
-    sw = float(w.sum())
-    if sw <= 0:
+    x = two_c[mask]
+    y = current[mask]
+    sd_x = float(x.std())
+    sd_y = float(y.std())
+    if sd_x <= 1e-9 or sd_y <= 1e-9:
         return None
-    mean_x = float(np.dot(w, x) / sw)
-    mean_y = float(np.dot(w, y) / sw)
-    var_x = float(np.dot(w, (x - mean_x) ** 2))
-    if var_x <= 1e-12:
-        return None
-    cov = float(np.dot(w, (x - mean_x) * (y - mean_y)))
-    k = cov / var_x
-    if not math.isfinite(k) or k < 1.0:
-        return None
-    return k
+    k = sd_y / sd_x
+    return k, float(y.mean()) - k * float(x.mean())
 
 
 def _fingerprint(sessions_df: pl.DataFrame, score: str, tau_days: Optional[float], ridge_lambda: float, r0: Optional[float], k_scale: Optional[float], min_sessions: int, min_partners: int) -> tuple:
@@ -364,6 +376,77 @@ def _cache_put(key: tuple, value: pl.DataFrame) -> None:
         _CACHE[key] = value.clone()
 
 
+class _Fit:
+    """Ridge contributions in log-odds units for one prepared session frame."""
+
+    def __init__(self, canonical: pl.DataFrame, tau_days: Optional[float], ridge_lambda: float) -> None:
+        from scipy.sparse import coo_matrix, eye, vstack
+        from scipy.sparse.linalg import lsqr
+
+        self.ids = sorted(
+            {
+                pid
+                for pid in canonical["player_a"].to_list() + canonical["player_b"].to_list()
+                if pid
+            }
+        )
+        self.index = {pid: i for i, pid in enumerate(self.ids)}
+        weights = _weights(canonical["date"].to_numpy(), tau_days)
+        lookup = pl.DataFrame(
+            {"player_id": self.ids, "ix": list(range(len(self.ids)))},
+            schema={"player_id": pl.Utf8, "ix": pl.Int64},
+        )
+        mapped = (
+            canonical.with_columns(
+                pl.Series("y", _logit_pct(canonical["pct"].to_numpy().astype(np.float64))),
+                pl.Series("sw", np.sqrt(weights)),
+            )
+            .join(lookup, left_on="player_a", right_on="player_id", how="left")
+            .rename({"ix": "ia"})
+            .join(lookup, left_on="player_b", right_on="player_id", how="left")
+            .rename({"ix": "ib"})
+        )
+        self.mapped = mapped
+        n = mapped.height
+        p = len(self.ids)
+        ia = mapped["ia"].fill_null(-1).to_numpy().astype(np.int64)
+        ib = mapped["ib"].fill_null(-1).to_numpy().astype(np.int64)
+        sw = mapped["sw"].to_numpy()
+        y = mapped["y"].to_numpy()
+        a_ok = ia >= 0
+        b_ok = ib >= 0
+        row_ix = np.arange(n, dtype=np.int64)
+        self.contribution = np.zeros(p, dtype=np.float64)
+        self.resid = y.copy()
+        if p == 0:
+            return
+        design = coo_matrix(
+            (
+                np.concatenate([sw[a_ok], sw[b_ok]]),
+                (
+                    np.concatenate([row_ix[a_ok], row_ix[b_ok]]),
+                    np.concatenate([ia[a_ok], ib[b_ok]]),
+                ),
+            ),
+            shape=(n, p),
+        ).tocsr()
+        target = y * sw
+        if ridge_lambda > 0:
+            system = vstack([design, math.sqrt(ridge_lambda) * eye(p, format="csr")], format="csr")
+            rhs = np.concatenate([target, np.zeros(p)])
+        else:
+            system = design
+            rhs = target
+        solved = lsqr(system, rhs, atol=1e-10, btol=1e-10, iter_lim=2000)
+        self.contribution = np.asarray(solved[0], dtype=np.float64)
+        self.resid[a_ok] -= self.contribution[ia[a_ok]]
+        self.resid[b_ok] -= self.contribution[ib[b_ok]]
+
+    def c(self, pid: str) -> float:
+        i = self.index.get(pid)
+        return 0.0 if i is None else float(self.contribution[i])
+
+
 def compute_clone_ratings(
     sessions_df: pl.DataFrame,
     score: str = "Scratch",
@@ -387,6 +470,8 @@ def compute_clone_ratings(
         raise ValueError(f"ridge_lambda must be >= 0, got {ridge_lambda}")
     if min_sessions < 1 or min_partners < 1:
         raise ValueError("min_sessions and min_partners must be >= 1")
+    if k_scale is not None and k_scale <= 0:
+        raise ValueError(f"k_scale must be positive, got {k_scale}")
     key = _fingerprint(
         sessions_df, score, tau_days, ridge_lambda, r0, k_scale, min_sessions, min_partners
     )
@@ -401,76 +486,14 @@ def compute_clone_ratings(
         _cache_put(key, result)
         return result
 
-    dates = canonical["date"].to_numpy()
-    weights = _weights(dates, tau_days)
-    pct = canonical["pct"].to_numpy().astype(np.float64)
-    logit = _logit_pct(pct)
-    elo_a = canonical["elo_a"].to_numpy().astype(np.float64)
-    elo_b = canonical["elo_b"].to_numpy().astype(np.float64)
-    pair_elo = np.where(np.isfinite(elo_a) & np.isfinite(elo_b), (elo_a + elo_b) / 2.0, np.nan)
-    latest = _latest_elos(canonical)
-    if r0 is None:
-        r0 = float(np.mean(list(latest.values()))) if latest else DEFAULT_R0
-    if k_scale is None:
-        k_scale = _calibrate_k(pair_elo, logit, weights) or K_SCALE_400
-    if k_scale <= 0:
-        raise ValueError(f"k_scale must be positive, got {k_scale}")
-
-    y = k_scale * logit
-    ids = sorted(
-        {
-            pid
-            for pid in canonical["player_a"].to_list() + canonical["player_b"].to_list()
-            if pid
-        }
-    )
+    fit = _Fit(canonical, tau_days, ridge_lambda)
+    ids = fit.ids
     if not ids:
         result = empty_clone_ratings()
         _cache_put(key, result)
         return result
-    index = {pid: i for i, pid in enumerate(ids)}
-    lookup = pl.DataFrame({"player_id": ids, "ix": list(range(len(ids)))})
-    mapped = (
-        canonical.with_columns(
-            pl.Series("y", y),
-            pl.Series("sw", np.sqrt(weights)),
-        )
-        .join(lookup, left_on="player_a", right_on="player_id", how="left")
-        .rename({"ix": "ia"})
-        .join(lookup, left_on="player_b", right_on="player_id", how="left")
-        .rename({"ix": "ib"})
-    )
-    n = mapped.height
-    p = len(ids)
-    ia = mapped["ia"].to_numpy()
-    ib = mapped["ib"].to_numpy()
-    sw = mapped["sw"].to_numpy()
-    y = mapped["y"].to_numpy()
-    row_ix = np.arange(n, dtype=np.int32)
-    a_ok = np.isfinite(ia.astype(np.float64))
-    b_ok = np.isfinite(ib.astype(np.float64))
-    ia_i = np.where(a_ok, ia, -1).astype(np.int32)
-    ib_i = np.where(b_ok, ib, -1).astype(np.int32)
-    rows = np.concatenate([row_ix[a_ok], row_ix[b_ok]])
-    cols = np.concatenate([ia_i[a_ok], ib_i[b_ok]])
-    data = np.concatenate([sw[a_ok], sw[b_ok]])
-    from scipy.sparse import coo_matrix, eye, vstack
-    from scipy.sparse.linalg import lsqr
-
-    design = coo_matrix((data, (rows, cols)), shape=(n, p)).tocsr()
-    target = y * sw
-    if ridge_lambda > 0:
-        system = vstack([design, math.sqrt(ridge_lambda) * eye(p, format="csr")], format="csr")
-        rhs = np.concatenate([target, np.zeros(p)])
-    else:
-        system = design
-        rhs = target
-    fit = lsqr(system, rhs, atol=1e-8, btol=1e-8, iter_lim=500)
-    contribution = np.asarray(fit[0], dtype=np.float64)
-
-    resid = y.copy()
-    resid[a_ok] -= contribution[ia_i[a_ok]]
-    resid[b_ok] -= contribution[ib_i[b_ok]]
+    mapped = fit.mapped
+    resid = fit.resid
 
     partners: dict[str, set[str]] = {pid: set() for pid in ids}
     edges = (
@@ -504,10 +527,10 @@ def compute_clone_ratings(
     )
     inseparable: set[str] = set()
     for pid, mates in partners.items():
-        if len(mates) != 1:
+        if len(mates) != 1 or pid in unknown_partners:
             continue
         other = next(iter(mates))
-        if partners.get(other) == {pid}:
+        if partners.get(other) == {pid} and other not in unknown_partners:
             inseparable.add(pid)
 
     seat_rows = pl.concat(
@@ -527,46 +550,62 @@ def compute_clone_ratings(
         if sd is not None and math.isfinite(sd)
     }
 
-    clone_elo: list[Optional[int]] = []
-    clone_pct: list[Optional[float]] = []
-    clone_sd: list[Optional[float]] = []
+    status: list[str] = []
     clone_n: list[int] = []
     clone_partners: list[int] = []
-    partner_effect: list[Optional[int]] = []
-    status: list[str] = []
     for pid in ids:
         n_sess = session_count[pid]
         n_partners = len(partners[pid]) + (1 if pid in unknown_partners else 0)
-        c = float(contribution[index[pid]])
-        rating = r0 + 2.0 * c
-        z = (rating - r0) / k_scale
-        prob = float(logistic(z))
-        pct_value = 100.0 * prob
-        slope = 100.0 * prob * (1.0 - prob) / k_scale
-        sd_points = resid_sd.get(pid)
-        sd_pct = None if sd_points is None else abs(slope) * sd_points
-        current = latest.get(pid)
-        effect = None if current is None else int(round(rating - current))
         if pid in inseparable:
             state = "not identifiable"
         elif n_sess < min_sessions or n_partners < min_partners:
             state = "low sample"
         else:
             state = "ok"
-        publish = state == "ok"
+        status.append(state)
         clone_n.append(n_sess)
         clone_partners.append(n_partners)
-        status.append(state)
-        if publish:
-            clone_elo.append(int(np.clip(round(rating), 0, 3500)))
-            clone_pct.append(round(pct_value, 1))
-            clone_sd.append(None if sd_pct is None else round(sd_pct, 1))
-            partner_effect.append(effect)
+
+    two_c = 2.0 * fit.contribution
+    latest = _latest_elos(canonical)
+    current = np.array([latest.get(pid, np.nan) for pid in ids], dtype=np.float64)
+    publish = np.array([state == "ok" for state in status])
+    scale = "given"
+    if k_scale is None:
+        matched = _match_scale(two_c[publish], current[publish])
+        if matched is None:
+            k_scale = K_SCALE_400
+            scale = "classic"
         else:
+            k_scale, matched_r0 = matched
+            scale = "matched"
+            if r0 is None:
+                r0 = matched_r0
+    if r0 is None:
+        finite = current[np.isfinite(current)]
+        r0 = float(finite.mean()) if finite.size else DEFAULT_R0
+
+    rating = r0 + k_scale * two_c
+    prob = logistic(two_c)
+    slope = 100.0 * prob * (1.0 - prob)
+    clone_elo: list[Optional[int]] = []
+    clone_pct: list[Optional[float]] = []
+    clone_sd: list[Optional[float]] = []
+    partner_effect: list[Optional[int]] = []
+    for i, pid in enumerate(ids):
+        if not publish[i]:
             clone_elo.append(None)
             clone_pct.append(None)
             clone_sd.append(None)
             partner_effect.append(None)
+            continue
+        clone_elo.append(int(np.clip(round(rating[i]), 0, 3500)))
+        clone_pct.append(round(100.0 * float(prob[i]), 1))
+        sd_logit = resid_sd.get(pid)
+        clone_sd.append(None if sd_logit is None else round(float(slope[i]) * sd_logit, 1))
+        partner_effect.append(
+            None if not math.isfinite(current[i]) else int(round(rating[i] - current[i]))
+        )
 
     result = pl.DataFrame(
         {
@@ -581,10 +620,12 @@ def compute_clone_ratings(
         }
     )
     elapsed = (datetime.now() - started).total_seconds()
+    n = mapped.height
     if n >= 5000 or elapsed >= 30:
         print(
-            f"[clone_elo] {score} fit {n} sessions, {p} players in {elapsed:.1f}s "
-            f"(tau_days={tau_days}, lambda={ridge_lambda}, r0={r0:.1f}, k_scale={k_scale:.2f})",
+            f"[clone_elo] {score} fit {n} sessions, {len(ids)} players, "
+            f"{int(publish.sum())} ok in {elapsed:.1f}s (tau_days={tau_days}, "
+            f"lambda={ridge_lambda}, r0={r0:.1f}, k_scale={k_scale:.2f} {scale})",
             flush=True,
         )
     _cache_put(key, result)
@@ -596,17 +637,19 @@ def holdout_clone_mae(
     *,
     score: str = "Scratch",
     holdout_fraction: float = 0.1,
-    **kwargs: Any,
+    tau_days: Optional[float] = DEFAULT_TAU_DAYS,
+    ridge_lambda: float = DEFAULT_RIDGE_LAMBDA,
 ) -> dict[str, float]:
     """Fit on the earlier sessions and score percentage MAE on the latest slice.
 
-    ``elo_mae`` predicts each held-out percentage from the average of the two
-    stored Elos on the same logistic scale. It is omitted when those Elos are
-    absent.
+    The clone prediction is ``logistic(c_A + c_B)`` with unseen players at 0.
+    ``elo_mae`` uses each player's last Elo in the training slice, averaged per
+    pair and mapped to percentage by a log-odds line fitted on the training
+    sessions. Held-out rows' own Elos are not used because they already include
+    that session. It is omitted when Elos are absent.
     """
     if not 0 < holdout_fraction < 1:
         raise ValueError("holdout_fraction must be between 0 and 1")
-    tau_days = kwargs.get("tau_days", DEFAULT_TAU_DAYS)
     canonical = _prepare_sessions(
         _canonical_sessions(sessions_df, _require_score(score)),
         tau_days=tau_days,
@@ -617,43 +660,48 @@ def holdout_clone_mae(
     cut = max(1, min(ordered.height - 1, int(round(ordered.height * (1.0 - holdout_fraction)))))
     train = ordered.head(cut)
     test = ordered.tail(ordered.height - cut)
-    loose = dict(kwargs)
-    loose["min_sessions"] = 1
-    loose["min_partners"] = 1
-    ratings = compute_clone_ratings(train, score=score, **loose)
-    r0 = kwargs.get("r0")
-    k_scale = kwargs.get("k_scale")
-    prepared = train
-    weights = _weights(prepared["date"].to_numpy(), tau_days)
-    logit = _logit_pct(prepared["pct"].to_numpy().astype(np.float64))
-    elo_a = prepared["elo_a"].to_numpy().astype(np.float64)
-    elo_b = prepared["elo_b"].to_numpy().astype(np.float64)
-    pair_elo = np.where(np.isfinite(elo_a) & np.isfinite(elo_b), (elo_a + elo_b) / 2.0, np.nan)
-    latest = _latest_elos(prepared)
-    if r0 is None:
-        r0 = float(np.mean(list(latest.values()))) if latest else DEFAULT_R0
-    if k_scale is None:
-        k_scale = _calibrate_k(pair_elo, logit, weights) or K_SCALE_400
-    by_id = {row["player_id"]: row for row in ratings.to_dicts()}
+    fit = _Fit(train, tau_days, ridge_lambda)
 
-    def _c(pid: str) -> float:
-        row = by_id.get(pid)
-        if not pid or row is None or row["Clone_Elo"] is None:
-            return 0.0
-        return (float(row["Clone_Elo"]) - float(r0)) / 2.0
+    lookup = pl.DataFrame(
+        {"player_id": fit.ids, "c": fit.contribution},
+        schema={"player_id": pl.Utf8, "c": pl.Float64},
+    )
+    scored = (
+        test.join(lookup.rename({"player_id": "player_a", "c": "c_a"}), on="player_a", how="left")
+        .join(lookup.rename({"player_id": "player_b", "c": "c_b"}), on="player_b", how="left")
+        .with_columns(pl.col("c_a").fill_null(0.0), pl.col("c_b").fill_null(0.0))
+    )
+    actual = scored["pct"].to_numpy().astype(np.float64)
+    clone_pred = 100.0 * logistic(scored["c_a"].to_numpy() + scored["c_b"].to_numpy())
+    out = {
+        "clone_mae": float(np.mean(np.abs(clone_pred - actual))),
+        "n_holdout": float(scored.height),
+    }
 
-    abs_err = []
-    elo_err = []
-    for row in test.to_dicts():
-        pred = 100.0 * float(logistic((_c(row["player_a"]) + _c(row["player_b"])) / k_scale))
-        abs_err.append(abs(pred - float(row["pct"])))
-        if row["elo_a"] is not None and row["elo_b"] is not None:
-            mid = (float(row["elo_a"]) + float(row["elo_b"])) / 2.0
-            elo_pred = 100.0 * float(logistic((mid - r0) / k_scale))
-            elo_err.append(abs(elo_pred - float(row["pct"])))
-    out = {"clone_mae": float(np.mean(abs_err)), "n_holdout": float(len(abs_err))}
-    if elo_err:
-        out["elo_mae"] = float(np.mean(elo_err))
+    last_elo = _latest_elos(train)
+
+    def _pair_elo(frame: pl.DataFrame) -> np.ndarray:
+        a = np.array([last_elo.get(pid, np.nan) for pid in frame["player_a"].to_list()], dtype=np.float64)
+        b = np.array([last_elo.get(pid, np.nan) for pid in frame["player_b"].to_list()], dtype=np.float64)
+        return np.where(np.isfinite(a) & np.isfinite(b), (a + b) / 2.0, np.nan)
+
+    train_elo = _pair_elo(train)
+    train_logit = _logit_pct(train["pct"].to_numpy().astype(np.float64))
+    train_w = _weights(train["date"].to_numpy(), tau_days)
+    mask = np.isfinite(train_elo)
+    test_elo = _pair_elo(scored)
+    test_mask = np.isfinite(test_elo)
+    if int(mask.sum()) >= _CALIBRATE_MIN_ROWS and test_mask.any():
+        x = train_elo[mask]
+        yv = train_logit[mask]
+        w = train_w[mask]
+        mean_x = float(np.average(x, weights=w))
+        mean_y = float(np.average(yv, weights=w))
+        var_x = float(np.average((x - mean_x) ** 2, weights=w))
+        beta = 0.0 if var_x <= 1e-12 else float(np.average((x - mean_x) * (yv - mean_y), weights=w)) / var_x
+        elo_pred = 100.0 * logistic(mean_y + beta * (test_elo[test_mask] - mean_x))
+        out["elo_mae"] = float(np.mean(np.abs(elo_pred - actual[test_mask])))
+        out["clone_mae_same_rows"] = float(np.mean(np.abs(clone_pred[test_mask] - actual[test_mask])))
     return out
 
 

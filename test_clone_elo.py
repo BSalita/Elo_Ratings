@@ -6,6 +6,7 @@ import math
 import unittest
 from datetime import date, timedelta
 
+import numpy as np
 import polars as pl
 
 from clone_elo import (
@@ -173,44 +174,93 @@ class CloneFitTests(unittest.TestCase):
         )
 
     def test_holdout_beats_partner_polluted_elo(self) -> None:
-        players = {
-            "A": 80.0,
-            "B": 40.0,
-            "C": -20.0,
-            "D": -30.0,
-            "E": 10.0,
-            "F": -10.0,
-        }
-        ids = list(players)
+        rng = np.random.default_rng(7)
+        true_c = {f"P{i}": float(v) for i, v in enumerate(rng.normal(0.0, 0.25, 24))}
+        ids = list(true_c)
+        regular = {ids[i]: ids[i ^ 1] for i in range(len(ids))}
+        # Stored Elo absorbs the regular partner, as a pair-level Elo does.
+        stored = {pid: 1500.0 + 400.0 * (true_c[pid] + true_c[regular[pid]]) for pid in ids}
         rows = []
-        day = date(2024, 1, 1)
-        n = 0
-        for i, a in enumerate(ids):
-            for b in ids[i + 1 :]:
-                for _ in range(8):
-                    c_sum = players[a] + players[b]
-                    pct = 100.0 * float(logistic(c_sum / K_SCALE_400))
-                    rows.append(
-                        _pair(
-                            a,
-                            b,
-                            pct,
-                            day + timedelta(days=n % 400),
-                            elo_a=1500.0 + 0.25 * players[a],
-                            elo_b=1500.0 + 0.25 * players[b],
-                        )
-                    )
-                    n += 1
-        report = holdout_clone_mae(
-            pl.DataFrame(rows),
-            tau_days=None,
-            r0=1500.0,
-            k_scale=K_SCALE_400,
-            min_sessions=1,
-            min_partners=1,
+        start = date(2024, 1, 1)
+        for n in range(6000):
+            a = ids[int(rng.integers(len(ids)))]
+            b = regular[a] if rng.random() < 0.6 else ids[int(rng.integers(len(ids)))]
+            if a == b:
+                continue
+            z = true_c[a] + true_c[b] + float(rng.normal(0.0, 0.2))
+            rows.append(
+                _pair(
+                    a,
+                    b,
+                    100.0 * float(logistic(z)),
+                    start + timedelta(days=n // 10),
+                    elo_a=stored[a],
+                    elo_b=stored[b],
+                )
+            )
+        report = holdout_clone_mae(pl.DataFrame(rows), tau_days=None, ridge_lambda=1.0)
+        self.assertLess(report["clone_mae"], 5.0)
+        self.assertLess(report["clone_mae_same_rows"], report["elo_mae"])
+
+    def test_iso_text_dates_are_parsed(self) -> None:
+        rows = []
+        for partner in ["F1", "F2", "F3", "F4"]:
+            for _ in range(6):
+                rows.append(
+                    {
+                        "player1_id": "S",
+                        "player2_id": partner,
+                        "date": "2026-09-28T00:00:00+02:00",
+                        "National_Scratch_Pct": 60.0,
+                        "player1_scratch_elo_after": 1500.0,
+                        "player2_scratch_elo_after": 1500.0,
+                    }
+                )
+        ratings = compute_clone_ratings(
+            pl.DataFrame(rows), score="Scratch", min_sessions=8, min_partners=3
         )
-        self.assertLess(report["clone_mae"], 2.0)
-        self.assertLess(report["clone_mae"], report["elo_mae"])
+        row = ratings.filter(pl.col("player_id") == "S").row(0, named=True)
+        self.assertEqual(row["Clone_Status"], "ok")
+        self.assertEqual(row["Clone_N"], 24)
+        self.assertGreater(row["Clone_Pct"], 55.0)
+
+    def test_zero_player_id_is_unknown_partner(self) -> None:
+        day = date(2026, 8, 1)
+        rows = [_pair("A", "0", 60.0, day) for _ in range(10)]
+        rows += [_pair("B", "0", 45.0, day) for _ in range(10)]
+        ratings = _fit(sessions_df=pl.DataFrame(rows), min_sessions=1, min_partners=1)
+        self.assertNotIn("0", ratings["player_id"].to_list())
+        self.assertEqual(
+            ratings.filter(pl.col("player_id") == "A")["Clone_Partners"][0], 1
+        )
+
+    def test_default_scale_matches_current_elo(self) -> None:
+        rng = np.random.default_rng(11)
+        true_c = {f"P{i}": float(v) for i, v in enumerate(rng.normal(0.0, 0.3, 60))}
+        ids = list(true_c)
+        rows = []
+        for n in range(8000):
+            a, b = rng.choice(len(ids), size=2, replace=False)
+            pa, pb = ids[int(a)], ids[int(b)]
+            z = true_c[pa] + true_c[pb] + float(rng.normal(0.0, 0.25))
+            rows.append(
+                _pair(
+                    pa,
+                    pb,
+                    100.0 * float(logistic(z)),
+                    date(2026, 1, 1),
+                    elo_a=1500.0 + 800.0 * true_c[pa],
+                    elo_b=1500.0 + 800.0 * true_c[pb],
+                )
+            )
+        ratings = compute_clone_ratings(pl.DataFrame(rows), tau_days=None)
+        ok = ratings.filter(pl.col("Clone_Status") == "ok")
+        self.assertEqual(ok.height, len(ids))
+        current = pl.Series([1500.0 + 800.0 * true_c[pid] for pid in ok["player_id"].to_list()])
+        self.assertAlmostEqual(float(ok["Clone_Elo"].mean()), float(current.mean()), delta=2.0)
+        self.assertAlmostEqual(float(ok["Clone_Elo"].std()), float(current.std()), delta=10.0)
+        self.assertLess(abs(float(ok["Partner_Effect"].mean())), 2.0)
+        self.assertLess(float(ok["Partner_Effect"].abs().max()), 60.0)
 
 
 if __name__ == "__main__":
