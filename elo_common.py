@@ -537,10 +537,19 @@ def _normalize_sort_model(model) -> list[dict] | None:
 
 
 def aggrid_sort_model(grid_response) -> list[dict] | None:
-    """Read the current AgGrid sort, or None if the component has no sort state yet."""
+    """Read the current AgGrid sort, or None if the component has no sort state yet.
+
+    Accepts an ``AgGridReturn`` or the raw component value that streamlit-aggrid
+    keeps in ``st.session_state[key]``.
+    """
     if grid_response is None:
         return None
-    state = getattr(grid_response, "grid_state", None)
+    if isinstance(grid_response, dict):
+        state = grid_response.get("gridState")
+        columns_state = grid_response.get("columnsState")
+    else:
+        state = getattr(grid_response, "grid_state", None)
+        columns_state = getattr(grid_response, "columns_state", None)
     if not isinstance(state, dict):
         state = {}
     sort_block = state.get("sort")
@@ -551,7 +560,6 @@ def aggrid_sort_model(grid_response) -> list[dict] | None:
     parsed = _normalize_sort_model(state.get("sortModel"))
     if parsed is not None:
         return parsed
-    columns_state = getattr(grid_response, "columns_state", None)
     if isinstance(columns_state, list):
         parsed = _normalize_sort_model(
             [item for item in columns_state if isinstance(item, dict) and item.get("sort")]
@@ -571,6 +579,32 @@ def remember_leaderboard_sort(session, grid_key: str, grid_response, default_mod
     if extracted is not None:
         session[LEADERBOARD_SORT_MODEL_KEY] = extracted
     return list(session.get(LEADERBOARD_SORT_MODEL_KEY) or default)
+
+
+def current_leaderboard_sort(session, grid_key: str, default_model) -> list[dict]:
+    """Sort to pin before rendering the grid.
+
+    Must read the grid's latest reported sort from ``session[grid_key]``. Pinning
+    the previous run's sort instead flips the grid back one step, it reports that
+    change, and the two sorts alternate in an endless rerun loop.
+    """
+    return remember_leaderboard_sort(session, grid_key, session.get(grid_key), default_model)
+
+
+# Nulls and NaN sort last in both directions. ``Number(a) - Number(b)`` returns NaN
+# for them, which makes AG Grid's order inconsistent.
+NUMERIC_NULLS_LAST_COMPARATOR_JS = """
+function(valueA, valueB, nodeA, nodeB, isDescending) {
+    const a = (valueA === null || valueA === undefined || valueA === '') ? NaN : Number(valueA);
+    const b = (valueB === null || valueB === undefined || valueB === '') ? NaN : Number(valueB);
+    const aMissing = Number.isNaN(a);
+    const bMissing = Number.isNaN(b);
+    if (aMissing && bMissing) return 0;
+    if (aMissing) return isDescending ? -1 : 1;
+    if (bMissing) return isDescending ? 1 : -1;
+    return a - b;
+}
+"""
 
 
 def apply_sort_model_to_grid_options(grid_options: dict, sort_model: list[dict]) -> dict:

@@ -89,8 +89,10 @@ from elo_common import (
     calculate_aggrid_height,
     coerce_int,
     coerce_numeric_columns,
+    current_leaderboard_sort,
     default_leaderboard_sort_model,
     LEADERBOARD_SORT_MODEL_KEY,
+    NUMERIC_NULLS_LAST_COMPARATOR_JS,
     init_url_params_to_state,
     leaderboard_aggrid_viewport_height,
     LEADERBOARD_PAGE_SIZE,
@@ -564,11 +566,7 @@ def build_selectable_aggrid(
     gb.configure_pagination(enabled=True, paginationAutoPageSize=False, paginationPageSize=page_size)
     gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
 
-    numeric_comparator = JsCode("""
-        function(valueA, valueB, nodeA, nodeB, isDescending) {
-            return Number(valueA) - Number(valueB);
-        }
-    """)
+    numeric_comparator = JsCode(NUMERIC_NULLS_LAST_COMPARATOR_JS)
     for col in display_df.columns:
         if pd.api.types.is_numeric_dtype(display_df[col]):
             gb.configure_column(
@@ -589,9 +587,7 @@ def build_selectable_aggrid(
     default_sort = default_leaderboard_sort_model(display_df.columns)
     update_on = ["selectionChanged"]
     if persist_sort:
-        sort_model = remember_leaderboard_sort(
-            st.session_state, key, None, default_sort,
-        )
+        sort_model = current_leaderboard_sort(st.session_state, key, default_sort)
         apply_sort_model_to_grid_options(grid_options, sort_model)
         update_on.append("sortChanged")
     elif default_sort:
@@ -650,11 +646,7 @@ def _render_detail_aggrid_ff(
     if selectable:
         gb.configure_selection(selection_mode='single', use_checkbox=False, suppressRowClickSelection=False)
     gb.configure_default_column(cellStyle={'color': 'black', 'font-size': '12px'}, suppressMenu=True)
-    numeric_comparator = JsCode("""
-        function(valueA, valueB, nodeA, nodeB, isDescending) {
-            return Number(valueA) - Number(valueB);
-        }
-    """)
+    numeric_comparator = JsCode(NUMERIC_NULLS_LAST_COMPARATOR_JS)
     for col in display_df.columns:
         if pd.api.types.is_numeric_dtype(display_df[col]):
             gb.configure_column(

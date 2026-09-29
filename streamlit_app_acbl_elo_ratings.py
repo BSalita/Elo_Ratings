@@ -74,8 +74,10 @@ from elo_common import (
     coerce_float,
     coerce_int,
     coerce_numeric_columns,
+    current_leaderboard_sort,
     default_leaderboard_sort_model,
     default_min_skill_z,
+    NUMERIC_NULLS_LAST_COMPARATOR_JS,
     init_url_params_to_state,
     leaderboard_aggrid_viewport_height,
     LEADERBOARD_PAGE_SIZE,
@@ -527,11 +529,7 @@ def _render_detail_aggrid(detail_df: pl.DataFrame, key: str, selectable: bool = 
     # comparator is required because streamlit-aggrid serializes cell values
     # as strings to the JS side; type=['numericColumn'] alone would not
     # force numeric sort.
-    numeric_comparator = JsCode("""
-        function(valueA, valueB, nodeA, nodeB, isDescending) {
-            return Number(valueA) - Number(valueB);
-        }
-    """)
+    numeric_comparator = JsCode(NUMERIC_NULLS_LAST_COMPARATOR_JS)
     for col in pdf.columns:
         if pd.api.types.is_numeric_dtype(pdf[col]):
             gb.configure_column(
@@ -1260,11 +1258,7 @@ def _acbl_report_panel() -> None:
             # so `type=['numericColumn']` alone is not enough (it only
             # right-aligns + sets the number filter); without an explicit
             # numeric comparator AgGrid would sort "10" before "2".
-            numeric_comparator = JsCode("""
-                function(valueA, valueB, nodeA, nodeB, isDescending) {
-                    return Number(valueA) - Number(valueB);
-                }
-            """)
+            numeric_comparator = JsCode(NUMERIC_NULLS_LAST_COMPARATOR_JS)
             for col in display_df.columns:
                 if pd.api.types.is_numeric_dtype(display_df[col]):
                     gb.configure_column(
@@ -1301,9 +1295,7 @@ def _acbl_report_panel() -> None:
             )
         
             default_sort = default_leaderboard_sort_model(display_df.columns)
-            sort_model = remember_leaderboard_sort(
-                st.session_state, dynamic_key, None, default_sort,
-            )
+            sort_model = current_leaderboard_sort(st.session_state, dynamic_key, default_sort)
             apply_sort_model_to_grid_options(gridOptions, sort_model)
             grid_response = AgGrid(
                 display_df,

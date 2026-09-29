@@ -5,9 +5,11 @@ import unittest
 import polars as pl
 
 from elo_common import (
+    NUMERIC_NULLS_LAST_COMPARATOR_JS,
     aggrid_sort_model,
     apply_aggrid_sort_model,
     apply_sort_model_to_grid_options,
+    current_leaderboard_sort,
     default_leaderboard_sort_model,
     remember_leaderboard_sort,
 )
@@ -95,6 +97,27 @@ class GridSortTests(unittest.TestCase):
         by_field = {col["field"]: col for col in options["columnDefs"]}
         self.assertNotIn("sort", by_field["Rank"])
         self.assertEqual(by_field["Quality_Rank"]["sort"], "desc")
+
+    def test_pinned_sort_follows_the_click_being_handled(self) -> None:
+        key = "players_v1"
+        default = [{"colId": "Rank", "sort": "asc"}]
+        session: dict = {}
+        asc = {"gridState": {"sort": {"sortModel": [{"colId": "Clone_Elo", "sort": "asc"}]}}}
+        desc = {"gridState": {"sort": {"sortModel": [{"colId": "Clone_Elo", "sort": "desc"}]}}}
+        session[key] = asc
+        self.assertEqual(current_leaderboard_sort(session, key, default), [{"colId": "Clone_Elo", "sort": "asc"}])
+        session[key] = desc
+        self.assertEqual(current_leaderboard_sort(session, key, default), [{"colId": "Clone_Elo", "sort": "desc"}])
+
+    def test_raw_component_value_columns_state(self) -> None:
+        raw = {"columnsState": [{"colId": "Partner_Effect", "sort": "desc", "sortIndex": 0}]}
+        self.assertEqual(aggrid_sort_model(raw), [{"colId": "Partner_Effect", "sort": "desc"}])
+
+    def test_comparator_puts_blanks_last_both_ways(self) -> None:
+        js = NUMERIC_NULLS_LAST_COMPARATOR_JS
+        self.assertIn("Number.isNaN", js)
+        self.assertIn("isDescending ? -1 : 1", js)
+        self.assertNotIn("return Number(valueA) - Number(valueB)", js)
 
 
 if __name__ == "__main__":
