@@ -1130,6 +1130,13 @@ def _acbl_report_panel() -> None:
         "it is a z-score over the qualifying pool, a given title means the "
         "same percentile in ACBL, FFBridge, and chess."
     )
+    st.caption(
+        "**Clone_Elo** is the rating this player would have partnered with a "
+        "copy of themselves, on the same chess scale as **Player_Elo_Score**. "
+        "**Clone_Pct** is the matchpoint percentage that rating implies. "
+        "Ratings stay blank below 20 sessions or 3 partners, and when a "
+        "player cannot be separated from their only partner."
+    )
 
     # Store online filter and current dataset type for downstream controls
     st.session_state.online_filter = online_filter

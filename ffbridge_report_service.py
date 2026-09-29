@@ -27,6 +27,7 @@ from elo_filter_common import (
     filter_normalized_substring,
     fuzzy_text_score,
 )
+from clone_elo import compute_clone_ratings, empty_clone_ratings, register_clone_ratings
 from elo_favorites import flatten_favorites, load_favorites, run_favorite, run_sql
 from elo_session_common import results_url_status
 from ffbridge_quality_pipeline import (
@@ -1135,6 +1136,13 @@ def run_top_players_favorite(
     con = duckdb.connect(config={"enable_external_access": "false"})
     try:
         con.register("self", results_df)
+        register_clone_ratings(
+            con,
+            compute_clone_ratings(
+                results_df,
+                score="Handicap" if use_handicap else "Scratch",
+            ),
+        )
         result, sql = run_favorite(con, _ffbridge_favorites(), "Top_Players", meta)
     finally:
         con.close()
@@ -1472,6 +1480,13 @@ def run_elo_sql(
     con = duckdb.connect(config={"enable_external_access": "false"})
     try:
         con.register("self", results_df)
+        if results_df.is_empty():
+            register_clone_ratings(con, empty_clone_ratings())
+        else:
+            register_clone_ratings(
+                con,
+                compute_clone_ratings(results_df, score=score),
+            )
         table, generated_sql = run_sql(con, cleaned, fav_meta)
     finally:
         con.close()

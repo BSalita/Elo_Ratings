@@ -7,6 +7,7 @@ import duckdb
 import polars as pl
 
 from acbl_api_server import acbl_favorites_meta
+from clone_elo import empty_clone_ratings, register_clone_ratings
 from elo_favorites import (
     ACBL_MACRO_KEYS,
     FFBRIDGE_MACRO_KEYS,
@@ -112,6 +113,7 @@ def _run_acbl(prompt_id: str, meta: dict) -> pl.DataFrame:
     con = duckdb.connect()
     try:
         con.register("self", _acbl_quality_fixture())
+        register_clone_ratings(con, empty_clone_ratings())
         result, _sql = run_favorite(con, favorites, prompt_id, meta)
         return result
     finally:
@@ -261,7 +263,9 @@ class FfbridgeGoldenRowTests(unittest.TestCase):
         )
         self.assertEqual(table.get_column("Player_ID").to_list(), ["1", "2"])
         self.assertEqual(table.get_column("Player_Elo").to_list(), [1400, 1300])
+        self.assertIn("Clone_Elo", table.columns)
         self.assertIn("player1_scratch_elo_after", sql)
+        self.assertIn("clone_ratings", sql)
         self.assertNotIn("{Elo_Kind}", sql)
 
     def test_top_pairs_quality_rank_can_differ(self) -> None:

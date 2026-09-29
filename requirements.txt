@@ -22,6 +22,7 @@ psycopg[binary]
 # initializer imports mlBridgeLib and mlBridgeAcblLib eagerly, so these remain
 # required until the lazy initializer is published there.
 scikit-learn
+scipy
 sqlalchemy
 sqlalchemy-utils
 

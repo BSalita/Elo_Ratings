@@ -13,6 +13,12 @@ import polars as pl
 import psutil
 
 from acbl_awards import attach_award_totals, attach_session_awards, load_awards_for_players, pair_member_ids
+from clone_elo import (
+    acbl_sessions_from_connection,
+    compute_clone_ratings,
+    empty_clone_ratings,
+    register_clone_ratings,
+)
 from acbl_platinum import load_platinum_events, platinum_event_ids, platinum_mp_color_expr
 from acbl_strata import STRATA_DEFAULT, strata_label_to_bucket
 from elo_filter_common import acbl_date_from_for_range, filter_acbl_leaderboard
@@ -408,6 +414,7 @@ _SQL_FORBIDDEN = re.compile(
 )
 MAX_ACBL_SQL_ROWS = 10000
 _ACBL_FAVORITES: dict | None = None
+_ACBL_CLONE_CACHE: dict[tuple, pl.DataFrame] = {}
 
 
 class AcblSqlBody(BaseModel):
@@ -1722,6 +1729,31 @@ def health() -> dict:
     }
 
 
+def _register_acbl_clone_ratings(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    source_path: str,
+    elo_rating_type: str,
+    cache_key: tuple,
+) -> None:
+    """Fit clone ratings on the filtered ``self`` view and register them."""
+    try:
+        mtime = pathlib.Path(source_path).stat().st_mtime
+    except OSError:
+        mtime = None
+    full_key = (mtime, elo_rating_type, cache_key)
+    cached = _ACBL_CLONE_CACHE.get(full_key)
+    if cached is None:
+        sessions = acbl_sessions_from_connection(
+            con, get_elo_column_names(elo_rating_type)
+        )
+        cached = compute_clone_ratings(sessions, score="Scratch")
+        _ACBL_CLONE_CACHE[full_key] = cached
+        if len(_ACBL_CLONE_CACHE) > 8:
+            _ACBL_CLONE_CACHE.pop(next(iter(_ACBL_CLONE_CACHE)))
+    register_clone_ratings(con, cached)
+
+
 @app.get("/acbl/report")
 def acbl_report(
     club_or_tournament: str = Query(..., pattern="^(club|tournament)$"),
@@ -1809,6 +1841,21 @@ def acbl_report(
                 )
                 prompt_ids = button_prompt_ids(favorites, "Leaderboard", meta)
                 with _DB_LOCK:
+                    if rating_type == "Players":
+                        _register_acbl_clone_ratings(
+                            con,
+                            source_path=source_path,
+                            elo_rating_type=elo_rating_type,
+                            cache_key=(
+                                club_or_tournament,
+                                str(parsed_date_from),
+                                online_filter,
+                                strata,
+                                platinum_events,
+                            ),
+                        )
+                    else:
+                        register_clone_ratings(con, empty_clone_ratings())
                     result_df, generated_sql = run_favorite(
                         con, favorites, prompt_ids[0], meta
                     )
@@ -1987,6 +2034,21 @@ def acbl_sql(
                     min_skill_z=min_skill_z,
                 )
                 with _DB_LOCK:
+                    if rating_type == "Players" or "clone_ratings" in sql.lower():
+                        _register_acbl_clone_ratings(
+                            con,
+                            source_path=source_path,
+                            elo_rating_type=elo_rating_type,
+                            cache_key=(
+                                club_or_tournament,
+                                str(parsed_date_from),
+                                online_filter,
+                                strata,
+                                platinum_events,
+                            ),
+                        )
+                    else:
+                        register_clone_ratings(con, empty_clone_ratings())
                     result_df, generated_sql = run_sql(con, sql, meta)
             finally:
                 _teardown_self_view(con)

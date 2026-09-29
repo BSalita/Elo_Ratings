@@ -2508,6 +2508,13 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                 "**Title** column uses standard bands (≥2400 IM, ≥2500 GM, "
                 "≥2600 SGM). A given title means the same percentile everywhere."
             )
+            st.caption(
+                "**Clone_Elo** is the rating this player would have partnered "
+                "with a copy of themselves. **Clone_Pct** is the matchpoint "
+                "percentage that rating implies. Ratings stay blank below 20 "
+                "sessions or 3 partners, and when a player cannot be separated "
+                "from their only partner."
+            )
 
             if sql_query:
                 with st.expander("SQL Query", expanded=False):
