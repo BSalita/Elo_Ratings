@@ -46,21 +46,15 @@ for %%F in (
     if errorlevel 1 exit /b 1
 )
 
-rem Compacted hierarchical archive only (metadata, manifest, dataset/).
-rem Skip fragments/, sqlite, and domain shards — those are builder artifacts.
+rem Production archive only: latest-revision v3 fragments, a matching manifest,
+rem and metadata.json (written last). Domain shards, dataset/, sqlite and logs
+rem are builder artifacts and are not published. Fails if metadata is not v3.
+set "pub_py=%USERPROFILE%\.venvs\bridge-postmortem\Scripts\python.exe"
+if not exist "%pub_py%" exit /b 1
 if not exist "%ffbridge_hier_source%\metadata.json" exit /b 1
 if not exist "%ffbridge_hier_source%\manifest.parquet" exit /b 1
-if not exist "%ffbridge_hier_source%\dataset\" exit /b 1
-if not exist "%ffbridge_hier_destination%\" (
-    mkdir "%ffbridge_hier_destination%"
-    if errorlevel 1 exit /b 1
-)
-xcopy "%ffbridge_hier_source%\metadata.json" "%ffbridge_hier_destination%\" /D /Y
+"%pub_py%" "%~dp0publish_ffbridge_hierarchical.py" --source "%ffbridge_hier_source%" --destination "%ffbridge_hier_destination%"
 if errorlevel 1 exit /b 1
-xcopy "%ffbridge_hier_source%\manifest.parquet" "%ffbridge_hier_destination%\" /D /Y
-if errorlevel 1 exit /b 1
-robocopy "%ffbridge_hier_source%\dataset" "%ffbridge_hier_destination%\dataset" /E /XO /R:2 /W:2 /NFL /NDL /NJH /NJS /NP
-if errorlevel 8 exit /b 1
 
 rem Publish the same artifacts to prod src\data. Do not /MIR — that would
 rem replace _wslc_host, which postmortem_start.ps1 stages for the mount.
@@ -97,15 +91,7 @@ for %%F in (
     xcopy "%ffbridge_quality_destination%\%%F" "%prod_elo%\ffbridge\quality_cache\" /D /Y
     if errorlevel 1 exit /b 1
 )
-if not exist "%prod_elo%\ffbridge\postmortem_archive_hierarchical\" (
-    mkdir "%prod_elo%\ffbridge\postmortem_archive_hierarchical"
-    if errorlevel 1 exit /b 1
-)
-xcopy "%ffbridge_hier_destination%\metadata.json" "%prod_elo%\ffbridge\postmortem_archive_hierarchical\" /D /Y
+"%pub_py%" "%~dp0publish_ffbridge_hierarchical.py" --source "%ffbridge_hier_source%" --destination "%prod_elo%\ffbridge\postmortem_archive_hierarchical"
 if errorlevel 1 exit /b 1
-xcopy "%ffbridge_hier_destination%\manifest.parquet" "%prod_elo%\ffbridge\postmortem_archive_hierarchical\" /D /Y
-if errorlevel 1 exit /b 1
-robocopy "%ffbridge_hier_destination%\dataset" "%prod_elo%\ffbridge\postmortem_archive_hierarchical\dataset" /E /XO /R:2 /W:2 /NFL /NDL /NJH /NJS /NP
-if errorlevel 8 exit /b 1
 
 exit /b 0
