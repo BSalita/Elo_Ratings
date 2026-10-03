@@ -922,15 +922,15 @@ def _require_platinum_event_ids() -> list[str]:
 
 
 def _apply_platinum_event_filter(df: pl.DataFrame) -> pl.DataFrame:
-    if "mp_color" in df.columns:
-        return df.filter(platinum_mp_color_expr())
-    if "event_id" not in df.columns:
+    if "mp_color" not in df.columns:
         raise HTTPException(
             status_code=500,
-            detail="Elo parquet is missing event_id; cannot filter platinum events.",
+            detail=(
+                "Elo parquet is missing mp_color. Rebuild tournament Elo "
+                "via acbl_elo_ratings_create.py and refresh the deployed parquet."
+            ),
         )
-    ids = _require_platinum_event_ids()
-    return df.filter(pl.col("event_id").cast(pl.Utf8).is_in(ids))
+    return df.filter(platinum_mp_color_expr())
 
 
 def _self_filter_sql_clauses(
@@ -953,15 +953,15 @@ def _self_filter_sql_clauses(
         # Bucket ids are controlled constants (no user free-text).
         clauses.append(f"strata_bucket = '{bucket}'")
     if platinum_events:
-        if "mp_color" in full_df.columns:
-            clauses.append("lower(trim(CAST(mp_color AS VARCHAR))) = 'platinum'")
-        elif "event_id" not in full_df.columns:
+        if "mp_color" not in full_df.columns:
             raise HTTPException(
                 status_code=500,
-                detail="Elo parquet is missing event_id; cannot filter platinum events.",
+                detail=(
+                    "Elo parquet is missing mp_color. Rebuild tournament Elo "
+                    "via acbl_elo_ratings_create.py and refresh the deployed parquet."
+                ),
             )
-        else:
-            clauses.append(f"event_id IN {_sql_string_list(_require_platinum_event_ids())}")
+        clauses.append("lower(trim(CAST(mp_color AS VARCHAR))) = 'platinum'")
     if "Pct_NS" in full_df.columns:
         clauses.append("(Pct_NS IS NULL OR (Pct_NS >= 0 AND Pct_NS <= 1))")
     return clauses

@@ -109,19 +109,14 @@ class PlatinumAwardTests(unittest.TestCase):
         self.assertTrue(any("platinum" in clause for clause in clauses))
         self.assertFalse(any("event_id IN" in clause for clause in clauses))
 
-    def test_self_filter_sql_includes_platinum_event_ids(self) -> None:
-        from unittest.mock import patch
-
+    def test_self_filter_sql_requires_mp_color(self) -> None:
         frame = pl.DataFrame({"event_id": ["A", "B"], "Pct_NS": [0.5, 0.6]})
-        with patch(
-            "acbl_api_server._require_platinum_event_ids",
-            return_value=["NABC253-NAIL", "NABC262-OSHL"],
-        ):
-            clauses = _self_filter_sql_clauses(
+        with self.assertRaises(HTTPException) as caught:
+            _self_filter_sql_clauses(
                 frame, None, "All", "All", platinum_events=True,
             )
-        self.assertTrue(any("event_id IN" in clause for clause in clauses))
-        self.assertTrue(any("NABC253-NAIL" in clause for clause in clauses))
+        self.assertEqual(caught.exception.status_code, 500)
+        self.assertIn("mp_color", caught.exception.detail)
         self.assertFalse(
             any("event_id IN" in clause for clause in _self_filter_sql_clauses(
                 frame, None, "All", "All", platinum_events=False,
