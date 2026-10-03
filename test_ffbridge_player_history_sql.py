@@ -51,6 +51,33 @@ def _history_frame() -> pl.DataFrame:
 
 
 class PlayerHistorySqlTests(unittest.TestCase):
+    def test_history_matches_stored_id_not_a_colliding_lancelot_id(self) -> None:
+        frame = _history_frame().head(2)
+        frame = pl.concat(
+            [
+                frame.with_columns(
+                    pl.lit("220380").alias("player2_id"),
+                    pl.lit("Hubert BRAMI").alias("pair_name"),
+                ),
+                frame.with_columns(
+                    pl.lit("88780").alias("player2_id"),
+                    pl.lit("Jeannine Bensamoun").alias("pair_name"),
+                ),
+            ]
+        )
+        with patch.object(
+            reports,
+            "load_results",
+            return_value=(frame, {"built_at": "2026-10-03T12:16:10Z"}),
+        ), patch(
+            "ffbridge_report_service.stored_ffbridge_player_ids",
+            return_value=["220380"],
+        ):
+            payload = reports.run_player_history("220380", limit=10)
+        names = {row["pair_name"] for row in payload["sessions"]}
+        self.assertEqual(names, {"Hubert BRAMI"})
+        self.assertEqual(payload["total_sessions"], 2)
+
     def test_schema_lists_national_scratch_rank(self) -> None:
         with patch.object(
             reports,

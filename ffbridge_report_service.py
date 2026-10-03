@@ -21,7 +21,7 @@ import polars as pl
 
 from elo_filter_common import (
     _ffbridge_index_helpers,
-    expand_ffbridge_player_numbers,
+    stored_ffbridge_player_ids,
     filter_ffbridge_leaderboard,
     filter_fuzzy_text,
     filter_normalized_substring,
@@ -123,6 +123,7 @@ SERIES_NAMES = {
     140: "Armour du Bridge",
     384: "Simultanet",
     386: "Simultane Octopus",
+    499: "Simultane du Comite du Val de Seine",
     604: "Atout Simultane",
     868: "Festival des Simultanes",
 }
@@ -1715,10 +1716,10 @@ def _player_history_frame(
     results_df, meta = load_results(api_key, fetch_iv)
     results_df = filter_valid_percentages(results_df)
     if pid:
-        aliases = expand_ffbridge_player_numbers([pid]) or [pid]
+        stored_ids = stored_ffbridge_player_ids([pid]) or [pid]
         player_expr = (
-            pl.col("player1_id").cast(pl.Utf8).is_in(aliases)
-            | pl.col("player2_id").cast(pl.Utf8).is_in(aliases)
+            pl.col("player1_id").cast(pl.Utf8).is_in(stored_ids)
+            | pl.col("player2_id").cast(pl.Utf8).is_in(stored_ids)
         )
         all_sessions = results_df.filter(player_expr)
     else:

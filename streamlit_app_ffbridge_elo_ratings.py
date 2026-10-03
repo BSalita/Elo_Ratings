@@ -105,7 +105,7 @@ from elo_common import (
 )
 
 # Import FFBridge-specific utilities
-from elo_ffbridge_common import normalize_series_id
+from elo_ffbridge_common import dedupe_session_pair_results, normalize_series_id
 from elo_filter_common import filter_ffbridge_leaderboard
 
 # Import API adapters
@@ -1183,6 +1183,7 @@ def process_tournaments_to_elo(
             if _FFBRIDGE_DEBUG:
                 print(f"[Processing] {i+1}/{total_t}: ID={t_id} - no results, skipping", flush=True)
             continue
+        results = dedupe_session_pair_results(results)
         
         # Calculate field average rating for both scratch and handicap
         scratch_field_ratings = []

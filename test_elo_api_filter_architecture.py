@@ -11,11 +11,13 @@ from ffbridge_report_service import (
     report_rank_window,
     resolve_series_id,
 )
+from elo_ffbridge_common import dedupe_session_pair_results
 from elo_filter_common import (
     acbl_date_from_for_range,
     filter_acbl_leaderboard,
     filter_ffbridge_leaderboard,
     normalize_acbl_date_range,
+    stored_id_from_person,
 )
 
 
@@ -83,8 +85,8 @@ class SharedFilterTests(unittest.TestCase):
             }
         )
         with patch(
-            "elo_filter_common.expand_ffbridge_player_numbers",
-            return_value=["9500754", "246273", "597539"],
+            "elo_filter_common.stored_ffbridge_player_ids",
+            return_value=["597539"],
         ):
             actual = filter_ffbridge_leaderboard(
                 source,
@@ -101,8 +103,8 @@ class SharedFilterTests(unittest.TestCase):
             }
         )
         with patch(
-            "elo_filter_common.expand_ffbridge_player_numbers",
-            return_value=["9500754", "246273", "597539"],
+            "elo_filter_common.stored_ffbridge_player_ids",
+            return_value=["597539"],
         ):
             actual = filter_ffbridge_leaderboard(
                 source,
@@ -110,6 +112,44 @@ class SharedFilterTests(unittest.TestCase):
                 player_number="9500754",
             )
         self.assertEqual(actual["Pair_ID"].to_list(), ["597539-111"])
+
+    def test_stored_id_uses_classic_when_lancelot_id_collides(self) -> None:
+        stored = stored_id_from_person(
+            {
+                "classic_person_id": "220380",
+                "lancelot_person_id": "88780",
+                "license_number": "2528307",
+            },
+            "2528307",
+        )
+        self.assertEqual(stored, "220380")
+
+    def test_duplicate_lancelot_teams_keep_the_better_rank(self) -> None:
+        results = [
+            {
+                "player1_id": "180844",
+                "player2_id": "220380",
+                "team_id": "14917595",
+                "National_Scratch_Rank": 55,
+            },
+            {
+                "player1_id": "220380",
+                "player2_id": "180844",
+                "team_id": "14883842",
+                "National_Scratch_Rank": 54,
+            },
+            {
+                "player1_id": "1",
+                "player2_id": "2",
+                "team_id": "9",
+                "National_Scratch_Rank": 1,
+            },
+        ]
+        kept = dedupe_session_pair_results(results)
+        self.assertEqual(len(kept), 2)
+        brami = next(row for row in kept if row["player1_id"] in {"180844", "220380"})
+        self.assertEqual(brami["National_Scratch_Rank"], 54)
+        self.assertEqual(brami["team_id"], "14883842")
 
     def test_ffbridge_tournament_and_club_filters_are_fuzzy(self) -> None:
         source = pl.DataFrame(

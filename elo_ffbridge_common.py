@@ -13,7 +13,7 @@ import re
 import sys
 import pathlib
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 # Shared FFBridge API client + converters. Prefer ./mlBridge (Docker clone),
 # else ../mlBridge (monorepo). The package root (mlBridge's parent) goes on
@@ -63,6 +63,7 @@ SERIES_NAMES = {
     140: "Armour du Bridge",
     384: "Simultanet",
     386: "Simultane Octopus",
+    499: "Simultane du Comite du Val de Seine",
     604: "Atout Simultane",
     868: "Festival des Simultanes",
     "all": "All Tournaments"
@@ -119,7 +120,7 @@ def fill_missing_score_ranks(results: list[dict[str, Any]]) -> None:
                     row[rank_column] = ranks[float(row[pct_column])]
 
 # List of all valid tournament series IDs
-VALID_SERIES_IDS = [3, 4, 5, 140, 384, 386, 604, 868]
+VALID_SERIES_IDS = [3, 4, 5, 140, 384, 386, 499, 604, 868]
 
 
 # -------------------------------
@@ -262,6 +263,65 @@ def load_from_disk_cache(
     except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
         logger.warning("Cache read failed for %s → %s: %s", identifier, cache_path, exc)
         return None
+
+
+def _positive_rank(result: Dict[str, Any], column: str) -> Optional[int]:
+    try:
+        number = int(result.get(column))
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return number
+
+
+def _prefer_duplicate_pair_row(candidate: Dict[str, Any], current: Dict[str, Any]) -> bool:
+    """True when candidate should replace current for the same player pair.
+
+    Lancelot can publish two team ids for one pair in a session, one rank
+    place apart. Keep the better official rank. A later team id breaks ties.
+    """
+    for column in ("National_Scratch_Rank", "National_Handicap_Rank"):
+        candidate_rank = _positive_rank(candidate, column)
+        current_rank = _positive_rank(current, column)
+        if candidate_rank is not None and current_rank is not None and candidate_rank != current_rank:
+            return candidate_rank < current_rank
+        if candidate_rank is not None and current_rank is None:
+            return True
+        if candidate_rank is None and current_rank is not None:
+            return False
+    return str(candidate.get("team_id") or "") > str(current.get("team_id") or "")
+
+
+def dedupe_session_pair_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep one ranking row per player pair inside a single session."""
+    chosen: Dict[tuple[str, str], Dict[str, Any]] = {}
+    order: List[tuple[str, str] | int] = []
+    passthrough: List[Dict[str, Any]] = []
+    for index, result in enumerate(results):
+        player1 = str(result.get("player1_id") or "").strip()
+        player2 = str(result.get("player2_id") or "").strip()
+        if not player1 or not player2:
+            passthrough.append(result)
+            order.append(index)
+            continue
+        key = tuple(sorted((player1, player2)))
+        previous = chosen.get(key)
+        if previous is None:
+            chosen[key] = result
+            order.append(key)
+            continue
+        if _prefer_duplicate_pair_row(result, previous):
+            chosen[key] = result
+    deduped: List[Dict[str, Any]] = []
+    seen_passthrough = 0
+    for item in order:
+        if isinstance(item, int):
+            deduped.append(passthrough[seen_passthrough])
+            seen_passthrough += 1
+        else:
+            deduped.append(chosen[item])
+    return deduped
 
 
 # -------------------------------

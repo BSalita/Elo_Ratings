@@ -173,6 +173,55 @@ def expand_ffbridge_player_numbers(tokens: Sequence[str]) -> list[str]:
     return expand_player_aliases(persons, cleaned)
 
 
+def _clean_person_id(value: object) -> str:
+    text = str(value or "").strip()
+    if text.casefold() in {"none", "null", "nan"}:
+        return ""
+    return text
+
+
+def stored_id_from_person(person: Optional[dict], token: str) -> str:
+    """Id written to player1_id and player2_id for this person.
+
+    The Elo builder stores classic migrationId when Lancelot sends one, and
+    the Lancelot id otherwise. License numbers stay out of that column.
+    """
+    if not person:
+        return token
+    classic = _clean_person_id(person.get("classic_person_id"))
+    lancelot = _clean_person_id(person.get("lancelot_person_id"))
+    return classic or lancelot or token
+
+
+def stored_ffbridge_player_ids(tokens: Sequence[str]) -> list[str]:
+    """Resolve each token to the single id stored on Elo result rows.
+
+    A number that is two people's ids raises ValueError from the persons
+    index. When the index is unavailable, the tokens are returned unchanged.
+    """
+    cleaned = [str(token).strip() for token in tokens if str(token).strip()]
+    if not cleaned:
+        return []
+    helpers = _ffbridge_index_helpers()
+    if helpers is None:
+        return list(dict.fromkeys(cleaned))
+    _, load_persons = helpers
+    try:
+        persons = load_persons()
+    except (FileNotFoundError, OSError, ValueError):
+        return list(dict.fromkeys(cleaned))
+    from mlBridge.mlBridgeFFIndexLib import lookup_person
+
+    stored: list[str] = []
+    seen: set[str] = set()
+    for token in cleaned:
+        chosen = stored_id_from_person(lookup_person(persons, token), token)
+        if chosen and chosen not in seen:
+            seen.add(chosen)
+            stored.append(chosen)
+    return stored
+
+
 def _pair_contains_number_expr(column: str, numbers: Sequence[str]) -> pl.Expr:
     parts = (
         pl.col(column)
@@ -349,8 +398,8 @@ def filter_ffbridge_leaderboard(
     number_token = (player_number or "").strip()
     if number_token and not number_token.isdigit():
         raise ValueError("player_number must contain digits only")
-    aliases = (
-        expand_ffbridge_player_numbers([number_token]) if number_token else None
+    stored_ids = (
+        stored_ffbridge_player_ids([number_token]) if number_token else None
     )
     result = filter_identity_table(
         df,
@@ -362,12 +411,12 @@ def filter_ffbridge_leaderboard(
         pair_name_column="Pair_Name",
         pair_id_column="Pair_ID",
     )
-    if not aliases or result.is_empty():
+    if not stored_ids or result.is_empty():
         return result
     if rating_type == "Players":
         if "Player_ID" not in result.columns:
             raise ValueError("Missing identity column 'Player_ID'")
-        return result.filter(pl.col("Player_ID").cast(pl.Utf8).is_in(aliases))
+        return result.filter(pl.col("Player_ID").cast(pl.Utf8).is_in(stored_ids))
     if "Pair_ID" not in result.columns:
         raise ValueError("Missing identity column 'Pair_ID'")
-    return result.filter(_pair_contains_number_expr("Pair_ID", aliases))
+    return result.filter(_pair_contains_number_expr("Pair_ID", stored_ids))
