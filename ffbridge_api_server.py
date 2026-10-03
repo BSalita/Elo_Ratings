@@ -111,6 +111,8 @@ def leaderboard_report(
     date_range: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
+    sort_by: str | None = Query(None),
+    sort_descending: bool | None = Query(None),
 ) -> dict:
     """Return filtered Elo rows with role-aware bridge-quality metrics."""
     tournament_filters = [
@@ -148,6 +150,8 @@ def leaderboard_report(
         date_range=date_range,
         date_from=date_from,
         date_to=date_to,
+        sort_by=sort_by,
+        sort_descending=sort_descending,
     )
 
 

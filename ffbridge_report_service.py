@@ -61,6 +61,7 @@ _QUALITY_METRIC_COLUMNS = (
     "par_contract_rate",
     "sacrifice_rate",
     "dd_tricks_diff_avg",
+    "dd_tricks_declared",
 )
 _QUALITY_OUTPUT_COLUMNS = (
     "Quality_Rank",
@@ -71,7 +72,101 @@ _QUALITY_OUTPUT_COLUMNS = (
     "Sacrifice_Rate_Pct",
     "Sacrifice_Rank",
     "DD_Tricks_Diff_Avg",
+    "DD_Tricks_Declared",
     "DD_Tricks_Diff_Rank",
+)
+
+# Default direction: higher is better, except ranks and dispersion.
+_LEADERBOARD_SORT_ASCENDING = frozenset({
+    "Rank",
+    "Quality_Rank",
+    "Par_Suit_Rank",
+    "Par_Contract_Rank",
+    "Sacrifice_Rank",
+    "DD_Tricks_Diff_Rank",
+    "Pct_Stdev",
+    "Clone_SD",
+    "Title",
+    "Scratch_Title",
+})
+LEADERBOARD_SORT_COLUMNS = (
+    "Rank",
+    "Player_Elo",
+    "HC_Player_Elo",
+    "Player_Elo_Raw",
+    "HC_Player_Elo_Raw",
+    "Pair_Elo",
+    "HC_Pair_Elo",
+    "Pair_Elo_Raw",
+    "HC_Pair_Elo_Raw",
+    "Title",
+    "Scratch_Title",
+    "Provisional_Games",
+    "Avg_Scratch",
+    "Avg_Handicap",
+    "Avg_IV_Bonus",
+    "Pct_Stdev",
+    "Games",
+    "Clone_Elo",
+    "Clone_Pct",
+    "Clone_SD",
+    "Clone_N",
+    "Clone_Partners",
+    "Partner_Effect",
+    "Clone_Status",
+    *_QUALITY_OUTPUT_COLUMNS,
+)
+_DEFAULT_ELO_SORTS = frozenset({
+    "Rank",
+    "Player_Elo",
+    "HC_Player_Elo",
+    "Pair_Elo",
+    "HC_Pair_Elo",
+})
+LEADERBOARD_SORT_FAVORITES = (
+    {
+        "id": "Rank_Declarers_By_Tricks_DD",
+        "title": "Rank declarers by Tricks-DD (club, period)",
+        "help": (
+            "Call ffbridge_top_players_v2 with sort_by=DD_Tricks_Diff_Avg, "
+            "sort_descending=true, plus club, date_range, and min_games. "
+            "Do not recompute Tricks-DD from board rows."
+        ),
+        "statements": [],
+        "tool": "ffbridge_top_players_v2",
+        "arguments": {
+            "sort_by": "DD_Tricks_Diff_Avg",
+            "sort_descending": True,
+        },
+    },
+    {
+        "id": "Most_Consistent_Players",
+        "title": "Most consistent players (lowest SD)",
+        "help": (
+            "Call ffbridge_top_players_v2 with sort_by=Pct_Stdev and "
+            "sort_descending=false, plus club, date_range, and min_games."
+        ),
+        "statements": [],
+        "tool": "ffbridge_top_players_v2",
+        "arguments": {
+            "sort_by": "Pct_Stdev",
+            "sort_descending": False,
+        },
+    },
+    {
+        "id": "Best_Par_Contract_Rate",
+        "title": "Best par-contract rate",
+        "help": (
+            "Call ffbridge_top_players_v2 with sort_by=Par_Contract_Rate_Pct "
+            "and sort_descending=true, plus club, date_range, and min_games."
+        ),
+        "statements": [],
+        "tool": "ffbridge_top_players_v2",
+        "arguments": {
+            "sort_by": "Par_Contract_Rate_Pct",
+            "sort_descending": True,
+        },
+    },
 )
 
 # ACBL-style rolling windows, plus FFBridge season years (ratings reset July 1).
@@ -101,15 +196,62 @@ def report_rank_window(
     *,
     player_name: Optional[str] = None,
     player_number: Optional[str] = None,
+    full_population: bool = False,
 ) -> int:
-    """Rank the full population when looking up a named or numbered player.
+    """Rank the full population when a later filter or sort would hide rows.
 
-    Identity filters run after the leaderboard SQL. A Top-N slice of 250
-    would hide a player at rank 251+, so look-ups must rank everyone first.
+    Identity filters and non-Elo sorts run after the leaderboard SQL. A
+    Top-N slice of 250 would hide a player ranked below that Elo cutoff.
     """
-    if (player_name or "").strip() or (player_number or "").strip():
+    if (
+        full_population
+        or (player_name or "").strip()
+        or (player_number or "").strip()
+    ):
         return max(int(top_n), int(population_size))
     return int(top_n)
+
+
+def leaderboard_sort_spec(
+    sort_by: Optional[str],
+    sort_descending: Optional[bool],
+) -> Optional[tuple[str, bool]]:
+    """Return (column, descending) when the caller asked for a non-Elo order.
+
+    None keeps the SQL order, which is published Elo. An unknown column
+    raises ValueError.
+    """
+    column = (sort_by or "").strip()
+    if not column:
+        return None
+    if column not in LEADERBOARD_SORT_COLUMNS:
+        raise ValueError(
+            f"Unknown sort_by {column!r}; valid: {list(LEADERBOARD_SORT_COLUMNS)}"
+        )
+    if column in _DEFAULT_ELO_SORTS and sort_descending is not False:
+        return None
+    if sort_descending is None:
+        descending = column not in _LEADERBOARD_SORT_ASCENDING
+    else:
+        descending = bool(sort_descending)
+    return column, descending
+
+
+def order_leaderboard(
+    table: pl.DataFrame,
+    sort_by: Optional[str],
+    sort_descending: Optional[bool],
+) -> pl.DataFrame:
+    """Sort a finished leaderboard. Blanks stay last in either direction."""
+    spec = leaderboard_sort_spec(sort_by, sort_descending)
+    if spec is None or table.is_empty():
+        return table
+    column, descending = spec
+    if column not in table.columns:
+        raise ValueError(
+            f"Cannot sort by {column!r}; this leaderboard has {table.columns}"
+        )
+    return table.sort(column, descending=descending, nulls_last=True)
 
 API_BACKEND_KEYS = {
     "FFBridge Classic API": "FFBridge_Classic_API",
@@ -611,6 +753,10 @@ def _attach_quality_sidecar(
         how="left",
         validate="m:1",
     )
+    if "dd_tricks_declared" not in joined.columns:
+        joined = joined.with_columns(
+            pl.lit(None, dtype=pl.UInt32).alias("dd_tricks_declared")
+        )
     joined = joined.with_columns(
         pl.col("par_suit_rate")
         .rank(method="min", descending=True)
@@ -659,6 +805,9 @@ def _attach_quality_sidecar(
         .alias("Par_Contract_Rate_Pct"),
         (pl.col("sacrifice_rate") * 100).round(1).alias("Sacrifice_Rate_Pct"),
         pl.col("dd_tricks_diff_avg").round(2).alias("DD_Tricks_Diff_Avg"),
+        pl.col("dd_tricks_declared").cast(pl.Int32, strict=False).alias(
+            "DD_Tricks_Declared"
+        ),
     )
     return joined.drop([*_QUALITY_METRIC_COLUMNS, "_quality_score"]).select(
         *leaderboard.columns,
@@ -1313,6 +1462,8 @@ def run_leaderboard_report(
     date_range: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_descending: Optional[bool] = None,
     api_key: Optional[str] = None,
     fetch_iv: bool = True,
 ) -> Dict[str, Any]:
@@ -1366,11 +1517,13 @@ def run_leaderboard_report(
 
     name_token = (player_name or "").strip()
     number_token = (player_number or "").strip()
+    sort_spec = leaderboard_sort_spec(sort_by, sort_descending)
     rank_window = report_rank_window(
         top_n,
         results_df.height,
         player_name=name_token,
         player_number=number_token,
+        full_population=sort_spec is not None,
     )
     if rating == "Players":
         table, sql, prior_anchor = run_top_players_favorite(
@@ -1392,6 +1545,7 @@ def run_leaderboard_report(
         player_name=name_token,
         player_number=number_token,
     )
+    table = order_leaderboard(table, sort_by, sort_descending)
     if table.height > top_n:
         table = table.head(top_n)
 
@@ -1400,6 +1554,8 @@ def run_leaderboard_report(
         "rating": rating,
         "score": score,
         "top_n": top_n,
+        "sort_by": None if sort_spec is None else sort_spec[0],
+        "sort_descending": None if sort_spec is None else sort_spec[1],
         "min_games": min_games,
         "prior_sessions": prior_sessions,
         "prior_anchor": prior_anchor,
@@ -1437,7 +1593,15 @@ def list_favorites(favorite_id: str | None = None) -> Dict[str, Any]:
     if wanted:
         items = [item for item in items if item["id"] == wanted]
         if not items:
+            items = [
+                item
+                for item in LEADERBOARD_SORT_FAVORITES
+                if item["id"] == wanted or item["title"] == wanted
+            ]
+        if not items:
             raise KeyError(f"Unknown favorite id {wanted!r}")
+    else:
+        items = [*items, *LEADERBOARD_SORT_FAVORITES]
     return {"organization": "ffbridge", "count": len(items), "favorites": items}
 
 

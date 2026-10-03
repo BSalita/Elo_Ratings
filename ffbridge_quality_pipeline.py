@@ -63,6 +63,10 @@ QUALITY_METRIC_DEFINITIONS = {
         "formula": "mean(Tricks - DD_Tricks)",
         "attribution": "declarer only; declaring partnership in pair reports",
     },
+    "DD_Tricks_Declared": {
+        "formula": "count of boards where Tricks-DD is defined",
+        "attribution": "declarer only; declaring partnership in pair reports",
+    },
     "Par_Contract_Rate_Pct": {
         "formula": "success percentage derived from +1 when directional DD score >= directional par, otherwise -1",
         "attribution": "both partnerships on every board",
@@ -1005,6 +1009,11 @@ def _quality_aggregates(frame: pl.DataFrame, id_column: str) -> pl.DataFrame:
             pl.col("_dd_tricks_diff").cast(pl.Float64).mean().alias(
                 "dd_tricks_diff_avg"
             ),
+            pl.col("_dd_tricks_diff")
+            .is_not_null()
+            .sum()
+            .cast(pl.UInt32)
+            .alias("dd_tricks_declared"),
         )
         .with_columns(
             _rank_desc("par_suit_rate", "Par_Suit_Rank"),

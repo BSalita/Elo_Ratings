@@ -416,6 +416,41 @@ def test_identical_reports_are_singleflight_cached(monkeypatch) -> None:
     assert results == [{"top_n": 10}] * 6
 
 
+def test_tricks_dd_sort_outranks_elo_and_keeps_nulls_last() -> None:
+    table = pl.DataFrame(
+        {
+            "Player_ID": ["1", "2", "3"],
+            "Rank": [1, 2, 3],
+            "Player_Elo": [2000, 1500, 1400],
+            "DD_Tricks_Diff_Avg": [0.1, 1.5, None],
+            "Pct_Stdev": [8.0, 2.0, 1.0],
+        }
+    )
+    declarers = reports.order_leaderboard(table, "DD_Tricks_Diff_Avg", None)
+    assert declarers.get_column("Player_ID").to_list() == ["2", "1", "3"]
+    consistent = reports.order_leaderboard(table, "Pct_Stdev", False)
+    assert consistent.get_column("Player_ID").to_list() == ["3", "2", "1"]
+    assert reports.leaderboard_sort_spec("Player_Elo", None) is None
+    assert reports.report_rank_window(250, 900, full_population=True) == 900
+
+
+def test_declared_board_count_ignores_boards_without_tricks_dd() -> None:
+    from ffbridge_quality_pipeline import _quality_aggregates
+
+    frame = pl.DataFrame(
+        {
+            "player_id": ["1", "1", "1"],
+            "session_id": ["a", "a", "b"],
+            "_par_suit_hit": [1.0, 0.0, None],
+            "_par_contract_score": [1.0, -1.0, 1.0],
+            "_sacrifice_hit": [None, 1.0, None],
+            "_dd_tricks_diff": [2.0, None, -1.0],
+        }
+    )
+    aggregated = _quality_aggregates(frame, "player_id")
+    assert aggregated.get_column("dd_tricks_declared").to_list() == [2]
+
+
 def test_schema_v1_quality_cache_is_rejected(tmp_path) -> None:
     _write_quality_cache(tmp_path)
     (tmp_path / reports.QUALITY_METADATA_PATH.name).write_text(

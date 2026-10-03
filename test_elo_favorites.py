@@ -325,7 +325,16 @@ class CatalogTests(unittest.TestCase):
         listed = ffbridge_list_favorites()
         self.assertEqual(listed["organization"], "ffbridge")
         ids = {item["id"] for item in listed["favorites"]}
-        self.assertEqual(ids, {"Top_Players", "Top_Pairs"})
+        self.assertEqual(
+            ids,
+            {
+                "Top_Players",
+                "Top_Pairs",
+                "Rank_Declarers_By_Tricks_DD",
+                "Most_Consistent_Players",
+                "Best_Par_Contract_Rate",
+            },
+        )
         ff_sql = next(
             item["statements"][0]["sql"]
             for item in listed["favorites"]
