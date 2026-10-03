@@ -1717,6 +1717,17 @@ def health() -> dict:
         "dual_frame_cache": runtime.get("dual_frame_cache"),
         "cached_frame_gb": round(_cached_frame_bytes() / (1024 ** 3), 2),
         "build_tag": API_BUILD_TAG,
+        "recent_club_games": {
+            "sql_view": "recent_club_games",
+            "path": r"e:/bridge/data/acbl/recent/board_results.parquet",
+            "available": pathlib.Path(
+                r"e:/bridge/data/acbl/recent/board_results.parquet"
+            ).is_file(),
+            "note": (
+                "Scores and contracts newer than the augmented parquet. "
+                "Table self remains the historical Elo boards."
+            ),
+        },
         "skill_gate": {
             "disabled_at_or_below": SKILL_GATE_DISABLED,
             "defaults": {

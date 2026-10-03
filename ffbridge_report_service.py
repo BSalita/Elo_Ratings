@@ -799,6 +799,22 @@ def dataset_info(api_key: Optional[str] = None, fetch_iv: bool = True) -> Dict[s
             {"series_id": series_id, "name": name}
             for series_id, name in SERIES_NAMES.items()
         ],
+        "recent_club_games": _recent_club_games_info(),
+    }
+
+
+def _recent_club_games_info() -> Dict[str, Any]:
+    path = pathlib.Path(
+        r"e:/bridge/data/ffbridge/recent/ffbridge_boards_recent.parquet"
+    )
+    return {
+        "sql_view": "recent_club_games",
+        "available": path.is_file(),
+        "path": str(path) if path.is_file() else None,
+        "note": (
+            "Board scores newer than the quality parquet. Query this view "
+            "for those rows. Table self remains the historical Elo set."
+        ),
     }
 
 
