@@ -2019,6 +2019,16 @@ def acbl_sql(
                 con, full_df, source_path, parsed_date_from, online_filter, strata,
                 platinum_events=platinum_events,
             )
+            if club_or_tournament == "club":
+                recent_games = pathlib.Path(
+                    r"e:/bridge/data/acbl/recent/board_results.parquet"
+                )
+                if recent_games.is_file():
+                    recent_sql = str(recent_games).replace("'", "''")
+                    con.execute(
+                        "CREATE OR REPLACE VIEW recent_club_games AS "
+                        f"SELECT * FROM read_parquet('{recent_sql}')"
+                    )
             try:
                 shrinkage_meta = _load_shrinkage_meta(club_or_tournament)
                 anchor_kind = "player" if rating_type == "Players" else "pair"

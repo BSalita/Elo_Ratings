@@ -1660,6 +1660,15 @@ def _register_club_board_results(connection: duckdb.DuckDBPyConnection, sql: str
     else:
         view_sql = f"SELECT * FROM read_parquet('{escaped}')"
     connection.execute(f"CREATE VIEW {CLUB_BOARD_RESULTS_TABLE} AS {view_sql}")
+    recent_games = pathlib.Path(
+        r"e:/bridge/data/ffbridge/recent/ffbridge_boards_recent.parquet"
+    )
+    if recent_games.is_file():
+        recent_sql = str(recent_games).replace("'", "''")
+        connection.execute(
+            "CREATE OR REPLACE VIEW recent_club_games AS "
+            f"SELECT * FROM read_parquet('{recent_sql}')"
+        )
 
 
 def _normalize_history_date(value: Optional[str], *, field: str) -> Optional[str]:

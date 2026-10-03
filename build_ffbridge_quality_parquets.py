@@ -228,6 +228,24 @@ def main(argv: list[str] | None = None) -> int:
                 ],
                 how="vertical",
             ).sort(["Date", "session_id", "Board", "board_id"])
+        if board_quality.height and "Date" in board_quality.columns:
+            newest = board_quality.select(
+                pl.col("Date").cast(pl.String).str.slice(0, 10).max()
+            ).item()
+            if newest:
+                from ffbridge_recent_update import DEFAULT_RECENT, upsert_boards
+
+                dropped_through = date.fromisoformat(str(newest)[:10])
+                upsert_boards(
+                    DEFAULT_RECENT,
+                    pl.DataFrame(),
+                    historical_max=dropped_through,
+                )
+                print(
+                    f"[quality-builder] recent store keeps sessions after {dropped_through.isoformat()}",
+                    flush=True,
+                )
+
         metadata_result = write_quality_artifacts(
             board_quality,
             output_dir,
