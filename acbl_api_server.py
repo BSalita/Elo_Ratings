@@ -50,7 +50,7 @@ DATA_ROOT = pathlib.Path(
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-09-20-elo-favorites"
+API_BUILD_TAG = "2026-10-06-par-sacrifice-columns"
 
 QUALITY_METRIC_DEFINITIONS = {
     "DD_Tricks_Diff_Avg": {
@@ -78,8 +78,29 @@ QUALITY_METRIC_DEFINITIONS = {
             "Declarations where the declaring direction's Par_Declarer is negative; "
             "credited to the declaring pair and both pair members."
         ),
-        "calculation": "Hit when DD_Score_Declarer equals negative Par_Declarer.",
+        "calculation": (
+            "Among rows where Par_Declarer < 0 (Is_Sacrifice_Opportunity), "
+            "a hit is DD_Score_Declarer equal to Par_Declarer."
+        ),
     },
+}
+
+# Board columns on Elo table self, or deliberately absent from it.
+# Kept separate from QUALITY_METRIC_DEFINITIONS, which is the leaderboard set.
+BOARD_COLUMN_NOTES = {
+    "Is_Sacrifice_Opportunity": (
+        "On Elo table self. True when Par_Declarer < 0. "
+        "Sacrifice_Rate_Pct is the share of those rows whose "
+        "DD_Score_Declarer equals Par_Declarer."
+    ),
+    "Par_Contract_NS": (
+        "Not on Elo table self. On the augmented board-results parquet and "
+        "ACBL postmortem frames: +1 when DD_Score_NS >= Par_NS, otherwise -1."
+    ),
+    "Par_Contract_EW": (
+        "Not on Elo table self. On the augmented board-results parquet and "
+        "ACBL postmortem frames: +1 when DD_Score_EW >= Par_EW, otherwise -1."
+    ),
 }
 
 # Module-level caches to avoid re-reading parquet files on every request.
@@ -1737,6 +1758,7 @@ def health() -> dict:
             "enabled_by_default": True,
         },
         "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
+        "board_column_notes": BOARD_COLUMN_NOTES,
     }
 
 
@@ -1945,6 +1967,7 @@ def acbl_report(
                     "metric": "pool z-score of DD_Tricks_Diff + Par_Suit + Par_Contract",
                 },
                 "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
+        "board_column_notes": BOARD_COLUMN_NOTES,
                 "platinum_events": {
                     "applied": bool(platinum_events),
                     "event_count": (
@@ -2010,7 +2033,11 @@ def acbl_sql(
     min_skill_z: float | None = Query(None, ge=-100.0, le=5.0),
     platinum_events: bool = Query(False),
 ) -> dict:
-    """Run SELECT/WITH SQL against the filtered board-level DuckDB table ``self``."""
+    """Run SELECT/WITH SQL against the filtered board-level DuckDB table ``self``.
+
+    ``self`` includes ``Is_Sacrifice_Opportunity`` (true when ``Par_Declarer`` < 0).
+    ``Par_Contract_NS`` and ``Par_Contract_EW`` are not on this table.
+    """
     with _REPORT_LOCK:
         try:
             _reject_club_platinum(club_or_tournament, platinum_events)
