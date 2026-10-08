@@ -2399,6 +2399,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
         return
     score_type = st.session_state.get("elo_score_type", "Scratch")
     use_handicap = score_type == "Handicap"
+    session_count_note = " (handicapped only)" if use_handicap else ""
     results_df = _filter_score_available(ctx["results_df"], use_handicap)
     quality_players, quality_pairs, quality_status = (
         _cached_filtered_quality_sidecars(results_df)
@@ -2640,7 +2641,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                 detail_df = player_results.select(cols_to_select + helper_cols)
 
                                 st.caption(
-                                    f"{detail_df.height} sessions — click a session "
+                                    f"{detail_df.height} sessions{session_count_note} — click a session "
                                     "to see tournament opponents"
                                 )
                                 st.markdown("#### Sessions")
@@ -2834,7 +2835,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                 detail_df = pair_results.select(cols_to_select + helper_cols)
 
                                 st.caption(
-                                    f"{detail_df.height} sessions — click a session "
+                                    f"{detail_df.height} sessions{session_count_note} — click a session "
                                     "to see tournament opponents"
                                 )
                                 st.markdown("#### Sessions")
