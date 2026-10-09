@@ -526,6 +526,29 @@ def _aggrid_key_part(value: str) -> str:
     return re.sub(r"[^\w\-]", "_", (value or "").strip())[:48]
 
 
+def _grid_player_ids(raw_id) -> list[str]:
+    """Ids to match against player1_id and player2_id for a clicked grid row.
+
+    AgGrid may return a numeric id, including a trailing ``.0``. The Elo rows
+    store the classic id as text. Map through the persons index when it is
+    available so a Lancelot id still finds those rows.
+    """
+    text = "" if raw_id is None else str(raw_id).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    if not text or text.lower() in {"none", "nan", "<na>"}:
+        return []
+    from elo_filter_common import stored_ffbridge_player_ids
+
+    stored = stored_ffbridge_player_ids([text])
+    ids: list[str] = []
+    for token in [*stored, text]:
+        token = str(token)
+        if token and token not in ids:
+            ids.append(token)
+    return ids
+
+
 def _leaderboard_aggrid_key(
     entity: str,
     rating_type: str,
@@ -537,10 +560,13 @@ def _leaderboard_aggrid_key(
     player_number_filter: str,
     prior_sessions: int,
     date_range_choice: str = "All time",
+    score_type: str = "Scratch",
 ) -> str:
-    # Omit Scratch/Handicap so H/S toggles update the same AgGrid instance.
+    # Scratch and Handicap use different columns (Player_Elo vs HC_Player_Elo).
+    # One shared grid keeps the other mode's sort and drops the row click, so
+    # the session list never opens.
     return (
-        f"ff_{entity}_table_{rating_type}_{simultaneous_type}_"
+        f"ff_{entity}_table_{rating_type}_{score_type}_{simultaneous_type}_"
         f"club_{_aggrid_key_part(club_filter)}_top{top_n}_min{min_games}_"
         f"name_{_aggrid_key_part(name_filter)}_"
         f"number_{_aggrid_key_part(player_number_filter)}_prior{prior_sessions}_"
@@ -2532,7 +2558,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                         "players", rating_type, simultaneous_type,
                         club_filter, top_n, min_games, name_filter,
                         player_number_filter, int(prior_sessions),
-                        date_range_choice,
+                        date_range_choice, score_type,
                     )
                     _load_debug_log(f"leaderboard panel: rendering AgGrid ({top_players.height} rows)")
                     grid_response = build_selectable_aggrid(
@@ -2543,15 +2569,14 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                     selected_rows = grid_response.get('selected_rows', None)
                     if selected_rows is not None and len(selected_rows) > 0:
                         selected_row = selected_rows.iloc[0] if hasattr(selected_rows, 'iloc') else selected_rows[0]
-                        player_id = selected_row.get('Player_ID')
+                        player_ids = _grid_player_ids(selected_row.get('Player_ID'))
                         player_name = selected_row.get('Player_Name', 'Unknown')
+                        player_id = player_ids[0] if player_ids else None
 
-                        if player_id and not results_df.is_empty():
+                        if player_ids and not results_df.is_empty():
                             st.markdown(f"#### Session History: **{player_name}** ({player_id})")
-                            player_results = results_df.filter(
-                                (pl.col('player1_id') == str(player_id)) | 
-                                (pl.col('player2_id') == str(player_id))
-                            ).sort('date', descending=True)
+                            id_match = pl.col('player1_id').cast(pl.Utf8).is_in(player_ids) | pl.col('player2_id').cast(pl.Utf8).is_in(player_ids)
+                            player_results = results_df.filter(id_match).sort('date', descending=True)
 
                             if not player_results.is_empty():
                                 cols_to_select = [
@@ -2753,7 +2778,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                         "pairs", rating_type, simultaneous_type,
                         club_filter, top_n, min_games, name_filter,
                         player_number_filter, int(prior_sessions),
-                        date_range_choice,
+                        date_range_choice, score_type,
                     )
                     _load_debug_log(f"leaderboard panel: rendering AgGrid ({top_pairs.height} rows)")
                     grid_response = build_selectable_aggrid(

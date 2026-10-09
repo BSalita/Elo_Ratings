@@ -11,6 +11,8 @@ import elo_ffbridge_lancelot as lancelot
 import ffbridge_report_service as reports
 from streamlit_app_ffbridge_elo_ratings import (
     _ffbridge_results_url_expr,
+    _grid_player_ids,
+    _leaderboard_aggrid_key,
     _move_url_columns_to_end,
     _results_cache_has_group_link_schema,
 )
@@ -162,6 +164,24 @@ class FFBridgeResultsUrlTests(unittest.TestCase):
                 schema={"tournament_id": pl.String},
             ).write_parquet(path)
             self.assertFalse(_results_cache_has_group_link_schema(path))
+
+
+class FFBridgeScratchGridTests(unittest.TestCase):
+    def test_scratch_and_handicap_leaderboards_are_different_grids(self) -> None:
+        args = ("players", "Players", "all", "", 250, 10, "", "", 50, "All time")
+        scratch = _leaderboard_aggrid_key(*args, "Scratch")
+        handicap = _leaderboard_aggrid_key(*args, "Handicap")
+        self.assertNotEqual(scratch, handicap)
+        self.assertIn("Scratch", scratch)
+        self.assertIn("Handicap", handicap)
+
+    def test_clicked_player_id_matches_stored_text_id(self) -> None:
+        with patch(
+            "elo_filter_common.stored_ffbridge_player_ids",
+            return_value=["597539"],
+        ):
+            self.assertEqual(_grid_player_ids("597539.0"), ["597539"])
+            self.assertEqual(_grid_player_ids(None), [])
 
 
 if __name__ == "__main__":
