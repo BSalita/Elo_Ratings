@@ -5,6 +5,8 @@ set "ffbridge_quality_source=e:\bridge\data\ffbridge\quality_cache"
 set "ffbridge_quality_destination=%shared%\ffbridge\quality_cache"
 set "ffbridge_hier_source=e:\bridge\data\ffbridge\postmortem_archive_hierarchical"
 set "ffbridge_hier_destination=%shared%\ffbridge\postmortem_archive_hierarchical"
+set "ffbridge_models_source=e:\bridge\data\ffbridge\SavedModels"
+set "ffbridge_models_destination=%shared%\ffbridge\SavedModels"
 
 rem Publish into the sibling src\data hub. Start scripts mount that tree.
 rem postmortem_start.ps1 owns _wslc_host\SavedModels.
@@ -56,6 +58,12 @@ if not exist "%ffbridge_hier_source%\manifest.parquet" exit /b 1
 "%pub_py%" "%~dp0publish_ffbridge_hierarchical.py" --source "%ffbridge_hier_source%" --destination "%ffbridge_hier_destination%"
 if errorlevel 1 exit /b 1
 
+if exist "%ffbridge_models_source%\" (
+    if not exist "%ffbridge_models_destination%\" mkdir "%ffbridge_models_destination%"
+    xcopy "%ffbridge_models_source%\*" "%ffbridge_models_destination%\" /D /Y /I
+    if errorlevel 1 exit /b 1
+)
+
 rem Publish the same artifacts to prod src\data. Do not /MIR — that would
 rem replace _wslc_host, which postmortem_start.ps1 stages for the mount.
 set "prod_elo=\\X1-pro-470-1tb\c\sw\bridge\ML-Contract-Bridge\src\data"
@@ -93,5 +101,10 @@ for %%F in (
 )
 "%pub_py%" "%~dp0publish_ffbridge_hierarchical.py" --source "%ffbridge_hier_source%" --destination "%prod_elo%\ffbridge\postmortem_archive_hierarchical"
 if errorlevel 1 exit /b 1
+if exist "%ffbridge_models_destination%\" (
+    if not exist "%prod_elo%\ffbridge\SavedModels\" mkdir "%prod_elo%\ffbridge\SavedModels"
+    xcopy "%ffbridge_models_destination%\*" "%prod_elo%\ffbridge\SavedModels\" /D /Y /I
+    if errorlevel 1 exit /b 1
+)
 
 exit /b 0
