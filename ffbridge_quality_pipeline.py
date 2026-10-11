@@ -6,11 +6,13 @@ choose an output directory before any artifact is written.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import logging
 import os
 import pathlib
 import re
+import shutil
 import sys
 import threading
 import time
@@ -24,6 +26,10 @@ import requests
 
 
 SCHEMA_VERSION = 2
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+_NATIVE_IMPORT_ATTEMPTS = 4
 DEFAULT_SOURCE_DIR = pathlib.Path(r"E:\bridge\data\ffbridge\data")
 DEFAULT_CUTOFF = date.today()
 DEFAULT_DISCOVERY_START = date(2026, 1, 1)
@@ -1595,6 +1601,106 @@ def _dd_tricks_expr() -> pl.Expr:
     return expr
 
 
+def _path_attributes(path: pathlib.Path) -> int:
+    try:
+        return int(getattr(path.stat(), "st_file_attributes", 0))
+    except OSError:
+        return 0
+
+
+def _native_modules_need_local_stage(path: pathlib.Path) -> bool:
+    """Windows blocks unsigned extensions loaded through the OneDrive reparse point."""
+    try:
+        resolved = str(path.resolve()).lower()
+    except OSError:
+        resolved = str(path).lower()
+    if "onedrive" in resolved:
+        return True
+    return bool(
+        _path_attributes(path)
+        & (
+            _FILE_ATTRIBUTE_REPARSE_POINT
+            | _FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+        )
+    )
+
+
+def _native_stage_site() -> pathlib.Path:
+    root = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or "."
+    return pathlib.Path(root) / "ffbridge-native" / "site-packages"
+
+
+def _binary_stamp(paths: Sequence[pathlib.Path]) -> str:
+    rows: list[str] = []
+    for root in paths:
+        if not root.exists():
+            continue
+        files = [root] if root.is_file() else sorted(root.rglob("*"))
+        for file in files:
+            if not file.is_file() or file.suffix.lower() not in {".dll", ".pyd"}:
+                continue
+            stat = file.stat()
+            modified = getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))
+            rows.append(f"{file.name}:{stat.st_size}:{modified}")
+    return "\n".join(rows)
+
+
+def _stage_native_distributions() -> pathlib.Path | None:
+    spec = importlib.util.find_spec("pyarrow")
+    if spec is None or not spec.origin:
+        return None
+    source_site = pathlib.Path(spec.origin).resolve().parent.parent
+    package = source_site / "pyarrow"
+    if not package.is_dir() or not _native_modules_need_local_stage(package):
+        return None
+    dest_site = _native_stage_site()
+    dest_site.mkdir(parents=True, exist_ok=True)
+    sources = [package]
+    libs = source_site / "pyarrow.libs"
+    if libs.is_dir():
+        sources.append(libs)
+    stamp_path = dest_site / ".pyarrow.stamp"
+    stamp = _binary_stamp(sources)
+    if not stamp_path.is_file() or stamp_path.read_text(encoding="utf-8") != stamp:
+        print(
+            "[quality-builder] staging PyArrow off OneDrive so Windows "
+            f"Application Control can load it from {dest_site}",
+            flush=True,
+        )
+        for source in sources:
+            dest = dest_site / source.name
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(source, dest)
+        copied_sizes = {
+            row.rsplit(":", 2)[0] + ":" + row.rsplit(":", 2)[1]
+            for row in _binary_stamp(
+                [dest_site / source.name for source in sources]
+            ).splitlines()
+        }
+        source_sizes = {
+            row.rsplit(":", 2)[0] + ":" + row.rsplit(":", 2)[1]
+            for row in stamp.splitlines()
+        }
+        if copied_sizes != source_sizes:
+            raise RuntimeError(
+                f"Staged PyArrow at {dest_site} does not match the installed binaries"
+            )
+        stamp_path.write_text(stamp, encoding="utf-8")
+    staged = str(dest_site)
+    if staged not in sys.path:
+        sys.path.insert(0, staged)
+    return dest_site
+
+
+def _purge_failed_native_imports() -> None:
+    prefixes = ("mlBridge", "pandas", "pyarrow")
+    for name in list(sys.modules):
+        if name in prefixes or name.startswith(tuple(f"{prefix}." for prefix in prefixes)):
+            del sys.modules[name]
+
+
 def _import_mlbridge() -> tuple[Any, Any]:
     here = pathlib.Path(__file__).resolve().parent
     mlbridge_root = next(
@@ -1603,12 +1709,23 @@ def _import_mlbridge() -> tuple[Any, Any]:
     )
     if mlbridge_root is None:
         raise FileNotFoundError("mlBridge not found at ./mlBridge or ../mlBridge")
+    _stage_native_distributions()
     if str(mlbridge_root.parent) not in sys.path:
         sys.path.insert(0, str(mlbridge_root.parent))
-    from mlBridge import mlBridgeFFLib  # type: ignore
-    from mlBridge import mlBridgeAugmentLib  # type: ignore
+    last_error: ImportError | None = None
+    for attempt in range(_NATIVE_IMPORT_ATTEMPTS):
+        try:
+            from mlBridge import mlBridgeFFLib  # type: ignore
+            from mlBridge import mlBridgeAugmentLib  # type: ignore
 
-    return mlBridgeFFLib, mlBridgeAugmentLib
+            return mlBridgeFFLib, mlBridgeAugmentLib
+        except ImportError as exc:
+            last_error = exc
+            if "DLL load failed" not in str(exc) or attempt + 1 == _NATIVE_IMPORT_ATTEMPTS:
+                raise
+            _purge_failed_native_imports()
+            time.sleep(2 ** attempt)
+    raise last_error  # pragma: no cover
 
 
 def _par_rows_from_embedded_dd(frame: pl.DataFrame, augment_lib: Any) -> pl.DataFrame:
