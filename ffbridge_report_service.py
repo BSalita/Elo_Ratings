@@ -1809,14 +1809,39 @@ def _run_history_sql_via_stats(
     }
 
 
-def _register_club_board_results(connection: duckdb.DuckDBPyConnection, sql: str) -> None:
-    if not _SQL_TABLE_NAME.search(sql):
-        return
-    path = resolve_club_board_results_path()
-    if path is None:
-        raise FileNotFoundError(CLUB_BOARD_RESULTS_TABLE)
-    escaped = str(path).replace("'", "''")
-    schema_names = set(pl.read_parquet_schema(str(path)).keys())
+# Keep in sync with bridgestats-ffbridge bridgestatslib. A rebuilt club file
+# stores a compass letter in Declarer and overtrick text in Result.
+_DECLARER_PLAYER_SQL = (
+    "CASE WHEN CAST(Declarer AS VARCHAR) IN ('N', 'E', 'S', 'W', 'O', '-', '') "
+    "OR Declarer IS NULL THEN CASE REPLACE(CAST(Declarer_Direction AS VARCHAR), 'O', 'W') "
+    "WHEN 'N' THEN CAST(Player_ID_N AS VARCHAR) "
+    "WHEN 'E' THEN CAST(Player_ID_E AS VARCHAR) "
+    "WHEN 'S' THEN CAST(Player_ID_S AS VARCHAR) "
+    "WHEN 'W' THEN CAST(Player_ID_W AS VARCHAR) "
+    "ELSE CAST(Declarer AS VARCHAR) END "
+    "ELSE CAST(Declarer AS VARCHAR) END"
+)
+_RESULT_OVERTRICK_SQL = (
+    "CASE WHEN Result IS NULL OR TRIM(CAST(Result AS VARCHAR)) "
+    "IN ('', '=', '0', '+0', '-0', '-') THEN 0 "
+    "ELSE TRY_CAST(REPLACE(TRIM(CAST(Result AS VARCHAR)), '+', '') AS INTEGER) END"
+)
+
+
+def _club_board_results_view_sql(escaped: str, schema_names: set, sql: str) -> str:
+    replacements = []
+    if {
+        "Declarer",
+        "Declarer_Direction",
+        "Player_ID_N",
+        "Player_ID_E",
+        "Player_ID_S",
+        "Player_ID_W",
+    }.issubset(schema_names):
+        replacements.append(f"{_DECLARER_PLAYER_SQL} AS Declarer")
+    if "Result" in schema_names:
+        replacements.append(f"{_RESULT_OVERTRICK_SQL} AS Result")
+    additions = []
     if re.search(r"\bContract\b", sql, re.IGNORECASE) and "Contract" not in schema_names:
         missing = [
             name
@@ -1828,18 +1853,33 @@ def _register_club_board_results(connection: duckdb.DuckDBPyConnection, sql: str
                 "Contract is not stored and cannot be fabricated; "
                 f"missing {', '.join(missing)}"
             )
-        view_sql = (
-            "SELECT src.*, "
+        additions.append(
             "CASE WHEN BidLvl IS NULL OR BidLvl = 0 THEN 'PASS' "
             "ELSE CAST(BidLvl AS VARCHAR) "
             "|| COALESCE(CAST(BidSuit AS VARCHAR), '') "
             "|| COALESCE(CAST(Dbl AS VARCHAR), '') "
             "|| COALESCE(CAST(Declarer_Direction AS VARCHAR), '') "
-            "END AS Contract "
-            f"FROM read_parquet('{escaped}') AS src"
+            "END AS Contract"
         )
-    else:
-        view_sql = f"SELECT * FROM read_parquet('{escaped}')"
+    select = "src.*"
+    if replacements:
+        select += " REPLACE (" + ", ".join(replacements) + ")"
+    if additions:
+        select += ", " + ", ".join(additions)
+    if replacements or additions:
+        return f"SELECT {select} FROM read_parquet('{escaped}') AS src"
+    return f"SELECT * FROM read_parquet('{escaped}')"
+
+
+def _register_club_board_results(connection: duckdb.DuckDBPyConnection, sql: str) -> None:
+    if not _SQL_TABLE_NAME.search(sql):
+        return
+    path = resolve_club_board_results_path()
+    if path is None:
+        raise FileNotFoundError(CLUB_BOARD_RESULTS_TABLE)
+    escaped = str(path).replace("'", "''")
+    schema_names = set(pl.read_parquet_schema(str(path)).keys())
+    view_sql = _club_board_results_view_sql(escaped, schema_names, sql)
     connection.execute(f"CREATE VIEW {CLUB_BOARD_RESULTS_TABLE} AS {view_sql}")
     recent_games = pathlib.Path(
         r"e:/bridge/data/ffbridge/recent/ffbridge_boards_recent.parquet"

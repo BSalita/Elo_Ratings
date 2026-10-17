@@ -197,6 +197,46 @@ class PlayerHistorySqlTests(unittest.TestCase):
         self.assertEqual(payload["row_count"], 2)
         self.assertAlmostEqual(payload["rows"][0]["mean_declarer_pct"], 0.8)
 
+    def test_join_rewrites_compass_declarer_and_result_text(self) -> None:
+        boards = pl.DataFrame(
+            {
+                "session_id": ["280000"],
+                "Declarer": ["N"],
+                "Declarer_Direction": ["N"],
+                "Player_ID_N": ["246273"],
+                "Player_ID_E": ["1"],
+                "Player_ID_S": ["2"],
+                "Player_ID_W": ["3"],
+                "Result": ["+2"],
+                "Declarer_Pct": [0.7],
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / reports.CLUB_BOARD_RESULTS_FILENAME
+            boards.write_parquet(path)
+            with patch.object(
+                reports,
+                "load_results",
+                return_value=(_history_frame(), {"built_at": "2026-09-08T00:00:00Z"}),
+            ), patch.dict(
+                "os.environ",
+                {"FFBRIDGE_STATS_CLUB_BOARD_RESULTS": str(path)},
+                clear=False,
+            ):
+                payload = reports.run_player_history_sql(
+                    "246273",
+                    """
+                    SELECT s.Declarer, s.Result
+                    FROM self h
+                    LEFT JOIN club_board_results s
+                      ON s.session_id = h.tournament_id
+                    WHERE h.tournament_id = '280000'
+                    LIMIT 5
+                    """,
+                )
+        self.assertEqual(payload["rows"][0]["Declarer"], "246273")
+        self.assertEqual(payload["rows"][0]["Result"], 2)
+
     def test_join_fabricates_contract_on_request(self) -> None:
         boards = pl.DataFrame(
             {
