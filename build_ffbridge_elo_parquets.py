@@ -27,6 +27,7 @@ What a rebuild does (and does NOT) refresh
 - Event RESULTS (raw data): INCREMENTAL. Lancelot rankings from the last 14 days
   and unpublished zero shells expire after six hours because FFBridge revises
   row counts, bonuses, and theoretical ranks after initial publication.
+  If that refresh times out, the last cached ranking is kept.
 - Elo ratings: FULL recompute from scratch over the entire history every time
   (``initial_players=None``). Elo is order-dependent, so a newly inserted event
   can shift the whole downstream chain — ratings are replayed, not appended.

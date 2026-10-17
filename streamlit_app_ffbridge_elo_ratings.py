@@ -3107,6 +3107,7 @@ def main():
         generate_pdf = st.button("Export Report to PDF File", width='stretch')
         st.caption("PDF uses the leaderboard's last column sort.")
         st.sidebar.markdown('<p style="color: #ffc107; font-weight: 600;">Other Morty websites</p>', unsafe_allow_html=True)
+        st.sidebar.markdown("[Bridge Chatbot](https://chat.7nt.info)")
         st.sidebar.markdown("[ACBL Elo Ratings](https://acbl-elo.7nt.info)")
         st.sidebar.markdown("[ACBL Postmortem](https://acbl.postmortem.chat)")
         st.sidebar.markdown("[ACBL Statistics](https://acbl-stats.7nt.info)")
