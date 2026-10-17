@@ -94,6 +94,7 @@ from elo_common import (
     LEADERBOARD_SORT_MODEL_KEY,
     NUMERIC_NULLS_LAST_COMPARATOR_JS,
     init_url_params_to_state,
+    split_player_query,
     leaderboard_aggrid_viewport_height,
     LEADERBOARD_PAGE_SIZE,
     LEADERBOARD_ROW_HEIGHT,
@@ -3025,19 +3026,22 @@ def main():
         )
         club_filter = "" if selected_club == _ALL_CLUBS_LABEL else selected_club
         
-        # Independent name and player-number filters.
-        name_filter = st.text_input(
-            "Filter by player name",
-            key="elo_name_filter",
-            placeholder="Fuzzy name match...",
-            help="Case-insensitive partial match; for pairs, matches either partner's name.",
+        if "elo_player_query" not in st.session_state:
+            number = str(st.session_state.get("elo_player_number_filter") or "").strip()
+            name = str(st.session_state.get("elo_name_filter") or "").strip()
+            st.session_state.elo_player_query = number or name
+        player_query = st.text_input(
+            "Player number or name",
+            key="elo_player_query",
+            placeholder="9500754 or Robert Salita",
+            help=(
+                "One box. Digits match a license, Lancelot, or Classic/migration ID. "
+                "Anything else is a fuzzy name. For pairs, either partner matches."
+            ),
         )
-        player_number_filter = st.text_input(
-            "Filter by player number",
-            key="elo_player_number_filter",
-            placeholder="Exact player number...",
-            help="Digits-only exact match on license, Lancelot, or Classic/migration ID; for pairs, matches either partner.",
-        )
+        name_filter, player_number_filter = split_player_query(player_query)
+        st.session_state.elo_name_filter = name_filter
+        st.session_state.elo_player_number_filter = player_number_filter
 
         date_range_choice = st.selectbox(
             "Date range",

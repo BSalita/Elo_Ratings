@@ -715,6 +715,14 @@ def coerce_int(min_value: int | None = None, max_value: int | None = None, step:
     return _parse
 
 
+def split_player_query(query: str) -> tuple[str, str]:
+    """Split one sidebar box into a name filter and a number filter."""
+    text = (query or "").strip()
+    if text.isdigit():
+        return "", text
+    return text, ""
+
+
 def init_url_params_to_state(
     st_module,
     params_config: dict,

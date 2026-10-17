@@ -79,6 +79,7 @@ from elo_common import (
     default_min_skill_z,
     NUMERIC_NULLS_LAST_COMPARATOR_JS,
     init_url_params_to_state,
+    split_player_query,
     leaderboard_aggrid_viewport_height,
     LEADERBOARD_PAGE_SIZE,
     LEADERBOARD_ROW_HEIGHT,
@@ -1686,22 +1687,23 @@ def main():
             st.session_state.show_main_content = True
             st.session_state.content_mode = 'table'
 
-        player_name_filter = st.text_input(
-            "Filter by player name",
-            value=st.session_state.get("player_name_filter", ""),
-            placeholder="Fuzzy name match...",
-            help="Case-insensitive partial match; for pairs, matches either partner's name.",
-            key="player_name_filter",
+        if "acbl_player_query" not in st.session_state:
+            number = str(st.session_state.get("player_number_filter") or "").strip()
+            name = str(st.session_state.get("player_name_filter") or "").strip()
+            st.session_state.acbl_player_query = number or name
+        player_query = st.text_input(
+            "Player number or name",
+            placeholder="2663279 or Robert Salita",
+            help=(
+                "One box. Digits match an ACBL number. "
+                "Anything else is a fuzzy name. For pairs, either partner matches."
+            ),
+            key="acbl_player_query",
             on_change=_on_player_filter_enter,
         )
-        player_number_filter = st.text_input(
-            "Filter by player number",
-            value=st.session_state.get("player_number_filter", ""),
-            placeholder="Exact player number...",
-            help="Digits-only exact match; for pairs, matches either partner's player number.",
-            key="player_number_filter",
-            on_change=_on_player_filter_enter,
-        )
+        player_name_filter, player_number_filter = split_player_query(player_query)
+        st.session_state.player_name_filter = player_name_filter
+        st.session_state.player_number_filter = player_number_filter
         
         # Date range quick filter (default All time)
         date_range_choice = st.selectbox(
