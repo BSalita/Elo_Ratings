@@ -1589,6 +1589,16 @@ def main():
             """,
             unsafe_allow_html=True,
         )
+        st.sidebar.markdown(
+            (
+                '<div style="display:flex;align-items:center;gap:0.6rem;margin:0 0 0.75rem 0;">'
+                f'<img src="{ASSISTANT_LOGO_URL}" alt="Morty" width="40" height="40" '
+                'style="width:2.5rem;height:2.5rem;border-radius:50%;flex:0 0 auto;">'
+                '<div style="font-size:1.05rem;font-weight:700;line-height:1.25;">ACBL Elo Ratings</div>'
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
         st.sidebar.caption(f"Build:{st.session_state.app_datetime}")
         st.sidebar.markdown("🔗 [What is Elo Rating?](https://en.wikipedia.org/wiki/Elo_rating_system)")
         club_or_tournament = st.radio(
