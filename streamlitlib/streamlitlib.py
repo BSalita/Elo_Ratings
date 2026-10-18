@@ -9,12 +9,42 @@ def print_to_log_debug(*args):
 def print_to_log(level, *args):
     logging.log(level, ' '.join(str(arg) for arg in args))
 
+import pathlib
+
 import streamlit as st
 import pandas as pd
 import polars as pl
 import matplotlib.pyplot as plt
 import seaborn as sns
 from st_aggrid import GridOptionsBuilder, AgGrid, GridUpdateMode, DataReturnMode, ColumnsAutoSizeMode, AgGridTheme, JsCode
+
+_ROW_CLICK_HOURGLASS_JS = (
+    pathlib.Path(__file__).with_name("row_click_hourglass.js").read_text(encoding="utf-8")
+)
+
+
+def _ranking_row_click_jscode() -> JsCode:
+    return JsCode(
+        "function(params) {\n"
+        + _ROW_CLICK_HOURGLASS_JS
+        + "\narmRankingRowHourglass(document);\n"
+        + "try { armRankingRowHourglass(window.parent.document); } catch (err) {}\n"
+        + "}\n"
+    )
+
+
+def clear_row_click_hourglass() -> None:
+    """Drop the hourglass once the rerun's grids have painted."""
+    import streamlit.components.v1 as components
+
+    components.html(
+        "<script>\n"
+        + _ROW_CLICK_HOURGLASS_JS
+        + "\ntry { clearRankingRowHourglassWhenGridsPaint(window.parent.document); } catch (err) {}\n"
+        + "</script>",
+        height=0,
+        width=0,
+    )
 import threading
 import time
 import queue
@@ -218,7 +248,7 @@ def plot_heatmap(cross_table, fmt='.2f', xlabel=None, ylabel=None, zlabel=None, 
 # AgGrid doesn't handle Series.
 # st.dataframe is incredibly slow when displaying color styles per cell. Haven't been able to find a way to display alternating row colors, only per cell styling.
 # st.table has huge row size.
-def ShowDataFrameTable(table_df,key=None,output_method='aggrid',color_column=None,ngroup_name=None,round=2,tooltips=None,height_rows=None):
+def ShowDataFrameTable(table_df,key=None,output_method='aggrid',color_column=None,ngroup_name=None,round=2,tooltips=None,height_rows=None,hourglass_on_row_click=False):
 
     # seems like everthing requires a pandas dataframe. table_df.style() doesn't work with polars.
     if isinstance(table_df, pl.DataFrame):
@@ -281,6 +311,8 @@ def ShowDataFrameTable(table_df,key=None,output_method='aggrid',color_column=Non
                 };
             """.replace('ngroup_name',ngroup_name)
             gridOptions['getRowStyle'] = JsCode(jscode)
+        if hourglass_on_row_click:
+            gridOptions['onRowClicked'] = _ranking_row_click_jscode()
         if round: # a bit dangerous as it introduces a hidden side-effect of modifying the dataframe by rounding.
             for col in table_df.select_dtypes('float'): # rounding or {:,.2f} only works on float64!
                 table_df[col] = table_df[col].astype('float64').round(round)
