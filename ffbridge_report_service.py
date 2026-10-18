@@ -128,12 +128,12 @@ LEADERBOARD_SORT_FAVORITES = (
         "id": "Rank_Declarers_By_Tricks_DD",
         "title": "Rank declarers by Tricks-DD (club, period)",
         "help": (
-            "Call ffbridge_top_players_v2 with sort_by=DD_Tricks_Diff_Avg, "
+            "Call ffbridge_top_players with sort_by=DD_Tricks_Diff_Avg, "
             "sort_descending=true, plus club, date_range, and min_games. "
             "Do not recompute Tricks-DD from board rows."
         ),
         "statements": [],
-        "tool": "ffbridge_top_players_v2",
+        "tool": "ffbridge_top_players",
         "arguments": {
             "sort_by": "DD_Tricks_Diff_Avg",
             "sort_descending": True,
@@ -143,11 +143,11 @@ LEADERBOARD_SORT_FAVORITES = (
         "id": "Most_Consistent_Players",
         "title": "Most consistent players (lowest SD)",
         "help": (
-            "Call ffbridge_top_players_v2 with sort_by=Pct_Stdev and "
+            "Call ffbridge_top_players with sort_by=Pct_Stdev and "
             "sort_descending=false, plus club, date_range, and min_games."
         ),
         "statements": [],
-        "tool": "ffbridge_top_players_v2",
+        "tool": "ffbridge_top_players",
         "arguments": {
             "sort_by": "Pct_Stdev",
             "sort_descending": False,
@@ -157,11 +157,11 @@ LEADERBOARD_SORT_FAVORITES = (
         "id": "Best_Par_Contract_Rate",
         "title": "Best par-contract rate",
         "help": (
-            "Call ffbridge_top_players_v2 with sort_by=Par_Contract_Rate_Pct "
+            "Call ffbridge_top_players with sort_by=Par_Contract_Rate_Pct "
             "and sort_descending=true, plus club, date_range, and min_games."
         ),
         "statements": [],
-        "tool": "ffbridge_top_players_v2",
+        "tool": "ffbridge_top_players",
         "arguments": {
             "sort_by": "Par_Contract_Rate_Pct",
             "sort_descending": True,
