@@ -135,7 +135,7 @@ def scale_elo_to_chess_range(current_elo: float,
 3. Consider adjusting DEFAULT_ELO to 1200 for new players
 
 ### Phase 3: Validation
-1. Compare scaled ratings to actual performance
+1. Compare scaled ratings to actual performance (see `ELO_RANK_BENCHMARK.md`)
 2. Ensure top players map to appropriate levels (1800-2000+)
 3. Ensure bottom players map appropriately (1200-1400)
 
