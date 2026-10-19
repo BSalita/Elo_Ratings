@@ -174,11 +174,36 @@ class FFBridgeSessionRankingServiceTests(unittest.TestCase):
         self.assertEqual(payload["field_size"], 12)
         self.assertEqual(payload["club_code"], CLUB_CODE)
         salita = _salita(payload["rows"])
-        self.assertEqual(salita["scratch_pct"], 61.57)
+        self.assertEqual(salita["scratch_pct"], 61.74)
         self.assertEqual(salita["scratch_rank"], 2)
-        self.assertEqual(salita["handicap_pct"], 71.57)
+        self.assertEqual(salita["handicap_pct"], 71.74)
         self.assertEqual(salita["handicap_rank"], 1)
+        self.assertEqual(salita["national_scratch_rank"], 7)
+        self.assertEqual(salita["national_handicap_rank"], 1)
+        self.assertEqual(salita["organizer_scratch_pct"], 61.57)
+        self.assertEqual(salita["organizer_scratch_rank"], 2)
+        self.assertEqual(salita["organizer_handicap_pct"], 71.57)
+        self.assertEqual(salita["organizer_handicap_rank"], 1)
         self.assertEqual(salita["field_size"], 12)
+
+    def test_club_scope_ranks_national_scores_without_organizer_tables(self) -> None:
+        frame = _session_frame().with_columns(
+            pl.lit(None, dtype=pl.Float64).alias(name)
+            for name in ("Club_Scratch_Pct", "Club_Handicap_Pct")
+        ).with_columns(
+            pl.lit(None, dtype=pl.Int64).alias(name)
+            for name in ("Club_Scratch_Rank", "Club_Handicap_Rank")
+        )
+        payload = rankings.get_session_ranking(
+            SESSION_ID, scope="club", club_code=CLUB_CODE, results_df=frame, meta={},
+        )
+        self.assertEqual(payload["field_size"], 12)
+        self.assertEqual([row["scratch_rank"] for row in payload["rows"]], list(range(1, 13)))
+        salita = _salita(payload["rows"])
+        self.assertEqual(salita["scratch_pct"], 61.74)
+        self.assertEqual(salita["scratch_rank"], 2)
+        self.assertEqual(salita["handicap_rank"], 1)
+        self.assertIsNone(salita["organizer_scratch_pct"])
 
     def test_api_registers_session_ranking_route(self) -> None:
         paths = {route.path for route in ffbridge_api_server.app.routes}

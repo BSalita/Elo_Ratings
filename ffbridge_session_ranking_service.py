@@ -54,8 +54,8 @@ def _rank(value: Any) -> int | None:
     return int(value)
 
 
-def _row(entry: Mapping[str, Any], *, prefix: str, field_size: int) -> dict[str, Any]:
-    return {
+def _row(entry: Mapping[str, Any], *, club_scope: bool, field_size: int) -> dict[str, Any]:
+    row = {
         "team_id": entry.get("team_id"),
         "player1_id": entry.get("player1_id"),
         "player2_id": entry.get("player2_id"),
@@ -64,13 +64,23 @@ def _row(entry: Mapping[str, Any], *, prefix: str, field_size: int) -> dict[str,
         "player1_name": entry.get("player1_name"),
         "player2_name": entry.get("player2_name"),
         "club_code": entry.get("club_code"),
-        "scratch_pct": _round_pct(entry.get(f"{prefix}_Scratch_Pct")),
-        "scratch_rank": _rank(entry.get(f"{prefix}_Scratch_Rank")),
+        "scratch_pct": _round_pct(entry.get("National_Scratch_Pct")),
+        "scratch_rank": _rank(entry.get("_Scratch_Rank")),
         "iv_bonus": _round_pct(entry.get("iv_bonus")),
-        "handicap_pct": _round_pct(entry.get(f"{prefix}_Handicap_Pct")),
-        "handicap_rank": _rank(entry.get(f"{prefix}_Handicap_Rank")),
+        "handicap_pct": _round_pct(entry.get("National_Handicap_Pct")),
+        "handicap_rank": _rank(entry.get("_Handicap_Rank")),
         "field_size": field_size,
     }
+    if club_scope:
+        row.update({
+            "national_scratch_rank": _rank(entry.get("National_Scratch_Rank")),
+            "national_handicap_rank": _rank(entry.get("National_Handicap_Rank")),
+            "organizer_scratch_pct": _round_pct(entry.get("Club_Scratch_Pct")),
+            "organizer_scratch_rank": _rank(entry.get("Club_Scratch_Rank")),
+            "organizer_handicap_pct": _round_pct(entry.get("Club_Handicap_Pct")),
+            "organizer_handicap_rank": _rank(entry.get("Club_Handicap_Rank")),
+        })
+    return row
 
 
 def get_session_ranking(
@@ -137,19 +147,31 @@ def get_session_ranking(
                 f"No Elo results for session {sid} club {wanted_club}"
             )
 
-    prefix = "Club" if normalized_scope == "club" else "National"
-    rank_column = f"{prefix}_Scratch_Rank"
-    if rank_column in session.columns:
+    # Club scope ranks the national percentages among the club's pairs, the
+    # same way the postmortem prediction rankings do. Organizer club tables
+    # exist only for Octopus and Simultanet, so they are reported separately.
+    club_scope = normalized_scope == "club"
+    ranks = []
+    for kind in ("Scratch", "Handicap"):
+        pct, rank = f"National_{kind}_Pct", f"National_{kind}_Rank"
+        if club_scope and pct in session.columns:
+            ranks.append(
+                pl.col(pct).rank("min", descending=True).cast(pl.Int64).alias(f"_{kind}_Rank")
+            )
+        elif rank in session.columns:
+            ranks.append(pl.col(rank).alias(f"_{kind}_Rank"))
+    session = session.with_columns(ranks)
+    if "_Scratch_Rank" in session.columns:
         session = session.sort(
             [
-                pl.col(rank_column).is_null(),
-                pl.col(rank_column),
+                pl.col("_Scratch_Rank").is_null(),
+                pl.col("_Scratch_Rank"),
                 pl.col("team_id").cast(pl.Utf8),
             ]
         )
     field_size = session.height
     rows = [
-        _row(entry, prefix=prefix, field_size=field_size)
+        _row(entry, club_scope=club_scope, field_size=field_size)
         for entry in session.to_dicts()
     ]
     first = session.row(0, named=True) if field_size else {}
