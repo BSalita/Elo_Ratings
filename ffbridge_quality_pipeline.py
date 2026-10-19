@@ -19,7 +19,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import polars as pl
 import requests
@@ -39,6 +39,8 @@ PAIR_FILENAME = "ffbridge_quality_pairs.parquet"
 METADATA_FILENAME = "ffbridge_quality_metadata.json"
 FRAGMENT_DIRNAME = "session_fragments"
 HRS_CACHE_FILENAME = "ffbridge_hand_records_cache.parquet"
+AUDIT_MANIFEST_FILENAME = "ffbridge_cache_audit.json"
+IDENTITY_CACHE_FILENAME = "ffbridge_identity_map.json"
 _EV_SUMMARY_RE = re.compile(r"^EV_(NS|EW)_[NESW]_[SHDCN]_[1-7]_(V|NV)$")
 _EV_PAIR_MAX_RE = re.compile(r"^EV_(NS|EW)_(V|NV)_Max$")
 SEATS = ("N", "E", "S", "W")
@@ -381,17 +383,59 @@ def _ranking_team_ids(ranking: Any, path: pathlib.Path) -> tuple[str, ...]:
     return tuple(sorted(ns_ids or ids))
 
 
+def default_audit_manifest_path(source_dir: pathlib.Path | None = None) -> pathlib.Path:
+    return pathlib.Path(source_dir or DEFAULT_SOURCE_DIR).parent / AUDIT_MANIFEST_FILENAME
+
+
+def _load_audit_manifest(path: pathlib.Path) -> dict[str, tuple[str, ...]]:
+    if not path.is_file():
+        return {}
+    payload = _read_json(path)
+    return {
+        str(session_id): tuple(str(team_id) for team_id in team_ids)
+        for session_id, team_ids in payload["complete_sessions"].items()
+    }
+
+
 def audit_historical_cache(
     source_dir: pathlib.Path = DEFAULT_SOURCE_DIR,
     training_parquet: pathlib.Path | None = None,
     cutoff: date = DEFAULT_CUTOFF,
+    *,
+    manifest_path: pathlib.Path | None = None,
+    metadata: Mapping[str, tuple[date, pathlib.Path, dict[str, Any]]] | None = None,
 ) -> AuditReport:
+    """Compare session metadata with the raw ranking/team-score cache.
+
+    Raw files never change once a session is complete, so ``manifest_path``
+    records complete sessions and their team IDs; later audits reuse them
+    instead of re-reading every ranking and checking every team-score file.
+    """
     source_dir = pathlib.Path(source_dir)
     training_path = training_parquet or source_dir / "ffbridge_training_data_df.parquet"
     covered = training_session_ids(training_path)
-    metadata = load_session_metadata(source_dir, cutoff)
+    if metadata is None:
+        metadata = load_session_metadata(source_dir, cutoff)
+    known = _load_audit_manifest(manifest_path) if manifest_path is not None else {}
     audited: list[SessionAudit] = []
     for session_id, (session_date, metadata_path, _) in metadata.items():
+        if session_date > cutoff:
+            continue
+        known_team_ids = known.get(session_id)
+        if known_team_ids is not None:
+            audited.append(
+                SessionAudit(
+                    session_id=session_id,
+                    session_date=session_date.isoformat(),
+                    metadata_path=str(metadata_path),
+                    in_training=session_id in covered,
+                    ranking_present=True,
+                    expected_team_ids=known_team_ids,
+                    present_team_ids=known_team_ids,
+                    missing_team_ids=(),
+                )
+            )
+            continue
         ranking_path = source_dir / "results" / "sessions" / session_id / "ranking.json"
         ranking_present = ranking_path.is_file()
         team_ids = _ranking_team_ids(_read_json(ranking_path), ranking_path) if ranking_present else ()
@@ -422,6 +466,23 @@ def audit_historical_cache(
             )
         )
     audited.sort(key=lambda item: (item.session_date, item.session_id))
+    if manifest_path is not None:
+        complete = {
+            session.session_id: session.expected_team_ids
+            for session in audited
+            if session.complete
+        }
+        if any(known.get(session_id) != team_ids for session_id, team_ids in complete.items()):
+            merged = {**known, **complete}
+            _atomic_write_json(
+                {
+                    "complete_sessions": {
+                        session_id: list(team_ids)
+                        for session_id, team_ids in sorted(merged.items())
+                    }
+                },
+                manifest_path,
+            )
     return AuditReport(
         source_dir=str(source_dir),
         cutoff=cutoff.isoformat(),
@@ -941,12 +1002,32 @@ def normalize_training_parquet(
     return apply_identity_map(normalized, identity_map or {})
 
 
-def load_identity_map(report: AuditReport) -> dict[str, str]:
-    """Load Lancelot-to-Elo aliases from every cached ranking in the audit."""
+def default_identity_cache_path(source_dir: pathlib.Path | None = None) -> pathlib.Path:
+    return pathlib.Path(source_dir or DEFAULT_SOURCE_DIR).parent / IDENTITY_CACHE_FILENAME
+
+
+def load_identity_map(
+    report: AuditReport,
+    cache_path: pathlib.Path | None = None,
+) -> dict[str, str]:
+    """Load Lancelot-to-Elo aliases from every cached ranking in the audit.
+
+    The merge keeps the one non-self alias per ID whatever the order, so
+    ``cache_path`` stores the merged map plus the sessions it covers and
+    only rankings of sessions added since are read.
+    """
     source_dir = pathlib.Path(report.source_dir)
+    wanted = {session.session_id for session in report.sessions if session.ranking_present}
     aliases: dict[str, str] = {}
+    covered: set[str] = set()
+    if cache_path is not None and cache_path.is_file():
+        cached = _read_json(cache_path)
+        cached_sessions = {str(session_id) for session_id in cached["sessions"]}
+        if cached_sessions <= wanted:
+            aliases = {str(key): str(value) for key, value in cached["aliases"].items()}
+            covered = cached_sessions
     for session in report.sessions:
-        if not session.ranking_present:
+        if not session.ranking_present or session.session_id in covered:
             continue
         ranking_path = (
             source_dir
@@ -971,6 +1052,8 @@ def load_identity_map(report: AuditReport) -> dict[str, str]:
                     f"{stable_id}"
                 )
             aliases[lancelot_id] = stable_id
+    if cache_path is not None and covered != wanted:
+        _atomic_write_json({"sessions": sorted(wanted), "aliases": aliases}, cache_path)
     return aliases
 
 
@@ -1431,48 +1514,80 @@ def _replace_embedded_dd_with_ddss(frame: pl.DataFrame) -> pl.DataFrame:
     return work.join(corrections, on="PBN", how="left")
 
 
+def solve_ddss_tables(pbns: Sequence[str]) -> pl.DataFrame:
+    """PBN plus the ddss DD table for each deal."""
+    tables = _ddss_tables_for_pbns(list(pbns))
+    return pl.DataFrame(
+        [{"PBN": pbn, **_ddss_columns_from_table(table)} for pbn, table in zip(pbns, tables)],
+        schema={"PBN": pl.String, **{column: pl.Int64 for column in EMBEDDED_DD_COLUMNS}},
+    )
+
+
 def _apply_lancelot_dd_audit(
-    frame: pl.DataFrame, *, rate: float = 1.0
+    frame: pl.DataFrame,
+    *,
+    rate: float = 1.0,
+    solved_dd: pl.DataFrame | None = None,
+    quiet: bool = False,
 ) -> tuple[pl.DataFrame, set[str]]:
     """Replace every unique deal's Lancelot DD table with ddss.
 
-    ``rate <= 0`` skips the replacement (tests). Otherwise every unique PBN is
-    solved with ddss; Lancelot is never the source of truth. Mismatched PBNs
-    are returned so the hand-records cache can rewrite DD/Par.
+    ``rate <= 0`` skips the replacement (tests). Otherwise every unique PBN
+    gets its ddss table; Lancelot is never the source of truth. ``solved_dd``
+    holds tables already solved with ddss (PBN plus DD columns); only the
+    other deals are solved here. Mismatched PBNs solved here are returned so
+    the hand-records cache can rewrite DD/Par.
     """
     if rate <= 0:
         return frame, set()
     unique = _unique_embedded_dd_deals(frame)
-    pbns = unique["PBN"].to_list()
-    if not pbns:
+    if unique.is_empty():
         return frame, set()
-    tables = _ddss_tables_for_pbns(pbns)
-    corrections: list[dict[str, Any]] = []
+    known = (
+        solved_dd.select("PBN", *EMBEDDED_DD_COLUMNS).join(
+            unique.select("PBN"), on="PBN", how="semi"
+        )
+        if solved_dd is not None
+        else pl.DataFrame(schema={"PBN": pl.String})
+    )
+    to_solve = unique.join(known.select("PBN"), on="PBN", how="anti")["PBN"].to_list()
+    solved = solve_ddss_tables(to_solve) if to_solve else None
+    corrections = pl.concat(
+        [
+            part.select("PBN", *[pl.col(column).cast(pl.Int64) for column in EMBEDDED_DD_COLUMNS])
+            for part in (known, solved)
+            if part is not None and not part.is_empty()
+        ],
+        how="vertical",
+    ).unique(subset=["PBN"], keep="first")
+    expected_by_pbn = {rec["PBN"]: rec for rec in corrections.iter_rows(named=True)}
+    solved_pbns = set(to_solve)
     mismatch_pbns: set[str] = set()
     mismatch_lines: list[str] = []
-    for rec, table in zip(unique.iter_rows(named=True), tables):
-        expected = _ddss_columns_from_table(table)
-        corrections.append({"PBN": rec["PBN"], **expected})
+    for rec in unique.iter_rows(named=True):
+        expected = expected_by_pbn[rec["PBN"]]
         diffs = [
             f"{column} Lancelot={int(rec[column])} ddss={expected[column]}"
             for column in EMBEDDED_DD_COLUMNS
             if int(rec[column]) != expected[column]
         ]
         if diffs:
-            mismatch_pbns.add(str(rec["PBN"]))
+            if rec["PBN"] in solved_pbns:
+                mismatch_pbns.add(str(rec["PBN"]))
             mismatch_lines.append(f"{rec['PBN']}: {', '.join(diffs)}")
-    print(
-        f"[ffbridge-quality] replaced {len(pbns)} Lancelot DD tables with ddss; "
-        f"{len(mismatch_pbns)} disagreed",
-        flush=True,
-    )
-    if mismatch_lines:
-        preview = "\n  ".join(mismatch_lines[:8])
-        print(f"[ffbridge-quality] Lancelot DD mismatches:\n  {preview}", flush=True)
+    if not quiet:
+        print(
+            f"[ffbridge-quality] replaced {unique.height} Lancelot DD tables with ddss "
+            f"({len(to_solve)} solved here); {len(mismatch_lines)} disagreed",
+            flush=True,
+        )
+        if mismatch_lines:
+            preview = "\n  ".join(mismatch_lines[:8])
+            print(f"[ffbridge-quality] Lancelot DD mismatches:\n  {preview}", flush=True)
     work = frame.drop(
         [column for column in EMBEDDED_DD_COLUMNS if column in frame.columns]
     )
-    return work.join(pl.DataFrame(corrections), on="PBN", how="left"), mismatch_pbns
+    return work.join(corrections, on="PBN", how="left"), mismatch_pbns
 
 
 def _audit_lancelot_dd_sample(frame: pl.DataFrame, *, rate: float = 0.1) -> int:
@@ -1785,6 +1900,18 @@ def _par_rows_from_embedded_dd(frame: pl.DataFrame, augment_lib: Any) -> pl.Data
     return pl.DataFrame(rows)
 
 
+def _with_board_dealer(frame: pl.DataFrame) -> pl.DataFrame:
+    if "Dealer" in frame.columns:
+        return frame
+    board = pl.col("Board").cast(pl.Int64, strict=False)
+    return frame.with_columns(
+        pl.when(board.is_null() | (board <= 0))
+        .then(pl.lit(None, dtype=pl.Utf8))
+        .otherwise(board.sub(1).mod(4).replace_strict({0: "N", 1: "E", 2: "S", 3: "W"}))
+        .alias("Dealer")
+    )
+
+
 def attach_embedded_dd_metrics(frame: pl.DataFrame) -> pl.DataFrame:
     """Derive quality/Club DD columns from an already-present DD trick table."""
     _require_columns(
@@ -1807,20 +1934,7 @@ def attach_embedded_dd_metrics(frame: pl.DataFrame) -> pl.DataFrame:
         .str.to_uppercase()
         .replace({"O": "W"}),
     )
-    if "Dealer" not in out.columns:
-        board = pl.col("Board").cast(pl.Int64, strict=False)
-        out = out.with_columns(
-            pl.when(board.is_null() | (board <= 0))
-            .then(pl.lit(None, dtype=pl.Utf8))
-            .otherwise(
-                pl.col("Board")
-                .cast(pl.Int64, strict=False)
-                .sub(1)
-                .mod(4)
-                .replace_strict({0: "N", 1: "E", 2: "S", 3: "W"})
-            )
-            .alias("Dealer")
-        )
+    out = _with_board_dealer(out)
     if "Vul" not in out.columns:
         raise ValueError("Vul is required to derive par from the embedded DD table")
     if "Result" in out.columns:
@@ -2497,7 +2611,11 @@ def _compute_ev_from_probs(
     prob_columns = ["PBN"] + [
         column for column in cache.columns if column.startswith("Probs_")
     ]
-    probs = cache.select(prob_columns).unique(subset=["PBN"], maintain_order=True)
+    probs = (
+        cache.select(prob_columns)
+        .join(unique.select("PBN"), on="PBN", how="semi")
+        .unique(subset=["PBN"], maintain_order=True)
+    )
     unique_aug = unique.join(probs, on="PBN", how="left")
     _scores_d, _scores, scores_df = augment_lib.precompute_contract_score_tables()
     unique_aug = augment_lib.add_single_dummy_expected_values(unique_aug, scores_df)
@@ -2558,6 +2676,7 @@ def _attach_sd_ev_from_unique_deals(
     sd_productions: int,
     max_sd_adds: int | None,
     force_dd_pbns: set[str] | None = None,
+    quiet: bool = False,
 ) -> tuple[pl.DataFrame, pl.DataFrame | None]:
     """ACBL cache (DD/Par/SD probs) on unique deals, then derive EV and join."""
     if max_sd_adds == 0:
@@ -2572,13 +2691,14 @@ def _attach_sd_ev_from_unique_deals(
         if hrs_cache_df is not None
         else unique
     )
-    print(
-        f"[ffbridge-quality] unique deals {len(needed)}; "
-        f"SD cache hits {len(needed) - len(missing_sd)}; "
-        f"DD/Par missing {missing_dd.height}; "
-        f"SD missing {len(missing_sd)}",
-        flush=True,
-    )
+    if not quiet or missing_sd or missing_dd.height:
+        print(
+            f"[ffbridge-quality] unique deals {len(needed)}; "
+            f"SD cache hits {len(needed) - len(missing_sd)}; "
+            f"DD/Par missing {missing_dd.height}; "
+            f"SD missing {len(missing_sd)}",
+            flush=True,
+        )
     _ff_lib, augment_lib = _import_mlbridge()
     if missing_sd or missing_dd.height:
         with _AUGMENT_LOCK:
@@ -2847,6 +2967,18 @@ def augment_raw_session(
     """
     if _has_quality_dd_scores(raw):
         return raw
+    return augment_prepared_session(
+        prepare_raw_session(raw),
+        hrs_cache=hrs_cache,
+        cache_file_path=cache_file_path,
+        sd_productions=sd_productions,
+        max_sd_adds=max_sd_adds,
+        dd_audit_rate=dd_audit_rate,
+    )
+
+
+def prepare_raw_session(raw: pl.DataFrame) -> pl.DataFrame:
+    """Rows with a deal and contract, converted to mlBridge columns."""
     _require_columns(raw, ["PBN", "Contract"], "Raw score frame")
     prepared = raw.filter(
         pl.col("PBN").is_not_null()
@@ -2864,8 +2996,45 @@ def augment_raw_session(
         else prepared
     )
     _validate_converted_suits(work)
+    return work
+
+
+def session_deals(work: pl.DataFrame) -> pl.DataFrame | None:
+    """PBN, Dealer, Vul, and the Lancelot DD table of each unique deal.
+
+    None when the session has no embedded DD table and needs the full
+    mlBridge augmentation instead.
+    """
+    if not _has_embedded_dd_table(work) or "Vul" not in work.columns:
+        return None
+    return (
+        _with_board_dealer(work)
+        .select("PBN", "Dealer", "Vul", *EMBEDDED_DD_COLUMNS)
+        .filter(
+            pl.col("PBN").is_not_null()
+            & pl.col("Dealer").is_not_null()
+            & pl.col("Vul").is_not_null()
+            & pl.all_horizontal([pl.col(column).is_not_null() for column in EMBEDDED_DD_COLUMNS])
+        )
+        .unique(subset=["PBN", "Dealer", "Vul"], maintain_order=True)
+    )
+
+
+def augment_prepared_session(
+    work: pl.DataFrame,
+    *,
+    hrs_cache: list[pl.DataFrame | None] | None = None,
+    cache_file_path: pathlib.Path | None = None,
+    sd_productions: int = 10,
+    max_sd_adds: int | None = None,
+    dd_audit_rate: float = 1.0,
+    solved_dd: pl.DataFrame | None = None,
+    quiet: bool = False,
+) -> pl.DataFrame:
     if _has_embedded_dd_table(work):
-        work, force_dd_pbns = _apply_lancelot_dd_audit(work, rate=dd_audit_rate)
+        work, force_dd_pbns = _apply_lancelot_dd_audit(
+            work, rate=dd_audit_rate, solved_dd=solved_dd, quiet=quiet
+        )
         work = attach_embedded_dd_metrics(work)
         work = _attach_contract_types(work)
         cache = _resolve_hrs_cache(hrs_cache, cache_file_path)
@@ -2876,6 +3045,7 @@ def augment_raw_session(
             sd_productions=sd_productions,
             max_sd_adds=max_sd_adds,
             force_dd_pbns=force_dd_pbns or None,
+            quiet=quiet,
         )
         if hrs_cache is not None:
             hrs_cache[0] = cache
@@ -2885,69 +3055,360 @@ def augment_raw_session(
     return _full_mlbridge_augment(work)
 
 
+SessionHook = Callable[[SessionAudit, pl.DataFrame], None]
+INCOMPLETE_SESSION_REASON = "Incomplete raw cache after fetch (missing ranking or team scores)"
+_WORKER_STATE: dict[str, Any] = {}
+
+
+def _unsupported_reason(exc: Exception) -> str | None:
+    """Reason a session is recorded as unusable, or None to re-raise."""
+    if isinstance(exc, NoQualityRowsError):
+        return str(exc)
+    if isinstance(exc, KeyError):
+        return f"Unsupported double-dummy lookup: {exc}" if "DD_" in str(exc) else None
+    if isinstance(exc, ValueError) and str(exc).startswith("Malformed score row in session "):
+        return str(exc)
+    return None
+
+
+def known_unusable_sessions(output_dir: pathlib.Path) -> dict[str, str]:
+    """Sessions an earlier build found unusable from their (immutable) raw data.
+
+    Incomplete sessions are left out: a later fetch can complete them.
+    """
+    metadata_path = pathlib.Path(output_dir) / METADATA_FILENAME
+    if not metadata_path.is_file():
+        return {}
+    payload = _read_json(metadata_path)
+    return {
+        str(item["session_id"]): str(item["reason"])
+        for item in payload.get("unsupported_sessions") or []
+        if item.get("session_id") and item.get("reason") != INCOMPLETE_SESSION_REASON
+    }
+
+
+def _init_session_worker(
+    source_dir: str,
+    fragment_dir: str,
+    session_dates: pl.DataFrame,
+    hook: SessionHook | None,
+) -> None:
+    _WORKER_STATE.update(
+        source_dir=pathlib.Path(source_dir),
+        fragment_dir=pathlib.Path(fragment_dir),
+        session_dates=session_dates,
+        hook=hook,
+    )
+    _import_mlbridge()
+    logging.getLogger("mlBridge.mlBridgeAugmentLib").setLevel(logging.WARNING)
+
+
+def _prepare_session_task(
+    session: SessionAudit,
+) -> tuple[str, pl.DataFrame | None, bool, pl.DataFrame | None, int, str | None]:
+    """Load one session; return (id, work frame, already augmented, deals, unmapped, reason)."""
+    try:
+        raw, unmapped = load_raw_session(_WORKER_STATE["source_dir"], session)
+        if _has_quality_dd_scores(raw):
+            return session.session_id, raw, True, None, unmapped, None
+        work = prepare_raw_session(raw)
+        return session.session_id, work, False, session_deals(work), unmapped, None
+    except Exception as exc:
+        reason = _unsupported_reason(exc)
+        if reason is None:
+            raise
+        return session.session_id, None, False, None, 0, reason
+
+
+def _finish_session_task(
+    session: SessionAudit,
+    work: pl.DataFrame,
+    already_augmented: bool,
+    cache_slice: pl.DataFrame | None,
+    solved_dd: pl.DataFrame | None,
+) -> tuple[str, pl.DataFrame | None, str | None]:
+    """Augment one prepared session, write its fragment, run the hook."""
+    try:
+        augmented = (
+            work
+            if already_augmented
+            else augment_prepared_session(
+                work,
+                hrs_cache=[cache_slice],
+                solved_dd=solved_dd,
+                quiet=True,
+            )
+        )
+        fragment = normalize_quality_frame(
+            augmented,
+            session_dates=_WORKER_STATE["session_dates"],
+            reject_duplicates=True,
+        )
+    except Exception as exc:
+        reason = _unsupported_reason(exc)
+        if reason is None:
+            raise
+        return session.session_id, None, reason
+    _atomic_write_parquet(
+        fragment, _WORKER_STATE["fragment_dir"] / f"{session.session_id}.parquet"
+    )
+    hook = _WORKER_STATE["hook"]
+    if hook is not None:
+        hook(session, augmented)
+    return session.session_id, fragment, None
+
+
+def _estimate_sd_task(todo: pl.DataFrame, sd_productions: int) -> pl.DataFrame:
+    _ff_lib, augment_lib = _import_mlbridge()
+    _sd_dfs, sd_df = augment_lib.estimate_sd_trick_distributions_for_df(
+        todo, _empty_hrs_cache(), sd_productions, None, None, None
+    )
+    return sd_df
+
+
+class _InlineExecutor:
+    """Runs tasks in this process; same submit() surface as a process pool."""
+
+    def __init__(self, initializer: Callable[..., None], initargs: tuple[Any, ...]) -> None:
+        initializer(*initargs)
+
+    def submit(self, fn: Callable[..., Any], *args: Any) -> Any:
+        from concurrent.futures import Future
+
+        future: Future = Future()
+        try:
+            future.set_result(fn(*args))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    def shutdown(self) -> None:
+        pass
+
+
+def _read_current_fragment(path: pathlib.Path) -> pl.DataFrame | None:
+    if not path.is_file() or not _fragment_schema_is_current(path):
+        return None
+    return pl.read_parquet(path, columns=list(QUALITY_BOARD_COLUMNS)).select(
+        *QUALITY_BOARD_COLUMNS
+    )
+
+
+def _solve_chunk_deals(
+    deals: pl.DataFrame,
+    cache: pl.DataFrame,
+    executor: Any,
+    *,
+    workers: int,
+    sd_productions: int,
+) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, float]]:
+    """ddss DD, Par, and SD for every deal of a chunk, solved once in batches.
+
+    Returns the updated cache, the ddss tables (PBN plus DD), and timings.
+    """
+    _ff_lib, augment_lib = _import_mlbridge()
+    stats: dict[str, float] = {}
+    pbns = deals["PBN"].unique(maintain_order=True).to_list()
+    started = time.perf_counter()
+    solved_dd = solve_ddss_tables(pbns)
+    stats["ddss_s"] = time.perf_counter() - started
+    lancelot = deals.select("PBN", *EMBEDDED_DD_COLUMNS).unique(subset=["PBN"])
+    stats["lancelot_mismatches"] = float(
+        lancelot.join(solved_dd, on="PBN", suffix="__ddss")
+        .filter(
+            pl.any_horizontal(
+                [
+                    pl.col(column).cast(pl.Int64) != pl.col(f"{column}__ddss")
+                    for column in EMBEDDED_DD_COLUMNS
+                ]
+            )
+        )
+        .height
+    )
+    dd_frame = deals.drop(*EMBEDDED_DD_COLUMNS).join(solved_dd, on="PBN", how="left")
+    started = time.perf_counter()
+    cache, dd_added = _upsert_dd_par_into_cache(dd_frame, cache, augment_lib)
+    stats["par_s"] = time.perf_counter() - started
+    stats["dd_par_rows"] = float(dd_added)
+    missing_sd = set(pbns) - _cached_sd_pbns(cache)
+    stats["sd_deals"] = float(len(missing_sd))
+    started = time.perf_counter()
+    if missing_sd:
+        todo = (
+            dd_frame.filter(pl.col("PBN").is_in(sorted(missing_sd)))
+            .select("PBN", "Dealer", "Vul")
+            .unique(subset=["PBN"], maintain_order=True)
+        )
+        part_rows = max(200, -(-todo.height // max(1, workers)))
+        futures = [
+            executor.submit(_estimate_sd_task, todo.slice(start, part_rows), sd_productions)
+            for start in range(0, todo.height, part_rows)
+        ]
+        sd_parts = [future.result() for future in futures]
+        sd_parts = [part for part in sd_parts if part is not None and not part.is_empty()]
+        if sd_parts:
+            cache = augment_lib.update_hand_records_cache(
+                cache, pl.concat(sd_parts, how="vertical_relaxed")
+            )
+    stats["sd_s"] = time.perf_counter() - started
+    return cache, solved_dd, stats
+
+
 def build_historical_fragments(
     report: AuditReport,
     output_dir: pathlib.Path,
     session_dates: pl.DataFrame,
     *,
     show_progress: bool = True,
+    known_unsupported: Mapping[str, str] | None = None,
+    workers: int = 1,
+    chunk_sessions: int = 128,
+    sd_productions: int = 10,
+    session_hook: SessionHook | None = None,
 ) -> tuple[list[pl.DataFrame], int, list[dict[str, str]]]:
+    """Quality fragments for every complete session outside the training parquet.
+
+    Existing fragments are reused and ``known_unsupported`` sessions are not
+    reloaded. The rest go in chunks: workers load and convert each session,
+    every new deal of the chunk is solved once (ddss DD, Par, SD) and the
+    hand-records cache is saved once, then workers augment the sessions from
+    a slice of the cache, write fragments, and call ``session_hook`` with the
+    augmented frame. The hook must be picklable when ``workers > 1``.
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    from tqdm import tqdm
+
+    known_unsupported = known_unsupported or {}
+    source_dir = pathlib.Path(report.source_dir)
     candidates = [
         session for session in report.sessions if not session.in_training and session.complete
     ]
-    iterator: Iterable[SessionAudit] = candidates
-    if show_progress and candidates:
-        from tqdm import tqdm
-
-        iterator = tqdm(candidates, desc="Normalizing historical FFBridge sessions")
     fragment_dir = pathlib.Path(output_dir) / FRAGMENT_DIRNAME
-    fragments: list[pl.DataFrame] = []
-    total_unmapped = 0
+    fragment_dir.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        existing = list(
+            pool.map(
+                _read_current_fragment,
+                [fragment_dir / f"{session.session_id}.parquet" for session in candidates],
+            )
+        )
+    fragments = [fragment for fragment in existing if fragment is not None]
     unsupported: list[dict[str, str]] = []
-    cache_path = default_hrs_cache_path(pathlib.Path(report.source_dir))
-    hrs_cache: list[pl.DataFrame | None] = [load_hrs_cache(cache_path)]
-    for session in iterator:
-        fragment_path = fragment_dir / f"{session.session_id}.parquet"
-        if fragment_path.is_file() and _fragment_schema_is_current(fragment_path):
-            fragments.append(pl.read_parquet(fragment_path).select(*QUALITY_BOARD_COLUMNS))
+    todo: list[SessionAudit] = []
+    for session, fragment in zip(candidates, existing):
+        if fragment is not None:
             continue
-        try:
-            raw, unmapped = load_raw_session(pathlib.Path(report.source_dir), session)
-            augmented = augment_raw_session(
-                raw,
-                hrs_cache=hrs_cache,
-                cache_file_path=cache_path,
+        reason = known_unsupported.get(session.session_id)
+        if reason is not None:
+            unsupported.append({"session_id": session.session_id, "reason": reason})
+        else:
+            todo.append(session)
+    print(
+        f"[quality-builder] {len(fragments)} fragments reused "
+        f"({time.perf_counter() - started:.1f}s); {len(unsupported)} known unusable "
+        f"sessions skipped; {len(todo)} sessions to build",
+        flush=True,
+    )
+    total_unmapped = 0
+    if not todo:
+        return fragments, total_unmapped, unsupported
+
+    _import_mlbridge()
+    cache_path = default_hrs_cache_path(source_dir)
+    cache = load_hrs_cache(cache_path)
+    if cache is None:
+        cache = _empty_hrs_cache()
+    initargs = (str(source_dir), str(fragment_dir), session_dates, session_hook)
+    previous_threads = os.environ.get("POLARS_MAX_THREADS")
+    if workers > 1:
+        os.environ["POLARS_MAX_THREADS"] = str(max(2, (os.cpu_count() or workers) // workers))
+        executor: Any = ProcessPoolExecutor(
+            max_workers=workers, initializer=_init_session_worker, initargs=initargs
+        )
+    else:
+        executor = _InlineExecutor(_init_session_worker, initargs)
+    progress = tqdm(
+        total=len(todo),
+        desc="Normalizing historical FFBridge sessions",
+        disable=not show_progress,
+    )
+    chunks = [todo[start : start + chunk_sessions] for start in range(0, len(todo), chunk_sessions)]
+    try:
+        for index, chunk in enumerate(chunks, start=1):
+            chunk_started = time.perf_counter()
+            prepared: dict[str, tuple[pl.DataFrame, bool, pl.DataFrame | None]] = {}
+            by_id = {session.session_id: session for session in chunk}
+            for future in as_completed([executor.submit(_prepare_session_task, s) for s in chunk]):
+                session_id, work, already, deals, unmapped, reason = future.result()
+                if reason is not None:
+                    unsupported.append({"session_id": session_id, "reason": reason})
+                    progress.update(1)
+                    continue
+                prepared[session_id] = (work, already, deals)
+                total_unmapped += unmapped
+            prepare_s = time.perf_counter() - chunk_started
+
+            deal_frames = [deals for _, _, deals in prepared.values() if deals is not None]
+            solved_dd: pl.DataFrame | None = None
+            stats: dict[str, float] = {}
+            if deal_frames:
+                cache, solved_dd, stats = _solve_chunk_deals(
+                    pl.concat(deal_frames, how="vertical_relaxed").unique(
+                        subset=["PBN", "Dealer", "Vul"], maintain_order=True
+                    ),
+                    cache,
+                    executor,
+                    workers=workers,
+                    sd_productions=sd_productions,
+                )
+                save_hrs_cache(cache, cache_path)
+
+            augment_started = time.perf_counter()
+            futures = []
+            for session_id, (work, already, deals) in prepared.items():
+                cache_slice = session_dd = None
+                if deals is not None and solved_dd is not None:
+                    keys = deals.select("PBN").unique()
+                    cache_slice = cache.join(keys, on="PBN", how="semi")
+                    session_dd = solved_dd.join(keys, on="PBN", how="semi")
+                futures.append(
+                    executor.submit(
+                        _finish_session_task,
+                        by_id[session_id],
+                        work,
+                        already,
+                        cache_slice,
+                        session_dd,
+                    )
+                )
+            prepared.clear()
+            for future in as_completed(futures):
+                session_id, fragment, reason = future.result()
+                if reason is not None:
+                    unsupported.append({"session_id": session_id, "reason": reason})
+                else:
+                    fragments.append(fragment)
+                progress.update(1)
+            print(
+                f"[quality-builder] chunk {index}/{len(chunks)}: {len(chunk)} sessions in "
+                f"{time.perf_counter() - chunk_started:.1f}s (prepare {prepare_s:.1f}s, "
+                f"ddss {stats.get('ddss_s', 0):.1f}s, par {stats.get('par_s', 0):.1f}s for "
+                f"{int(stats.get('dd_par_rows', 0))} new keys, SD {stats.get('sd_s', 0):.1f}s for "
+                f"{int(stats.get('sd_deals', 0))} deals, augment "
+                f"{time.perf_counter() - augment_started:.1f}s); "
+                f"{int(stats.get('lancelot_mismatches', 0))} Lancelot DD tables disagreed with ddss",
+                flush=True,
             )
-            fragment = normalize_quality_frame(
-                augmented,
-                session_dates=session_dates,
-                reject_duplicates=True,
-            )
-        except NoQualityRowsError as exc:
-            unsupported.append(
-                {"session_id": session.session_id, "reason": str(exc)}
-            )
-            continue
-        except ValueError as exc:
-            if not str(exc).startswith("Malformed score row in session "):
-                raise
-            unsupported.append(
-                {"session_id": session.session_id, "reason": str(exc)}
-            )
-            continue
-        except KeyError as exc:
-            if "DD_" not in str(exc):
-                raise
-            unsupported.append(
-                {
-                    "session_id": session.session_id,
-                    "reason": f"Unsupported double-dummy lookup: {exc}",
-                }
-            )
-            continue
-        _atomic_write_parquet(fragment, fragment_path)
-        fragments.append(fragment)
-        total_unmapped += unmapped
+    finally:
+        progress.close()
+        executor.shutdown()
+        if workers > 1:
+            if previous_threads is None:
+                os.environ.pop("POLARS_MAX_THREADS", None)
+            else:
+                os.environ["POLARS_MAX_THREADS"] = previous_threads
     return fragments, total_unmapped, unsupported
 
 

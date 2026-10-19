@@ -7,6 +7,7 @@ import pathlib
 import sys
 import time
 from datetime import date, datetime, timezone
+from typing import Any
 
 import polars as pl
 
@@ -14,12 +15,16 @@ from ffbridge_quality_pipeline import (
     DEFAULT_CUTOFF,
     DEFAULT_DISCOVERY_START,
     DEFAULT_SOURCE_DIR,
+    INCOMPLETE_SESSION_REASON,
     QUALITY_BOARD_COLUMNS,
     SCHEMA_VERSION,
     audit_historical_cache,
     build_historical_fragments,
+    default_audit_manifest_path,
+    default_identity_cache_path,
     discover_session_metadata,
     fetch_missing_artifacts,
+    known_unusable_sessions,
     load_identity_map,
     load_session_metadata,
     normalize_training_parquet,
@@ -133,7 +138,47 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable tqdm session progress.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Session augment processes; also splits SD solving (default: 8).",
+    )
+    parser.add_argument(
+        "--retry-unsupported",
+        action="store_true",
+        help="Rebuild sessions the previous metadata listed as unusable.",
+    )
+    parser.add_argument(
+        "--club-output-dir",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Also write Club BridgeStats session fragments here from each "
+            "augmented session (bridgestats-ffbridge ClubFragmentWriter)."
+        ),
+    )
     return parser
+
+
+def _club_fragment_hook(
+    club_output_dir: pathlib.Path | None,
+    metadata: dict[str, tuple[date, pathlib.Path, dict[str, Any]]],
+) -> Any:
+    if club_output_dir is None:
+        return None
+    builder_dir = pathlib.Path(__file__).resolve().parent.parent / "bridgestats-ffbridge"
+    if str(builder_dir) not in sys.path:
+        sys.path.insert(0, str(builder_dir))
+    from build_ffbridge_club_parquets import (
+        ClubFragmentWriter,
+        session_lookup_from_payloads,
+    )
+
+    lookup = session_lookup_from_payloads(
+        (path.stem, payload) for _date, path, payload in metadata.values()
+    )
+    return ClubFragmentWriter(club_output_dir.resolve(), lookup)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -173,21 +218,39 @@ def main(argv: list[str] | None = None) -> int:
                 f"[quality-builder] discovered {discovered} new session metadata file(s)",
                 flush=True,
             )
-        audit = audit_historical_cache(source_dir, training_path, args.cutoff)
+        metadata = load_session_metadata(source_dir, args.cutoff)
+        manifest_path = None if args.audit_only else default_audit_manifest_path(source_dir)
+        phase_clock = time.perf_counter()
+        audit = audit_historical_cache(
+            source_dir,
+            training_path,
+            args.cutoff,
+            manifest_path=manifest_path,
+            metadata=metadata,
+        )
+        print(
+            f"[quality-builder] audited {len(audit.sessions)} sessions in "
+            f"{time.perf_counter() - phase_clock:.1f}s",
+            flush=True,
+        )
         if args.fetch_missing and not args.audit_only:
             writes = fetch_missing_artifacts(audit, workers=args.fetch_workers)
             print(f"[quality-builder] fetched {writes} missing artifact(s)", flush=True)
-            audit = audit_historical_cache(source_dir, training_path, args.cutoff)
+            if writes:
+                audit = audit_historical_cache(
+                    source_dir,
+                    training_path,
+                    args.cutoff,
+                    manifest_path=manifest_path,
+                    metadata=metadata,
+                )
         if args.audit_only:
             print(json.dumps(audit.to_dict(), indent=2, sort_keys=True), flush=True)
             return 0
 
         assert output_dir is not None
         incomplete_unsupported = [
-            {
-                "session_id": session.session_id,
-                "reason": "Incomplete raw cache after fetch (missing ranking or team scores)",
-            }
+            {"session_id": session.session_id, "reason": INCOMPLETE_SESSION_REASON}
             for session in audit.sessions
             if not session.in_training and not session.complete
         ]
@@ -198,9 +261,10 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
 
-        metadata = load_session_metadata(source_dir, args.cutoff)
         dates = session_dates_frame(metadata)
-        identity_map = load_identity_map(audit)
+        identity_map = load_identity_map(
+            audit, cache_path=default_identity_cache_path(source_dir)
+        )
         phase_clock = time.perf_counter()
         board_quality = normalize_training_parquet(
             training_path,
@@ -214,12 +278,24 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
 
+        phase_clock = time.perf_counter()
         fragments, unmapped, unsupported = build_historical_fragments(
             audit,
             output_dir,
             dates,
             show_progress=not args.no_progress,
+            known_unsupported=(
+                {} if args.retry_unsupported else known_unusable_sessions(output_dir)
+            ),
+            workers=args.workers,
+            session_hook=_club_fragment_hook(args.club_output_dir, metadata),
         )
+        elapsed = time.perf_counter() - phase_clock
+        if elapsed > 30:
+            print(
+                f"[quality-builder] built historical fragments in {elapsed:.1f}s",
+                flush=True,
+            )
         if fragments:
             board_quality = pl.concat(
                 [

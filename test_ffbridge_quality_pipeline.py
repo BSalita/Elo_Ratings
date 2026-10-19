@@ -11,6 +11,8 @@ import polars as pl
 import requests
 
 from ffbridge_quality_pipeline import (
+    EMBEDDED_DD_COLUMNS,
+    INCOMPLETE_SESSION_REASON,
     AuditReport,
     LancelotDDMismatchError,
     NoQualityRowsError,
@@ -31,13 +33,17 @@ from ffbridge_quality_pipeline import (
     attach_embedded_dd_metrics,
     audit_historical_cache,
     augment_raw_session,
+    build_historical_fragments,
     build_pair_sidecar,
     build_player_sidecar,
     discover_session_metadata,
     fetch_missing_artifacts,
     flatten_team_scores,
+    known_unusable_sessions,
+    load_identity_map,
     normalize_quality_frame,
     resolve_output_dir,
+    session_deals,
     stable_pair_id,
     write_quality_artifacts,
 )
@@ -867,7 +873,144 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {}, clear=True):
             with self.assertRaisesRegex(ValueError, "--output-dir is required"):
                 resolve_output_dir(None)
-        self.assertEqual(resolve_output_dir(pathlib.Path("chosen")), pathlib.Path("chosen"))
+            self.assertEqual(resolve_output_dir(pathlib.Path("chosen")), pathlib.Path("chosen"))
+
+
+def _one_session_source(root: pathlib.Path) -> pathlib.Path:
+    source = root / "data"
+    source.mkdir()
+    _training(source / "ffbridge_training_data_df.parquet", [])
+    _write_json(source / "competitions" / "sessions" / "5.json", {"id": 5, "date": "2026-01-02"})
+    _write_json(
+        source / "results" / "sessions" / "5" / "ranking.json",
+        [
+            {
+                "orientation": "NS",
+                "team": {
+                    "id": 50,
+                    "orientation": "NS",
+                    "player1": {"id": 7, "migrationId": 70},
+                    "player2": {"id": 8},
+                },
+            }
+        ],
+    )
+    _write_json(source / "results" / "teams" / "50" / "session" / "5" / "scores.json", [])
+    return source
+
+
+class FFBridgeQualityIncrementalTests(unittest.TestCase):
+    def test_audit_manifest_reuses_complete_sessions_without_reading_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = _one_session_source(pathlib.Path(temporary))
+            manifest = pathlib.Path(temporary) / "audit.json"
+            first = audit_historical_cache(source, cutoff=date(2026, 1, 2), manifest_path=manifest)
+            self.assertTrue(first.sessions[0].complete)
+            self.assertEqual(
+                json.loads(manifest.read_text()), {"complete_sessions": {"5": ["50"]}}
+            )
+            (source / "results" / "teams" / "50" / "session" / "5" / "scores.json").unlink()
+            (source / "results" / "sessions" / "5" / "ranking.json").unlink()
+            reused = audit_historical_cache(source, cutoff=date(2026, 1, 2), manifest_path=manifest)
+            self.assertTrue(reused.sessions[0].complete)
+            self.assertEqual(reused.sessions[0].expected_team_ids, ("50",))
+            fresh = audit_historical_cache(source, cutoff=date(2026, 1, 2))
+            self.assertFalse(fresh.sessions[0].complete)
+
+    def test_identity_cache_reads_only_rankings_it_does_not_cover(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = _one_session_source(pathlib.Path(temporary))
+            report = audit_historical_cache(source, cutoff=date(2026, 1, 2))
+            cache = pathlib.Path(temporary) / "identity.json"
+            self.assertEqual(load_identity_map(report, cache_path=cache), {"7": "70", "8": "8"})
+            (source / "results" / "sessions" / "5" / "ranking.json").unlink()
+            self.assertEqual(load_identity_map(report, cache_path=cache), {"7": "70", "8": "8"})
+
+    def test_known_unusable_sessions_leave_incomplete_sessions_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = pathlib.Path(temporary)
+            _write_json(
+                output / "ffbridge_quality_metadata.json",
+                {
+                    "unsupported_sessions": [
+                        {"session_id": "1", "reason": "Raw session has no board rows"},
+                        {"session_id": "2", "reason": INCOMPLETE_SESSION_REASON},
+                    ]
+                },
+            )
+            self.assertEqual(
+                known_unusable_sessions(output), {"1": "Raw session has no board rows"}
+            )
+            self.assertEqual(known_unusable_sessions(output / "missing"), {})
+
+    def test_build_fragments_reuses_fragments_and_skips_known_unusable(self) -> None:
+        def audit(session_id: str, *, in_training: bool = False) -> SessionAudit:
+            return SessionAudit(
+                session_id=session_id,
+                session_date="2024-01-02",
+                metadata_path="",
+                in_training=in_training,
+                ranking_present=True,
+                expected_team_ids=("1",),
+                present_team_ids=("1",),
+                missing_team_ids=(),
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = pathlib.Path(temporary)
+            fragment = normalize_quality_frame(_quality_input(), session_dates=_dates())
+            (output / "session_fragments").mkdir()
+            fragment.write_parquet(output / "session_fragments" / "10.parquet")
+            report = AuditReport(
+                source_dir=str(output / "source"),
+                cutoff="2024-12-31",
+                training_session_count=1,
+                cached_session_count=3,
+                sessions=(audit("10"), audit("11"), audit("12", in_training=True)),
+            )
+            with mock.patch("ffbridge_quality_pipeline._import_mlbridge") as imported:
+                fragments, unmapped, unsupported = build_historical_fragments(
+                    report,
+                    output,
+                    _dates(),
+                    show_progress=False,
+                    known_unsupported={"11": "Raw session has no board rows"},
+                )
+            imported.assert_not_called()
+            self.assertEqual([frame.height for frame in fragments], [fragment.height])
+            self.assertEqual(unmapped, 0)
+            self.assertEqual(
+                unsupported, [{"session_id": "11", "reason": "Raw session has no board rows"}]
+            )
+
+    def test_session_deals_requires_embedded_dd_table(self) -> None:
+        frame = pl.DataFrame({"PBN": ["N:..."], "Board": [1], "Vul": ["None"]})
+        self.assertIsNone(session_deals(frame))
+        with_dd = frame.with_columns(
+            *[pl.lit(7).alias(column) for column in EMBEDDED_DD_COLUMNS]
+        )
+        deals = session_deals(pl.concat([with_dd, with_dd]))
+        self.assertEqual(deals.select("PBN", "Dealer", "Vul").rows(), [("N:...", "N", "None")])
+
+    def test_dd_audit_solves_only_deals_missing_from_solved_dd(self) -> None:
+        def table(value: int) -> dict[str, int]:
+            return {column: value for column in EMBEDDED_DD_COLUMNS}
+
+        frame = pl.DataFrame(
+            [{"PBN": "known", **table(5)}, {"PBN": "new", **table(5)}]
+        )
+        solved_dd = pl.DataFrame([{"PBN": "known", **table(6)}])
+        with mock.patch(
+            "ffbridge_quality_pipeline.solve_ddss_tables",
+            return_value=pl.DataFrame([{"PBN": "new", **table(4)}]),
+        ) as solve:
+            corrected, force_pbns = _apply_lancelot_dd_audit(
+                frame, rate=1.0, solved_dd=solved_dd, quiet=True
+            )
+        solve.assert_called_once_with(["new"])
+        by_pbn = {row["PBN"]: row["DD_N_S"] for row in corrected.iter_rows(named=True)}
+        self.assertEqual(by_pbn, {"known": 6, "new": 4})
+        self.assertEqual(force_pbns, {"new"})
 
 
 if __name__ == "__main__":
