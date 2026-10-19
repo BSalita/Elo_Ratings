@@ -426,6 +426,22 @@ class ScoreAvailabilityTests(unittest.TestCase):
         self.assertIsNone(row["National_Scratch_Rank"])
         self.assertEqual(row["scoring_mode"], "handicap")
 
+    def test_zero_bonus_pair_keeps_its_scratch_rank_when_others_have_bonuses(self) -> None:
+        rows = lancelot._normalize_ranking_results(
+            [
+                _ranking_row(10, "Salita", "Jacoupy", score=64.32, total_bonus=10.5),
+                _ranking_row(20, "Strong", "Pair", score=58.0, total_bonus=0.0),
+            ],
+            series_id=5,
+            tournament_date="2026-10-06",
+        )
+        by_team = {row["team_id"]: row for row in rows}
+        self.assertAlmostEqual(by_team["10"]["National_Scratch_Pct"], 53.82)
+        self.assertEqual(by_team["20"]["National_Scratch_Pct"], 58.0)
+        self.assertEqual(by_team["20"]["National_Handicap_Pct"], 58.0)
+        self.assertEqual(by_team["20"]["National_Scratch_Rank"], 1)
+        self.assertEqual(by_team["10"]["National_Scratch_Rank"], 2)
+
     def test_keeps_licensed_player_when_partner_is_visitor_name_string(self) -> None:
         ranking = [
             {

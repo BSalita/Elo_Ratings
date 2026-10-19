@@ -493,6 +493,13 @@ def _normalize_ranking_results(
         normalized_series_id, tournament_date
     )
     national_pending = national_ranking_is_pending(ranking)
+    # An all-zero totalBonus column can mean the IV was not published. Once
+    # any pair in the session carries a bonus, a zero bonus is a real zero.
+    bonus_is_authoritative = normalized_series_id in {384, 386} or any(
+        (_as_number(entry.get("totalBonus")) or 0.0) > 0.0
+        for entry in ranking
+        if isinstance(entry, dict)
+    )
     provisional_scores = organizer_scores or (
         fetch_provisional_pair_percentages(
             ranking, tournament_date, normalized_series_id
@@ -598,7 +605,7 @@ def _normalize_ranking_results(
                     entry,
                     session_score=national_pct,
                     scoring_mode=scoring_mode,
-                    bonus_is_authoritative=normalized_series_id in {384, 386},
+                    bonus_is_authoritative=bonus_is_authoritative,
                 )
             )
             if national_scratch_pct is None:
