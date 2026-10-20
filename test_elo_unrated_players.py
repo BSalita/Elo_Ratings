@@ -72,11 +72,11 @@ class UnratedPlayerEloTests(unittest.TestCase):
 class PairKeyTests(unittest.TestCase):
     def test_orders_as_strings_and_is_null_without_both_ids(self) -> None:
         frame = pl.DataFrame(
-            {"a": [123, 45, 7, None], "b": [45, 123, None, None]},
+            {"a": [123, 45, 7, None, 9], "b": [45, 123, None, None, 9]},
             schema={"a": pl.Int32, "b": pl.Int32},
         )
         keys = frame.select(pair_key_expr("a", "b").alias("key"))["key"].to_list()
-        self.assertEqual(keys, ["123-45", "123-45", None, None])
+        self.assertEqual(keys, ["123-45", "123-45", None, None, None])
 
 
 if __name__ == "__main__":
