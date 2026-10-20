@@ -55,6 +55,33 @@ def _copy(source: pathlib.Path, destination: pathlib.Path) -> int:
     return source.stat().st_size
 
 
+def _destination_only(destination: pathlib.Path, source_latest: pl.DataFrame) -> pl.DataFrame:
+    """Destination manifest rows the source lacks.
+
+    The postmortem service appends sessions it generates to the destination
+    manifest; replacing it with the source's would orphan their fragments.
+    """
+    path = destination / "manifest.parquet"
+    if not path.is_file():
+        return source_latest.clear()
+    extra = (
+        pl.read_parquet(path)
+        .cast(source_latest.schema)
+        .join(source_latest.select("session_id", "revision"), on=["session_id", "revision"], how="anti")
+    )
+    missing = [
+        str(row[column])
+        for row in extra.iter_rows(named=True)
+        for column in ("boards_path", "results_path")
+        if not (destination / str(row[column])).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"{len(missing)} destination manifest fragments missing under {destination}; first: {missing[:3]}"
+        )
+    return extra
+
+
 def publish(source: pathlib.Path, destination: pathlib.Path, workers: int) -> dict:
     metadata_path = source / "metadata.json"
     manifest_path = source / "manifest.parquet"
@@ -64,13 +91,15 @@ def publish(source: pathlib.Path, destination: pathlib.Path, workers: int) -> di
             f"{metadata_path} is layout version {metadata.get('layout_version')!r}; "
             f"expected {EXPECTED_LAYOUT_VERSION}. Run the layout migration first."
         )
-    latest = _latest(pl.read_parquet(manifest_path))
-    if latest.is_empty():
+    source_latest = _latest(pl.read_parquet(manifest_path))
+    if source_latest.is_empty():
         raise ValueError(f"Empty manifest: {manifest_path}")
+    kept = _destination_only(destination, source_latest)
+    latest = _latest(pl.concat([source_latest, kept]))
 
     pairs: list[tuple[pathlib.Path, pathlib.Path]] = []
     missing: list[str] = []
-    for row in latest.iter_rows(named=True):
+    for row in source_latest.iter_rows(named=True):
         for column in ("boards_path", "results_path"):
             relative = str(row[column])
             if f"layout_version={EXPECTED_LAYOUT_VERSION}" not in relative:
@@ -102,6 +131,7 @@ def publish(source: pathlib.Path, destination: pathlib.Path, workers: int) -> di
     _copy(metadata_path, destination / "metadata.json")
     return {
         "sessions": latest.height,
+        "destination_rows_kept": kept.height,
         "fragments_total": len(pairs),
         "fragments_copied": len(pending),
         "gb_copied": round(copied_bytes / 1e9, 2),
