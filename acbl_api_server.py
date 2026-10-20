@@ -33,6 +33,7 @@ from elo_common import (
     title_from_elo_expr,
 )
 from elo_favorites import (
+    DUCKDB_THREADS,
     button_prompt_ids,
     flatten_favorites,
     load_favorites,
@@ -177,17 +178,6 @@ def _detect_cgroup_limits() -> dict:
         "memory_limit_bytes": memory_limit_bytes,
         "cpu_limit_cores": cpu_limit_cores,
     }
-
-
-def _recommended_threads() -> int:
-    limits = _detect_cgroup_limits()
-    host_cpus = int(os.cpu_count() or 4)
-    if limits["cpu_limit_cores"] is not None:
-        cpu_budget = max(1, int(limits["cpu_limit_cores"]))
-    else:
-        cpu_budget = host_cpus
-    # Keep conservative default while respecting container CPU budget.
-    return max(4, cpu_budget // 2) if cpu_budget >= 8 else max(1, cpu_budget)
 
 
 def _cgroup_memory_limit_bytes() -> int | None:
@@ -862,7 +852,7 @@ def _get_db_connection() -> duckdb.DuckDBPyConnection:
         if _DB_CON is not None:
             return _DB_CON
         con = duckdb.connect()
-        con.execute(f"PRAGMA threads={_recommended_threads()};")
+        con.execute(f"PRAGMA threads={DUCKDB_THREADS};")
         con.execute("PRAGMA preserve_insertion_order=false;")
         # Cap the buffer manager so DuckDB never overcommits the container
         # alongside the resident Polars frame, and allow spill-to-disk so a
@@ -1134,7 +1124,7 @@ def _server_runtime_info() -> dict:
         cpu_count = int(os.cpu_count() or 0)
         cpu_limit_cores = None
 
-    threads = _recommended_threads()
+    threads = DUCKDB_THREADS
 
     cached_frames = {}
     for src, cached_time in _FRAME_CACHE_TIMES.items():

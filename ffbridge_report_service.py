@@ -28,7 +28,13 @@ from elo_filter_common import (
     fuzzy_text_score,
 )
 from clone_elo import compute_clone_ratings, empty_clone_ratings, register_clone_ratings
-from elo_favorites import flatten_favorites, load_favorites, run_favorite, run_sql
+from elo_favorites import (
+    DUCKDB_THREADS,
+    flatten_favorites,
+    load_favorites,
+    run_favorite,
+    run_sql,
+)
 from elo_session_common import results_url_status
 from ffbridge_quality_pipeline import (
     BOARD_FILENAME as QUALITY_BOARD_FILENAME,
@@ -1299,7 +1305,9 @@ def run_top_players_favorite(
         min_games=min_games,
         prior_sessions=prior_sessions,
     )
-    con = duckdb.connect(config={"enable_external_access": "false"})
+    con = duckdb.connect(
+        config={"enable_external_access": "false", "threads": DUCKDB_THREADS}
+    )
     try:
         con.register("self", results_df)
         register_clone_ratings(
@@ -1340,7 +1348,9 @@ def run_top_pairs_favorite(
         min_games=min_games,
         prior_sessions=prior_sessions,
     )
-    con = duckdb.connect(config={"enable_external_access": "false"})
+    con = duckdb.connect(
+        config={"enable_external_access": "false", "threads": DUCKDB_THREADS}
+    )
     try:
         con.register("self", results_df)
         result, sql = run_favorite(con, _ffbridge_favorites(), "Top_Pairs", meta)
@@ -1658,7 +1668,9 @@ def run_elo_sql(
         prior_sessions=prior_sessions,
     )
     row_limit = min(max(int(limit), 1), MAX_ELO_SQL_LIMIT)
-    con = duckdb.connect(config={"enable_external_access": "false"})
+    con = duckdb.connect(
+        config={"enable_external_access": "false", "threads": DUCKDB_THREADS}
+    )
     try:
         con.register("self", results_df)
         if results_df.is_empty():
@@ -2141,7 +2153,7 @@ def run_player_history_sql(
             limit=limit,
             meta=meta,
         )
-    connection = duckdb.connect()
+    connection = duckdb.connect(config={"threads": DUCKDB_THREADS})
     try:
         connection.register("self", sessions)
         _register_club_board_results(connection, cleaned)

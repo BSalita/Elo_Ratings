@@ -16,6 +16,7 @@ import duckdb
 import polars as pl
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
+DUCKDB_THREADS = 8
 
 MACRO_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -269,7 +270,9 @@ def run_favorite_on_df(
     meta: dict[str, Any],
 ) -> tuple[pl.DataFrame, str]:
     favorites = load_favorites(organization)
-    con = duckdb.connect(config={"enable_external_access": "false"})
+    con = duckdb.connect(
+        config={"enable_external_access": "false", "threads": DUCKDB_THREADS}
+    )
     try:
         con.register("self", df)
         return run_favorite(con, favorites, prompt_id, meta)
