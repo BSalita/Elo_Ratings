@@ -1915,6 +1915,12 @@ def _normalize_history_date(value: Optional[str], *, field: str) -> Optional[str
     return token
 
 
+PLAYER_ID_PATTERN = r"^(?i:(?:lancelot|person|classic|migration|license|ffb):)?\d+$"
+PLAYER_ID_ERROR = (
+    "player_id must be digits, optionally prefixed with lancelot:, classic:, or license:"
+)
+
+
 def _player_history_frame(
     player_id: Optional[str] = None,
     *,
@@ -1924,8 +1930,8 @@ def _player_history_frame(
 ) -> tuple[pl.DataFrame, Dict[str, Any], str, str]:
     """Projected per-session history. Omit player_id for the full field."""
     pid = str(player_id or "").strip()
-    if pid and not pid.isdigit():
-        raise ValueError("player_id must contain digits only")
+    if pid and not re.fullmatch(PLAYER_ID_PATTERN, pid):
+        raise ValueError(PLAYER_ID_ERROR)
     normalized_score = score.strip().lower()
     if normalized_score not in {"scratch", "handicap"}:
         raise ValueError("score must be either Scratch or Handicap")

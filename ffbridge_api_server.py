@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 from datetime import datetime, timezone
 
@@ -21,22 +22,22 @@ FFBRIDGE_API_BUILD_TAG = "2026-09-20-elo-favorites"
 app = FastAPI(title="FFBridge Elo API", version="1.6.0")
 
 
-def _optional_digit_id(value: object) -> str | None:
+def _optional_player_id(value: object) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
     if not text:
         return None
-    if not text.isdigit():
-        raise ValueError("player_id must contain digits only")
+    if not re.fullmatch(reports.PLAYER_ID_PATTERN, text):
+        raise ValueError(reports.PLAYER_ID_ERROR)
     return text
 
 
-OptionalDigitId = Annotated[str | None, BeforeValidator(_optional_digit_id)]
+OptionalPlayerId = Annotated[str | None, BeforeValidator(_optional_player_id)]
 
 
 class PlayerHistorySqlBody(BaseModel):
-    player_id: OptionalDigitId = None
+    player_id: OptionalPlayerId = None
     sql: str
     score: str = Field("Scratch", pattern="^(Scratch|Handicap)$")
     limit: int = Field(reports.DEFAULT_HISTORY_SQL_LIMIT, ge=1, le=reports.MAX_HISTORY_SQL_LIMIT)
@@ -233,7 +234,7 @@ def player_lookup(
 
 @app.get("/ffbridge/player-history")
 def player_history(
-    player_id: str = Query(..., pattern=r"^\d+$"),
+    player_id: str = Query(..., pattern=reports.PLAYER_ID_PATTERN),
     limit: int = Query(100, ge=1, le=500),
     score: str = Query("Scratch", pattern="^(Scratch|Handicap)$"),
     max_national_rank: int | None = Query(None, ge=1, le=5000),
@@ -256,7 +257,7 @@ def player_history(
 
 @app.get("/ffbridge/player-history/schema")
 def player_history_schema(
-    player_id: OptionalDigitId = None,
+    player_id: OptionalPlayerId = None,
     score: str = Query("Scratch", pattern="^(Scratch|Handicap)$"),
     api_backend: str | None = Query(None),
 ) -> dict:
