@@ -194,7 +194,14 @@ class SharedFilterTests(unittest.TestCase):
 
 class FirstPartyApiBoundaryTests(unittest.TestCase):
     @patch("ffbridge_api_server.reports.dataset_info")
-    def test_ffbridge_health_exposes_best_effort_link_policy(
+    def test_ffbridge_health_is_liveness_only(self, dataset_info: Mock) -> None:
+        response = ffbridge_api_server.health()
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["api_version"], ffbridge_api_server.app.version)
+        dataset_info.assert_not_called()
+
+    @patch("ffbridge_api_server.reports.dataset_info")
+    def test_ffbridge_dataset_info_exposes_best_effort_link_policy(
         self,
         dataset_info: Mock,
     ) -> None:
@@ -204,8 +211,7 @@ class FirstPartyApiBoundaryTests(unittest.TestCase):
             "results_link_policy": "best_effort",
             "quality_metric_definitions": {"filter_scope": "test"},
         }
-        response = ffbridge_api_server.health()
-        self.assertEqual(response["api_version"], "1.5.0")
+        response = ffbridge_api_server.dataset_info(api_backend=None)
         self.assertEqual(response["results_link_policy"], "best_effort")
         self.assertEqual(
             response["quality_metric_definitions"], {"filter_scope": "test"}

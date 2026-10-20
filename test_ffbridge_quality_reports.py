@@ -38,6 +38,7 @@ def _quality(id_column: str, ids: list[str]) -> pl.DataFrame:
             "par_contract_rate": [0.9, 0.1, 0.8][: len(ids)],
             "sacrifice_rate": [0.2, 0.8, 0.5][: len(ids)],
             "dd_tricks_diff_avg": [0.9, 0.1, 0.8][: len(ids)],
+            "dd_tricks_declared": [2, 1, 1][: len(ids)],
         }
     )
 
@@ -253,6 +254,7 @@ def test_incompatible_quality_cache_raises(tmp_path) -> None:
             "par_contract_rate": [0.5],
             "sacrifice_rate": [0.5],
             "dd_tricks_diff_avg": [0.0],
+            "dd_tricks_declared": [1],
         }
     ).write_parquet(tmp_path / reports.QUALITY_PLAYERS_PATH.name)
     _quality("pair_id", ["1"]).write_parquet(

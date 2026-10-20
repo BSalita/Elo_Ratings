@@ -12,6 +12,7 @@ from acbl_api_server import (
     _required_columns_for_mode,
     acbl_favorites_meta,
 )
+from clone_elo import empty_clone_ratings, register_clone_ratings
 from elo_common import default_min_skill_z
 from elo_favorites import load_favorites, process_sql_macros, run_favorite, vetted_prompt_sql
 
@@ -98,6 +99,7 @@ def _run(prompt_id: str, meta: dict) -> pl.DataFrame:
     con = duckdb.connect()
     try:
         con.register("self", _quality_fixture())
+        register_clone_ratings(con, empty_clone_ratings())
         result, _sql = run_favorite(con, load_favorites("acbl"), prompt_id, meta)
         return result
     finally:
