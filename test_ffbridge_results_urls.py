@@ -16,6 +16,7 @@ from streamlit_app_ffbridge_elo_ratings import (
     _move_url_columns_to_end,
     _results_cache_has_group_link_schema,
 )
+from streamlitlib.streamlitlib import _ranking_row_click_jscode
 
 
 class FFBridgeResultsUrlTests(unittest.TestCase):
@@ -182,6 +183,11 @@ class FFBridgeScratchGridTests(unittest.TestCase):
         ):
             self.assertEqual(_grid_player_ids("597539.0"), ["597539"])
             self.assertEqual(_grid_player_ids(None), [])
+
+    def test_row_click_arms_the_wait_cursor(self) -> None:
+        script = str(_ranking_row_click_jscode().js_code)
+        self.assertIn("armRankingRowHourglass", script)
+        self.assertIn("cursor: wait", script)
 
 
 if __name__ == "__main__":

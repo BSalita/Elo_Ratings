@@ -55,6 +55,8 @@ import duckdb
 
 from streamlitlib.streamlitlib import (
     ShowDataFrameTable,
+    _ranking_row_click_jscode,
+    clear_row_click_hourglass,
     create_pdf,
     widen_scrollbars,
 )
@@ -607,6 +609,9 @@ def build_selectable_aggrid(
         for col in _url_columns(display_df):
             gb.configure_column(col, cellRenderer=_URL_CELL_RENDERER, minWidth=240, width=360)
     grid_options = gb.build()
+    # Row click starts the session-summary rerun. Show the wait cursor until
+    # that rerun paints the summary grids.
+    grid_options['onRowClicked'] = _ranking_row_click_jscode()
     grid_options['rowHeight'] = LEADERBOARD_ROW_HEIGHT
     grid_options['headerHeight'] = 50
     grid_options['domLayout'] = 'normal'
@@ -2909,6 +2914,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
             else:
                 st.info(f"No pairs match the minimum requirement of {min_games} games.")
 
+    clear_row_click_hourglass()
     _load_debug_log("leaderboard panel complete")
 
 
