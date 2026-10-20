@@ -1169,7 +1169,14 @@ def filter_results(
                 column="tournament_name",
                 query=tournament_contains,
             )
-    if club and not df.is_empty() and "club_name" in df.columns:
+    if club and club.strip().isdigit() and not df.is_empty():
+        if "club_code" not in df.columns:
+            raise ValueError("Persisted results do not contain club_code")
+        df = df.filter(
+            pl.col("club_code").cast(pl.Utf8).str.strip_chars().str.strip_chars_start("0")
+            == (club.strip().lstrip("0") or "0")
+        )
+    elif club and not df.is_empty() and "club_name" in df.columns:
         df = filter_fuzzy_text(df, column="club_name", query=club)
     if (date_from or date_to) and not df.is_empty() and "date" in df.columns:
         session_day = pl.col("date").cast(pl.Utf8).str.slice(0, 10)

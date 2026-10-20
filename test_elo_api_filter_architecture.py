@@ -166,6 +166,18 @@ class SharedFilterTests(unittest.TestCase):
         self.assertEqual(resolve_series_id("Octpus"), 386)
         self.assertEqual(actual.height, 1)
 
+    def test_ffbridge_numeric_club_filters_on_club_code(self) -> None:
+        source = pl.DataFrame(
+            {
+                "club_code": ["5802079", "05802079", "5802080"],
+                "club_name": ["Bridge Club Levallois Perret"] * 2 + ["Other Club"],
+            }
+        )
+        self.assertEqual(filter_results(source, club="5802079").height, 2)
+        self.assertEqual(filter_results(source, club="05802079").height, 2)
+        with self.assertRaisesRegex(ValueError, "club_code"):
+            filter_results(source.drop("club_code"), club="5802079")
+
     def test_tournament_name_filters_apply_to_result_rows(self) -> None:
         source = pl.DataFrame(
             {
