@@ -1756,7 +1756,7 @@ def _apply_club_name_mapping(
         pl.col('club_code')
         .cast(pl.Utf8)
         .str.strip_chars_start('0')
-        .replace(club_mapping, default=None)
+        .replace_strict(club_mapping, default=None, return_dtype=pl.Utf8)
         .fill_null(pl.col('club_name'))
         .alias('club_name')
     )
