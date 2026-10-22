@@ -15,8 +15,8 @@ uvicorn
 
 # Data processing and analysis
 pandas
-polars==1.44.2
-duckdb==1.5.6
+polars==2.0.0
+duckdb==2.0.0
 psycopg[binary]
 # The deployment image clones the published mlBridge repository. Its package
 # initializer imports mlBridgeLib and mlBridgeAcblLib eagerly, so these remain
