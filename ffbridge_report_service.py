@@ -2171,7 +2171,7 @@ def run_player_history_sql(
         connection.register("self", sessions)
         _register_club_board_results(connection, cleaned)
         try:
-            result = connection.execute(cleaned).pl()
+            result = connection.sql(cleaned).pl()
         except duckdb.Error as exc:
             raise ValueError(str(exc)) from exc
     finally:

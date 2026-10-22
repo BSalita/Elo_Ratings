@@ -251,7 +251,7 @@ def run_sql(
     leftover = extract_macros(substituted)
     if leftover:
         raise ValueError(f"Unsubstituted favorites macros: {sorted(leftover)}")
-    return con.execute(substituted).pl(), substituted
+    return con.sql(substituted).pl(), substituted
 
 
 def run_favorite(

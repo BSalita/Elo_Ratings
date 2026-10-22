@@ -749,4 +749,4 @@ def acbl_sessions_from_connection(con: Any, elo_columns: dict[str, Optional[str]
             GROUP BY 1, 2, 3, session_id
         )
     """
-    return con.execute(sql).pl()
+    return con.sql(sql).pl()

@@ -1882,7 +1882,7 @@ def acbl_report(
                     result_df, generated_sql = run_favorite(
                         con, favorites, prompt_ids[0], meta
                     )
-                    session_ids_df = con.execute(
+                    session_ids_df = con.sql(
                         "SELECT DISTINCT CAST(session_id AS VARCHAR) AS session_id FROM self"
                     ).pl()
             finally:
