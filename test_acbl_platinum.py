@@ -133,6 +133,39 @@ class PlatinumAwardTests(unittest.TestCase):
         filtered = _apply_platinum_event_filter(frame)
         self.assertEqual(filtered["event_id"].to_list(), ["NABC253-NAIL"])
 
+    def test_platinum_detail_loads_mp_color(self) -> None:
+        # The detail endpoint loads a column subset; the platinum filter
+        # needs mp_color in it (a missing column was a 500 in production).
+        from unittest import mock
+
+        import acbl_api_server as server
+
+        seen: list[list[str]] = []
+
+        def fake_load(club_or_tournament, columns=None, date_from=None):
+            seen.append(list(columns or []))
+            raise RuntimeError("stop after the load")
+
+        with mock.patch.object(server, "load_elo_ratings", fake_load),                 mock.patch.object(server, "load_elo_ratings_schema_map", return_value={}):
+            for platinum in (True, False):
+                try:
+                    server.acbl_detail(
+                        club_or_tournament="tournament",
+                        rating_type="Pairs",
+                        elo_rating_type="Current Rating (End of Session)",
+                        date_from=None,
+                        online_filter="Local Only",
+                        strata="Open (unlimited)",
+                        player_id=None,
+                        pair_ids="1709925-6811434",
+                        platinum_events=platinum,
+                    )
+                except Exception:
+                    pass
+        self.assertEqual(len(seen), 2)
+        self.assertIn("mp_color", seen[0])
+        self.assertNotIn("mp_color", seen[1])
+
     def test_sql_in_list_escapes_quotes(self) -> None:
         self.assertEqual(
             _sql_string_list(["NABC253-NAIL", "O'Brien"]),

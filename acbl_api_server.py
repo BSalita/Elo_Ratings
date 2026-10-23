@@ -2135,6 +2135,10 @@ def acbl_detail(
             required_columns = _required_columns_for_detail(rating_type, elo_rating_type)
             if "event_id" in load_elo_ratings_schema_map(club_or_tournament):
                 required_columns.append("event_id")
+            if platinum_events:
+                # The platinum filter reads mp_color; without it in the
+                # projection every Platinum drill-down failed with a 500.
+                required_columns.append("mp_color")
             df = load_elo_ratings(club_or_tournament, columns=required_columns, date_from=parsed_date_from)
             df = _filter_valid_percentages_acbl(df)
             t_load_end = time.perf_counter()
