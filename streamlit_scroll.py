@@ -23,15 +23,21 @@ def scroll_to_here(token: str) -> None:
     components.html(
         f"""<script>
 (function () {{
-  const doc = window.parent.document;
-  let tries = 0;
+  // Grids below load after this runs, so the page may not be tall enough
+  // yet: keep aligning for a few seconds, and stop as soon as the user
+  // scrolls, clicks, or types.
+  const win = window.parent;
+  const doc = win.document;
+  const started = Date.now();
+  let stopped = false;
+  for (const type of ["wheel", "touchstart", "keydown", "mousedown"]) {{
+    win.addEventListener(type, () => {{ stopped = true; }}, {{ once: true, passive: true }});
+  }}
   const go = () => {{
+    if (stopped) return;
     const el = doc.getElementById("{anchor}");
-    if (el) {{
-      el.scrollIntoView({{ block: "start" }});
-      return;
-    }}
-    if (++tries < 50) setTimeout(go, 100);
+    if (el) el.scrollIntoView({{ block: "start" }});
+    if (Date.now() - started < 20000) setTimeout(go, 200);
   }};
   go();
 }})();
