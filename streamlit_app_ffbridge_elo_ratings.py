@@ -51,6 +51,7 @@ import pandas as pd
 import polars as pl
 import requests
 import streamlit as st
+from streamlit_scroll import scroll_to_here
 import duckdb
 
 from streamlitlib.streamlitlib import (
@@ -2580,6 +2581,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                         player_id = player_ids[0] if player_ids else None
 
                         if player_ids and not results_df.is_empty():
+                            scroll_to_here(f"ffbridge:player:{player_id}")
                             st.markdown(f"#### Session History: **{player_name}** ({player_id})")
                             id_match = pl.col('player1_id').cast(pl.Utf8).is_in(player_ids) | pl.col('player2_id').cast(pl.Utf8).is_in(player_ids)
                             player_results = results_df.filter(id_match).sort('date', descending=True)
@@ -2688,6 +2690,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                 )
 
                                 if selected_session is not None:
+                                    scroll_to_here(f"ffbridge:session:{selected_session.get('Event_ID', '')}:{selected_session.get('_pair_id', '')}")
                                     event_id = str(selected_session.get('Event_ID', ''))
                                     row_pair_id = selected_session.get('_pair_id')
                                     if event_id:
@@ -2799,6 +2802,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                         pair_name = selected_row.get('Pair_Name', 'Unknown')
 
                         if pair_id and not results_df.is_empty():
+                            scroll_to_here(f"ffbridge:pair:{pair_id}")
                             st.markdown(f"#### Session History: **{pair_name}**")
 
                             pair_results = results_df.filter(
@@ -2882,6 +2886,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
                                 )
 
                                 if selected_session is not None:
+                                    scroll_to_here(f"ffbridge:session:{selected_session.get('Event_ID', '')}:{selected_session.get('_pair_id', '')}")
                                     event_id = str(selected_session.get('Event_ID', ''))
                                     if event_id:
                                         _show_tournament_opponents(

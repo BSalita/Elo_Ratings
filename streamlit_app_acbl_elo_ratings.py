@@ -97,6 +97,7 @@ from elo_filter_common import (
     masterpoints_bounds as get_masterpoints_bounds,
 )
 from elo_session_common import summarize_acbl_sessions
+from streamlit_scroll import scroll_to_here
 
 logger = logging.getLogger(__name__)
 
@@ -1325,6 +1326,7 @@ def _acbl_report_panel() -> None:
                             if not player_id:
                                 st.warning("Missing Player_ID in selected row.")
                             else:
+                                scroll_to_here(f"acbl:{club_or_tournament}:player:{player_id}")
                                 st.markdown(f"#### Session History: **{player_name}** ({player_id})")
                                 detail = _fetch_remote_detail_table(
                                     club_or_tournament=club_or_tournament,
@@ -1359,6 +1361,7 @@ def _acbl_report_panel() -> None:
                                         club_or_tournament=club_or_tournament,
                                     )
                                     if selected_session is not None:
+                                        scroll_to_here(f"acbl:{club_or_tournament}:session:{selected_session['Session']}")
                                         _show_opponent_aggregation(detail, selected_session)
                                         session_id = selected_session["Session"]
                                         st.markdown(f"#### Boards — Session {session_id}")
@@ -1372,6 +1375,7 @@ def _acbl_report_panel() -> None:
                             if not pair_ids:
                                 st.warning("Missing Pair_IDs in selected row.")
                             else:
+                                scroll_to_here(f"acbl:{club_or_tournament}:pair:{pair_ids}")
                                 st.markdown(f"#### Session History: **{pair_names}**")
                                 detail = _fetch_remote_detail_table(
                                     club_or_tournament=club_or_tournament,
@@ -1406,6 +1410,7 @@ def _acbl_report_panel() -> None:
                                         club_or_tournament=club_or_tournament,
                                     )
                                     if selected_session is not None:
+                                        scroll_to_here(f"acbl:{club_or_tournament}:session:{selected_session['Session']}")
                                         _show_opponent_aggregation(detail, selected_session)
                                         session_id = selected_session["Session"]
                                         st.markdown(f"#### Boards — Session {session_id}")
