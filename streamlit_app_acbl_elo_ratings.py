@@ -48,12 +48,6 @@ import duckdb
 import requests
 from streamlit_extras.bottom_container import bottom
 
-try:
-    import endplay
-    ENDPLAY_VERSION = endplay.__version__
-except (ImportError, AttributeError):
-    ENDPLAY_VERSION = "N/A"
-
 from streamlitlib.streamlitlib import (
     ShowDataFrameTable,
     create_pdf,
@@ -85,6 +79,7 @@ from elo_common import (
     LEADERBOARD_ROW_HEIGHT,
     remember_leaderboard_sort,
     render_app_footer,
+    package_versions_line,
     footer_streamlit_app_diagnostics_line,
     sync_state_to_url_params,
 )
@@ -403,10 +398,7 @@ def initialize_session_state():
 def app_info() -> None:
     """Display app information"""
     info_line_1 = f"Query Params:{st.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}"
-    info_line_2 = (
-        f"Streamlit:{st.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} "
-        f"pandas:{pd.__version__} polars:{pl.__version__} duckdb:{duckdb.__version__} endplay:{ENDPLAY_VERSION}"
-    )
+    info_line_2 = package_versions_line()
     try:
         import psutil
 
@@ -2007,13 +1999,7 @@ def main():
 
     render_app_footer(
         st,
-        ENDPLAY_VERSION,
         diagnostics_lines=_acbl_footer_diagnostics_lines(st),
-        dependency_versions={
-            "pandas": pd.__version__,
-            "polars": pl.__version__,
-            "duckdb": duckdb.__version__,
-        },
     )
 
 

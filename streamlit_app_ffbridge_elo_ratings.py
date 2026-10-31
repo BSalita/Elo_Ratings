@@ -139,12 +139,6 @@ from ffbridge_report_service import (
     run_top_pairs_favorite,
 )
 
-# Import for version display only
-try:
-    import endplay
-    ENDPLAY_VERSION = endplay.__version__
-except (ImportError, AttributeError):
-    ENDPLAY_VERSION = "N/A"
 
 # Available API backends
 API_BACKENDS = {
@@ -3432,14 +3426,8 @@ def _load_main_content(
     
     render_app_footer(
         st,
-        ENDPLAY_VERSION,
         source_line=f"Data sourced using {selected_api_name} • {selected_tournament_label}",
         diagnostics_lines=_ffbridge_footer_diagnostics_lines(st),
-        dependency_versions={
-            "pandas": pd.__version__,
-            "polars": pl.__version__,
-            "duckdb": duckdb.__version__,
-        },
     )
 
 

@@ -18,6 +18,7 @@ import sys
 import threading
 import html
 from datetime import datetime
+from importlib import metadata as importlib_metadata
 import polars as pl
 
 
@@ -992,18 +993,41 @@ def get_cache_diagnostic_line(cache_dir_env_var: str = "FFBRIDGE_CACHE_DIR") -> 
     )
 
 
+# (label shown in footer, pip distribution name)
+KEY_PACKAGES: tuple[tuple[str, str], ...] = (
+    ("streamlit", "streamlit"),
+    ("pandas", "pandas"),
+    ("polars", "polars"),
+    ("pyarrow", "pyarrow"),
+    ("duckdb", "duckdb"),
+    ("numpy", "numpy"),
+    ("endplay", "endplay"),
+    ("pytorch", "torch"),
+    ("scikit-learn", "scikit-learn"),
+)
+
+
+def package_versions_line() -> str:
+    """Python plus installed key package versions, e.g. 'Python:3.12.4 streamlit:1.40.0 ...'.
+
+    Reads package metadata, so torch etc. are never imported just for the footer.
+    Packages that are not installed are left out.
+    """
+    parts = [f"Python:{'.'.join(map(str, sys.version_info[:3]))}"]
+    for label, dist in KEY_PACKAGES:
+        try:
+            parts.append(f"{label}:{importlib_metadata.version(dist)}")
+        except importlib_metadata.PackageNotFoundError:
+            continue
+    return " ".join(parts)
+
+
 def render_app_footer(
     st_module,
-    endplay_version: str,
     source_line: str | None = None,
-    dependency_versions: dict[str, str] | None = None,
     diagnostics_lines: list[str] | None = None,
 ) -> None:
     """Render the common footer used by both Streamlit apps."""
-    dependency_versions = dependency_versions or {}
-    pandas_version = dependency_versions.get("pandas", "N/A")
-    polars_version = dependency_versions.get("polars", pl.__version__)
-    duckdb_version = dependency_versions.get("duckdb", "N/A")
     memory_line = "" if diagnostics_lines else get_memory_usage_line()
     date_str = datetime.now().strftime('%Y-%m-%d')
 
@@ -1020,7 +1044,7 @@ def render_app_footer(
         <div style="text-align: center; color: #80cbc4; font-size: 0.8rem; opacity: 0.7;">
             Project lead is Robert Salita research@AiPolice.org. Code written in Python by Cursor AI. UI written in streamlit. Data engine is polars. Repo: <a href="https://github.com/BSalita/Elo_Ratings" target="_blank" style="color: #80cbc4;">github.com/BSalita/Elo_Ratings</a><br>
             {diagnostics_html}Query Params:{st_module.query_params.to_dict()} Environment:{os.getenv('STREAMLIT_ENV','')}<br>
-            Streamlit:{st_module.__version__} Python:{'.'.join(map(str, sys.version_info[:3]))} pandas:{pandas_version} polars:{polars_version} duckdb:{duckdb_version} endplay:{endplay_version}<br>
+            {html.escape(package_versions_line())}<br>
             {source_html}{html.escape(memory_line)}<br>
             System Current Date: {html.escape(date_str)}
         </div>
