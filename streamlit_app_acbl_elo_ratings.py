@@ -1848,11 +1848,17 @@ def main():
         st.sidebar.markdown("🔗 [FFBridge Postmortem](https://ffbridge.postmortem.chat)")
         st.sidebar.markdown("🔗 [FFBridge Statistics](https://ffbridge-stats.7nt.info)")
         st.sidebar.markdown("🔗 [PBN/LIN Postmortem](https://pbn.postmortem.chat)")
-        
-        # Developer Settings (kept in sidebar for SQL-gating control)
+
+        st.sidebar.markdown("---")
+        # Bound by key to st.session_state.show_sql_query (initialized False).
+        st.sidebar.checkbox(
+            "Show SQL query",
+            key="show_sql_query",
+            help="Show the SQL query above each table produced by SQL.",
+        )
+
+        # Developer Settings (custom SQL panel requires "Show SQL query" above)
         with st.sidebar.expander("🔧 **Developer Settings**"):
-            show_sql = st.checkbox('Show SQL Query', value=st.session_state.show_sql_query, help='Show SQL used to query dataframes.')
-            st.session_state.show_sql_query = show_sql
             enable_custom_queries = st.checkbox(
                 "Enable custom queries",
                 value=st.session_state.get("enable_custom_queries", False),

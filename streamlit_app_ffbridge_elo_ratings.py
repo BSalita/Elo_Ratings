@@ -2279,6 +2279,16 @@ def initialize_session_state():
         ).strftime('%Y-%m-%d %H:%M:%S %Z')
     else:
         st.session_state.first_time = False
+    if 'show_sql_query' not in st.session_state:
+        st.session_state.show_sql_query = False
+
+
+def _show_sql_query_block(sql_text: str) -> None:
+    """Render SQL in a collapsed expander when "Show SQL query" is checked."""
+    if not st.session_state.show_sql_query:
+        return
+    with st.expander("SQL Query", expanded=False):
+        st.code(sql_text, language="sql")
 
 
 # Default API helper kept for Classic cleanup later. The sidebar no longer
@@ -2538,8 +2548,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
             )
 
             if sql_query:
-                with st.expander("SQL Query", expanded=False):
-                    st.code(sql_query, language="sql")
+                _show_sql_query_block(sql_query)
 
             if not top_players.is_empty():
                 try:
@@ -2760,8 +2769,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
             )
 
             if sql_query:
-                with st.expander("SQL Query", expanded=False):
-                    st.code(sql_query, language="sql")
+                _show_sql_query_block(sql_query)
 
             if not top_pairs.is_empty():
                 try:
@@ -3120,6 +3128,14 @@ def main():
         st.sidebar.markdown("[FFBridge Postmortem](https://ffbridge.postmortem.chat)")
         st.sidebar.markdown("[FFBridge Statistics](https://ffbridge-stats.7nt.info)")
         st.sidebar.markdown("[PBN/LIN Postmortem](https://pbn.postmortem.chat)")
+
+        st.sidebar.markdown("---")
+        # Bound by key to st.session_state.show_sql_query (initialized False).
+        st.sidebar.checkbox(
+            "Show SQL query",
+            key="show_sql_query",
+            help="Show the SQL query above each table produced by SQL.",
+        )
 
     # Persist current sidebar state to URL query params for shareable links.
     sync_state_to_url_params(st, FFBRIDGE_URL_PARAMS)
