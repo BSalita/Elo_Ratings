@@ -9,8 +9,8 @@ import polars as pl
 import publish_ffbridge_hierarchical as publisher
 
 
-def _row(session_id: str, revision: str, archived_at: str) -> dict:
-    relative = f"fragments/year=2026/session_id={session_id}/layout_version=3/revision={revision}"
+def _row(session_id: str, revision: str, archived_at: str, layout: int = publisher.EXPECTED_LAYOUT_VERSION) -> dict:
+    relative = f"fragments/year=2026/session_id={session_id}/layout_version={layout}/revision={revision}"
     return {
         "session_id": session_id,
         "revision": revision,
@@ -32,7 +32,7 @@ def _write_archive(root: Path, rows: list[dict]) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             pl.DataFrame({"session_id": [row["session_id"]]}).write_parquet(path)
     pl.DataFrame(rows).write_parquet(root / "manifest.parquet")
-    (root / "metadata.json").write_text(json.dumps({"layout_version": 3}), encoding="utf-8")
+    (root / "metadata.json").write_text(json.dumps({"layout_version": publisher.EXPECTED_LAYOUT_VERSION}), encoding="utf-8")
 
 
 class PublishKeepsDestinationSessionsTests(unittest.TestCase):
@@ -63,6 +63,21 @@ class PublishKeepsDestinationSessionsTests(unittest.TestCase):
             (destination / orphan["results_path"]).unlink()
 
             with self.assertRaises(FileNotFoundError):
+                publisher.publish(source, destination, workers=1)
+
+    def test_destination_only_session_on_old_layout_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, destination = Path(tmp) / "source", Path(tmp) / "destination"
+            _write_archive(source, [_row("1", "a", "2026-09-30T00:00:00+00:00")])
+            old = _row(
+                "394099",
+                "live",
+                "2026-10-17T00:00:00+00:00",
+                layout=publisher.EXPECTED_LAYOUT_VERSION - 1,
+            )
+            _write_archive(destination, [old])
+
+            with self.assertRaisesRegex(ValueError, "394099"):
                 publisher.publish(source, destination, workers=1)
 
 

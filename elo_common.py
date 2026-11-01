@@ -438,6 +438,7 @@ _NUMERIC_NAME_EXACT: frozenset[str] = frozenset({
     "Elo", "Elo_Before", "Elo_After", "Elo_Delta",
     "DD_Tricks_Diff_Avg",
     "DD_Tricks_Declared",
+    "Lead_Cost_Avg", "Lead_Best_Pct", "Leads_Scored", "SD_Lead_Cost_Avg",
 })
 
 

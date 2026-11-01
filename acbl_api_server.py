@@ -51,7 +51,7 @@ DATA_ROOT = pathlib.Path(
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-10-06-par-sacrifice-columns"
+API_BUILD_TAG = "2026-11-01-opening-lead-columns"
 
 QUALITY_METRIC_DEFINITIONS = {
     "DD_Tricks_Diff_Avg": {
@@ -84,6 +84,44 @@ QUALITY_METRIC_DEFINITIONS = {
             "a hit is DD_Score_Declarer equal to Par_Declarer."
         ),
     },
+    "Lead_Cost_Avg": {
+        "label": "DD lead cost",
+        "population": (
+            "Club opening leads only (tournaments record no lead); credited to the "
+            "opening leader and the defending pair."
+        ),
+        "calculation": (
+            "Mean DD_Lead_Cost: defenders' tricks lost versus the best double-dummy "
+            "opening lead. 0 is best; lower is better."
+        ),
+    },
+    "Lead_Best_Pct": {
+        "label": "DD best lead percentage",
+        "population": "Same leads as Lead_Cost_Avg.",
+        "calculation": "Share of scored leads with Lead_Is_DD_Best.",
+    },
+    "Leads_Scored": {
+        "label": "Leads scored",
+        "population": "Same leads as Lead_Cost_Avg.",
+        "calculation": "Count of opening leads with a DD_Lead_Cost.",
+    },
+    "SD_Lead_Cost_Avg": {
+        "label": "SD lead cost",
+        "population": "Same leads as Lead_Cost_Avg.",
+        "calculation": (
+            "Mean SD_Lead_Cost (single-dummy tricks lost versus the best lead); "
+            "null when the single-dummy lead score was not computed. Lower is better."
+        ),
+    },
+}
+
+# Opening-lead board columns read by the leaderboard SQL. Tournaments record
+# no lead, so their frames lack all three; SD_Lead_Cost exists only when the
+# single-dummy lead option ran. Missing ones are exposed as typed NULLs.
+_LEAD_COLUMN_SQL_TYPES = {
+    "DD_Lead_Cost": "UTINYINT",
+    "Lead_Is_DD_Best": "BOOLEAN",
+    "SD_Lead_Cost": "FLOAT",
 }
 
 # Board columns on Elo table self, or deliberately absent from it.
@@ -978,6 +1016,23 @@ def _self_filter_sql_clauses(
     return clauses
 
 
+def _missing_lead_columns_sql(columns: list[str], club_or_tournament: str) -> list[str]:
+    """NULL select items for absent lead columns; a club frame must have the DD ones."""
+    present = set(columns)
+    if club_or_tournament.lower() == "club":
+        missing = [c for c in ("DD_Lead_Cost", "Lead_Is_DD_Best") if c not in present]
+        if missing:
+            raise ValueError(
+                f"Club Elo parquet lacks opening-lead columns {missing}. Rebuild "
+                "acbl_club_elo_ratings.parquet with acbl_elo_ratings_create.py."
+            )
+    return [
+        f"CAST(NULL AS {sql_type}) AS {column}"
+        for column, sql_type in _LEAD_COLUMN_SQL_TYPES.items()
+        if column not in present
+    ]
+
+
 def _prepare_self_view(
     con: duckdb.DuckDBPyConnection,
     full_df: pl.DataFrame,
@@ -986,6 +1041,8 @@ def _prepare_self_view(
     online_filter: str,
     strata: str = STRATA_DEFAULT,
     platinum_events: bool = False,
+    *,
+    club_or_tournament: str,
 ) -> tuple[int | None, str]:
     """Register the cached full frame and expose filtered rows as temp view ``self``.
 
@@ -997,6 +1054,10 @@ def _prepare_self_view(
         full_df, date_from, online_filter, strata, platinum_events=platinum_events,
     )
     where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
+    extra_select = _missing_lead_columns_sql(full_df.columns, club_or_tournament)
+    if "Round" not in full_df.columns:
+        extra_select.append("CAST(NULL AS INTEGER) AS Round")
+    select_sql = ", ".join(["*", *extra_select])
     with _DB_LOCK:
         try:
             con.execute("DROP VIEW IF EXISTS self")
@@ -1007,7 +1068,6 @@ def _prepare_self_view(
         except Exception:
             pass
         con.register("_full", full_df)
-        select_sql = "*" if "Round" in full_df.columns else "*, CAST(NULL AS INTEGER) AS Round"
         con.execute(f"CREATE TEMP VIEW self AS SELECT {select_sql} FROM _full WHERE {where_sql}")
     input_rows = full_df.height if not where_clauses else None
     date_range = _frame_date_range(source_path, date_from)
@@ -1843,6 +1903,7 @@ def acbl_report(
             input_rows, date_range = _prepare_self_view(
                 con, full_df, source_path, parsed_date_from, online_filter, strata,
                 platinum_events=platinum_events,
+                club_or_tournament=club_or_tournament,
             )
             t_filter_end = time.perf_counter()
 
@@ -2046,6 +2107,7 @@ def acbl_sql(
             _prepare_self_view(
                 con, full_df, source_path, parsed_date_from, online_filter, strata,
                 platinum_events=platinum_events,
+                club_or_tournament=club_or_tournament,
             )
             if club_or_tournament == "club":
                 recent_games = pathlib.Path(

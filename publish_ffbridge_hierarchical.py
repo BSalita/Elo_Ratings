@@ -22,7 +22,7 @@ import polars as pl
 from tqdm import tqdm
 
 
-EXPECTED_LAYOUT_VERSION = 3
+EXPECTED_LAYOUT_VERSION = 4
 
 
 def _latest(manifest: pl.DataFrame) -> pl.DataFrame:
@@ -96,6 +96,20 @@ def publish(source: pathlib.Path, destination: pathlib.Path, workers: int) -> di
         raise ValueError(f"Empty manifest: {manifest_path}")
     kept = _destination_only(destination, source_latest)
     latest = _latest(pl.concat([source_latest, kept]))
+    # Sessions the service wrote before a layout change lack the new layout's
+    # columns, and the published metadata.json would make them unreadable.
+    stale = latest.filter(
+        ~pl.col("results_path").str.contains(
+            f"layout_version={EXPECTED_LAYOUT_VERSION}", literal=True
+        )
+    )
+    if stale.height:
+        raise ValueError(
+            f"{stale.height} destination-only sessions are not layout "
+            f"v{EXPECTED_LAYOUT_VERSION}; archive them in the source first "
+            f"(stage 4) or remove them from {destination / 'manifest.parquet'}. "
+            f"First: {stale['session_id'].head(10).to_list()}"
+        )
 
     pairs: list[tuple[pathlib.Path, pathlib.Path]] = []
     missing: list[str] = []

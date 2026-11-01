@@ -25,7 +25,8 @@ import polars as pl
 import requests
 
 
-SCHEMA_VERSION = 2
+# 3: opening-lead columns (DD_Lead_Cost, Lead_Is_DD_Best, SD_Lead_Cost).
+SCHEMA_VERSION = 3
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000
 _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
@@ -39,11 +40,25 @@ PAIR_FILENAME = "ffbridge_quality_pairs.parquet"
 METADATA_FILENAME = "ffbridge_quality_metadata.json"
 FRAGMENT_DIRNAME = "session_fragments"
 HRS_CACHE_FILENAME = "ffbridge_hand_records_cache.parquet"
+# Single-dummy samples per side for each new deal. Deals cached with fewer
+# are re-solved only by backfill_sd_trials (ffbridge_sd_backfill.py).
+SD_PRODUCTIONS = 40
 AUDIT_MANIFEST_FILENAME = "ffbridge_cache_audit.json"
 IDENTITY_CACHE_FILENAME = "ffbridge_identity_map.json"
 _EV_SUMMARY_RE = re.compile(r"^EV_(NS|EW)_[NESW]_[SHDCN]_[1-7]_(V|NV)$")
 _EV_PAIR_MAX_RE = re.compile(r"^EV_(NS|EW)_(V|NV)_Max$")
 SEATS = ("N", "E", "S", "W")
+# Opening-lead scores from mlBridge (add_dd_lead_cost / add_sd_lead_score).
+# Null on boards with no recorded lead, on sessions taken from the training
+# parquet (it has no lead columns), and SD_Lead_Cost when the single-dummy
+# lead option did not run.
+LEAD_QUALITY_DTYPES = {
+    "DD_Lead_Cost": pl.UInt8,
+    "Lead_Is_DD_Best": pl.Boolean,
+    "SD_Lead_Cost": pl.Float32,
+}
+# The opening leader sits to the declarer's left: seat -> declarer it leads against.
+LEAD_DECLARER_FOR_SEAT = {"N": "W", "E": "N", "S": "E", "W": "S"}
 QUALITY_COLUMNS = (
     "Is_Par_Suit",
     "Is_Sacrifice",
@@ -51,6 +66,7 @@ QUALITY_COLUMNS = (
     "Par_Contract_Score_NS",
     "Par_Contract_Score_EW",
     "DD_Tricks_Diff",
+    *LEAD_QUALITY_DTYPES,
 )
 QUALITY_BOARD_COLUMNS = (
     "session_id",
@@ -86,6 +102,22 @@ QUALITY_METRIC_DEFINITIONS = {
     "Sacrifice_Rate_Pct": {
         "formula": "DD score equals negative directional par / negative-par declarations",
         "attribution": "declaring partnership",
+    },
+    "Lead_Cost_Avg": {
+        "formula": "mean(DD_Lead_Cost): defenders' tricks lost vs the best double-dummy opening lead; 0 is best, lower is better",
+        "attribution": "opening leader only; defending partnership in pair reports",
+    },
+    "Lead_Best_Pct": {
+        "formula": "leads with Lead_Is_DD_Best / scored leads",
+        "attribution": "opening leader only; defending partnership in pair reports",
+    },
+    "Leads_Scored": {
+        "formula": "count of opening leads with a DD_Lead_Cost",
+        "attribution": "opening leader only; defending partnership in pair reports",
+    },
+    "SD_Lead_Cost_Avg": {
+        "formula": "mean(SD_Lead_Cost): single-dummy tricks lost vs the best lead; null when the single-dummy lead score was not computed",
+        "attribution": "opening leader only; defending partnership in pair reports",
     },
     "filter_scope": "same sessions and teams selected by the leaderboard filters",
 }
@@ -923,6 +955,19 @@ def normalize_quality_frame(
             out = out.with_columns(pl.lit(None, dtype=pl.String).alias(column))
         else:
             out = out.with_columns(pl.col(column).cast(pl.String, strict=False))
+    if "Lead" in out.columns:
+        # A session that records leads must have been lead-scored.
+        _require_columns(
+            out, ["DD_Lead_Cost", "Lead_Is_DD_Best"], "Augmented FFBridge frame with Lead"
+        )
+    out = out.with_columns(
+        (
+            pl.col(column).cast(dtype)
+            if column in out.columns
+            else pl.lit(None, dtype=dtype)
+        ).alias(column)
+        for column, dtype in LEAD_QUALITY_DTYPES.items()
+    )
     selected = out.select(*QUALITY_BOARD_COLUMNS)
     identity_columns = [f"Player_ID_{seat}" for seat in SEATS]
     selected = selected.filter(
@@ -983,6 +1028,7 @@ def normalize_training_parquet(
         "DDTricks_Diff",
         "DD_Tricks",
         "DD_Tricks_Diff",
+        *LEAD_QUALITY_DTYPES,
         *(f"Player_ID_{seat}" for seat in SEATS),
     }
     selected = [
@@ -1103,6 +1149,14 @@ def _quality_aggregates(frame: pl.DataFrame, id_column: str) -> pl.DataFrame:
             .sum()
             .cast(pl.UInt32)
             .alias("dd_tricks_declared"),
+            pl.col("_lead_cost").cast(pl.Float64).mean().alias("lead_cost_avg"),
+            pl.col("_lead_best").cast(pl.Float64).mean().alias("lead_best_rate"),
+            pl.col("_lead_cost").is_not_null().sum().cast(pl.UInt32).alias(
+                "leads_scored"
+            ),
+            pl.col("_sd_lead_cost").cast(pl.Float64).mean().alias(
+                "sd_lead_cost_avg"
+            ),
         )
         .with_columns(
             _rank_desc("par_suit_rate", "Par_Suit_Rank"),
@@ -1112,6 +1166,18 @@ def _quality_aggregates(frame: pl.DataFrame, id_column: str) -> pl.DataFrame:
         )
         .sort(id_column)
     )
+
+
+def _lead_exprs(on_lead: pl.Expr) -> list[pl.Expr]:
+    """Opening-lead scores for appearances where ``on_lead`` holds."""
+    return [
+        pl.when(on_lead).then(pl.col(source)).otherwise(None).alias(alias)
+        for source, alias in (
+            ("DD_Lead_Cost", "_lead_cost"),
+            ("Lead_Is_DD_Best", "_lead_best"),
+            ("SD_Lead_Cost", "_sd_lead_cost"),
+        )
+    ]
 
 
 def build_player_sidecar(board_quality: pl.DataFrame) -> pl.DataFrame:
@@ -1138,6 +1204,9 @@ def build_player_sidecar(board_quality: pl.DataFrame) -> pl.DataFrame:
                 .then(pl.col("DD_Tricks_Diff"))
                 .otherwise(None)
                 .alias("_dd_tricks_diff"),
+                *_lead_exprs(
+                    pl.col("Declarer_Direction") == LEAD_DECLARER_FOR_SEAT[seat]
+                ),
             )
             for seat in SEATS
         ],
@@ -1170,6 +1239,9 @@ def build_pair_sidecar(board_quality: pl.DataFrame) -> pl.DataFrame:
                 .then(pl.col("DD_Tricks_Diff"))
                 .otherwise(None)
                 .alias("_dd_tricks_diff"),
+                *_lead_exprs(
+                    pl.col("Pair_Declarer_Direction") == ("EW" if side == "NS" else "NS")
+                ),
             )
             for pair_column, side in (("Pair_ID_NS", "NS"), ("Pair_ID_EW", "EW"))
         ],
@@ -1295,6 +1367,7 @@ def flatten_team_scores(
                 "contract": score.get("contract"),
                 "declarer": score.get("declarer"),
                 "result": score.get("result"),
+                "lead": score.get("lead"),
                 "nsScore": score.get("nsScore"),
                 "ewScore": score.get("ewScore"),
                 "nsNote": score.get("nsNote"),
@@ -2924,7 +2997,7 @@ def _resolve_hrs_cache(
     return None
 
 
-def _full_mlbridge_augment(converted: pl.DataFrame) -> pl.DataFrame:
+def _full_mlbridge_augment(converted: pl.DataFrame, sd_lead: Any = None, suitc: Any = None) -> pl.DataFrame:
     _ff_lib, augment_lib = _import_mlbridge()
     augment_logger = logging.getLogger("mlBridge.mlBridgeAugmentLib")
     previous_level = augment_logger.level
@@ -2935,10 +3008,12 @@ def _full_mlbridge_augment(converted: pl.DataFrame) -> pl.DataFrame:
                 augmented, _ = augment_lib.AllAugmentations(
                     converted,
                     None,
-                    sd_productions=10,
+                    sd_productions=SD_PRODUCTIONS,
                     max_sd_adds=None,
                     output_progress=False,
                     incorporate_elo_ratings=False,
+                    sd_lead=sd_lead,
+                    suitc=suitc,
                 ).perform_all_augmentations()
         except pl.exceptions.InvalidOperationError as exc:
             raise NoQualityRowsError(
@@ -2954,9 +3029,11 @@ def augment_raw_session(
     *,
     hrs_cache: list[pl.DataFrame | None] | None = None,
     cache_file_path: pathlib.Path | None = None,
-    sd_productions: int = 10,
+    sd_productions: int = SD_PRODUCTIONS,
     max_sd_adds: int | None = None,
     dd_audit_rate: float = 1.0,
+    sd_lead: Any = None,
+    suitc: Any = None,
 ) -> pl.DataFrame:
     """Augment a session the ACBL way: cache DD/Par/SD probs, derive EV, join.
 
@@ -2974,6 +3051,8 @@ def augment_raw_session(
         sd_productions=sd_productions,
         max_sd_adds=max_sd_adds,
         dd_audit_rate=dd_audit_rate,
+        sd_lead=sd_lead,
+        suitc=suitc,
     )
 
 
@@ -3025,12 +3104,16 @@ def augment_prepared_session(
     *,
     hrs_cache: list[pl.DataFrame | None] | None = None,
     cache_file_path: pathlib.Path | None = None,
-    sd_productions: int = 10,
+    sd_productions: int = SD_PRODUCTIONS,
     max_sd_adds: int | None = None,
     dd_audit_rate: float = 1.0,
     solved_dd: pl.DataFrame | None = None,
     quiet: bool = False,
+    sd_lead: Any = None,
+    suitc: Any = None,
 ) -> pl.DataFrame:
+    """``sd_lead`` (make_sd_lead_cache) adds the single-dummy lead score;
+    ``suitc`` (make_suitc_cache) adds the SC_* SuitC columns."""
     if _has_embedded_dd_table(work):
         work, force_dd_pbns = _apply_lancelot_dd_audit(
             work, rate=dd_audit_rate, solved_dd=solved_dd, quiet=quiet
@@ -3051,8 +3134,53 @@ def augment_prepared_session(
             hrs_cache[0] = cache
         if "Score_EW" not in work.columns and "Score_NS" in work.columns:
             work = work.with_columns((-pl.col("Score_NS")).alias("Score_EW"))
-        return _attach_board_ev_columns(work)
-    return _full_mlbridge_augment(work)
+        work = _attach_lead_scores(_attach_board_ev_columns(work), sd_lead)
+        return _attach_suitc(work, suitc)
+    return _full_mlbridge_augment(work, sd_lead, suitc)
+
+
+_SUITC_LOCK = threading.Lock()
+
+
+def make_suitc_cache(directory: pathlib.Path | None = None) -> Any:
+    """mlBridgeSuitCLib.SuitCCache (default: the shared SUITC_CACHE_DIR)."""
+    _import_mlbridge()
+    from mlBridge import mlBridgeSuitCLib
+    return mlBridgeSuitCLib.SuitCCache(directory)
+
+
+def _attach_suitc(frame: pl.DataFrame, suitc: Any) -> pl.DataFrame:
+    """SC_* deal columns plus SC_Guess_Declarer / DD_Tricks_Diff_SC (embedded-DD path)."""
+    if suitc is None or "SC_ET_NS" in frame.columns:
+        return frame
+    from mlBridge import mlBridgeSuitCLib
+    with _SUITC_LOCK:  # the cache object is shared by the stage 2 threads
+        frame = mlBridgeSuitCLib.add_suitc_features(frame, suitc, show_progress=False)
+    diff = "DD_Tricks_Diff" if "DD_Tricks_Diff" in frame.columns else "DDTricks_Diff"
+    return mlBridgeSuitCLib.add_suitc_declarer_columns(frame, diff)
+
+
+def make_sd_lead_cache(samples: int, directory: pathlib.Path) -> Any:
+    """mlBridge SDLeadCache (contract mode) kept in ``directory``."""
+    _ff_lib, augment_lib = _import_mlbridge()
+    return augment_lib.SDLeadCache(samples, "contract", directory)
+
+
+def _attach_lead_scores(frame: pl.DataFrame, sd_lead: Any = None) -> pl.DataFrame:
+    """DD_Lead_Cost / Lead_Is_DD_Best, plus SD_Lead_* when ``sd_lead`` is given.
+
+    The full mlBridge path adds them in FinalContractAugmenter; this covers
+    sessions augmented from Lancelot's embedded DD table.
+    """
+    if "Lead" not in frame.columns:
+        return frame
+    _ff_lib, augment_lib = _import_mlbridge()
+    with _AUGMENT_LOCK:  # ddss is not safe to call from several threads at once
+        if "DD_Lead_Cost" not in frame.columns:
+            frame = augment_lib.add_dd_lead_cost(frame)
+        if sd_lead is not None and "SD_Lead_Cost" not in frame.columns:
+            frame = augment_lib.add_sd_lead_score(frame, sd_lead)
+    return frame
 
 
 SessionHook = Callable[[SessionAudit, pl.DataFrame], None]
@@ -3166,6 +3294,82 @@ def _estimate_sd_task(todo: pl.DataFrame, sd_productions: int) -> pl.DataFrame:
     return sd_df
 
 
+def backfill_sd_trials(
+    cache_path: pathlib.Path,
+    *,
+    sd_productions: int = SD_PRODUCTIONS,
+    workers: int = 4,
+    batch_deals: int = 2000,
+    limit: int | None = None,
+    show_progress: bool = True,
+) -> dict[str, Any]:
+    """Re-solve single dummy for cached deals with fewer than ``sd_productions`` samples.
+
+    New deals are solved at SD_PRODUCTIONS by the daily build; this upgrades
+    deals cached before that. The cache is saved after every batch, so an
+    interrupted run resumes where it stopped. Do not run it beside
+    ffbridge_all.bat: both rewrite the same cache file.
+    """
+    from concurrent.futures import ProcessPoolExecutor
+
+    from tqdm import tqdm
+
+    if workers < 1 or batch_deals < 1:
+        raise ValueError("workers and batch_deals must be at least 1")
+    cache_path = pathlib.Path(cache_path)
+    cache = load_hrs_cache(cache_path)
+    if cache is None:
+        raise FileNotFoundError(f"hand-records cache not found: {cache_path}")
+    todo = (
+        cache.filter(
+            pl.col("Probs_Trials").is_null() | (pl.col("Probs_Trials") < sd_productions)
+        )
+        .select("PBN", "Dealer", "Vul")
+        .unique(subset=["PBN"], maintain_order=True)
+    )
+    if limit is not None:
+        todo = todo.head(limit)
+    _ff_lib, augment_lib = _import_mlbridge()
+    summary: dict[str, Any] = {"deals": todo.height, "sd_productions": sd_productions}
+    if todo.is_empty():
+        return summary
+    # Each worker loads its own ddss; split the cores between them.
+    previous_threads = os.environ.get("DDSS_MAX_THREADS")
+    os.environ["DDSS_MAX_THREADS"] = str(max(1, (os.cpu_count() or workers) // workers))
+    started = time.perf_counter()
+    progress = tqdm(total=todo.height, desc="SD backfill", unit="deal", disable=not show_progress)
+    try:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            for start in range(0, todo.height, batch_deals):
+                batch = todo.slice(start, batch_deals)
+                part_rows = -(-batch.height // workers)
+                futures = [
+                    executor.submit(_estimate_sd_task, batch.slice(offset, part_rows), sd_productions)
+                    for offset in range(0, batch.height, part_rows)
+                ]
+                parts = [future.result() for future in futures]
+                parts = [part for part in parts if part is not None and not part.is_empty()]
+                if parts:
+                    cache = augment_lib.update_hand_records_cache(
+                        cache, pl.concat(parts, how="vertical_relaxed")
+                    )
+                    save_hrs_cache(cache, cache_path)
+                progress.update(batch.height)
+    finally:
+        progress.close()
+        if previous_threads is None:
+            os.environ.pop("DDSS_MAX_THREADS", None)
+        else:
+            os.environ["DDSS_MAX_THREADS"] = previous_threads
+    summary["elapsed_s"] = round(time.perf_counter() - started, 1)
+    summary["remaining_below"] = int(
+        cache.filter(
+            pl.col("Probs_Trials").is_null() | (pl.col("Probs_Trials") < sd_productions)
+        )["PBN"].n_unique()
+    )
+    return summary
+
+
 class _InlineExecutor:
     """Runs tasks in this process; same submit() surface as a process pool."""
 
@@ -3263,7 +3467,7 @@ def build_historical_fragments(
     known_unsupported: Mapping[str, str] | None = None,
     workers: int = 1,
     chunk_sessions: int = 128,
-    sd_productions: int = 10,
+    sd_productions: int = SD_PRODUCTIONS,
     session_hook: SessionHook | None = None,
 ) -> tuple[list[pl.DataFrame], int, list[dict[str, str]]]:
     """Quality fragments for every complete session outside the training parquet.

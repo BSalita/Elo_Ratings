@@ -68,6 +68,10 @@ _QUALITY_METRIC_COLUMNS = (
     "sacrifice_rate",
     "dd_tricks_diff_avg",
     "dd_tricks_declared",
+    "lead_cost_avg",
+    "lead_best_rate",
+    "leads_scored",
+    "sd_lead_cost_avg",
 )
 _QUALITY_OUTPUT_COLUMNS = (
     "Quality_Rank",
@@ -80,9 +84,13 @@ _QUALITY_OUTPUT_COLUMNS = (
     "DD_Tricks_Diff_Avg",
     "DD_Tricks_Declared",
     "DD_Tricks_Diff_Rank",
+    "Lead_Cost_Avg",
+    "Lead_Best_Pct",
+    "Leads_Scored",
+    "SD_Lead_Cost_Avg",
 )
 
-# Default direction: higher is better, except ranks and dispersion.
+# Default direction: higher is better, except ranks, dispersion and lead cost.
 _LEADERBOARD_SORT_ASCENDING = frozenset({
     "Rank",
     "Quality_Rank",
@@ -90,6 +98,8 @@ _LEADERBOARD_SORT_ASCENDING = frozenset({
     "Par_Contract_Rank",
     "Sacrifice_Rank",
     "DD_Tricks_Diff_Rank",
+    "Lead_Cost_Avg",
+    "SD_Lead_Cost_Avg",
     "Pct_Stdev",
     "Clone_SD",
     "Title",
@@ -171,6 +181,21 @@ LEADERBOARD_SORT_FAVORITES = (
         "arguments": {
             "sort_by": "Par_Contract_Rate_Pct",
             "sort_descending": True,
+        },
+    },
+    {
+        "id": "Best_Opening_Leaders",
+        "title": "Best opening leaders (lowest DD lead cost)",
+        "help": (
+            "Call ffbridge_top_players with sort_by=Lead_Cost_Avg and "
+            "sort_descending=false, plus club, date_range, and min_games. "
+            "Leads_Scored is the number of leads behind the average."
+        ),
+        "statements": [],
+        "tool": "ffbridge_top_players",
+        "arguments": {
+            "sort_by": "Lead_Cost_Avg",
+            "sort_descending": False,
         },
     },
 )
@@ -814,6 +839,10 @@ def _attach_quality_sidecar(
         pl.col("dd_tricks_declared").cast(pl.Int32, strict=False).alias(
             "DD_Tricks_Declared"
         ),
+        pl.col("lead_cost_avg").round(2).alias("Lead_Cost_Avg"),
+        (pl.col("lead_best_rate") * 100).round(1).alias("Lead_Best_Pct"),
+        pl.col("leads_scored").cast(pl.Int32, strict=False).alias("Leads_Scored"),
+        pl.col("sd_lead_cost_avg").round(2).alias("SD_Lead_Cost_Avg"),
     )
     return joined.drop([*_QUALITY_METRIC_COLUMNS, "_quality_score"]).select(
         *leaderboard.columns,

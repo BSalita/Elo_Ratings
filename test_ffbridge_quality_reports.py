@@ -39,7 +39,12 @@ def _quality(id_column: str, ids: list[str]) -> pl.DataFrame:
             "sacrifice_rate": [0.2, 0.8, 0.5][: len(ids)],
             "dd_tricks_diff_avg": [0.9, 0.1, 0.8][: len(ids)],
             "dd_tricks_declared": [2, 1, 1][: len(ids)],
-        }
+            "lead_cost_avg": [0.25, 1.0, None][: len(ids)],
+            "lead_best_rate": [0.75, 0.0, None][: len(ids)],
+            "leads_scored": [4, 2, 0][: len(ids)],
+            "sd_lead_cost_avg": [None, None, None][: len(ids)],
+        },
+        schema_overrides={"sd_lead_cost_avg": pl.Float64},
     )
 
 
@@ -66,7 +71,14 @@ def _board_quality() -> pl.DataFrame:
             "Par_Contract_Score_NS": [1, -1],
             "Par_Contract_Score_EW": [-1, 1],
             "DD_Tricks_Diff": [2, -2],
-        }
+            "DD_Lead_Cost": [1, 0],
+            "Lead_Is_DD_Best": [False, True],
+            "SD_Lead_Cost": [None, None],
+        },
+        schema_overrides={
+            "DD_Lead_Cost": pl.UInt8,
+            "SD_Lead_Cost": pl.Float32,
+        },
     ).with_columns(pl.col("Date").cast(pl.Date))
 
 
@@ -195,6 +207,10 @@ def test_pair_quality_rank_can_differ_from_elo_rank() -> None:
             "par_contract_rate": [0.9, 0.8, 0.7],
             "sacrifice_rate": [0.1, 0.9, 0.5],
             "dd_tricks_diff_avg": [0.9, 0.8, 0.7],
+            "lead_cost_avg": [0.5, 0.4, 0.3],
+            "lead_best_rate": [0.5, 0.6, 0.7],
+            "leads_scored": [2, 5, 10],
+            "sd_lead_cost_avg": [0.6, 0.5, 0.4],
         }
     )
 
@@ -247,15 +263,8 @@ def test_quality_cache_reuses_frames_then_reloads_on_mtime_change(tmp_path) -> N
 
 def test_incompatible_quality_cache_raises(tmp_path) -> None:
     _board_quality().write_parquet(tmp_path / reports.QUALITY_BOARDS_PATH.name)
-    pl.DataFrame(
-        {
-            "player_id": ["1"],
-            "par_suit_rate": ["not numeric"],
-            "par_contract_rate": [0.5],
-            "sacrifice_rate": [0.5],
-            "dd_tricks_diff_avg": [0.0],
-            "dd_tricks_declared": [1],
-        }
+    _quality("player_id", ["1"]).with_columns(
+        pl.lit("not numeric").alias("par_suit_rate")
     ).write_parquet(tmp_path / reports.QUALITY_PLAYERS_PATH.name)
     _quality("pair_id", ["1"]).write_parquet(
         tmp_path / reports.QUALITY_PAIRS_PATH.name
@@ -447,10 +456,18 @@ def test_declared_board_count_ignores_boards_without_tricks_dd() -> None:
             "_par_contract_score": [1.0, -1.0, 1.0],
             "_sacrifice_hit": [None, 1.0, None],
             "_dd_tricks_diff": [2.0, None, -1.0],
-        }
+            "_lead_cost": [None, 1, 0],
+            "_lead_best": [None, False, True],
+            "_sd_lead_cost": [None, None, None],
+        },
+        schema_overrides={"_sd_lead_cost": pl.Float32},
     )
     aggregated = _quality_aggregates(frame, "player_id")
     assert aggregated.get_column("dd_tricks_declared").to_list() == [2]
+    assert aggregated.get_column("leads_scored").to_list() == [2]
+    assert aggregated.get_column("lead_cost_avg").to_list() == [0.5]
+    assert aggregated.get_column("lead_best_rate").to_list() == [0.5]
+    assert aggregated.get_column("sd_lead_cost_avg").to_list() == [None]
 
 
 def test_schema_v1_quality_cache_is_rejected(tmp_path) -> None:
@@ -460,5 +477,81 @@ def test_schema_v1_quality_cache_is_rejected(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="schema_version must be 2"):
+    with pytest.raises(ValueError, match=f"schema_version must be {SCHEMA_VERSION}"):
+        reports.load_quality_sidecars(tmp_path)
+
+
+def test_lead_metrics_reach_the_player_leaderboard() -> None:
+    table, _sql, _anchor = reports.run_top_players_favorite(
+        _player_results(),
+        top_n=4,
+        min_games=10,
+        quality_df=_quality("player_id", ["1", "2", "3"]),
+    )
+    rows = {row["Player_ID"]: row for row in table.to_dicts()}
+    assert rows["1"]["Lead_Cost_Avg"] == 0.25
+    assert rows["1"]["Lead_Best_Pct"] == 75.0
+    assert rows["1"]["Leads_Scored"] == 4
+    assert rows["1"]["SD_Lead_Cost_Avg"] is None
+    assert rows["3"]["Lead_Cost_Avg"] is None
+    assert rows["3"]["Leads_Scored"] == 0
+    assert rows["4"]["Leads_Scored"] is None
+
+
+def test_lead_cost_sorts_lowest_first_and_keeps_nulls_last() -> None:
+    table = pl.DataFrame(
+        {
+            "Player_ID": ["1", "2", "3"],
+            "Rank": [1, 2, 3],
+            "Lead_Cost_Avg": [0.8, None, 0.2],
+            "Lead_Best_Pct": [40.0, None, 70.0],
+            "SD_Lead_Cost_Avg": [0.3, 0.1, None],
+        }
+    )
+    by_cost = reports.order_leaderboard(table, "Lead_Cost_Avg", None)
+    assert by_cost.get_column("Player_ID").to_list() == ["3", "1", "2"]
+    by_best = reports.order_leaderboard(table, "Lead_Best_Pct", None)
+    assert by_best.get_column("Player_ID").to_list() == ["3", "1", "2"]
+    by_sd = reports.order_leaderboard(table, "SD_Lead_Cost_Avg", None)
+    assert by_sd.get_column("Player_ID").to_list() == ["2", "1", "3"]
+    for column in ("Lead_Cost_Avg", "Lead_Best_Pct", "Leads_Scored", "SD_Lead_Cost_Avg"):
+        assert column in reports.LEADERBOARD_SORT_COLUMNS
+        assert column in reports.QUALITY_METRIC_DEFINITIONS
+
+
+def test_filtered_quality_credits_leads_to_the_leader_and_defending_pair(tmp_path) -> None:
+    _write_quality_cache(tmp_path)
+    selected = pl.DataFrame({"tournament_id": ["10", "20"]})
+
+    players, pairs, _status = reports.load_filtered_quality_sidecars(
+        selected, tmp_path
+    )
+
+    assert players is not None and pairs is not None
+    by_player = {row["player_id"]: row for row in players.to_dicts()}
+    # Session 10: N declares, E (player 2) leads, cost 1.
+    # Session 20: E declares, S (player 3) leads, best lead.
+    assert by_player["2"]["leads_scored"] == 1
+    assert by_player["2"]["lead_cost_avg"] == 1.0
+    assert by_player["2"]["lead_best_rate"] == 0.0
+    assert by_player["3"]["leads_scored"] == 1
+    assert by_player["3"]["lead_cost_avg"] == 0.0
+    assert by_player["3"]["lead_best_rate"] == 1.0
+    for player_id in ("1", "4"):
+        assert by_player[player_id]["leads_scored"] == 0
+        assert by_player[player_id]["lead_cost_avg"] is None
+    by_pair = {row["pair_id"]: row for row in pairs.to_dicts()}
+    assert by_pair["2_4"]["lead_cost_avg"] == 1.0
+    assert by_pair["1_3"]["lead_cost_avg"] == 0.0
+    assert by_pair["1_3"]["leads_scored"] == 1
+    assert by_pair["1_3"]["sd_lead_cost_avg"] is None
+
+
+def test_quality_sidecar_without_lead_columns_is_rejected(tmp_path) -> None:
+    _write_quality_cache(tmp_path)
+    _quality("player_id", ["1"]).drop(
+        "lead_cost_avg", "lead_best_rate", "leads_scored", "sd_lead_cost_avg"
+    ).write_parquet(tmp_path / reports.QUALITY_PLAYERS_PATH.name)
+
+    with pytest.raises(ValueError, match="missing columns .*lead_cost_avg"):
         reports.load_quality_sidecars(tmp_path)

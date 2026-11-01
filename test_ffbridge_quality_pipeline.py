@@ -17,6 +17,7 @@ from ffbridge_quality_pipeline import (
     LancelotDDMismatchError,
     NoQualityRowsError,
     QUALITY_BOARD_COLUMNS,
+    SCHEMA_VERSION,
     SessionAudit,
     _apply_lancelot_dd_audit,
     _attach_board_ev_columns,
@@ -786,6 +787,56 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
         self.assertEqual(repeated_pair["par_suit_rate"], 0.0)
         self.assertEqual(repeated_pair["sacrifice_rate"], 1.0)
 
+    def test_lead_columns_default_to_null_without_lead_data(self) -> None:
+        result = normalize_quality_frame(_quality_input(), session_dates=_dates())
+        self.assertEqual(result.schema["DD_Lead_Cost"], pl.UInt8)
+        self.assertEqual(result.schema["Lead_Is_DD_Best"], pl.Boolean)
+        self.assertEqual(result.schema["SD_Lead_Cost"], pl.Float32)
+        for column in ("DD_Lead_Cost", "Lead_Is_DD_Best", "SD_Lead_Cost"):
+            self.assertEqual(result[column].null_count(), result.height)
+
+    def test_recorded_lead_without_lead_score_fails(self) -> None:
+        frame = _quality_input().with_columns(pl.lit("SA").alias("Lead"))
+        with self.assertRaisesRegex(ValueError, "DD_Lead_Cost"):
+            normalize_quality_frame(frame, session_dates=_dates())
+
+    def test_lead_scores_credit_the_opening_leader_and_defending_pair(self) -> None:
+        # Board 1: N declares, so E (40) leads. Board 2: E declares, S (8) leads.
+        frame = _quality_input().with_columns(
+            pl.Series("Lead", ["HK", "C2"]),
+            pl.Series("DD_Lead_Cost", [2, 0], dtype=pl.UInt8),
+            pl.Series("Lead_Is_DD_Best", [False, True]),
+            pl.Series("SD_Lead_Cost", [0.5, 0.25], dtype=pl.Float32),
+        )
+        quality = normalize_quality_frame(frame, session_dates=_dates())
+        self.assertEqual(quality["DD_Lead_Cost"].to_list(), [2, 0])
+        players = {
+            row["player_id"]: row for row in build_player_sidecar(quality).to_dicts()
+        }
+        self.assertEqual(players["40"]["lead_cost_avg"], 2.0)
+        self.assertEqual(players["40"]["lead_best_rate"], 0.0)
+        self.assertEqual(players["40"]["leads_scored"], 1)
+        self.assertEqual(players["40"]["sd_lead_cost_avg"], 0.5)
+        self.assertEqual(players["8"]["lead_cost_avg"], 0.0)
+        self.assertEqual(players["8"]["lead_best_rate"], 1.0)
+        self.assertEqual(players["8"]["sd_lead_cost_avg"], 0.25)
+        for player_id in ("20", "3", "11", "9"):
+            self.assertEqual(players[player_id]["leads_scored"], 0)
+            self.assertIsNone(players[player_id]["lead_cost_avg"])
+        pairs = {row["pair_id"]: row for row in build_pair_sidecar(quality).to_dicts()}
+        self.assertEqual(pairs["11_40"]["lead_cost_avg"], 2.0)
+        self.assertEqual(pairs["11_40"]["leads_scored"], 1)
+        self.assertEqual(pairs["8_9"]["lead_cost_avg"], 0.0)
+        self.assertEqual(pairs["20_3"]["leads_scored"], 0)
+
+    def test_fragments_without_lead_columns_are_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "v2.parquet"
+            normalize_quality_frame(_quality_input(), session_dates=_dates()).drop(
+                "DD_Lead_Cost", "Lead_Is_DD_Best", "SD_Lead_Cost"
+            ).write_parquet(path)
+            self.assertFalse(_fragment_schema_is_current(path))
+
     def test_atomic_metadata_is_written_last_and_describes_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -819,7 +870,7 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
             out = root / "out"
             parsed = json.loads((out / "ffbridge_quality_metadata.json").read_text())
             self.assertEqual(parsed, metadata)
-            self.assertEqual(parsed["schema_version"], 2)
+            self.assertEqual(parsed["schema_version"], SCHEMA_VERSION)
             self.assertIn("Sacrifice_Rate_Pct", parsed["metric_definitions"])
             self.assertEqual(parsed["raw_unmapped_seat_count"], 99)
             self.assertGreaterEqual(parsed["raw_unmapped_seat_count"], parsed["unmapped_seat_count"])

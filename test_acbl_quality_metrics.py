@@ -9,6 +9,7 @@ import polars as pl
 from acbl_api_server import (
     QUALITY_METRIC_DEFINITIONS,
     SKILL_GATE_DISABLED,
+    _missing_lead_columns_sql,
     _required_columns_for_mode,
     acbl_favorites_meta,
 )
@@ -79,7 +80,13 @@ def _quality_fixture() -> pl.DataFrame:
             row[f"Elo_R_{seat}"] = 1500.0 + int(player_id)
         row["Elo_R_NS"] = 1510.0
         row["Elo_R_EW"] = 1490.0
-    return pl.DataFrame(rows)
+    # Board 1: N declares, E (2) leads. Board 2: E declares, S (3) leads.
+    leads = {1: (1, False, 0.5), 2: (0, True, None), 3: (None, None, None)}
+    for row in rows:
+        row["DD_Lead_Cost"], row["Lead_Is_DD_Best"], row["SD_Lead_Cost"] = leads[row["Board"]]
+    return pl.DataFrame(rows).with_columns(
+        pl.col("DD_Lead_Cost").cast(pl.UInt8), pl.col("SD_Lead_Cost").cast(pl.Float32)
+    )
 
 
 def _meta(*, rating_type: str = "Players", min_skill_z: float = SKILL_GATE_DISABLED) -> dict:
@@ -166,7 +173,66 @@ class AcblQualityMetricSqlTests(unittest.TestCase):
                 "Par_Contract_Rate_Pct",
                 "Par_Suit_Rate_Pct",
                 "Sacrifice_Rate_Pct",
+                "Lead_Cost_Avg",
+                "Lead_Best_Pct",
+                "Leads_Scored",
+                "SD_Lead_Cost_Avg",
             },
+        )
+
+    def test_player_sql_credits_leads_to_the_opening_leader(self) -> None:
+        result = _run("Top_Players", _meta())
+        players = {row["Player_ID"]: row for row in result.to_dicts()}
+
+        self.assertEqual(players["2"]["Lead_Cost_Avg"], 1.0)
+        self.assertEqual(players["2"]["Lead_Best_Pct"], 0.0)
+        self.assertEqual(players["2"]["Leads_Scored"], 1)
+        self.assertEqual(players["2"]["SD_Lead_Cost_Avg"], 0.5)
+        self.assertEqual(players["3"]["Lead_Cost_Avg"], 0.0)
+        self.assertEqual(players["3"]["Lead_Best_Pct"], 100.0)
+        self.assertIsNone(players["3"]["SD_Lead_Cost_Avg"])
+        for player_id in ("1", "4"):
+            self.assertEqual(players[player_id]["Leads_Scored"], 0)
+            self.assertIsNone(players[player_id]["Lead_Cost_Avg"])
+
+    def test_pair_sql_credits_leads_to_the_defending_pair(self) -> None:
+        result = _run("Top_Pairs", _meta(rating_type="Pairs"))
+        pairs = {row["Pair_IDs"]: row for row in result.to_dicts()}
+
+        self.assertEqual(pairs["2-4"]["Lead_Cost_Avg"], 1.0)
+        self.assertEqual(pairs["2-4"]["Leads_Scored"], 1)
+        self.assertEqual(pairs["1-3"]["Lead_Cost_Avg"], 0.0)
+        self.assertEqual(pairs["1-3"]["Lead_Best_Pct"], 100.0)
+
+    def test_tournament_frames_get_null_lead_columns(self) -> None:
+        frame = _quality_fixture().drop("DD_Lead_Cost", "Lead_Is_DD_Best", "SD_Lead_Cost")
+        extra = _missing_lead_columns_sql(frame.columns, "tournament")
+        self.assertEqual(
+            extra,
+            [
+                "CAST(NULL AS UTINYINT) AS DD_Lead_Cost",
+                "CAST(NULL AS BOOLEAN) AS Lead_Is_DD_Best",
+                "CAST(NULL AS FLOAT) AS SD_Lead_Cost",
+            ],
+        )
+        con = duckdb.connect()
+        try:
+            con.register("_full", frame)
+            con.execute(f"CREATE TEMP VIEW self AS SELECT *, {', '.join(extra)} FROM _full")
+            register_clone_ratings(con, empty_clone_ratings())
+            result, _sql = run_favorite(con, load_favorites("acbl"), "Top_Players", _meta())
+        finally:
+            con.close()
+        self.assertTrue(all(value is None for value in result["Lead_Cost_Avg"].to_list()))
+        self.assertEqual(set(result["Leads_Scored"].to_list()), {0})
+
+    def test_club_frame_without_lead_columns_fails(self) -> None:
+        frame = _quality_fixture().drop("DD_Lead_Cost", "Lead_Is_DD_Best", "SD_Lead_Cost")
+        with self.assertRaisesRegex(ValueError, "lacks opening-lead columns"):
+            _missing_lead_columns_sql(frame.columns, "club")
+        self.assertEqual(
+            _missing_lead_columns_sql(frame.columns + ["DD_Lead_Cost", "Lead_Is_DD_Best"], "club"),
+            ["CAST(NULL AS FLOAT) AS SD_Lead_Cost"],
         )
 
     def test_skill_gate_defaults_are_stricter_for_club(self) -> None:

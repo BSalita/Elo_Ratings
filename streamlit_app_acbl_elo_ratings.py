@@ -1110,7 +1110,10 @@ def _acbl_report_panel() -> None:
         "`Par_Contract_Rank`, and `DD_Tricks_Diff_Rank` over the "
         "qualifying pool — when a player's Quality_Rank is much higher "
         "(worse) than their Elo rank, their Elo is being inflated by "
-        "weak-field play. Click any column header to re-sort."
+        "weak-field play. **Lead_Cost_Avg** is the opening leader's mean "
+        "tricks lost versus the best double-dummy lead (0 is best, lower is "
+        "better; club only), with **Lead_Best_Pct** and **Leads_Scored**. "
+        "Click any column header to re-sort."
     )
 
     # Explain the unified chess-anchored Elo scale + titles.

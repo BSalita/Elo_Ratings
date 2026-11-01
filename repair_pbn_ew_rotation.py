@@ -182,7 +182,7 @@ def repair_ew_rotation(
     *,
     dry_run: bool = False,
     session_limit: int | None = None,
-    sd_productions: int = 10,
+    sd_productions: int = 40,
 ) -> dict[str, int]:
     started = dt.datetime.now()
     print(

@@ -90,7 +90,13 @@ def _acbl_quality_fixture() -> pl.DataFrame:
             row[f"Elo_R_{seat}"] = 1500.0 + int(player_id)
         row["Elo_R_NS"] = 1510.0
         row["Elo_R_EW"] = 1490.0
-    return pl.DataFrame(rows)
+    # Board 1: N declares, E (2) leads. Board 2: E declares, S (3) leads.
+    leads = {1: (1, False, 0.5), 2: (0, True, None), 3: (None, None, None)}
+    for row in rows:
+        row["DD_Lead_Cost"], row["Lead_Is_DD_Best"], row["SD_Lead_Cost"] = leads[row["Board"]]
+    return pl.DataFrame(rows).with_columns(
+        pl.col("DD_Lead_Cost").cast(pl.UInt8), pl.col("SD_Lead_Cost").cast(pl.Float32)
+    )
 
 
 def _acbl_meta(**overrides) -> dict:
@@ -293,7 +299,12 @@ class FfbridgeGoldenRowTests(unittest.TestCase):
                 "par_contract_rate": [0.9, 0.8, 0.7],
                 "sacrifice_rate": [0.1, 0.9, 0.5],
                 "dd_tricks_diff_avg": [0.9, 0.8, 0.7],
-            }
+                "lead_cost_avg": [0.5, 0.4, 0.3],
+                "lead_best_rate": [0.5, 0.6, 0.7],
+                "leads_scored": [2, 5, 10],
+                "sd_lead_cost_avg": [None, None, None],
+            },
+            schema_overrides={"sd_lead_cost_avg": pl.Float64},
         )
         table, _sql, _anchor = run_top_pairs_favorite(
             results, top_n=3, min_games=1, quality_df=quality
@@ -333,6 +344,7 @@ class CatalogTests(unittest.TestCase):
                 "Rank_Declarers_By_Tricks_DD",
                 "Most_Consistent_Players",
                 "Best_Par_Contract_Rate",
+                "Best_Opening_Leaders",
             },
         )
         ff_sql = next(
