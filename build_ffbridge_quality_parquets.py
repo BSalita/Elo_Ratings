@@ -12,6 +12,7 @@ from typing import Any
 import polars as pl
 
 from ffbridge_quality_pipeline import (
+    SD_LEAD_CACHE_DIRNAME,
     DEFAULT_CUTOFF,
     DEFAULT_DISCOVERY_START,
     DEFAULT_SOURCE_DIR,
@@ -45,6 +46,7 @@ def _quality_cache_is_fresh(
     output_dir: pathlib.Path,
     cutoff: date,
     max_age_hours: float,
+    sd_lead_samples: int = 0,
 ) -> tuple[bool, str]:
     metadata_path = output_dir / "ffbridge_quality_metadata.json"
     if not metadata_path.is_file():
@@ -67,6 +69,11 @@ def _quality_cache_is_fresh(
         return False, (
             f"schema is {metadata.get('schema_version')!r}, "
             f"expected {SCHEMA_VERSION}"
+        )
+    if metadata.get("sd_lead_samples", 0) != sd_lead_samples:
+        return False, (
+            f"SD lead samples were {metadata.get('sd_lead_samples', 0)}, "
+            f"now {sd_lead_samples}"
         )
     if age_hours >= max_age_hours:
         return False, f"cache is {age_hours:.1f}h old"
@@ -158,6 +165,32 @@ def _parser() -> argparse.ArgumentParser:
             "augmented session (bridgestats-ffbridge ClubFragmentWriter)."
         ),
     )
+    parser.add_argument(
+        "--sd-lead-samples",
+        type=int,
+        default=0,
+        help=(
+            "Add the single-dummy lead score (SD_Lead_Cost) with this many samples; "
+            "0 = off. Session fragments built without it are rebuilt."
+        ),
+    )
+    parser.add_argument(
+        "--sd-lead-dir",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Solved lead positions, shared with Club BridgeStats "
+            f"(default: the source dir's parent / {SD_LEAD_CACHE_DIRNAME})."
+        ),
+    )
+    parser.add_argument(
+        "--suitc",
+        action="store_true",
+        help=(
+            "Add the SuitC columns to the Club fragments written with "
+            "--club-output-dir, so stage 2 need not re-augment those sessions."
+        ),
+    )
     return parser
 
 
@@ -187,7 +220,19 @@ def main(argv: list[str] | None = None) -> int:
     started_clock = time.perf_counter()
     print(f"[quality-builder] start {started.isoformat(timespec='seconds')}", flush=True)
     try:
+        if args.sd_lead_samples < 0:
+            raise ValueError("--sd-lead-samples must not be negative")
         source_dir = args.source_dir.resolve()
+        sd_lead_dir = (
+            (args.sd_lead_dir or source_dir.parent / SD_LEAD_CACHE_DIRNAME).resolve()
+            if args.sd_lead_samples > 0
+            else None
+        )
+        if sd_lead_dir is not None:
+            print(
+                f"[quality-builder] SD lead {args.sd_lead_samples} samples, cache {sd_lead_dir}",
+                flush=True,
+            )
         training_path = (
             args.training_parquet.resolve()
             if args.training_parquet is not None
@@ -201,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.if_stale and not args.audit_only:
             assert output_dir is not None
             fresh, reason = _quality_cache_is_fresh(
-                output_dir, args.cutoff, args.max_age_hours
+                output_dir, args.cutoff, args.max_age_hours, args.sd_lead_samples
             )
             if fresh:
                 print(f"[quality-builder] {reason}; skipping", flush=True)
@@ -289,6 +334,9 @@ def main(argv: list[str] | None = None) -> int:
             ),
             workers=args.workers,
             session_hook=_club_fragment_hook(args.club_output_dir, metadata),
+            sd_lead_samples=args.sd_lead_samples,
+            sd_lead_dir=sd_lead_dir,
+            suitc=args.suitc,
         )
         elapsed = time.perf_counter() - phase_clock
         if elapsed > 30:
@@ -330,6 +378,7 @@ def main(argv: list[str] | None = None) -> int:
             audit=audit,
             unmapped_seat_count=unmapped,
             unsupported_sessions=[*unsupported, *incomplete_unsupported],
+            sd_lead_samples=args.sd_lead_samples,
         )
         print(
             f"[quality-builder] wrote {metadata_result['board_rows']} board rows, "

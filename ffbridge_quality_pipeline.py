@@ -5,6 +5,7 @@ choose an output directory before any artifact is written.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import importlib.util
 import json
@@ -40,6 +41,9 @@ PAIR_FILENAME = "ffbridge_quality_pairs.parquet"
 METADATA_FILENAME = "ffbridge_quality_metadata.json"
 FRAGMENT_DIRNAME = "session_fragments"
 HRS_CACHE_FILENAME = "ffbridge_hand_records_cache.parquet"
+# Solved SD lead positions (make_sd_lead_cache), kept beside the raw source
+# directory and shared by stage 1, Club BridgeStats (stage 2) and the archive.
+SD_LEAD_CACHE_DIRNAME = "ffbridge_sd_lead_cache"
 # Single-dummy samples per side for each new deal. Deals cached with fewer
 # are re-solved only by backfill_sd_trials (ffbridge_sd_backfill.py).
 SD_PRODUCTIONS = 40
@@ -1311,6 +1315,18 @@ def _quality_safe_frequencies(value: Any) -> list[dict[str, Any]]:
     return cleaned
 
 
+# Score-row fields that name the listing rather than the play; two rows equal
+# in every other field are copies of one play.
+_PLAY_COPY_ID_FIELDS = frozenset(
+    {
+        "play_id",
+        "team_id",
+        "lineup_segment_game_homeTeam_id",
+        "lineup_segment_game_awayTeam_id",
+    }
+)
+
+
 def flatten_team_scores(
     session_id: str,
     scores: Sequence[Mapping[str, Any]],
@@ -1320,6 +1336,8 @@ def flatten_team_scores(
     rows: list[dict[str, Any]] = []
     unmapped = 0
     seen_play_ids: dict[str, dict[str, Any]] = {}
+    seen_play_contents: set[str] = set()
+    copies = 0
     seat_person = _import_ffbridge_lib().lancelot_seat_person
     for score in scores:
         board = score.get("board")
@@ -1424,15 +1442,39 @@ def flatten_team_scores(
                     if suit in "SHDCN":
                         row[f"DD_{direction}_{suit}"] = value
         prior = seen_play_ids.get(play_id)
-        if prior is None:
-            seen_play_ids[play_id] = row
-            rows.append(row)
-            unmapped += sum(value is None for value in players.values())
-        elif prior != row:
-            raise ValueError(f"Conflicting duplicate play_id {play_id} in session {session_id}")
+        if prior is not None:
+            if prior != row:
+                raise ValueError(
+                    f"Conflicting duplicate play_id {play_id} in session {session_id}"
+                )
+            continue
+        seen_play_ids[play_id] = row
+        # FFBridge sometimes lists one play under several score ids: repeated
+        # in every team file (session 105247: each play 31-57 times) or under
+        # a pair registered as two teams (session 282857). Such copies match
+        # in everything but their own ids. A row with an unknown player cannot
+        # be told apart from another table's identical result, so it is kept.
+        if all(value is not None for value in players.values()):
+            content = json.dumps(
+                {k: v for k, v in row.items() if k not in _PLAY_COPY_ID_FIELDS},
+                sort_keys=True,
+                default=str,
+            )
+            if content in seen_play_contents:
+                copies += 1
+                continue
+            seen_play_contents.add(content)
+        rows.append(row)
+        unmapped += sum(value is None for value in players.values())
     if not rows:
         raise NoQualityRowsError(
             f"Raw session {session_id} score files contain no board rows"
+        )
+    if copies:
+        print(
+            f"[ffbridge-quality] session {session_id}: dropped {copies} repeated "
+            f"copies of a play ({len(rows)} plays kept)",
+            flush=True,
         )
     return pl.from_dicts(rows, infer_schema_length=None), unmapped
 
@@ -3074,6 +3116,10 @@ def prepare_raw_session(raw: pl.DataFrame) -> pl.DataFrame:
         if _needs_lancelot_convert(prepared)
         else prepared
     )
+    # Lancelot writes contract "-" when the bridgemates did not report it;
+    # session 130853 has only scores on every row, nothing to rate.
+    if work["Contract"].is_null().all():
+        raise NoQualityRowsError("Raw session has no board rows with a recorded contract")
     _validate_converted_suits(work)
     return work
 
@@ -3220,15 +3266,34 @@ def _init_session_worker(
     fragment_dir: str,
     session_dates: pl.DataFrame,
     hook: SessionHook | None,
+    sd_lead_samples: int = 0,
+    sd_lead_dir: str | None = None,
+    suitc_workers: int = 0,
 ) -> None:
+    """``sd_lead_samples`` > 0 adds the SD lead score from the cache in
+    ``sd_lead_dir``; ``suitc_workers`` > 0 adds the SuitC columns (running at
+    most that many SuitC programs for uncached holdings)."""
+    if sd_lead_samples > 0 and sd_lead_dir is None:
+        raise ValueError("SD lead samples given without an SD lead cache directory")
+    _import_mlbridge()
+    logging.getLogger("mlBridge.mlBridgeAugmentLib").setLevel(logging.WARNING)
+    suitc = None
+    if suitc_workers > 0:
+        suitc = make_suitc_cache()
+        suitc.workers = suitc_workers
+        logging.getLogger("mlBridge.mlBridgeSuitCLib").setLevel(logging.WARNING)
     _WORKER_STATE.update(
         source_dir=pathlib.Path(source_dir),
         fragment_dir=pathlib.Path(fragment_dir),
         session_dates=session_dates,
         hook=hook,
+        sd_lead=(
+            make_sd_lead_cache(sd_lead_samples, pathlib.Path(sd_lead_dir))
+            if sd_lead_samples > 0 and sd_lead_dir is not None
+            else None
+        ),
+        suitc=suitc,
     )
-    _import_mlbridge()
-    logging.getLogger("mlBridge.mlBridgeAugmentLib").setLevel(logging.WARNING)
 
 
 def _prepare_session_task(
@@ -3257,6 +3322,7 @@ def _finish_session_task(
 ) -> tuple[str, pl.DataFrame | None, str | None]:
     """Augment one prepared session, write its fragment, run the hook."""
     try:
+        sd_lead = _WORKER_STATE.get("sd_lead")
         augmented = (
             work
             if already_augmented
@@ -3265,8 +3331,12 @@ def _finish_session_task(
                 hrs_cache=[cache_slice],
                 solved_dd=solved_dd,
                 quiet=True,
+                sd_lead=sd_lead,
+                suitc=_WORKER_STATE.get("suitc"),
             )
         )
+        if sd_lead is not None:
+            sd_lead.flush()  # keep newly solved lead positions
         fragment = normalize_quality_frame(
             augmented,
             session_dates=_WORKER_STATE["session_dates"],
@@ -3390,12 +3460,23 @@ class _InlineExecutor:
         pass
 
 
-def _read_current_fragment(path: pathlib.Path) -> pl.DataFrame | None:
+def _read_current_fragment(
+    path: pathlib.Path, need_sd_lead: bool = False
+) -> pl.DataFrame | None:
+    """A reusable fragment, or None to rebuild it. With ``need_sd_lead``, one
+    whose scored leads have no SD_Lead_Cost (built without the option) is rebuilt."""
     if not path.is_file() or not _fragment_schema_is_current(path):
         return None
-    return pl.read_parquet(path, columns=list(QUALITY_BOARD_COLUMNS)).select(
+    fragment = pl.read_parquet(path, columns=list(QUALITY_BOARD_COLUMNS)).select(
         *QUALITY_BOARD_COLUMNS
     )
+    if (
+        need_sd_lead
+        and fragment["DD_Lead_Cost"].is_not_null().any()
+        and fragment["SD_Lead_Cost"].is_null().all()
+    ):
+        return None
+    return fragment
 
 
 def _solve_chunk_deals(
@@ -3469,6 +3550,9 @@ def build_historical_fragments(
     chunk_sessions: int = 128,
     sd_productions: int = SD_PRODUCTIONS,
     session_hook: SessionHook | None = None,
+    sd_lead_samples: int = 0,
+    sd_lead_dir: pathlib.Path | None = None,
+    suitc: bool = False,
 ) -> tuple[list[pl.DataFrame], int, list[dict[str, str]]]:
     """Quality fragments for every complete session outside the training parquet.
 
@@ -3478,7 +3562,14 @@ def build_historical_fragments(
     hand-records cache is saved once, then workers augment the sessions from
     a slice of the cache, write fragments, and call ``session_hook`` with the
     augmented frame. The hook must be picklable when ``workers > 1``.
+
+    ``sd_lead_samples`` > 0 adds the SD lead score (positions cached in
+    ``sd_lead_dir``); fragments built without it are rebuilt. ``suitc`` adds
+    the SuitC columns to the augmented frame the hook gets (Club fragments);
+    quality fragments do not store them, so it never forces a rebuild.
     """
+    if sd_lead_samples > 0 and sd_lead_dir is None:
+        raise ValueError("SD lead samples need an SD lead cache directory")
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     from tqdm import tqdm
@@ -3494,7 +3585,7 @@ def build_historical_fragments(
     with ThreadPoolExecutor(max_workers=16) as pool:
         existing = list(
             pool.map(
-                _read_current_fragment,
+                functools.partial(_read_current_fragment, need_sd_lead=sd_lead_samples > 0),
                 [fragment_dir / f"{session.session_id}.parquet" for session in candidates],
             )
         )
@@ -3524,7 +3615,16 @@ def build_historical_fragments(
     cache = load_hrs_cache(cache_path)
     if cache is None:
         cache = _empty_hrs_cache()
-    initargs = (str(source_dir), str(fragment_dir), session_dates, session_hook)
+    initargs = (
+        str(source_dir),
+        str(fragment_dir),
+        session_dates,
+        session_hook,
+        sd_lead_samples,
+        str(sd_lead_dir) if sd_lead_dir is not None else None,
+        # Each worker's SuitC runs for uncached holdings share the cores.
+        max(1, (os.cpu_count() or workers) // workers) if suitc else 0,
+    )
     previous_threads = os.environ.get("POLARS_MAX_THREADS")
     if workers > 1:
         os.environ["POLARS_MAX_THREADS"] = str(max(2, (os.cpu_count() or workers) // workers))
@@ -3625,8 +3725,11 @@ def write_quality_artifacts(
     audit: AuditReport,
     unmapped_seat_count: int | None = None,
     unsupported_sessions: Sequence[Mapping[str, str]] = (),
+    sd_lead_samples: int = 0,
 ) -> dict[str, Any]:
-    """Write sidecars first and metadata last as the atomic completion marker."""
+    """Write sidecars first and metadata last as the atomic completion marker.
+
+    ``sd_lead_samples`` (0 = off) is recorded so --if-stale rebuilds when it changes."""
     validate_unique_board_plays(board_quality)
     player_quality = build_player_sidecar(board_quality)
     pair_quality = build_pair_sidecar(board_quality)
@@ -3655,6 +3758,7 @@ def write_quality_artifacts(
         "raw_unmapped_seat_count": unmapped_seat_count,
         "unsupported_session_count": len(unsupported_sessions),
         "unsupported_sessions": [dict(item) for item in unsupported_sessions],
+        "sd_lead_samples": sd_lead_samples,
         "metric_definitions": QUALITY_METRIC_DEFINITIONS,
         "audit_summary": audit.to_dict()["summary"],
         "files": {

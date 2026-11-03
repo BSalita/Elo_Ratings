@@ -5,6 +5,7 @@ import pathlib
 import tempfile
 import unittest
 from datetime import date
+from typing import Any
 from unittest import mock
 
 import polars as pl
@@ -43,6 +44,7 @@ from ffbridge_quality_pipeline import (
     known_unusable_sessions,
     load_identity_map,
     normalize_quality_frame,
+    prepare_raw_session,
     resolve_output_dir,
     session_deals,
     stable_pair_id,
@@ -363,6 +365,67 @@ class FFBridgeQualityPipelineTests(unittest.TestCase):
         self.assertEqual(row["lineup_southPlayer_lastName"], "SYMCHOWICZ")
         self.assertEqual(row["Player_ID_S"], "100544")
         self.assertEqual(unmapped, 1)
+
+    @staticmethod
+    def _score(play_id: int, team_id: int, result: str, west: Any) -> dict[str, Any]:
+        return {
+            "id": play_id,
+            "boardNumber": 1,
+            "contract": "3NT",
+            "declarer": "N",
+            "lead": "H3",
+            "result": result,
+            "nsScore": "400",
+            "ewScore": "",
+            "board": {"id": 50, "boardNumber": 1, "deal": None, "frequencies": []},
+            "lineup": {
+                "northPlayer": {"id": 1},
+                "eastPlayer": {"id": 2},
+                "southPlayer": {"id": 3},
+                "westPlayer": west,
+                "segment": {"game": {"homeTeam": {"id": team_id}}},
+            },
+        }
+
+    def test_copies_of_one_play_under_new_score_ids_are_collapsed(self) -> None:
+        scores = [
+            self._score(500, 7, "=", {"id": 4}),
+            self._score(501, 7, "=", {"id": 4}),  # same team file, new id
+            self._score(502, 8, "=", {"id": 4}),  # pair registered twice
+            self._score(503, 7, "+1", {"id": 4}),  # a different play
+        ]
+        frame, _unmapped = flatten_team_scores("10", scores, {})
+        self.assertEqual(frame["play_id"].to_list(), ["500", "503"])
+
+    def test_session_with_no_recorded_contract_is_unsupported(self) -> None:
+        scores = []
+        for play_id, east in ((600, 2), (601, 5)):
+            score = self._score(play_id, 7, "-", {"id": 4})
+            score.update(contract="-", declarer="-", lead="")
+            score["lineup"]["eastPlayer"] = {"id": east}
+            score["lineup"]["segment"]["game"] = {
+                "homeTeam": {"id": 7, "section": "A", "orientation": "NS", "startTableNumber": 1},
+                "awayTeam": {"id": 8, "section": "A", "orientation": "EW", "startTableNumber": 1},
+            }
+            score["board"]["deal"] = (
+                "N:T6.62.KT9.QJ9742 AKJ532.JT54.J74. .K873.A86532.865 Q9874.AQ9.Q.AKT3"
+            )
+            score["board"]["frequencies"] = [
+                {"nsScore": "400", "ewScore": "", "nsNote": 50.0, "ewNote": 50.0, "count": 2}
+            ]
+            scores.append(score)
+        frame, _unmapped = flatten_team_scores("130853", scores, {})
+        with self.assertRaisesRegex(NoQualityRowsError, "recorded contract"):
+            prepare_raw_session(frame)
+
+    def test_identical_results_with_an_unknown_player_are_kept(self) -> None:
+        scores = [
+            self._score(500, 7, "=", None),
+            self._score(501, 8, "=", None),
+        ]
+        frame, unmapped = flatten_team_scores("10", scores, {})
+        self.assertEqual(frame.height, 2)
+        self.assertEqual(unmapped, 2)
 
     def test_duplicate_endpoint_copies_are_collapsed(self) -> None:
         duplicated = pl.concat([_quality_input().head(1), _quality_input().head(1)])
