@@ -254,6 +254,26 @@ def _batch_signature(rows: pl.DataFrame) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _concat_fragments(paths: list[pathlib.Path]) -> pl.DataFrame:
+    # Migrated fragments append new columns at the end; rebuilt ones are
+    # sorted. Same columns are required, then the order is unified.
+    frames = [pl.read_parquet(path) for path in paths]
+    columns = frames[0].columns
+    expected = set(columns)
+    for path, frame in zip(paths, frames):
+        if set(frame.columns) != expected:
+            raise ValueError(
+                f"Fragment columns differ from {paths[0]}: {path} "
+                f"extra={sorted(set(frame.columns) - expected)} "
+                f"missing={sorted(expected - set(frame.columns))}"
+            )
+    return pl.concat(
+        [frame.select(columns) for frame in frames],
+        how="vertical_relaxed",
+        rechunk=False,
+    )
+
+
 def _stage_partition_batches(
     root: pathlib.Path,
     batch_root: pathlib.Path,
@@ -291,11 +311,7 @@ def _stage_partition_batches(
             source_paths = [
                 root / str(value) for value in batch_rows[source_column].to_list()
             ]
-            source_frame = pl.concat(
-                [pl.read_parquet(path) for path in source_paths],
-                how="vertical_relaxed",
-                rechunk=False,
-            )
+            source_frame = _concat_fragments(source_paths)
             table_catalog = catalog.filter(
                 pl.col("source_table") == source_table
             )

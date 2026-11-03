@@ -48,9 +48,9 @@ for %%F in (
     if errorlevel 1 exit /b 1
 )
 
-rem Production archive only: latest-revision v3 fragments, a matching manifest,
+rem Production archive only: latest-revision v4 fragments, a matching manifest,
 rem and metadata.json (written last). Domain shards, dataset/, sqlite and logs
-rem are builder artifacts and are not published. Fails if metadata is not v3.
+rem are builder artifacts and are not published. Fails if metadata is not v4.
 set "pub_py=%USERPROFILE%\.venvs\bridge-postmortem\Scripts\python.exe"
 if not exist "%pub_py%" exit /b 1
 if not exist "%ffbridge_hier_source%\metadata.json" exit /b 1
