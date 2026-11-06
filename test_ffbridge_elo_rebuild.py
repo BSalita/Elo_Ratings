@@ -63,3 +63,27 @@ class SessionListCacheTests(unittest.TestCase):
             )
         self.assertEqual([session["id"] for session in sessions], [304741])
         self.assertEqual(sessions[0]["series_id"], 868)
+
+
+class PersistedBuiltAtTests(unittest.TestCase):
+    """The UI reloads its in-memory dataset when the parquet on disk is newer."""
+
+    def test_reads_built_at_from_meta_on_disk(self):
+        import json
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            meta = pathlib.Path(tmp) / "k.meta.json"
+            paths = (pathlib.Path(tmp) / "r", pathlib.Path(tmp) / "p", meta)
+            with patch.object(app, "_resolve_elo_cache_key", return_value="k"), \
+                 patch.object(app, "_elo_cache_paths", return_value=paths):
+                self.assertIsNone(app._persisted_built_at("FFBridge Lancelot API", True))
+                meta.write_text(
+                    json.dumps({"built_at": "2026-11-06T11:18:12+00:00"}),
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    app._persisted_built_at("FFBridge Lancelot API", True),
+                    "2026-11-06T11:18:12+00:00",
+                )

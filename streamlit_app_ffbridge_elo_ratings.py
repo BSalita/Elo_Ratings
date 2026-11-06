@@ -2107,6 +2107,7 @@ def compute_and_persist_elo_dataset(
             scratch_ratings_dict[row['player_id']] = row['scratch_elo']
             handicap_ratings_dict[row['player_id']] = row['handicap_elo']
 
+    built_at = datetime.now(timezone.utc).isoformat()
     # Persist for the next cold start (best-effort; ephemeral FS is fine).
     try:
         if finalize_status is not None:
@@ -2123,7 +2124,7 @@ def compute_and_persist_elo_dataset(
             "handicap_ratings": handicap_ratings_dict,
             "processing_stats": stats,
             "processed_tournament_ids": stats.get("processed_tournament_ids", []),
-            "built_at": datetime.now(timezone.utc).isoformat(),
+            "built_at": built_at,
         }), encoding="utf-8")
         print(f"[ffbridge] persisted Elo dataset '{key}' to parquet", flush=True)
         _prune_old_elo_cache(api_key, fetch_iv, key)
@@ -2140,7 +2141,19 @@ def compute_and_persist_elo_dataset(
         "scratch_ratings": scratch_ratings_dict,
         "handicap_ratings": handicap_ratings_dict,
         "processing_stats": stats,
+        "built_at": built_at,
     }
+
+
+def _persisted_built_at(api_key: str, fetch_iv: bool) -> Optional[str]:
+    """``built_at`` of the parquet set on disk, or None when there is none."""
+    key = _resolve_elo_cache_key(api_key, fetch_iv)
+    if key is None:
+        return None
+    _, _, meta_path = _elo_cache_paths(key)
+    if not meta_path.exists():
+        return None
+    return json.loads(meta_path.read_text(encoding="utf-8")).get("built_at")
 
 
 @st.cache_resource(show_spinner="Building FFBridge Elo ratings (first load may take ~1 minute)…")
@@ -3295,6 +3308,19 @@ def _load_main_content(
         dataset = load_ffbridge_elo_dataset(
             api_module, all_tournaments, api_key, fetch_iv, n_tournaments
         )
+        # build_ffbridge_elo_parquets.py (or another process) may have replaced
+        # the parquet since this process cached it; serve the newer build.
+        disk_built_at = _persisted_built_at(api_key, fetch_iv)
+        if disk_built_at is not None and dataset.get("built_at") != disk_built_at:
+            print(
+                f"[ffbridge] parquet rebuilt ({dataset.get('built_at')} -> "
+                f"{disk_built_at}); reloading Elo dataset",
+                flush=True,
+            )
+            load_ffbridge_elo_dataset.clear()
+            dataset = load_ffbridge_elo_dataset(
+                api_module, all_tournaments, api_key, fetch_iv, n_tournaments
+            )
         _load_debug_log("load_ffbridge_elo_dataset returned")
     st.session_state._ffbridge_loaded_api_key = api_key
     full_results_df = dataset['results_df']
