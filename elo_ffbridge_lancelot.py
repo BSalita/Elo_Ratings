@@ -16,6 +16,7 @@ import requests
 import streamlit as st
 import polars as pl
 
+import ffbridge_bridgeplus_scores
 from ffbridge_provisional_scores import (
     BI_SERIES_IDS,
     fetch_provisional_pair_percentages,
@@ -24,6 +25,7 @@ from ffbridge_provisional_scores import (
 
 # Import shared utilities
 from elo_ffbridge_common import (
+    ROY_RENE_SERIES_ID,
     SERIES_NAMES,
     VALID_SERIES_IDS,
     normalize_series_id,
@@ -64,6 +66,13 @@ RECENT_RESULTS_DAYS = 14
 SESSION_LIST_CACHE_HOURS = 6
 PROVENANCE_API_START = "2026-07-01"
 ORGANIZER_SCORE_CACHE_VERSION = "v2"
+BRIDGEPLUS_SCORE_CACHE_VERSION = "v1"
+# Matchpoint percentages average 50% across a field; Roy René handicap
+# percentages average 58-62%.
+SCRATCH_FIELD_MEAN_TOLERANCE = 1.0
+# Handicap minus scratch is the IV bonus, never negative. Allow for the small
+# drift between FFBridge's and Bridge+'s provisional fields.
+MIN_IV_BONUS = -1.0
 
 # Lancelot ID to Migration ID (FFBridge series ID) mapping (shared)
 LANCELOT_TO_MIGRATION = mlBridgeFFLib.LANCELOT_TO_MIGRATION
@@ -254,12 +263,174 @@ def _missing_expected_provenance(
     )
 
 
+def _entry_score(entry: Dict[str, Any]) -> Optional[float]:
+    return _as_number(
+        entry.get("sessionScore")
+        if entry.get("sessionScore") is not None
+        else entry.get("totalScore")
+    )
+
+
+def handicap_published_as_scratch(
+    ranking: List[Dict[str, Any]],
+    tournament_date: str,
+    series_id: Optional[Any],
+) -> bool:
+    """True when a handicap-schedule session's ranking holds scratch scores.
+
+    FFBridge's Roy René handicap rankings usually carry handicap percentages,
+    but some (3 Nov 2026, 6 Aug 2024) carry the scratch ones with no bonus.
+    Matchpoint percentages average 50% across the field; handicap ones do not.
+    """
+    if ffbridge_scoring_mode(series_id, tournament_date) != "handicap":
+        return False
+    rows = [row for row in ranking if isinstance(row, dict)]
+    if not rows or national_ranking_is_pending(rows):
+        return False
+    if any(
+        row.get(field) is not None
+        for row in rows
+        for field in ("scoreHandicap", "handicapPercentage", "totalScoreWithoutHandicap")
+    ):
+        return False
+    if any((_as_number(row.get("totalBonus")) or 0.0) > 0.0 for row in rows):
+        return False
+    scores = [score for score in (_entry_score(row) for row in rows) if score is not None]
+    if not scores:
+        return False
+    return abs(sum(scores) / len(scores) - 50.0) <= SCRATCH_FIELD_MEAN_TOLERANCE
+
+
+def _same_table(entry: Dict[str, Any], row: Dict[str, Any]) -> bool:
+    """Mitchell seat match. Howell rows (no direction) never match by table."""
+    table = entry.get("tableNumber")
+    if row.get("direction") is None or table in (None, ""):
+        return False
+    # Lancelot sends table 4 for some sessions and 104/204 for others.
+    return (
+        str(entry.get("section") or "").upper() == row["section"]
+        and str(entry.get("orientation") or "").upper() == row["direction"]
+        and int(table) % 100 == row["table"]
+    )
+
+
+def _match_bridgeplus_row(
+    entry: Dict[str, Any], rows: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """The club row for this pair: by license, else by Mitchell table."""
+    licenses = _entry_licenses(entry)
+    by_license = [row for row in rows if licenses & row["licenses"]] if licenses else []
+    if len(by_license) > 1:
+        raise ValueError(
+            f"Bridge+ has {len(by_license)} pairs with licenses {sorted(licenses)}"
+        )
+    if by_license:
+        return by_license[0]
+    by_table = [row for row in rows if _same_table(entry, row)]
+    if not by_table:
+        return None
+    row = by_table[0]
+    if licenses and row["licenses"]:
+        raise ValueError(
+            f"Bridge+ pair at section {row['section']} {row['direction']}{row['table']} "
+            f"has licenses {sorted(row['licenses'])}, Lancelot has {sorted(licenses)}"
+        )
+    return row
+
+
+def _entry_licenses(entry: Dict[str, Any]) -> set:
+    team = entry.get("team") or {}
+    licenses = set()
+    for seat in ("player1", "player2"):
+        person = mlBridgeFFLib.lancelot_seat_person(team.get(seat)) or {}
+        key = ffbridge_bridgeplus_scores.license_key(person.get("ffbId"))
+        if key:
+            licenses.add(key)
+    return licenses
+
+
+def bridgeplus_handicap_scores(
+    ranking: List[Dict[str, Any]],
+    tournament_date: str,
+    fetch: ffbridge_bridgeplus_scores.Fetch = ffbridge_bridgeplus_scores.default_fetch,
+) -> Dict[str, Dict[str, Any]]:
+    """Bridge+ national handicap % and rank, keyed by Lancelot team id.
+
+    Empty when Bridge+ no longer lists the day, or when its percentages equal
+    FFBridge's (a normal pairs game, not a handicap one).
+    """
+    rows = [row for row in ranking if isinstance(row, dict)]
+    bridgeplus = ffbridge_bridgeplus_scores.club_rows(
+        tournament_date,
+        {normalize_club_code(row.get("simultaneousId")) for row in rows},
+        fetch=fetch,
+    )
+    if not bridgeplus:
+        return {}
+    scores: Dict[str, Dict[str, Any]] = {}
+    used: set = set()
+    differs = False
+    for entry in rows:
+        club = normalize_club_code(entry.get("simultaneousId"))
+        match = _match_bridgeplus_row(entry, bridgeplus.get(club, []))
+        if match is None:
+            continue
+        if id(match) in used:
+            raise ValueError(f"Bridge+ row {match['url']} matches two Lancelot pairs")
+        used.add(id(match))
+        scratch = _entry_score(entry)
+        handicap = float(match["pct"])
+        if scratch is not None:
+            if handicap - scratch < MIN_IV_BONUS:
+                raise ValueError(
+                    f"Bridge+ handicap {handicap} is below FFBridge scratch {scratch} "
+                    f"for {match['url']}"
+                )
+            differs = differs or abs(handicap - scratch) >= 0.01
+        team_id = str((entry.get("team") or {}).get("id", ""))
+        scores[team_id] = {
+            "national_handicap_percentage": handicap,
+            "national_handicap_rank": int(match["rank"]),
+            "handicap_url": str(match["url"]),
+        }
+    return scores if differs else {}
+
+
+def _fetch_bridgeplus_scores(
+    session_id: str,
+    ranking: List[Dict[str, Any]],
+    tournament_date: str,
+    series_id: Optional[Any],
+) -> Dict[str, Dict[str, Any]]:
+    if not handicap_published_as_scratch(ranking, tournament_date, series_id):
+        return {}
+    cache_name = (
+        f"organizer_scores_bridgeplus_{BRIDGEPLUS_SCORE_CACHE_VERSION}_{session_id}"
+    )
+    # Bridge+ percentages move while clubs are still reporting.
+    cached = load_from_disk_cache(
+        CACHE_DIR,
+        cache_name,
+        max_age_hours=(
+            RECENT_RESULTS_CACHE_HOURS if _is_recent_result(tournament_date) else None
+        ),
+        series_id=series_id,
+    )
+    if isinstance(cached, dict) and "scores" in cached:
+        return cached["scores"]
+    scores = bridgeplus_handicap_scores(ranking, tournament_date)
+    save_to_disk_cache(CACHE_DIR, cache_name, {"scores": scores}, series_id=series_id)
+    return scores
+
+
 def _fetch_organizer_scores(
     session_id: str,
     ranking: List[Dict[str, Any]],
     tournament_date: str,
     series_id: Optional[Any],
 ) -> Dict[str, Dict[str, Any]]:
+    if normalize_series_id(series_id) == ROY_RENE_SERIES_ID:
+        return _fetch_bridgeplus_scores(session_id, ranking, tournament_date, series_id)
     if normalize_series_id(series_id) not in BI_SERIES_IDS:
         return {}
     cache_name = f"organizer_scores_{ORGANIZER_SCORE_CACHE_VERSION}_{session_id}"
@@ -421,7 +592,9 @@ def _official_scratch_and_handicap(
     Verified against FFBridge and club tables (2026-08-25):
     - `sessionScore` is scratch for scratch-only series (Rondes de France, etc.).
     - `sessionScore` is the national handicap percentage for registered
-      handicap schedules (Octopus, Simultanet, Roy René first Tuesday).
+      handicap schedules (Octopus, Simultanet, Roy René first Tuesday),
+      except a Roy René ranking whose scores average 50%: that one is
+      scratch (see handicap_published_as_scratch).
     - `totalBonus` is the Octopus IV handicap in percentage points.
     - `peBonus` is PE ranking points. Never convert it into a percentage.
     """
@@ -507,7 +680,21 @@ def _normalize_ranking_results(
         if national_pending
         else {}
     )
-    
+    # sessionScore is scratch here; any handicap % comes from Bridge+. With
+    # none, the session holds only scratch scores and is scored as scratch.
+    published_scratch = handicap_published_as_scratch(
+        ranking, tournament_date, normalized_series_id
+    )
+    if published_scratch:
+        scoring_mode = (
+            "handicap"
+            if any(
+                score.get("national_handicap_percentage") is not None
+                for score in provisional_scores.values()
+            )
+            else "scratch"
+        )
+
     for entry in ranking:
         if not isinstance(entry, dict):
             continue
@@ -604,10 +791,25 @@ def _normalize_ranking_results(
                 _official_scratch_and_handicap(
                     entry,
                     session_score=national_pct,
-                    scoring_mode=scoring_mode,
+                    scoring_mode="scratch" if published_scratch else scoring_mode,
                     bonus_is_authoritative=bonus_is_authoritative,
                 )
             )
+            if published_scratch and scoring_mode == "handicap":
+                national_handicap_pct = organizer_national_handicap
+                iv_bonus = (
+                    float(national_handicap_pct) - float(national_scratch_pct)
+                    if national_handicap_pct is not None
+                    and national_scratch_pct is not None
+                    else None
+                )
+                handicap_status = (
+                    "unresolved"
+                    if national_handicap_pct is None
+                    else "provisional"
+                    if _is_recent_result(tournament_date)
+                    else "official"
+                )
             if national_scratch_pct is None:
                 national_scratch_pct = organizer_national_scratch
             if national_handicap_pct is None:
@@ -644,6 +846,14 @@ def _normalize_ranking_results(
         if national_pending:
             national_handicap_rank = None
             national_scratch_rank = None
+        elif published_scratch:
+            # FFBridge's rank is the scratch rank; Bridge+'s is the handicap one.
+            national_scratch_rank = national_rank
+            national_handicap_rank = (
+                organizer.get("national_handicap_rank")
+                if national_handicap_pct is not None
+                else None
+            )
         elif scoring_mode == "handicap":
             national_handicap_rank = (
                 national_rank if national_handicap_pct is not None else None
