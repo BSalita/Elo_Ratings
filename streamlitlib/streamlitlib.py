@@ -546,7 +546,8 @@ def dataframe_to_table(df, max_rows: int | None = None, max_cols: int | None = N
     return table
 
 
-def create_pdf(pdf_assets, title, output_filename=None, max_rows: int | None = None, max_cols: int | None = 11, rows_per_page: int | list[int] | tuple[int, ...] | None = None, shrink_to_fit: bool = False):
+def create_pdf(pdf_assets, title, output_filename=None, max_rows: int | None = None, max_cols: int | None = 11, rows_per_page: int | list[int] | tuple[int, ...] | None = None, shrink_to_fit: bool = False, page_per_section: bool = False):
+    """PDF of the assets. Tables follow one another unless page_per_section starts each on a new page."""
     # Create a BytesIO object to capture the PDF data
     buffer = BytesIO()
     
@@ -632,8 +633,8 @@ def create_pdf(pdf_assets, title, output_filename=None, max_rows: int | None = N
                 # Force a page break between chunks on same asset except after the last chunk
                 if i < len(frames) - 1:
                     story.append(PageBreak())
-            # Add page break after table (so next header starts on new page)
-            story.append(PageBreak())
+            # Sections follow one another unless each should start a new page.
+            story.append(PageBreak() if page_per_section else Spacer(1, 12))
             previous_was_table = True
         else:
             assert False, f"Unknown asset type: {type(a)}"
