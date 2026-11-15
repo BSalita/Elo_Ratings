@@ -18,7 +18,7 @@ import ffbridge_session_ranking_service as rankings
 from streamlitlib.memory_usage import get_memory_usage_dict
 
 
-FFBRIDGE_API_BUILD_TAG = "2026-09-20-elo-favorites"
+FFBRIDGE_API_BUILD_TAG = "2026-11-15-foresight-columns"
 app = FastAPI(title="FFBridge Elo API", version="1.6.0")
 
 
@@ -114,6 +114,13 @@ def leaderboard_report(
     date_to: str | None = Query(None),
     sort_by: str | None = Query(None),
     sort_descending: bool | None = Query(None),
+    foresight: bool = Query(
+        False,
+        description=(
+            "Add Foresight_Z, Lead_Foresight_Z, Guess_Foresight_Z and Home_Edge_Z "
+            "(peer z-scores; see foresight.metric_definitions in the response)."
+        ),
+    ),
 ) -> dict:
     """Return filtered Elo rows with role-aware bridge-quality metrics."""
     tournament_filters = [
@@ -153,6 +160,7 @@ def leaderboard_report(
         date_to=date_to,
         sort_by=sort_by,
         sort_descending=sort_descending,
+        foresight=foresight,
     )
 
 

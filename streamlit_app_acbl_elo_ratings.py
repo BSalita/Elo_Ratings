@@ -57,6 +57,7 @@ from streamlitlib.streamlitlib import (
 
 # Import common Elo utilities (shared with FFBridge app)
 from acbl_strata import STRATA_DEFAULT, STRATA_OPTIONS
+from foresight import FORESIGHT_CHECKBOX_HELP, foresight_caption
 from elo_common import (
     ASSISTANT_LOGO_URL,
     SKILL_GATE_DISABLED,
@@ -123,6 +124,7 @@ def _fetch_remote_report_table(
     strata: str = STRATA_DEFAULT,
     platinum_events: bool = False,
     min_skill_z: float | None = None,
+    foresight: bool = False,
 ) -> tuple[pl.DataFrame, dict]:
     """Fetch pre-aggregated report rows from the ACBL API service.
 
@@ -156,6 +158,9 @@ def _fetch_remote_report_table(
     }
     if params["min_skill_z"] is None:
         params.pop("min_skill_z")
+    if foresight:
+        # Developer Settings: foresight z-score columns (elo/foresight.py).
+        params["foresight"] = True
 
     timeout_connect = int(os.getenv("ACBL_API_CONNECT_TIMEOUT_SECONDS", "15"))
     timeout_read = int(os.getenv("ACBL_API_TIMEOUT_SECONDS", "600"))
@@ -732,6 +737,7 @@ def _acbl_report_fetch_signature(
     strata: str = STRATA_DEFAULT,
     platinum_events: bool = False,
     min_skill_z: float | None = None,
+    foresight: bool = False,
 ) -> str:
     return json.dumps(
         {
@@ -748,6 +754,7 @@ def _acbl_report_fetch_signature(
             "prior_sessions": int(prior_sessions),
             "platinum_events": bool(platinum_events),
             "min_skill_z": None if min_skill_z is None else float(min_skill_z),
+            "foresight": bool(foresight),
         },
         sort_keys=True,
     )
@@ -768,6 +775,7 @@ def _acbl_report_cache_key(
     strata: str = STRATA_DEFAULT,
     platinum_events: bool = False,
     min_skill_z: float | None = None,
+    foresight: bool = False,
 ) -> str:
     plat = "plat1" if platinum_events else "plat0"
     skill = "off" if min_skill_z is None or float(min_skill_z) <= SKILL_GATE_DISABLED else f"{float(min_skill_z):.2f}"
@@ -775,6 +783,7 @@ def _acbl_report_cache_key(
         f"cached_table_{club_or_tournament}_{rating_type}_{top_n}_{min_sessions}_"
         f"{rating_method}_{moving_avg_days}_{elo_rating_type}_{date_range}_"
         f"{online_filter}_{strata}_{masterpoints_filter}_prior{prior_sessions}_{plat}_z{skill}"
+        f"{'_foresight' if foresight else ''}"
     )
 
 
@@ -977,6 +986,7 @@ def _acbl_report_panel() -> None:
     club_or_tournament = ctx["club_or_tournament"]
     platinum_events = bool(ctx.get("platinum_events", False))
     min_skill_z = float(ctx.get("min_skill_z", default_min_skill_z(club_or_tournament)))
+    foresight = bool(st.session_state.get("acbl_show_foresight", False))
 
     prior_sessions = int(st.session_state.get("acbl_prior_sessions", 50))
     masterpoints_filter = st.session_state.get("masterpoints_filter", "All")
@@ -994,6 +1004,7 @@ def _acbl_report_panel() -> None:
         strata=strata,
         platinum_events=platinum_events,
         min_skill_z=min_skill_z,
+        foresight=foresight,
     )
     cached_fetch = st.session_state.get("_acbl_report_fetch_cache")
     if (
@@ -1026,6 +1037,7 @@ def _acbl_report_panel() -> None:
                     strata=strata,
                     platinum_events=platinum_events,
                     min_skill_z=min_skill_z,
+                    foresight=foresight,
                 )
         except Exception as exc:
             st.error(str(exc))
@@ -1132,6 +1144,9 @@ def _acbl_report_panel() -> None:
         "Ratings stay blank below 20 sessions or 3 partners, and when a "
         "player cannot be separated from their only partner."
     )
+    foresight_info = remote_payload.get("foresight", {}) if isinstance(remote_payload, dict) else {}
+    if foresight and isinstance(foresight_info, dict):
+        st.caption(foresight_caption(foresight_info.get("status") or {}))
 
     # Store online filter and current dataset type for downstream controls
     st.session_state.online_filter = online_filter
@@ -1172,6 +1187,7 @@ def _acbl_report_panel() -> None:
             strata=strata,
             platinum_events=platinum_events,
             min_skill_z=min_skill_z,
+            foresight=foresight,
         )
         st.session_state.acbl_report_cache_key = cache_key
         st.session_state.acbl_club_or_tournament = club_or_tournament
@@ -1869,6 +1885,11 @@ def main():
             )
             st.session_state.enable_custom_queries = enable_custom_queries
             st.session_state.use_sql_engine = True
+            st.checkbox(
+                "Show foresight columns",
+                key="acbl_show_foresight",
+                help=FORESIGHT_CHECKBOX_HELP,
+            )
 
     # Persist current sidebar state to URL query params for shareable links.
     sync_state_to_url_params(st, ACBL_URL_PARAMS)

@@ -439,6 +439,7 @@ _NUMERIC_NAME_EXACT: frozenset[str] = frozenset({
     "DD_Tricks_Diff_Avg",
     "DD_Tricks_Declared",
     "Lead_Cost_Avg", "Lead_Best_Pct", "Leads_Scored", "SD_Lead_Cost_Avg",
+    "Foresight_Z", "Lead_Foresight_Z", "Guess_Foresight_Z", "Home_Edge_Z",
 })
 
 

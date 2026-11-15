@@ -71,6 +71,7 @@ from st_aggrid import (
 )
 
 # Import common Elo utilities (shared with ACBL app)
+from foresight import FORESIGHT_CHECKBOX_HELP, foresight_caption
 from elo_common import (
     DEFAULT_ELO,
     K_FACTOR,
@@ -132,6 +133,7 @@ from ffbridge_report_service import (
     ffbridge_results_url_expr as _ffbridge_results_url_expr,
     legacy_elo_cache_keys as _legacy_elo_cache_keys,
     load_filtered_quality_sidecars as _load_filtered_quality_sidecars,
+    load_foresight_stats as _load_foresight_stats,
     load_quality_sidecars as _load_quality_sidecars,
     player_metrics_from_results as _player_metrics_from_results,
     resolve_elo_cache_key as _resolve_elo_cache_key,
@@ -2199,6 +2201,14 @@ def _cached_filtered_quality_sidecars(
     return _load_filtered_quality_sidecars(results_df)
 
 
+@st.cache_data(show_spinner="Computing foresight statistics…")
+def _cached_foresight_stats(
+    results_df: pl.DataFrame,
+) -> Tuple[Optional[pl.DataFrame], Optional[pl.DataFrame], dict]:
+    """Developer Settings: foresight statistics for the filtered sessions."""
+    return _load_foresight_stats(results_df, has_population_filter=True)
+
+
 @st.cache_data(show_spinner=False)
 def _cached_top_players_both(
     results_df: pl.DataFrame,
@@ -2206,17 +2216,18 @@ def _cached_top_players_both(
     min_games: int,
     prior_sessions: int,
     quality_df: Optional[pl.DataFrame],
+    foresight_df: Optional[pl.DataFrame] = None,
 ) -> Tuple[pl.DataFrame, pl.DataFrame, str, str, Optional[float], Optional[float]]:
     if results_df.is_empty():
         empty = pl.DataFrame()
         return empty, empty, "", "", None, None
     hc, sql_h, anchor_h = run_top_players_favorite(
         results_df, top_n, min_games, use_handicap=True, prior_sessions=prior_sessions,
-        quality_df=quality_df,
+        quality_df=quality_df, foresight_df=foresight_df,
     )
     sc, sql_s, anchor_s = run_top_players_favorite(
         results_df, top_n, min_games, use_handicap=False, prior_sessions=prior_sessions,
-        quality_df=quality_df,
+        quality_df=quality_df, foresight_df=foresight_df,
     )
     return hc, sc, sql_h, sql_s, anchor_h, anchor_s
 
@@ -2228,6 +2239,7 @@ def _cached_top_pairs_both(
     min_games: int,
     prior_sessions: int,
     quality_df: Optional[pl.DataFrame],
+    foresight_df: Optional[pl.DataFrame] = None,
 ) -> Tuple[pl.DataFrame, pl.DataFrame, str, str, Optional[float], Optional[float]]:
     if results_df.is_empty():
         empty = pl.DataFrame()
@@ -2235,10 +2247,12 @@ def _cached_top_pairs_both(
     hc, sql_h, anchor_h = run_top_pairs_favorite(
         results_df, top_n, min_games, use_handicap=True,
         prior_sessions=prior_sessions, quality_df=quality_df,
+        foresight_df=foresight_df,
     )
     sc, sql_s, anchor_s = run_top_pairs_favorite(
         results_df, top_n, min_games, use_handicap=False,
         prior_sessions=prior_sessions, quality_df=quality_df,
+        foresight_df=foresight_df,
     )
     return hc, sc, sql_h, sql_s, anchor_h, anchor_s
 
@@ -2514,13 +2528,18 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
     )
     st.markdown("<br>", unsafe_allow_html=True)
     st.session_state.full_results_df = results_df
+    # Developer Settings: foresight z-score columns (foresight.py).
+    foresight_players = foresight_pairs = None
+    if st.session_state.get("ffbridge_show_foresight", False) and not results_df.is_empty():
+        foresight_players, foresight_pairs, foresight_status = _cached_foresight_stats(results_df)
+        st.caption(foresight_caption(foresight_status))
     # Display tables
     if rating_type == "Players":
         if not results_df.is_empty():
             _load_debug_log("leaderboard panel: running top players SQL (hc+sc)")
             hc_players, sc_players, sql_h, sql_s, anchor_h, anchor_s = _cached_top_players_both(
                 results_df, top_n, min_games, int(prior_sessions),
-                quality_players,
+                quality_players, foresight_players,
             )
             _load_debug_log(
                 f"leaderboard panel: top players ready "
@@ -2748,7 +2767,7 @@ def _ffbridge_leaderboard_panel(metric_m2, metric_m3, metric_m4) -> None:
             _load_debug_log("leaderboard panel: running top pairs SQL (hc+sc)")
             hc_pairs, sc_pairs, sql_h, sql_s, anchor_h, anchor_s = _cached_top_pairs_both(
                 results_df, top_n, min_games, int(prior_sessions),
-                quality_pairs,
+                quality_pairs, foresight_pairs,
             )
             _load_debug_log(
                 f"leaderboard panel: top pairs ready "
@@ -3149,6 +3168,13 @@ def main():
             key="show_sql_query",
             help="Show the SQL query above each table produced by SQL.",
         )
+
+        with st.sidebar.expander("🔧 **Developer Settings**"):
+            st.checkbox(
+                "Show foresight columns",
+                key="ffbridge_show_foresight",
+                help=FORESIGHT_CHECKBOX_HELP,
+            )
 
     # Persist current sidebar state to URL query params for shareable links.
     sync_state_to_url_params(st, FFBRIDGE_URL_PARAMS)

@@ -28,6 +28,11 @@ from elo_filter_common import (
     fuzzy_text_score,
 )
 from clone_elo import compute_clone_ratings, empty_clone_ratings, register_clone_ratings
+from foresight import (
+    FORESIGHT_METRIC_DEFINITIONS,
+    attach_foresight,
+    ffbridge_foresight_stats,
+)
 from elo_favorites import (
     DUCKDB_THREADS,
     flatten_favorites,
@@ -764,6 +769,43 @@ def load_report_quality_sidecars(
     return players, pairs, {**status, "filter_scope": "all_quality_sessions"}
 
 
+def load_foresight_stats(
+    results_df: pl.DataFrame,
+    *,
+    has_population_filter: bool,
+) -> Tuple[Optional[pl.DataFrame], Optional[pl.DataFrame], Dict[str, str]]:
+    """Foresight statistics (see foresight.py) for players and pairs.
+
+    Board-level metrics cover the selected sessions when a report filter is
+    active, otherwise every session. Returns (players, pairs, per-metric status).
+    """
+    if results_df.is_empty():
+        return None, None, {}
+    session_ids = None
+    if has_population_filter:
+        if "tournament_id" not in results_df.columns:
+            raise ValueError("Filtered FFBridge results lack tournament_id")
+        session_ids = (
+            results_df.get_column("tournament_id")
+            .cast(pl.String)
+            .drop_nulls()
+            .unique()
+            .to_list()
+        )
+    frames = []
+    status: Dict[str, str] = {}
+    for rating_type in ("Players", "Pairs"):
+        frame, status = ffbridge_foresight_stats(
+            results=results_df,
+            rating_type=rating_type,
+            quality_boards_path=QUALITY_BOARDS_PATH,
+            club_boards_path=resolve_club_board_results_path(),
+            session_ids=session_ids,
+        )
+        frames.append(frame)
+    return frames[0], frames[1], status
+
+
 def _attach_quality_sidecar(
     leaderboard: pl.DataFrame,
     quality_df: Optional[pl.DataFrame],
@@ -1323,6 +1365,21 @@ def _drop_prior_anchor(result: pl.DataFrame) -> tuple[pl.DataFrame, Optional[flo
     return result.drop("_prior_anchor"), prior_anchor
 
 
+def _attach_foresight_columns(
+    leaderboard: pl.DataFrame,
+    foresight_df: Optional[pl.DataFrame],
+    *,
+    id_column: str,
+    elo_column: str,
+) -> pl.DataFrame:
+    """Add the foresight z-scores, banding peers by the full leaderboard's Elo."""
+    if foresight_df is None or leaderboard.is_empty():
+        return leaderboard
+    return attach_foresight(
+        leaderboard, foresight_df, id_column=id_column, elo_column=elo_column
+    )
+
+
 def run_top_players_favorite(
     results_df: pl.DataFrame,
     top_n: int,
@@ -1330,8 +1387,12 @@ def run_top_players_favorite(
     use_handicap: bool = False,
     prior_sessions: int = 0,
     quality_df: Optional[pl.DataFrame] = None,
+    foresight_df: Optional[pl.DataFrame] = None,
 ) -> Tuple[pl.DataFrame, str, Optional[float]]:
-    """Run the Top_Players favorite against session-level ``self``."""
+    """Run the Top_Players favorite against session-level ``self``.
+
+    ``foresight_df`` (load_foresight_stats) adds the foresight z-score columns.
+    """
     if results_df.is_empty():
         return results_df, "", None
     meta = ffbridge_favorites_meta(
@@ -1362,8 +1423,11 @@ def run_top_players_favorite(
         quality_df,
         leaderboard_id="Player_ID",
         quality_id="player_id",
-    ).head(top_n)
-    return result, sql, prior_anchor
+    )
+    result = _attach_foresight_columns(
+        result, foresight_df, id_column="Player_ID", elo_column=meta["Elo_Col_Name"]
+    )
+    return result.head(top_n), sql, prior_anchor
 
 
 def run_top_pairs_favorite(
@@ -1373,8 +1437,12 @@ def run_top_pairs_favorite(
     use_handicap: bool = False,
     prior_sessions: int = 0,
     quality_df: Optional[pl.DataFrame] = None,
+    foresight_df: Optional[pl.DataFrame] = None,
 ) -> Tuple[pl.DataFrame, str, Optional[float]]:
-    """Run the Top_Pairs favorite against session-level ``self``."""
+    """Run the Top_Pairs favorite against session-level ``self``.
+
+    ``foresight_df`` (load_foresight_stats) adds the foresight z-score columns.
+    """
     if results_df.is_empty():
         return results_df, "", None
     meta = ffbridge_favorites_meta(
@@ -1398,8 +1466,11 @@ def run_top_pairs_favorite(
         quality_df,
         leaderboard_id="Pair_ID",
         quality_id="pair_id",
-    ).head(top_n)
-    return result, sql, prior_anchor
+    )
+    result = _attach_foresight_columns(
+        result, foresight_df, id_column="Pair_ID", elo_column=meta["Elo_Col_Name"]
+    )
+    return result.head(top_n), sql, prior_anchor
 
 
 def player_metrics_from_results(
@@ -1512,8 +1583,11 @@ def run_leaderboard_report(
     sort_descending: Optional[bool] = None,
     api_key: Optional[str] = None,
     fetch_iv: bool = True,
+    foresight: bool = False,
 ) -> Dict[str, Any]:
     """Full pipeline: load parquet -> filter -> aggregate -> leaderboard SQL.
+
+    ``foresight`` adds the foresight z-score columns (foresight.py).
 
     Mirrors the Streamlit app's report path (percentage filter, sidebar
     filters, ARG_MAX aggregation, Bayesian shrinkage). Explicit
@@ -1560,6 +1634,11 @@ def run_leaderboard_report(
     quality_players, quality_pairs, quality_status = load_report_quality_sidecars(
         results_df, has_population_filter=has_population_filter
     )
+    foresight_players, foresight_pairs, foresight_status = (
+        load_foresight_stats(results_df, has_population_filter=has_population_filter)
+        if foresight
+        else (None, None, {})
+    )
 
     name_token = (player_name or "").strip()
     number_token = (player_number or "").strip()
@@ -1575,13 +1654,13 @@ def run_leaderboard_report(
         table, sql, prior_anchor = run_top_players_favorite(
             results_df, rank_window, min_games,
             use_handicap=use_handicap, prior_sessions=prior_sessions,
-            quality_df=quality_players,
+            quality_df=quality_players, foresight_df=foresight_players,
         )
     else:
         table, sql, prior_anchor = run_top_pairs_favorite(
             results_df, rank_window, min_games,
             use_handicap=use_handicap, prior_sessions=prior_sessions,
-            quality_df=quality_pairs,
+            quality_df=quality_pairs, foresight_df=foresight_pairs,
         )
     del sql
 
@@ -1625,6 +1704,11 @@ def run_leaderboard_report(
         "quality_status": quality_status["status"],
         "quality_cutoff": quality_status.get("cutoff"),
         "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
+        "foresight": {
+            "applied": bool(foresight),
+            "status": foresight_status,
+            "metric_definitions": FORESIGHT_METRIC_DEFINITIONS if foresight else {},
+        },
     }
 
 

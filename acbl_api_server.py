@@ -40,6 +40,11 @@ from elo_favorites import (
     run_favorite,
     run_sql,
 )
+from foresight import (
+    FORESIGHT_METRIC_DEFINITIONS,
+    acbl_foresight_stats,
+    attach_foresight,
+)
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -51,7 +56,7 @@ DATA_ROOT = pathlib.Path(
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-11-01-opening-lead-columns"
+API_BUILD_TAG = "2026-11-15-foresight-columns"
 
 QUALITY_METRIC_DEFINITIONS = {
     "DD_Tricks_Diff_Avg": {
@@ -464,6 +469,8 @@ _SQL_FORBIDDEN = re.compile(
 MAX_ACBL_SQL_ROWS = 10000
 _ACBL_FAVORITES: dict | None = None
 _ACBL_CLONE_CACHE: dict[tuple, pl.DataFrame] = {}
+# (parquet mtime, rating type, Elo type, filters) -> (statistics, per-metric status)
+_ACBL_FORESIGHT_CACHE: dict[tuple, tuple[pl.DataFrame, dict[str, str]]] = {}
 
 
 class AcblSqlBody(BaseModel):
@@ -1837,6 +1844,35 @@ def _register_acbl_clone_ratings(
     register_clone_ratings(con, cached)
 
 
+def _acbl_foresight_stats(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    source_path: str,
+    columns: set[str],
+    rating_type: str,
+    elo_rating_type: str,
+    cache_key: tuple,
+) -> tuple[pl.DataFrame, dict[str, str]]:
+    """Foresight statistics over the filtered ``self`` view (see foresight.py)."""
+    try:
+        mtime = pathlib.Path(source_path).stat().st_mtime
+    except OSError:
+        mtime = None
+    full_key = (mtime, rating_type, elo_rating_type, cache_key)
+    cached = _ACBL_FORESIGHT_CACHE.get(full_key)
+    if cached is None:
+        cached = acbl_foresight_stats(
+            con,
+            columns=columns,
+            rating_type=rating_type,
+            elo_columns=get_elo_column_names(elo_rating_type),
+        )
+        _ACBL_FORESIGHT_CACHE[full_key] = cached
+        if len(_ACBL_FORESIGHT_CACHE) > 8:
+            _ACBL_FORESIGHT_CACHE.pop(next(iter(_ACBL_FORESIGHT_CACHE)))
+    return cached
+
+
 @app.get("/acbl/report")
 def acbl_report(
     club_or_tournament: str = Query(..., pattern="^(club|tournament)$"),
@@ -1874,6 +1910,14 @@ def acbl_report(
         description=(
             "Tournament only: rank using only events whose mp_color is Platinum. "
             "Excludes every other tournament event."
+        ),
+    ),
+    foresight: bool = Query(
+        False,
+        description=(
+            "Add Foresight_Z, Lead_Foresight_Z, Guess_Foresight_Z and Home_Edge_Z "
+            "(peer z-scores; see foresight.metric_definitions in the response). "
+            "Three more scans of the board table."
         ),
     ),
 ) -> dict:
@@ -1943,6 +1987,22 @@ def acbl_report(
                     result_df, generated_sql = run_favorite(
                         con, favorites, prompt_ids[0], meta
                     )
+                    foresight_stats, foresight_status = None, {}
+                    if foresight:
+                        foresight_stats, foresight_status = _acbl_foresight_stats(
+                            con,
+                            source_path=source_path,
+                            columns=set(full_df.columns),
+                            rating_type=rating_type,
+                            elo_rating_type=elo_rating_type,
+                            cache_key=(
+                                club_or_tournament,
+                                str(parsed_date_from),
+                                online_filter,
+                                strata,
+                                platinum_events,
+                            ),
+                        )
                     session_ids_df = con.sql(
                         "SELECT DISTINCT CAST(session_id AS VARCHAR) AS session_id FROM self"
                     ).pl()
@@ -1969,6 +2029,13 @@ def acbl_report(
                 prior_sessions=prior_sessions,
                 strata=strata,
             )
+            if foresight_stats is not None and not result_df.is_empty():
+                result_df = attach_foresight(
+                    result_df,
+                    foresight_stats,
+                    id_column="Player_ID" if rating_type == "Players" else "Pair_IDs",
+                    after="Skill_Z",
+                )
             result_df = filter_acbl_leaderboard(
                 result_df,
                 rating_type=rating_type,
@@ -2019,6 +2086,11 @@ def acbl_report(
                 },
                 "quality_metric_definitions": QUALITY_METRIC_DEFINITIONS,
         "board_column_notes": BOARD_COLUMN_NOTES,
+                "foresight": {
+                    "applied": bool(foresight),
+                    "status": foresight_status,
+                    "metric_definitions": FORESIGHT_METRIC_DEFINITIONS if foresight else {},
+                },
                 "platinum_events": {
                     "applied": bool(platinum_events),
                     "event_count": (
