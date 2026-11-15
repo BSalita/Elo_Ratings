@@ -106,9 +106,10 @@ class LeaderboardTests(unittest.TestCase):
             declarers=["S", "W", "E"], types=self.types,
         )
         self.sessions = elo_brill.rate_sessions(elo_brill.session_table(self.boards))
+        self.scale = elo_brill.elo_scale(self.sessions, min_games=1)
 
     def test_type_column_and_ranks(self) -> None:
-        table = elo_brill.leaderboard(self.boards, self.sessions, min_games=1)
+        table = elo_brill.leaderboard(self.boards, self.sessions, self.scale, min_games=1)
         rows = {row["Player_Name"]: row for row in table.to_dicts()}
         self.assertEqual(rows["bot"]["Type"], elo_brill.ROBOT)
         self.assertEqual(rows["ann"]["Type"], elo_brill.HUMAN)
@@ -125,10 +126,10 @@ class LeaderboardTests(unittest.TestCase):
         self.assertEqual(rows["ann"]["Defense_Tricks_Diff_Avg"], -1.0)
 
     def test_min_games_drops_players_before_ranking(self) -> None:
-        self.assertTrue(elo_brill.leaderboard(self.boards, self.sessions, min_games=2).is_empty())
+        self.assertTrue(elo_brill.leaderboard(self.boards, self.sessions, self.scale, min_games=2).is_empty())
 
     def test_ranking_order_and_display_filters(self) -> None:
-        table = elo_brill.leaderboard(self.boards, self.sessions, min_games=1)
+        table = elo_brill.leaderboard(self.boards, self.sessions, self.scale, min_games=1)
         leaders = elo_brill.order_for_ranking(table, "Opening Lead")
         self.assertEqual(leaders.columns[:3], ["Leader_Rank", "Player_Name", "Type"])
         self.assertEqual(leaders["Leader_Rank"].to_list(), sorted(leaders["Leader_Rank"].to_list()))
@@ -149,6 +150,72 @@ class LeaderboardTests(unittest.TestCase):
         self.assertIn("tournament=t1&entrant=ann", history["Postmortem_URL"][0])
         standings = elo_brill.event_standings(self.sessions, "t1")
         self.assertEqual(standings["Player_Name"][0], "ann")
+
+
+class SelectionAndScaleTests(unittest.TestCase):
+    """An MP-only or IMP-only view is its own rating, and every view shares one scale."""
+
+    def setUp(self) -> None:
+        # ann wins the MP event and loses the IMP event to bob; cat is always in the middle.
+        mp = _board_rows({"H:ann": [100], "H:bob": [-100], "H:cat": [0]}, "t1", "2026-11-01T11:00:00+00:00")
+        imp = _board_rows({"H:ann": [-100], "H:bob": [100], "H:cat": [0]}, "t2", "2026-11-02T11:00:00+00:00")
+        imp = imp.with_columns(pl.lit("IMP").alias("Scoring"), pl.lit("Daily IMP").alias("Event_Type"))
+        self.boards = pl.concat([mp, imp])
+        self.sessions = elo_brill.rate_sessions(elo_brill.session_table(self.boards))
+        self.scale = elo_brill.elo_scale(self.sessions, min_games=1)
+
+    def _elo_raw(self, scoring: str) -> dict[str, float]:
+        boards, sessions = elo_brill.rated_selection(self.boards, scoring=scoring)
+        table = elo_brill.leaderboard(boards, sessions, self.scale, min_games=1)
+        return dict(zip(table["Player_Name"], table["Elo_Raw"]))
+
+    def test_one_scoring_is_replayed_over_its_own_events(self) -> None:
+        mp, imp, everything = self._elo_raw("MP"), self._elo_raw("IMP"), self._elo_raw("All")
+        self.assertAlmostEqual(mp["ann"], DEFAULT_ELO + 16)
+        self.assertAlmostEqual(imp["ann"], DEFAULT_ELO - 16)
+        # The IMP event starts from 1200 in its own replay, not from ann's MP gain.
+        self.assertGreater(imp["ann"], everything["ann"] - 16 - 1e-9)
+        self.assertTrue(imp["ann"] < everything["ann"] < mp["ann"])
+
+    def test_selection_keeps_only_its_events(self) -> None:
+        boards, sessions = elo_brill.rated_selection(self.boards, scoring="IMP")
+        self.assertEqual(sessions["tournament_id"].unique().to_list(), ["t2"])
+        self.assertEqual(boards["Scoring"].unique().to_list(), ["IMP"])
+        self.assertEqual(sessions["Elo_Before"].to_list(), [DEFAULT_ELO] * 3)
+
+    def test_empty_selection_gives_an_empty_leaderboard(self) -> None:
+        boards, sessions = elo_brill.rated_selection(self.boards, "No such series")
+        self.assertTrue(elo_brill.leaderboard(boards, sessions, self.scale).is_empty())
+
+    def test_scale_is_the_mean_and_spread_of_latest_ratings(self) -> None:
+        mean, sd = elo_brill.elo_scale(self.sessions, min_games=1)
+        latest = self.sessions.sort("Event_Time").group_by("Player_ID").agg(pl.col("Elo_After").last())["Elo_After"]
+        self.assertAlmostEqual(mean, latest.mean())
+        self.assertAlmostEqual(sd, latest.std(ddof=0))
+        with self.assertRaises(ValueError):
+            elo_brill.elo_scale(self.sessions, min_games=3)
+
+    def test_elo_does_not_depend_on_who_is_listed(self) -> None:
+        # Two events for everyone, then one more for ann and bob only.
+        extra = _board_rows({"H:ann": [100], "H:bob": [-100]}, "t3", "2026-11-03T11:00:00+00:00")
+        boards = pl.concat([self.boards, extra])
+        sessions = elo_brill.rate_sessions(elo_brill.session_table(boards))
+        everyone = elo_brill.leaderboard(boards, sessions, self.scale, min_games=1)
+        regulars = elo_brill.leaderboard(boards, sessions, self.scale, min_games=3)
+        self.assertEqual(sorted(regulars["Player_Name"].to_list()), ["ann", "bob"])
+        elo = dict(zip(everyone["Player_Name"], everyone["Elo"]))
+        for row in regulars.to_dicts():
+            self.assertEqual(row["Elo"], elo[row["Player_Name"]])
+        # The rank is among the listed players.
+        self.assertEqual(sorted(regulars["Elo_Rank"].to_list()), [1, 2])
+
+    def test_scale_maps_its_mean_to_1500_and_one_sd_to_400(self) -> None:
+        table = elo_brill.leaderboard(self.boards, self.sessions, (DEFAULT_ELO, 16.0), min_games=1)
+        raw = dict(zip(table["Player_Name"], zip(table["Elo_Raw"], table["Elo"])))
+        self.assertEqual(raw["cat"][1], 1500)  # cat's rating is the scale's mean
+        for rating, shown in raw.values():
+            # Elo_Raw is shown to one decimal, worth up to 1.25 points on this scale.
+            self.assertLessEqual(abs(shown - (1500 + (rating - DEFAULT_ELO) / 16.0 * 400)), 1.5)
 
 
 if __name__ == "__main__":

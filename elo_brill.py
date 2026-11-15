@@ -16,7 +16,9 @@ Data path
 Elo is replayed over every event in time order: an entrant's score is the mean
 of their board matchpoint percentages against the other tables (for IMP events
 as well), and the expectation comes from their rating against the mean rating
-of the rest of the field.
+of the rest of the field. A view of one event series or one scoring replays
+Elo over those events alone (rated_selection), and every view is shown on one
+fixed scale taken from the all-event ratings (elo_scale).
 
 Env:
   BRILL_ELO_CACHE_DIR   dataset directory (default data/brill next to this file)
@@ -632,6 +634,8 @@ def dataset_age_hours() -> Optional[float]:
 # Filters and the leaderboard
 # ---------------------------------------------------------------------------
 
+# Players with at least this many events (over all events) set the Elo scale.
+SCALE_MIN_GAMES = 10
 DATE_RANGE_OPTIONS = ("All time", "Last 7 days", "Last 30 days", "Last 90 days")
 PLAYER_TYPE_OPTIONS = ("All", "Humans", "Robots")
 ALL_EVENTS = "All Events"
@@ -656,8 +660,9 @@ LEADERBOARD_COLUMNS = (
     "Last_Played", "Elo_Raw", "Player_ID",
 )
 METRIC_DEFINITIONS = {
-    "Elo": "Rating after the player's latest event in the selection, put on a chess-style scale "
-           "(mean 1500, standard deviation 400 over the listed players).",
+    "Elo": "Rating replayed over the selected events alone, as it stood after the player's latest "
+           "event in the date range, on a fixed chess-style scale: 1500 and 400 are the mean and "
+           "standard deviation of the all-event ratings of the players with 10 or more events.",
     "Avg_Pct": "Mean board matchpoint percentage against the other tables, IMP events included.",
     "Avg_IMP": "Mean cross-IMPs per board against the other tables.",
     "Wins": "Events where the site ranked the player first.",
@@ -702,6 +707,40 @@ def filter_frame(
     return frame
 
 
+def rated_selection(
+    boards: pl.DataFrame,
+    event_type_choice: str = ALL_EVENTS,
+    scoring: str = "All",
+) -> Tuple[pl.DataFrame, pl.DataFrame]:
+    """(boards, sessions) of one event series and scoring, with Elo replayed
+    over those events alone.
+
+    An MP-only or IMP-only rating is its own rating: it never sees the other
+    events. Filtering the all-event sessions instead would show the all-event
+    rating as it stood after the player's last selected event.
+    """
+    selected = filter_frame(boards, event_type_choice, scoring)
+    return selected, rate_sessions(session_table(selected))
+
+
+def elo_scale(sessions: pl.DataFrame, min_games: int = SCALE_MIN_GAMES) -> Tuple[float, float]:
+    """(mean, standard deviation) of the latest ratings of the players with at
+    least min_games events in sessions.
+
+    Taken once from the all-event replay, this is the fixed reference every
+    view is scaled against, so a displayed Elo means the same whichever
+    filters and Minimum Games are chosen.
+    """
+    latest = (
+        sessions.sort("Event_Time", "tournament_id").group_by("Player_ID")
+        .agg(pl.len().alias("Games"), pl.col("Elo_After").last())
+        .filter(pl.col("Games") >= min_games)["Elo_After"]
+    )
+    if latest.len() < 2:
+        raise ValueError(f"Fewer than two players have {min_games} or more events; no Elo scale.")
+    return float(latest.mean()), float(latest.std(ddof=0))
+
+
 def _rank(column: str, alias: str, descending: bool = True) -> pl.Expr:
     return (
         pl.when(pl.col(column).is_not_null())
@@ -716,11 +755,18 @@ def _pct(expr: pl.Expr) -> pl.Expr:
     return (expr.cast(pl.Float64).mean() * 100).round(1)
 
 
-def leaderboard(boards: pl.DataFrame, sessions: pl.DataFrame, min_games: int = 1) -> pl.DataFrame:
-    """One row per player over the given (already filtered) boards and sessions.
+def leaderboard(
+    boards: pl.DataFrame,
+    sessions: pl.DataFrame,
+    scale: Tuple[float, float],
+    min_games: int = 1,
+) -> pl.DataFrame:
+    """One row per player over the given (already selected) boards and sessions.
 
-    Players with fewer than min_games events are left out before anything is
-    ranked or standardized, so every rank is among the listed players.
+    scale is the (mean, standard deviation) of raw ratings that maps to 1500
+    and 400 on the displayed Elo (see elo_scale). Players with fewer than
+    min_games events are left out before anything is ranked, so every rank is
+    among the listed players; the Elo does not depend on who is listed.
     """
     if sessions.is_empty():
         return pl.DataFrame(schema={column: pl.String for column in LEADERBOARD_COLUMNS})
@@ -760,8 +806,7 @@ def leaderboard(boards: pl.DataFrame, sessions: pl.DataFrame, min_games: int = 1
     )
     table = played.join(quality, on="Player_ID", how="left")
 
-    mean = table["Elo_Raw"].mean()
-    sd = table["Elo_Raw"].std(ddof=0) or 0.0
+    mean, sd = scale
     table = table.with_columns(
         pl.col("Elo_Raw").map_elements(lambda r: int(round(zscore_to_chess(r, mean, sd))), return_dtype=pl.Int32).alias("Elo"),
     ).with_columns(

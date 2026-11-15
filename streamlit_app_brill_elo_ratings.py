@@ -124,8 +124,16 @@ _refresh_failure: Dict[str, Any] = {}
 # -------------------------------
 @st.cache_resource(show_spinner=False, max_entries=1)
 def _load_dataset(built_at: str) -> Dict[str, Any]:
-    """The dataset on disk. built_at is the cache key: a rebuild loads anew."""
-    return elo_brill.load_dataset()
+    """The dataset on disk, with the fixed Elo scale of its all-event ratings.
+    built_at is the cache key: a rebuild loads anew."""
+    dataset = elo_brill.load_dataset()
+    return {**dataset, "scale": elo_brill.elo_scale(dataset["sessions"])}
+
+
+@st.cache_resource(show_spinner=False, max_entries=24)
+def _rated_selection(built_at: str, event_choice: str, scoring: str) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Boards and sessions of one event series and scoring, Elo replayed over them alone."""
+    return elo_brill.rated_selection(_load_dataset(built_at)["boards"], event_choice, scoring)
 
 
 def _refresh_dataset() -> Optional[str]:
@@ -327,23 +335,23 @@ def _sidebar(event_types: List[str]) -> Dict[str, Any]:
         )
         player_type = st.radio(
             "Players", list(elo_brill.PLAYER_TYPE_OPTIONS), key="brill_player_type", horizontal=True,
-            help="Show humans, robots or both. Ranks and Elo are always among all listed players.",
+            help="Show humans, robots or both. Ranks are always among all listed players.",
         )
         event_options = [elo_brill.ALL_EVENTS, *event_types]
         if st.session_state.get("brill_event_type") not in event_options:
             st.session_state.brill_event_type = elo_brill.ALL_EVENTS
         event_choice = st.selectbox(
             "Filter by Event", event_options, key="brill_event_type",
-            help="Use only the events of one daily series.",
+            help="Use only the events of one daily series. Elo is replayed over those events alone.",
         )
         scoring = st.radio(
             "Scoring", list(SCORING_OPTIONS), key="brill_scoring", horizontal=True,
-            help="Use only matchpoint events or only IMP events.",
+            help="Use only matchpoint events or only IMP events. Elo is replayed over those events alone.",
         )
         name_filter = st.text_input("Player name", key="brill_name_filter", placeholder="Part of a name")
         date_range = st.selectbox(
             "Date range", list(elo_brill.DATE_RANGE_OPTIONS), key="brill_date_range",
-            help="Use only the events played in this window.",
+            help="Use only the events played in this window. Elo is the rating after the last of them.",
         )
         if "brill_min_games" not in st.session_state:
             st.session_state.brill_min_games = DEFAULT_MIN_GAMES
@@ -420,9 +428,12 @@ def main() -> None:
         st.warning(refresh_warning)
 
     date_from = elo_brill.date_range_start(choices["date_range"])
-    boards = elo_brill.filter_frame(all_boards, choices["event_choice"], choices["scoring"], date_from)
-    sessions = elo_brill.filter_frame(all_sessions, choices["event_choice"], choices["scoring"], date_from)
-    table = elo_brill.leaderboard(boards, sessions, min_games=choices["min_games"])
+    # The series and scoring filters replay Elo over their own events; the date
+    # range then keeps the events in the window, so Elo is as of its last event.
+    boards, sessions = _rated_selection(metadata["built_at"], choices["event_choice"], choices["scoring"])
+    boards = elo_brill.filter_frame(boards, date_from=date_from)
+    sessions = elo_brill.filter_frame(sessions, date_from=date_from)
+    table = elo_brill.leaderboard(boards, sessions, dataset["scale"], min_games=choices["min_games"])
 
     m1, m2, m3, m4 = st.columns(4)
     _metric_card(m1, "Tournaments", str(sessions["tournament_id"].n_unique()))
@@ -440,11 +451,13 @@ def main() -> None:
     )
     if ranking == "Elo":
         st.caption(
-            "Elo is replayed over every event in time order from each entrant's mean board matchpoint "
-            "percentage against the other tables (IMP events included), then standardized to a chess-style "
-            "scale (mean **1500**, sd **400**) so it lines up with the ACBL and FFBridge apps; the **Title** "
-            "column uses standard bands (≥2400 IM, ≥2500 GM, ≥2600 SGM). **Elo_Raw** is the rating before "
-            "standardizing."
+            "Elo is replayed in time order over the selected events alone, from each entrant's mean board "
+            "matchpoint percentage against the other tables (IMP events included). Choosing one event series "
+            "or one scoring gives a rating of its own that never sees the other events. Every view uses one "
+            "fixed chess-style scale: **1500** and **400** are the mean and standard deviation of the "
+            f"all-event ratings of the players with {elo_brill.SCALE_MIN_GAMES} or more events, so a number "
+            "means the same whichever filters are set. The **Title** column uses standard bands (≥2400 IM, "
+            "≥2500 GM, ≥2600 SGM). **Elo_Raw** is the rating before scaling."
         )
     for column in RANKING_NOTES[ranking]:
         if not (ranking == "Elo" and column == "Elo"):
