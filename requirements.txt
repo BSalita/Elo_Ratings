@@ -38,6 +38,8 @@ beautifulsoup4
 # Standard library extensions (if needed)
 typing-extensions
 psutil
+# Progress bars in the build scripts (build_brill_elo_parquets.py runs in the container)
+tqdm
 
 # Development and debugging
 IPython
