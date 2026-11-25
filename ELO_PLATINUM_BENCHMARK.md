@@ -2,8 +2,8 @@
 
 Written 2026-11-25. Code in `elo/platinum_bench/` (run with the acbl-pipeline venv,
 which has numba). Working files and every result table in `D:\bridge-elo-plat`;
-copies of the result tables in `elo/platinum_bench/results/`. Nothing in the
-pipeline, the Elo files on E: or prod was changed.
+copies of the result tables in `elo/platinum_bench/results/`. The new formula
+was adopted the same day and is live on prod (section 5).
 
 ## Summary
 
@@ -170,7 +170,7 @@ K and boost grid (development sets): the results are flat from K 6 to 10 with
 boost 4 to 6. K 6 / 6x / 200 boards was best on club 2025, and best or tied on
 tournament 2025 plus platinum 2016-24. Club K 4 was not tested.
 
-## 5. Adoption status (2026-11-25, uncommitted)
+## 5. Adoption status (2026-11-25, live on prod)
 
 The user approved a local rebuild. Done:
 
@@ -208,19 +208,34 @@ The user approved a local rebuild. Done:
    `E:\bridge\data\acbl\elo_backup_20261125_before_new_formula\`; to undo, move
    them back. `elo_candidate_20261125\` holds only the build log.
 
+5. **Site default shrinkage 50 -> 0 sessions**, live on prod since 15:26
+   (Elo_Ratings `ffec9b1`, acbl-pipeline `68f617b`).
+6. **Published to prod on 2026-11-25 at 19:15** (the user said yes). The eight
+   files were copied to a staging folder on X1's `src\data` (70 s). Then the Elo
+   containers were stopped, the files moved into place, and the containers started
+   again (Elo_Ratings `3b86723`), so the API loaded the new files fresh rather
+   than reloading them in a running process. The previous prod files are in
+   `src\data\_elo_backup_20261125_before_new_formula\` on X1; to undo, move
+   them back and restart the Elo containers (`elo_ratings_stop.ps1`, then
+   `elo_ratings_start.ps1`, through `run_in_desktop.ps1`). Checks: `/acbl/report`
+   answers for tournament (14 s) and club (46 s, `acbl-api` at 42.5 of 64 GB
+   afterwards); shrinkage anchor 1522.01 (was 1498.5), prior 0; the Elo pages
+   and acbl-elo, ffbridge-elo and brill-elo sites return 200. Dev's `src\data`
+   hub holds the same files.
+
 Not done (each needs the user):
 
-- Steps 5a/5b/5c (prediction data and retrain) and prod. The prediction data
-  and models on E: still carry the old Elo until 5a is rerun.
-- The published shrinkage: `acbl_api_server.py` / the Streamlit app still default
-  to 50 prior sessions. With the new formula it should be 0 or a few sessions.
-  Not changed, since it is the acbl-elo site's behaviour.
+- Steps 5a/5b/5c (prediction data and retrain), on hold by the user. The
+  prediction data and models still carry the old Elo until 5a is rerun. The
+  postmortem's predictions do not read these Elo files (they use the step-3c
+  augmented data), so publishing did not change them.
 - The starting rating needs the awards sidecar (`elo/acbl_awards.py`). Awards
   after its date (the file is from 2026-09-03) are missing until it is refreshed.
 - Pair ratings (`_elo_pair_kernel`) were not studied; the same K change probably
   helps them.
-- Commits: mlBridge `d406d3b` and acbl-pipeline `c4c9037` on master, 2026-11-25,
-  not pushed. This write-up and `elo/platinum_bench/` are not committed.
+- Not new: the report's cross-context column (`Club_Elo` / `Tournament_Elo`) is
+  scaled against only the players in the returned list and clipped at 0, so in a
+  short list the lowest value can show 0.
 
 ## Files
 
