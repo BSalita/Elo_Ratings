@@ -166,10 +166,12 @@ these happen once after a restart.
 
 ## Follow-ups
 
-- **Prod.** Not deployed. `acbl-api` on X1 needs the new `acbl_api_server.py`
-  and `requirements.txt` (pyarrow is already in the image, pinned 25.0.1) and a
-  restart; check `server.ram_used_gb` in responses afterwards, which should sit
-  near 44 GB with both frames loaded.
+- **Prod.** Deployed 2026-11-25 21:03 (user OK; `deploy_elo_ratings.ps1` on
+  X1, all Elo containers at e447361, build tag `2026-11-25-memory-arrow-export`).
+  Check right after: Club Players cold 47 s -> 34.2 GB; Tournament Players cold
+  13 s -> 43.3 GB; Club Pairs 5 s, Tournament Pairs 3 s, Club Players warm
+  18 s, all leaving 43.5-43.7 GB. Keep an eye on `server.ram_used_gb` in
+  responses: it should stay near 44 GB.
 - **Below 40 GB.** With a container limit under 40 GB the server keeps one frame
   (single-frame mode) and every Club/Tournament switch is a cold load, now 20
   to 35 s slower because of the export. Prod has 64 GB, so this does not apply
