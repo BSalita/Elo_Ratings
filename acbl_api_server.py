@@ -456,7 +456,10 @@ _SHRINKAGE_META_CACHE: dict[str, dict | None] = {}
 
 # Default Bayesian shrinkage prior weight (sessions equivalent). The Streamlit
 # /acbl/report client may override via the prior_sessions query parameter.
-SHRINKAGE_DEFAULT_PRIOR_SESSIONS = 50
+# 0 since 2026-11-25: shrinking toward the global median made the published Elo
+# the worst predictor of later results (elo/ELO_PLATINUM_BENCHMARK.md); the new
+# player Elo starts players from masterpoints and platinum points instead.
+SHRINKAGE_DEFAULT_PRIOR_SESSIONS = 0
 
 # Favorites SQL disables the skill gate at or below this value.
 SKILL_GATE_DEFAULT_Z = SKILL_GATE_DISABLED

@@ -100,6 +100,11 @@ logger = logging.getLogger(__name__)
 # -------------------------------
 # Config / API
 # -------------------------------
+
+# Default shrinkage prior (sessions). 0 since 2026-11-25: the published Elo is
+# the raw Elo (elo/ELO_PLATINUM_BENCHMARK.md). Users can still raise it.
+ACBL_DEFAULT_PRIOR_SESSIONS = 0
+
 def _acbl_api_base_url() -> str | None:
     """Return configured ACBL API base URL, if enabled."""
     raw = os.getenv("ACBL_API_BASE_URL", "").strip()
@@ -120,7 +125,7 @@ def _fetch_remote_report_table(
     elo_rating_type: str,
     date_from: datetime | None,
     online_filter: str,
-    prior_sessions: int = 50,
+    prior_sessions: int = ACBL_DEFAULT_PRIOR_SESSIONS,
     strata: str = STRATA_DEFAULT,
     platinum_events: bool = False,
     min_skill_z: float | None = None,
@@ -244,7 +249,7 @@ def _fetch_remote_sql(sql: str, ctx: dict) -> tuple[pl.DataFrame, str]:
         "date_from": _acbl_date_from_param(date_from) if date_from is not None else None,
         "online_filter": ctx["online_filter"],
         "strata": ctx["strata"],
-        "prior_sessions": int(ctx.get("prior_sessions", 50)),
+        "prior_sessions": int(ctx.get("prior_sessions", ACBL_DEFAULT_PRIOR_SESSIONS)),
         "platinum_events": bool(ctx.get("platinum_events", False)),
         "min_skill_z": float(ctx["min_skill_z"]),
     }
@@ -949,7 +954,7 @@ ACBL_URL_PARAMS = {
     "prior_sessions": {
         "session_key": "acbl_prior_sessions",
         "parser": coerce_int(0, 1000),
-        "default": 50,
+        "default": ACBL_DEFAULT_PRIOR_SESSIONS,
     },
     "platinum": {
         "session_key": "acbl_platinum_events",
@@ -988,7 +993,7 @@ def _acbl_report_panel() -> None:
     min_skill_z = float(ctx.get("min_skill_z", default_min_skill_z(club_or_tournament)))
     foresight = bool(st.session_state.get("acbl_show_foresight", False))
 
-    prior_sessions = int(st.session_state.get("acbl_prior_sessions", 50))
+    prior_sessions = int(st.session_state.get("acbl_prior_sessions", ACBL_DEFAULT_PRIOR_SESSIONS))
     masterpoints_filter = st.session_state.get("masterpoints_filter", "All")
     fetch_sig = _acbl_report_fetch_signature(
         club_or_tournament=club_or_tournament,
@@ -1183,7 +1188,7 @@ def _acbl_report_panel() -> None:
             club_or_tournament, rating_type, int(top_n), int(min_sessions),
             rating_method, int(moving_avg_days), elo_rating_type, date_range,
             online_filter, st.session_state.get('masterpoints_filter', 'All'),
-            int(st.session_state.get('acbl_prior_sessions', 50)),
+            int(st.session_state.get('acbl_prior_sessions', ACBL_DEFAULT_PRIOR_SESSIONS)),
             strata=strata,
             platinum_events=platinum_events,
             min_skill_z=min_skill_z,
@@ -1797,7 +1802,7 @@ def main():
             "Shrinkage prior (sessions)",
             min_value=0,
             max_value=200,
-            value=50,
+            value=ACBL_DEFAULT_PRIOR_SESSIONS,
             step=5,
             key="acbl_prior_sessions",
             help=(
