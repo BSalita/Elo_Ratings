@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import duckdb
 import polars as pl
 import psutil
+import pyarrow as pa
 
 from acbl_awards import attach_award_totals, attach_session_awards, load_awards_for_players, pair_member_ids
 from clone_elo import (
@@ -56,7 +57,7 @@ DATA_ROOT = pathlib.Path(
 API_SOURCE_PATH = pathlib.Path(__file__).resolve()
 API_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 # Bump when deploying memory/toggle fixes so /health confirms the running build.
-API_BUILD_TAG = "2026-11-15-foresight-columns"
+API_BUILD_TAG = "2026-11-25-memory-arrow-export"
 
 QUALITY_METRIC_DEFINITIONS = {
     "DD_Tricks_Diff_Avg": {
@@ -152,6 +153,13 @@ BOARD_COLUMN_NOTES = {
 _SCHEMA_CACHE: dict[str, dict] = {}
 _FRAME_CACHE: dict[str, pl.DataFrame] = {}
 _FRAME_CACHE_TIMES: dict[str, float] = {}
+# Arrow view of each cached frame, exported once at load and registered in
+# DuckDB on every request. It shares the frame's buffers (zero copy). Handing
+# DuckDB the Polars frame itself made it call ``to_arrow()`` at the oldest
+# compat level on every request: string views were copied into large_string
+# arrays, +13.7 GB and 20-30 s per Club request, and the freed pages were not
+# all returned (ACBL_API_MEMORY.md).
+_ARROW_CACHE: dict[str, pa.Table] = {}
 # Full-dataset Date bounds captured once at frame load (avoids per-request scans).
 _FRAME_DATE_BOUNDS: dict[str, tuple[datetime | None, datetime | None]] = {}
 _PLATINUM_EVENTS_CACHE: pl.DataFrame | None = None
@@ -160,7 +168,7 @@ import threading as _threading
 _DB_LOCK = _threading.Lock()
 _FRAME_LOCK = _threading.Lock()
 # Serialize report/detail handlers so Club↔Tournament toggles cannot overlap two
-# full-frame loads (~13 GB Club + reload) and OOM the container.
+# full-frame loads (~34 GB Club + reload) and OOM the container.
 _REPORT_LOCK = _threading.Lock()
 _DB_CON: duckdb.DuckDBPyConnection | None = None
 
@@ -299,10 +307,14 @@ def _estimated_frame_bytes(club_or_tournament: str) -> int:
             return int(cached.estimated_size())
         except Exception:
             pass
+    # Resident memory measured 2026-11-25 with the new-formula Elo files (club
+    # 74M rows, tournament 19M), frame plus Arrow export: club 33.8 GB,
+    # tournament 9.7 GB (ACBL_API_MEMORY.md). The old 13 GB club figure
+    # undercounted String columns, which estimated_size() reports at a fraction
+    # of their real size; they are all Categorical now.
     if club_or_tournament.lower() == "club":
-        # Shrunk resident frame ~13 GB; streaming collect peaks higher before shrink.
-        return int(22 * 1024 ** 3)
-    return int(5 * 1024 ** 3)
+        return int(34 * 1024 ** 3)
+    return int(10 * 1024 ** 3)
 
 
 def _dual_frame_cache_safe_for_load(club_or_tournament: str) -> bool:
@@ -334,6 +346,7 @@ def _evict_frames_except(keep_source_path: str) -> None:
         if old_path == keep_source_path:
             continue
         old_frame = _FRAME_CACHE.pop(old_path, None)
+        _ARROW_CACHE.pop(old_path, None)
         _FRAME_CACHE_TIMES.pop(old_path, None)
         _FRAME_DATE_BOUNDS.pop(old_path, None)
         if old_frame is not None:
@@ -415,7 +428,7 @@ def _duckdb_memory_limit_bytes() -> int:
     """Hard cap for DuckDB's buffer manager.
 
     DuckDB defaults its ``memory_limit`` to ~80% of detected RAM. With the
-    resident Polars frame (~19 GB for Club on prod) cached alongside, that
+    resident Polars frame (~34 GB for Club, 2026-11-25) cached alongside, that
     default overcommits the container and triggers OOM on the next query.
     Budget from cgroup limit minus the live cached frame (or a conservative
     club estimate before first load). Override at deploy with
@@ -430,7 +443,8 @@ def _duckdb_memory_limit_bytes() -> int:
     total = _memory_budget_bytes()
     frame_bytes = _cached_frame_bytes()
     if frame_bytes <= 0:
-        frame_bytes = int(19.5 * 1024 ** 3)
+        # Club resident size before any frame is cached (see _estimated_frame_bytes).
+        frame_bytes = int(34 * 1024 ** 3)
     runtime_overhead = int(2 * 1024 ** 3)
     reserve = frame_bytes + runtime_overhead
     headroom = total - reserve
@@ -730,43 +744,56 @@ def _reset_duckdb_connection() -> None:
     _malloc_trim()
 
 
+def _categorical_dtype(dtype: pl.DataType) -> pl.DataType | None:
+    """``dtype`` with every String inside it made Categorical, or None if it has no String."""
+    if dtype == pl.String:
+        return pl.Categorical()
+    if isinstance(dtype, pl.List):
+        inner = _categorical_dtype(dtype.inner)
+        return None if inner is None else pl.List(inner)
+    if isinstance(dtype, pl.Struct):
+        fields = [(field.name, _categorical_dtype(field.dtype)) for field in dtype.fields]
+        if all(new is None for _, new in fields):
+            return None
+        return pl.Struct(
+            [
+                pl.Field(field.name, new if new is not None else field.dtype)
+                for field, (_, new) in zip(dtype.fields, fields)
+            ]
+        )
+    return None
+
+
 def _dtype_shrink_exprs(schema: dict) -> list[pl.Expr]:
-    """Polars expressions that down-cast wasteful dtypes.
+    """Polars expressions that down-cast wasteful dtypes of the loaded frame.
 
-    Three categories of waste live in the raw parquet:
-
-    1. ``Player_Name_*`` and ``Player_ID_*`` are String columns whose values
-       repeat across millions of board-level rows (the same ~500K names and
-       ~1M ids appear over and over in 58M rows on the club parquet).
-       Converting to Categorical (dictionary-encoded) collapses them to
-       roughly one Int32 code per row plus a small dictionary.
-    2. ``session_id`` is Int64 on club (down-casts to Int32) and a compound
-       String on tournament (down-casts to Categorical).
+    1. Every String column, and every String field inside a list or struct
+       (``ParContracts`` is a list of structs of four strings), becomes
+       Categorical. A Polars String is a 16-byte view per row even for a
+       one-letter value, so each of the club frame's ten String columns cost
+       1.1 GB (74M rows), and ``ParContracts`` 7.3 GB; ``estimated_size()``
+       reported a fraction of that (0.04 to 1.6 GB), which hid it. All of them
+       repeat a few values (3 to ~170K distinct), so a 4-byte code per row
+       plus a small dictionary holds the same data. Measured 2026-11-25 in
+       ACBL_API_MEMORY.md.
+    2. ``session_id`` Int64 (club) down-casts to Int32.
     3. The float columns are already Float32 so we leave them alone.
 
-    DuckDB consumes polars Categorical columns natively (dictionary-encoded
-    VARCHAR), so existing SQL such as ``Player_ID_N || '-' || Player_ID_S``
-    and ``WHERE Player_ID_{pos} IS NOT NULL`` keep working unchanged.
-
-    Net effect: club parquet drops from ~15.7 GB to ~13.1 GB in-memory;
-    tournament parquet from ~4.4 GB to ~3.6 GB. Returned as expressions so
-    callers can splice them into a lazy plan and avoid materializing the
-    bigger pre-cast frame during the streaming collect.
+    DuckDB reads Categorical columns as dictionary-encoded VARCHAR, so SQL such
+    as ``Player_ID_N || '-' || Player_ID_S``, ``Declarer_Direction = 'N'`` and
+    ``list_transform(ParContracts, lambda p: p.Strain)`` keeps working
+    unchanged. Pass the schema of the lazy plan (after the Date parse), not the
+    parquet's, so an already-converted column is not cast again. Returned as
+    expressions so callers can splice them into a lazy plan and avoid
+    materializing the bigger pre-cast frame during the streaming collect.
     """
     exprs: list[pl.Expr] = []
-    for p in "NESW":
-        name_col = f"Player_Name_{p}"
-        id_col = f"Player_ID_{p}"
-        if name_col in schema and schema[name_col] == pl.Utf8:
-            exprs.append(pl.col(name_col).cast(pl.Categorical))
-        if id_col in schema and schema[id_col] == pl.Utf8:
-            exprs.append(pl.col(id_col).cast(pl.Categorical))
-    if "session_id" in schema:
-        sid_dtype = schema["session_id"]
-        if sid_dtype == pl.Utf8:
-            exprs.append(pl.col("session_id").cast(pl.Categorical))
-        elif sid_dtype == pl.Int64:
-            exprs.append(pl.col("session_id").cast(pl.Int32, strict=False))
+    for name, dtype in schema.items():
+        new = _categorical_dtype(dtype)
+        if new is not None:
+            exprs.append(pl.col(name).cast(new))
+    if schema.get("session_id") == pl.Int64:
+        exprs.append(pl.col("session_id").cast(pl.Int32, strict=False))
     return exprs
 
 
@@ -854,21 +881,36 @@ def _load_full_frame(club_or_tournament: str) -> pl.DataFrame:
             else:
                 lf = lf.with_columns(pl.col("Date").cast(pl.Datetime, strict=False).alias("Date"))
 
-        shrink_exprs = _dtype_shrink_exprs(dict(schema_map))
+        shrink_exprs = _dtype_shrink_exprs(dict(lf.collect_schema()))
         if shrink_exprs:
             lf = lf.with_columns(shrink_exprs)
 
         full_df = lf.collect(engine="streaming")
+        t_arrow = time.perf_counter()
+        # Newest compat level: string views and Categorical dictionaries are
+        # exported as they are, sharing the frame's buffers.
+        arrow_table = full_df.to_arrow(compat_level=pl.CompatLevel.newest())
         _FRAME_CACHE[source_path] = full_df
+        _ARROW_CACHE[source_path] = arrow_table
         _FRAME_CACHE_TIMES[source_path] = time.time()
         _record_frame_date_bounds(source_path, full_df)
         _malloc_trim()
         print(
             f"[acbl-api] loaded {club_or_tournament} "
-            f"({full_df.height} rows, {time.perf_counter() - t0:.1f}s, mem {_cgroup_mem_summary()})",
+            f"({full_df.height} rows, {time.perf_counter() - t0:.1f}s, arrow export "
+            f"{time.perf_counter() - t_arrow:.1f}s, mem {_cgroup_mem_summary()})",
             flush=True,
         )
         return full_df
+
+
+def _arrow_table_for(source_path: str) -> pa.Table:
+    """Arrow export of a cached frame; call after :func:`_load_full_frame`."""
+    with _FRAME_LOCK:
+        table = _ARROW_CACHE.get(source_path)
+    if table is None:
+        raise RuntimeError(f"no Arrow export cached for {source_path}; load the frame first")
+    return table
 
 
 def load_elo_ratings(club_or_tournament: str, columns: list[str] | None = None, date_from: datetime | None = None) -> pl.DataFrame:
@@ -1056,8 +1098,10 @@ def _prepare_self_view(
 ) -> tuple[int | None, str]:
     """Register the cached full frame and expose filtered rows as temp view ``self``.
 
-    Avoids per-request Polars ``select``/``filter`` copies of the ~19 GB club
-    frame; DuckDB reads columns lazily from the registered Arrow buffer.
+    Avoids per-request Polars ``select``/``filter`` copies of the club frame;
+    DuckDB reads columns lazily from the Arrow export cached at load, which
+    shares the frame's buffers. (Registering ``full_df`` itself made DuckDB
+    convert the whole frame to Arrow on every request.)
     Row counts and date ranges come from load-time metadata (no COUNT scans).
     """
     where_clauses = _self_filter_sql_clauses(
@@ -1077,7 +1121,7 @@ def _prepare_self_view(
             con.unregister("_full")
         except Exception:
             pass
-        con.register("_full", full_df)
+        con.register("_full", _arrow_table_for(source_path))
         con.execute(f"CREATE TEMP VIEW self AS SELECT {select_sql} FROM _full WHERE {where_sql}")
     input_rows = full_df.height if not where_clauses else None
     date_range = _frame_date_range(source_path, date_from)
