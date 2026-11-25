@@ -75,6 +75,7 @@ from foresight import FORESIGHT_CHECKBOX_HELP, foresight_caption
 from elo_common import (
     DEFAULT_ELO,
     K_FACTOR,
+    ffbridge_k_factor,
     AGGRID_ROW_HEIGHT,
     AGGRID_HEADER_HEIGHT,
     AGGRID_FOOTER_HEIGHT,
@@ -1428,6 +1429,7 @@ def process_tournaments_to_elo(
                         scratch_r1_before,
                         scratch_pct,
                         scratch_field_avg,
+                        k_factor=ffbridge_k_factor(player_games.get(p1_id, 0)),
                         field_strength_scale=scratch_field_strength,
                     )
                     if scratch_eligible
@@ -1442,6 +1444,7 @@ def process_tournaments_to_elo(
                         handicap_r1_before,
                         handicap_pct,
                         handicap_field_avg,
+                        k_factor=ffbridge_k_factor(player_games.get(p1_id, 0)),
                         field_strength_scale=handicap_field_strength,
                     )
                     if handicap_eligible
@@ -1483,6 +1486,7 @@ def process_tournaments_to_elo(
                         scratch_r2_before,
                         scratch_pct,
                         scratch_field_avg,
+                        k_factor=ffbridge_k_factor(player_games.get(p2_id, 0)),
                         field_strength_scale=scratch_field_strength,
                     )
                     if scratch_eligible
@@ -1497,6 +1501,7 @@ def process_tournaments_to_elo(
                         handicap_r2_before,
                         handicap_pct,
                         handicap_field_avg,
+                        k_factor=ffbridge_k_factor(player_games.get(p2_id, 0)),
                         field_strength_scale=handicap_field_strength,
                     )
                     if handicap_eligible
@@ -1765,8 +1770,8 @@ def _elo_cache_meta_paths(api_key: str, fetch_iv: bool) -> List[pathlib.Path]:
     seen: set[pathlib.Path] = set()
     paths: List[pathlib.Path] = []
     for pattern in (
-        f"elo_full_v11_{api_key}_iv_{iv}.meta.json",
-        f"elo_full_v11_{api_key}_*_iv_{iv}.meta.json",
+        f"elo_full_v12_{api_key}_iv_{iv}.meta.json",
+        f"elo_full_v12_{api_key}_*_iv_{iv}.meta.json",
     ):
         for meta_path in _FFBRIDGE_ELO_CACHE_DIR.glob(pattern):
             if meta_path not in seen:

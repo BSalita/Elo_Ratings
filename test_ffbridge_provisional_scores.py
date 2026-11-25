@@ -382,7 +382,7 @@ class ScoreAvailabilityTests(unittest.TestCase):
     def test_schema_version_forces_full_elo_replay(self) -> None:
         self.assertTrue(
             reports.elo_cache_key("FFBridge_Lancelot_API", True).startswith(
-                "elo_full_v11_"
+                "elo_full_v12_"
             )
         )
 

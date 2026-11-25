@@ -29,6 +29,20 @@ DEFAULT_ELO = 1200.0
 K_FACTOR = 32.0
 PERFORMANCE_SCALING = 400  # Standard Elo scaling factor
 
+# FFBridge session Elo K (elo/FFBRIDGE_ELO_BENCHMARK.md, 2026-11-25): K 24,
+# 4x while a player has fewer than 10 rated sessions (was K 32 throughout).
+# Chosen on 2025, tested on 2026: club-session rank Spearman 0.525 -> 0.533.
+FFBRIDGE_K_FACTOR = 24.0
+FFBRIDGE_PROVISIONAL_BOOST = 4.0
+FFBRIDGE_PROVISIONAL_SESSIONS = 10
+
+
+def ffbridge_k_factor(sessions_played: int) -> float:
+    """K for an FFBridge player who has ``sessions_played`` rated sessions before this one."""
+    if sessions_played < FFBRIDGE_PROVISIONAL_SESSIONS:
+        return FFBRIDGE_K_FACTOR * FFBRIDGE_PROVISIONAL_BOOST
+    return FFBRIDGE_K_FACTOR
+
 # -------------------------------
 # Field-strength K-dampening (the "weak-field inflation" fix)
 # -------------------------------
