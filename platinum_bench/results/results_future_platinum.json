@@ -1,0 +1,326 @@
+{
+ "2022-01-01": {
+  "all": {
+   "players": 2754,
+   "rate_after|elo_tourn": [
+    0.3723,
+    2483
+   ],
+   "rate_after|elo_tourn_published": [
+    0.241,
+    2483
+   ],
+   "rate_after|elo_replay_base": [
+    0.3846,
+    2483
+   ],
+   "rate_after|elo_candidate": [
+    0.4248,
+    2483
+   ],
+   "rate_after|elo_club": [
+    0.1919,
+    1979
+   ],
+   "rate_after|masterpoints": [
+    0.3529,
+    2302
+   ],
+   "rate_after|plat_pts": [
+    0.45,
+    2754
+   ],
+   "rate_after|gold_pts": [
+    0.1459,
+    2754
+   ],
+   "rate_after|plat_perf": [
+    0.3944,
+    2754
+   ],
+   "pct_after|elo_tourn": [
+    0.3785,
+    2483
+   ],
+   "pct_after|elo_tourn_published": [
+    0.2396,
+    2483
+   ],
+   "pct_after|elo_replay_base": [
+    0.3841,
+    2483
+   ],
+   "pct_after|elo_candidate": [
+    0.4338,
+    2483
+   ],
+   "pct_after|elo_club": [
+    0.2205,
+    1979
+   ],
+   "pct_after|masterpoints": [
+    0.3468,
+    2302
+   ],
+   "pct_after|plat_pts": [
+    0.4301,
+    2754
+   ],
+   "pct_after|gold_pts": [
+    0.1451,
+    2754
+   ],
+   "pct_after|plat_perf": [
+    0.404,
+    2754
+   ]
+  },
+  "20plus_sessions": {
+   "players": 2056,
+   "rate_after|elo_tourn": [
+    0.4091,
+    2056
+   ],
+   "rate_after|elo_tourn_published": [
+    0.3491,
+    2056
+   ],
+   "rate_after|elo_replay_base": [
+    0.4204,
+    2056
+   ],
+   "rate_after|elo_candidate": [
+    0.4661,
+    2056
+   ],
+   "rate_after|elo_club": [
+    0.1965,
+    1779
+   ],
+   "rate_after|masterpoints": [
+    0.383,
+    1985
+   ],
+   "rate_after|plat_pts": [
+    0.5536,
+    2056
+   ],
+   "rate_after|gold_pts": [
+    0.365,
+    2056
+   ],
+   "rate_after|plat_perf": [
+    0.4264,
+    2056
+   ],
+   "pct_after|elo_tourn": [
+    0.4311,
+    2056
+   ],
+   "pct_after|elo_tourn_published": [
+    0.3679,
+    2056
+   ],
+   "pct_after|elo_replay_base": [
+    0.4378,
+    2056
+   ],
+   "pct_after|elo_candidate": [
+    0.4889,
+    2056
+   ],
+   "pct_after|elo_club": [
+    0.2356,
+    1779
+   ],
+   "pct_after|masterpoints": [
+    0.3863,
+    1985
+   ],
+   "pct_after|plat_pts": [
+    0.5444,
+    2056
+   ],
+   "pct_after|gold_pts": [
+    0.395,
+    2056
+   ],
+   "pct_after|plat_perf": [
+    0.4421,
+    2056
+   ]
+  },
+  "top100_overlap": {
+   "elo_tourn": 26,
+   "elo_tourn_published": 21,
+   "elo_replay_base": 29,
+   "elo_candidate": 33,
+   "masterpoints": 24,
+   "plat_pts": 41,
+   "gold_pts": 19,
+   "plat_perf": 35
+  }
+ },
+ "2024-01-01": {
+  "all": {
+   "players": 2264,
+   "rate_after|elo_tourn": [
+    0.3825,
+    2146
+   ],
+   "rate_after|elo_tourn_published": [
+    0.2513,
+    2146
+   ],
+   "rate_after|elo_replay_base": [
+    0.3958,
+    2146
+   ],
+   "rate_after|elo_candidate": [
+    0.4279,
+    2146
+   ],
+   "rate_after|elo_club": [
+    0.187,
+    1767
+   ],
+   "rate_after|masterpoints": [
+    0.2934,
+    1976
+   ],
+   "rate_after|plat_pts": [
+    0.4715,
+    2264
+   ],
+   "rate_after|gold_pts": [
+    0.1583,
+    2264
+   ],
+   "rate_after|plat_perf": [
+    0.4689,
+    2264
+   ],
+   "pct_after|elo_tourn": [
+    0.4085,
+    2146
+   ],
+   "pct_after|elo_tourn_published": [
+    0.2784,
+    2146
+   ],
+   "pct_after|elo_replay_base": [
+    0.4115,
+    2146
+   ],
+   "pct_after|elo_candidate": [
+    0.4444,
+    2146
+   ],
+   "pct_after|elo_club": [
+    0.2096,
+    1767
+   ],
+   "pct_after|masterpoints": [
+    0.3164,
+    1976
+   ],
+   "pct_after|plat_pts": [
+    0.454,
+    2264
+   ],
+   "pct_after|gold_pts": [
+    0.174,
+    2264
+   ],
+   "pct_after|plat_perf": [
+    0.4783,
+    2264
+   ]
+  },
+  "20plus_sessions": {
+   "players": 1909,
+   "rate_after|elo_tourn": [
+    0.4187,
+    1909
+   ],
+   "rate_after|elo_tourn_published": [
+    0.3508,
+    1909
+   ],
+   "rate_after|elo_replay_base": [
+    0.4303,
+    1909
+   ],
+   "rate_after|elo_candidate": [
+    0.4651,
+    1909
+   ],
+   "rate_after|elo_club": [
+    0.1885,
+    1675
+   ],
+   "rate_after|masterpoints": [
+    0.3241,
+    1821
+   ],
+   "rate_after|plat_pts": [
+    0.5676,
+    1909
+   ],
+   "rate_after|gold_pts": [
+    0.322,
+    1909
+   ],
+   "rate_after|plat_perf": [
+    0.4856,
+    1909
+   ],
+   "pct_after|elo_tourn": [
+    0.4489,
+    1909
+   ],
+   "pct_after|elo_tourn_published": [
+    0.3828,
+    1909
+   ],
+   "pct_after|elo_replay_base": [
+    0.4497,
+    1909
+   ],
+   "pct_after|elo_candidate": [
+    0.4906,
+    1909
+   ],
+   "pct_after|elo_club": [
+    0.2146,
+    1675
+   ],
+   "pct_after|masterpoints": [
+    0.3458,
+    1821
+   ],
+   "pct_after|plat_pts": [
+    0.5603,
+    1909
+   ],
+   "pct_after|gold_pts": [
+    0.3561,
+    1909
+   ],
+   "pct_after|plat_perf": [
+    0.5062,
+    1909
+   ]
+  },
+  "top100_overlap": {
+   "elo_tourn": 24,
+   "elo_tourn_published": 15,
+   "elo_replay_base": 28,
+   "elo_candidate": 28,
+   "masterpoints": 25,
+   "plat_pts": 43,
+   "gold_pts": 19,
+   "plat_perf": 38
+  }
+ }
+}
