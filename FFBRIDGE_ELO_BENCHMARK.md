@@ -77,10 +77,20 @@ the first 10 to 20 sessions gives the same +0.008.
 - **More history before 2023-11.** Everyone starts at 1200 on that date, so the
   first months are a warm-up for the whole population.
 
-## Adopting the boost
+## Adopted (2026-11-25, live on prod)
 
-In `streamlit_app_ffbridge_elo_ratings.py` the per-player update would use K 24,
-times 4 while the player has fewer than 10 rated sessions (`player_games`). The
-cached Elo parquets would then need a rebuild, and the FFBridge prediction data
-and models would follow. This is a change to the FFBridge Elo site and its
-ratings, so it waits for the user.
+- Code: `elo_common.ffbridge_k_factor` (K 24, times 4 while a player has fewer
+  than 10 rated sessions), used by both Elo tracks in
+  `streamlit_app_ffbridge_elo_ratings.py`. The dataset key went from
+  `elo_full_v11` to `elo_full_v12`, so the builder replays the whole history.
+  Elo_Ratings `81ece19`, pushed. The elo tests pass (309).
+- Local rebuild: `data/ffbridge/elo_cache/elo_full_v12_*` (981,394 rows to
+  2026-11-24; the v11 files are kept beside it).
+- Prod: `deploy_elo_ratings.ps1` on X1 at 15:22 (containers at `81ece19`, all
+  services 200). The builder wrote `elo_full_v12_*` at 15:21 (982,505 rows).
+  Checked with `ffbridge_bench/check_rebuilt.py`: the stored ratings follow the
+  new formula (rank correlation 0.9989 with its replay, 0.981 with the old one).
+  2026 club sessions on prod's data: 0.5275 with the old formula, **0.5346** with
+  the new one (+0.0071 ±0.0009).
+- Not done: the FFBridge prediction data and models (`ffbridge-pipeline` 5a/5c)
+  still use the old ratings until they are rerun.
