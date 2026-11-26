@@ -53,6 +53,27 @@ class IdentityTests(unittest.TestCase):
 
 
 class FieldScoreTests(unittest.TestCase):
+    def test_imp_scale_is_the_wbf_table_at_every_band_edge(self) -> None:
+        # (difference, IMPs) at each band's bottom and top edge: WBF table and Brill's js/scoring.js.
+        top = [10, 40, 80, 120, 160, 210, 260, 310, 360, 420, 490, 590, 740, 890, 1090, 1290,
+               1490, 1740, 1990, 2240, 2490, 2990, 3490, 3990]
+        bottom = [0, 20, 50, 90, 130, 170, 220, 270, 320, 370, 430, 500, 600, 750, 900, 1100,
+                  1300, 1500, 1750, 2000, 2250, 2500, 3000, 3500, 4000]
+        for n, lo in enumerate(bottom):
+            self.assertEqual(int(elo_brill.imps(lo)), n, lo)
+            self.assertEqual(int(elo_brill.imps(-lo)), -n, -lo)
+        for n, hi in enumerate(top):
+            self.assertEqual(int(elo_brill.imps(hi)), n, hi)
+            self.assertEqual(int(elo_brill.imps(-hi)), -n, -hi)
+        self.assertEqual(int(elo_brill.imps(7600)), 24)
+        self.assertEqual(elo_brill.imps(np.array([0, 10, 20, 40, 50, 80, 90])).tolist(), [0, 0, 1, 1, 2, 2, 3])
+
+    def test_cross_imps_at_band_edges(self) -> None:
+        # 10 points is a push in IMPs; 40 is 1; 80 is 2.
+        self.assertEqual(elo_brill.cross_imps(np.array([420, 410])).tolist(), [0.0, 0.0])
+        self.assertEqual(elo_brill.cross_imps(np.array([140, 100])).tolist(), [1.0, -1.0])
+        self.assertEqual(elo_brill.cross_imps(np.array([-50, -130])).tolist(), [2.0, -2.0])
+
     def test_cross_imps_are_the_mean_against_the_other_tables(self) -> None:
         imps = elo_brill.cross_imps(np.array([620, 170, -100]))
         # 620 v 170 = 450 -> 10 IMPs; 620 v -100 = 720 -> 12; 170 v -100 = 270 -> 7.

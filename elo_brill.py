@@ -80,11 +80,21 @@ _RESULT_COLUMNS = (
 )
 _STANDING_COLUMNS = "tournament_id,display_name,user_id,final_rank"
 _ID_CHUNK = 40
-# Differences up to each bound score 0, 1, 2, ... IMPs.
+# The WBF IMP table, as Brill's own site scores (js/scoring.js): a difference of at
+# least each bound scores 1, 2, 3, ... IMPs (0-10 = 0, 20-40 = 1, 50-80 = 2, ...).
+# Use with np.searchsorted(..., side="right"), as imps() does. Until 2026-11-26 this
+# held the top edges [10, 40, 80, ...] instead, which with side="right" gave one IMP
+# too many at every top edge (10 points = 1 IMP, 40 = 2, 80 = 3, ...).
 _IMP_BOUNDS = np.array(
-    [10, 40, 80, 120, 160, 210, 260, 310, 360, 420, 490, 590, 740, 890, 1090, 1290,
-     1490, 1740, 1990, 2240, 2490, 2990, 3490, 3990]
+    [20, 50, 90, 130, 170, 220, 270, 320, 370, 430, 500, 600, 750, 900, 1100, 1300,
+     1500, 1750, 2000, 2250, 2500, 3000, 3500, 4000]
 )
+
+
+def imps(diff):
+    """IMPs, with their sign, for a score difference (a number or an array)."""
+    diff = np.asarray(diff)
+    return np.sign(diff) * np.searchsorted(_IMP_BOUNDS, np.abs(diff), side="right")
 
 _build_lock = threading.Lock()
 
@@ -372,8 +382,7 @@ def cross_imps(scores: np.ndarray) -> np.ndarray:
     if len(scores) < 2:
         return np.full(len(scores), np.nan)
     diff = scores[:, None] - scores[None, :]
-    imps = np.sign(diff) * np.searchsorted(_IMP_BOUNDS, np.abs(diff), side="right")
-    return imps.sum(axis=1) / (len(scores) - 1)
+    return imps(diff).sum(axis=1) / (len(scores) - 1)
 
 
 def add_field_scores(df: pl.DataFrame) -> pl.DataFrame:
