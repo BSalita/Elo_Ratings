@@ -57,7 +57,7 @@ SESSIONS_PATH = CACHE_DIR / "brill_sessions.parquet"
 METADATA_PATH = CACHE_DIR / "brill_elo_metadata.json"
 
 # Bump when a fragment's columns or their meaning change; old fragments are rebuilt.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: IMP_NS on the WBF table (2026-11-26)
 
 SEATS = ("N", "E", "S", "W")
 STRAINS = "SHDCN"
